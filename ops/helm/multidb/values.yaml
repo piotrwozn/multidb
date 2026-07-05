@@ -1,0 +1,66 @@
+replicaCount: 1
+
+image:
+  repository: multidb
+  tag: local
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  pgwirePort: 5432
+  adminPort: 8080
+
+runtime:
+  mode: production
+  dbPath: /var/lib/multidb/multidb.redb
+  studioDir: /usr/share/multidb/studio
+  adminBind: 0.0.0.0:8080
+  pgBind: 0.0.0.0:5432
+
+secrets:
+  adminPassword:
+    name: multidb-admin
+    key: admin-password
+  adminToken:
+    name: multidb-admin
+    key: admin-token
+  pgPassword:
+    name: multidb-pg
+    key: password
+  pgTls:
+    name: multidb-pg-tls
+    certKey: tls.crt
+    privateKey: tls.key
+    mountPath: /etc/multidb/pg-tls
+
+persistence:
+  enabled: true
+  devEmptyDir: false
+  existingClaim: ""
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+
+config:
+  profile: transactional
+  replication: cp
+  auditJsonlPath: /var/lib/multidb/audit/audit.jsonl
+  backupTarget: s3://multidb-local/backups
+  minioEndpoint: http://minio:9000
+  vaultAddress: http://vault:8200
+  vaultKekPath: secret/data/multidb/kek
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+probes:
+  readinessPath: /ready
+  livenessPath: /health
+  initialDelaySeconds: 5
+  periodSeconds: 10

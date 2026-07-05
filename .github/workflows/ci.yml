@@ -1,0 +1,106 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/go.mod
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --lib phase33 -- --nocapture
+      - run: cargo test --locked --all-features
+      - name: Template smoke
+        shell: pwsh
+        run: ./scripts/templates-smoke.ps1
+      - name: SDK smoke
+        shell: pwsh
+        run: ./scripts/sdk-smoke.ps1 -RequireGo
+      - name: Studio check
+        shell: pwsh
+        run: ./scripts/studio-check.ps1
+      - name: Studio Playwright browser
+        working-directory: studio
+        run: npx playwright install --with-deps chromium
+      - name: Studio Playwright smoke
+        working-directory: studio
+        run: npm run e2e
+      - name: Docker runtime smoke
+        shell: pwsh
+        run: ./scripts/docker-smoke.ps1
+      - name: SDK examples smoke
+        shell: pwsh
+        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo
+      - name: Fuzz smoke
+        shell: pwsh
+        run: ./scripts/fuzz-smoke.ps1
+      - name: Performance gate self-test
+        shell: pwsh
+        run: ./scripts/perf_gate.ps1 -SelfTest
+      - name: Performance ci-gate
+        shell: pwsh
+        run: |
+          ./scripts/perf.ps1 -Profile ci-gate -Rows 1000 -Output target/perf/ci-candidate.json
+          ./scripts/perf_gate.ps1 -Baseline baselines/perf/ci-gate.json -Candidate target/perf/ci-candidate.json -SummaryOutput target/perf/ci-gate-summary.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-ci-performance
+          path: target/perf/*.json
+      - uses: EmbarkStudios/cargo-deny-action@f9cc7aa250dec5698b425dc01fbf0d745fcd1b78
+        with:
+          command: check
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - run: cargo check --locked --all-targets --all-features
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
+      - name: SBOM CycloneDX
+        run: |
+          cargo install cargo-cyclonedx --locked
+          mkdir -p target/sbom
+          cargo cyclonedx --locked --all --format json --output-cdx target/sbom/multidb
+      - name: cargo-vet policy
+        run: |
+          cargo install cargo-vet --locked
+          cargo vet --locked
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-sbom
+          path: target/sbom/*.json

@@ -1,0 +1,59 @@
+version: 1
+name: Agent Memory
+profile: ai_agent_memory
+deployment:
+  mode: single_node
+  storage_path: agent_memory.redb
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: false
+    pitr: false
+  encryption:
+    at_rest: false
+  audit:
+    enabled: true
+  sensitive_data: false
+  strict_cross_domain_transactions: false
+domains:
+- name: primary
+  mode: local_snapshot
+collections:
+- name: memories
+  role: vector_memory
+  domain: primary
+  indexes:
+  - vector
+- name: facts
+  role: document_entity
+  domain: primary
+  indexes:
+  - document
+- name: conversation_events
+  role: event_log
+  domain: primary
+  indexes:
+  - primary
+- name: scratch_cache
+  role: cache
+  domain: primary
+  indexes:
+  - primary
+extensions:
+- name: cdc
+  version: 1.0.0
+  stability: stable
+- name: document_index
+  version: 1.0.0
+  stability: stable
+- name: vector_hnsw
+  version: 1.0.0
+  stability: stable
+overrides: {}
+operation_hints:
+  template.profile_reason: Uses the stable AI memory profile because vector collections, document facts, event context and cache data are all part of its support catalog.
+  template.slug: ai-memory

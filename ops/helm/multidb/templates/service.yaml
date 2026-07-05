@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "multidb.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "multidb.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "multidb.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: pgwire
+      port: {{ .Values.service.pgwirePort }}
+      targetPort: pgwire
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin

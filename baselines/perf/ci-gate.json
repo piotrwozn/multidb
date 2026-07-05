@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "profile": "ci-gate",
+  "generated_at_utc": "2026-07-04T00:00:00Z",
+  "git": {
+    "sha": "versioned-baseline",
+    "ref": "baselines/perf/ci-gate.json",
+    "dirty": "false"
+  },
+  "environment": {
+    "class": "shared-ci-runner",
+    "runner": "github-actions",
+    "rows": "1000",
+    "benches": "performance_micro,columnar_aggregation",
+    "measurement": "shared-runner wall-clock smoke threshold",
+    "release_blocker": "false"
+  },
+  "thresholds": {
+    "throughput_regression_percent": 10,
+    "latency_regression_percent": 10
+  },
+  "calibration_status": "smoke-minimum",
+  "benchmarks": [
+    {
+      "name": "performance_micro_wall_clock",
+      "throughput_ops_per_sec": 1.0,
+      "p50_ms": 180000.0,
+      "p95_ms": 180000.0,
+      "p99_ms": 180000.0,
+      "metadata": {
+        "profile": "ci-gate",
+        "rows": "1000",
+        "measurement": "shared-runner wall-clock smoke threshold",
+        "bench": "performance_micro"
+      }
+    },
+    {
+      "name": "columnar_aggregation_wall_clock",
+      "throughput_ops_per_sec": 1.0,
+      "p50_ms": 180000.0,
+      "p95_ms": 180000.0,
+      "p99_ms": 180000.0,
+      "metadata": {
+        "profile": "ci-gate",
+        "rows": "1000",
+        "measurement": "shared-runner wall-clock smoke threshold",
+        "bench": "columnar_aggregation"
+      }
+    },
+    {
+      "name": "phase33_benchmark_harness",
+      "throughput_ops_per_sec": 1.0,
+      "p50_ms": 1.0,
+      "p95_ms": 1.0,
+      "p99_ms": 1.0,
+      "metadata": {
+        "profile": "ci-gate",
+        "rows": "1000",
+        "measurement": "harness presence marker"
+      }
+    }
+  ]
+}

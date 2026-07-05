@@ -1,0 +1,30 @@
+services:
+  multidb:
+    build:
+      context: .
+    image: multidb:local
+    environment:
+      MULTIDB_RUNTIME_MODE: local-dev
+      MULTIDB_PG_TLS_MODE: disabled
+      MULTIDB_ADMIN_PASSWORD: local-dev-admin-password
+      MULTIDB_ADMIN_TOKEN: local-dev-admin-token
+      MULTIDB_PG_USER: multidb
+      MULTIDB_PG_PASSWORD: local-dev-pg-password
+      MULTIDB_PROFILE: transactional
+      MULTIDB_DB_PATH: /var/lib/multidb/multidb.redb
+      MULTIDB_BIND: 0.0.0.0:8080
+      MULTIDB_PG_BIND: 0.0.0.0:5432
+    ports:
+      - "5432:5432"
+      - "8080:8080"
+    volumes:
+      - multidb-data:/var/lib/multidb
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  multidb-data:

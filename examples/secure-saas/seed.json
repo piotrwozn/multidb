@@ -1,0 +1,23 @@
+{
+  "records": {
+    "app_state": [
+      {
+        "key": "billing_mode",
+        "value": "test"
+      }
+    ],
+    "outbox": [
+      {
+        "event": "tenant_created",
+        "tenant_id": "tenant-demo"
+      }
+    ],
+    "tenants": [
+      {
+        "plan": "starter",
+        "tenant_id": "tenant-demo"
+      }
+    ]
+  },
+  "template": "secure-saas"
+}

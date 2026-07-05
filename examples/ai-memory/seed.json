@@ -1,0 +1,29 @@
+{
+  "records": {
+    "conversation_events": [
+      {
+        "event": "memory_seeded",
+        "memory_id": "memory-1"
+      }
+    ],
+    "facts": [
+      {
+        "object": "DatabaseSpec",
+        "predicate": "uses",
+        "subject": "project"
+      }
+    ],
+    "memories": [
+      {
+        "embedding": [
+          0.1,
+          0.2,
+          0.3
+        ],
+        "id": "memory-1",
+        "text": "User prefers concise plans."
+      }
+    ]
+  },
+  "template": "ai-memory"
+}

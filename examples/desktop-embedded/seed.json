@@ -1,0 +1,25 @@
+{
+  "records": {
+    "documents": [
+      {
+        "body": "Edit locally.",
+        "id": "welcome",
+        "title": "Welcome"
+      }
+    ],
+    "settings": [
+      {
+        "key": "theme",
+        "value": "system"
+      }
+    ],
+    "usage_metrics": [
+      {
+        "name": "open",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "value": 1
+      }
+    ]
+  },
+  "template": "desktop-embedded"
+}

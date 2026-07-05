@@ -1,0 +1,565 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "MultiDB Control Plane API",
+    "version": "1.0.0",
+    "description": "Public Phase 52 HTTP contract for the MultiDB Control Plane API."
+  },
+  "x-multidb-api-version": 1,
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "Local Docker or multidb serve runtime"
+    }
+  ],
+  "tags": [
+    { "name": "Auth" },
+    { "name": "Status" },
+    { "name": "Catalog" },
+    { "name": "SQL" },
+    { "name": "Data" },
+    { "name": "Builder" },
+    { "name": "Admin" },
+    { "name": "Advice" },
+    { "name": "Contract" }
+  ],
+  "paths": {
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApi",
+        "tags": ["Contract"],
+        "summary": "Return the Control Plane OpenAPI v1 document.",
+        "security": [],
+        "x-multidb-stability": "stable",
+        "responses": {
+          "200": {
+            "description": "OpenAPI document",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "tags": ["Status"],
+        "summary": "Liveness probe.",
+        "security": [],
+        "x-multidb-stability": "stable",
+        "responses": {
+          "200": {
+            "description": "Liveness response",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "operationId": "getReady",
+        "tags": ["Status"],
+        "summary": "Readiness probe.",
+        "security": [],
+        "x-multidb-stability": "stable",
+        "responses": {
+          "200": {
+            "description": "Ready response"
+          },
+          "503": {
+            "description": "Runtime is not ready"
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "operationId": "login",
+        "tags": ["Auth"],
+        "summary": "Create an admin session token.",
+        "security": [],
+        "x-multidb-stability": "stable",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LoginRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoginEnvelope" },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "operationId": "logout",
+        "tags": ["Auth"],
+        "summary": "Revoke the current session token.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/auth/change-password": {
+      "post": {
+        "operationId": "changePassword",
+        "tags": ["Auth"],
+        "summary": "Change the durable admin password.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChangePasswordRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "operationId": "getAuthMe",
+        "tags": ["Auth"],
+        "summary": "Return the authenticated admin principal.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "responses": {
+          "200": { "$ref": "#/components/responses/AuthMeEnvelope" },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "tags": ["Status"],
+        "summary": "Return runtime status.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "getMetrics",
+        "tags": ["Status"],
+        "summary": "Return raw text metrics.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "preview",
+        "responses": {
+          "200": {
+            "description": "Raw metrics text",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/catalog": { "get": { "$ref": "#/components/pathItems/getCatalog" } },
+    "/sql": {
+      "post": {
+        "operationId": "executeSql",
+        "tags": ["SQL"],
+        "summary": "Execute a SQL statement.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "requestBody": { "$ref": "#/components/requestBodies/SqlRequest" },
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      }
+    },
+    "/data/tables/{name}/rows": {
+      "get": {
+        "operationId": "listTableRows",
+        "tags": ["Data"],
+        "summary": "List table rows.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamePath" },
+          { "$ref": "#/components/parameters/OffsetQuery" },
+          { "$ref": "#/components/parameters/LimitQuery" }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "post": {
+        "operationId": "insertTableRow",
+        "tags": ["Data"],
+        "summary": "Insert a table row.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [{ "$ref": "#/components/parameters/NamePath" }],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "put": {
+        "operationId": "updateTableRow",
+        "tags": ["Data"],
+        "summary": "Update a table row by primary key.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [{ "$ref": "#/components/parameters/NamePath" }],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "delete": {
+        "operationId": "deleteTableRow",
+        "tags": ["Data"],
+        "summary": "Delete a table row after exact confirmation.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [{ "$ref": "#/components/parameters/NamePath" }],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
+          "422": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/data/collections/{name}/documents": {
+      "get": {
+        "operationId": "listDocuments",
+        "tags": ["Data"],
+        "summary": "List collection documents.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamePath" },
+          { "$ref": "#/components/parameters/OffsetQuery" },
+          { "$ref": "#/components/parameters/LimitQuery" }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "post": {
+        "operationId": "createDocument",
+        "tags": ["Data"],
+        "summary": "Create a collection document.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [{ "$ref": "#/components/parameters/NamePath" }],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      }
+    },
+    "/data/collections/{name}/documents/{id}": {
+      "put": {
+        "operationId": "updateDocument",
+        "tags": ["Data"],
+        "summary": "Update a collection document.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamePath" },
+          { "$ref": "#/components/parameters/IdPath" }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "delete": {
+        "operationId": "deleteDocument",
+        "tags": ["Data"],
+        "summary": "Delete a collection document after exact confirmation.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamePath" },
+          { "$ref": "#/components/parameters/IdPath" }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
+          "422": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/data/vectors/{name}/vectors": { "post": { "$ref": "#/components/pathItems/insertVector" } },
+    "/data/vectors/{name}/search": { "post": { "$ref": "#/components/pathItems/searchVector" } },
+    "/data/time-series/{name}/points": {
+      "get": {
+        "operationId": "listTimeSeriesPoints",
+        "tags": ["Data"],
+        "summary": "Read a time-series range.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamePath" },
+          { "name": "series", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "start", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
+          { "name": "end", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "post": {
+        "operationId": "insertTimeSeriesPoint",
+        "tags": ["Data"],
+        "summary": "Insert a time-series point.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "parameters": [{ "$ref": "#/components/parameters/NamePath" }],
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      }
+    },
+    "/builder/table": { "post": { "$ref": "#/components/pathItems/createTable" } },
+    "/builder/collection": { "post": { "$ref": "#/components/pathItems/createCollection" } },
+    "/builder/vector": { "post": { "$ref": "#/components/pathItems/createVector" } },
+    "/builder/time-series": { "post": { "$ref": "#/components/pathItems/createTimeSeries" } },
+    "/builder/full-text": { "post": { "$ref": "#/components/pathItems/createFullText" } },
+    "/builder/geo": { "post": { "$ref": "#/components/pathItems/createGeoIndex" } },
+    "/builder/graph": { "post": { "$ref": "#/components/pathItems/createGraph" } },
+    "/security": {
+      "get": {
+        "operationId": "getSecurity",
+        "tags": ["Admin"],
+        "summary": "Read RBAC state.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
+      },
+      "post": {
+        "operationId": "updateSecurity",
+        "tags": ["Admin"],
+        "summary": "Update RBAC state.",
+        "security": [{ "BearerAuth": [] }],
+        "x-multidb-stability": "stable",
+        "requestBody": { "$ref": "#/components/requestBodies/JsonObject" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
+          "403": { "$ref": "#/components/responses/ErrorEnvelope" }
+        }
+      }
+    },
+    "/audit": { "get": { "$ref": "#/components/pathItems/getAudit" } },
+    "/config": { "get": { "$ref": "#/components/pathItems/getConfig" } },
+    "/config/validate": { "post": { "$ref": "#/components/pathItems/validateConfig" } },
+    "/config/plan": { "post": { "$ref": "#/components/pathItems/planConfig" } },
+    "/config/apply": { "post": { "$ref": "#/components/pathItems/applyConfig" } },
+    "/profiles": { "get": { "$ref": "#/components/pathItems/getProfiles" } },
+    "/roles": { "get": { "$ref": "#/components/pathItems/getRoles" } },
+    "/domains": { "get": { "$ref": "#/components/pathItems/getDomains" } },
+    "/extensions": { "get": { "$ref": "#/components/pathItems/getExtensions" } },
+    "/advice": { "get": { "$ref": "#/components/pathItems/getAdvice" } },
+    "/advice/plan": { "post": { "$ref": "#/components/pathItems/planAdvice" } },
+    "/advice/decision": { "post": { "$ref": "#/components/pathItems/recordAdviceDecision" } },
+    "/studio": { "get": { "$ref": "#/components/pathItems/getStudioManifest" } }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "JsonValue": true,
+      "JsonObject": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "ApiError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
+      "SuccessEnvelope": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": { "$ref": "#/components/schemas/JsonValue" }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": ["ok", "error"],
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": { "$ref": "#/components/schemas/ApiError" }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["ok", "status"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "status": { "type": "string" }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string", "format": "password" }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "required": ["token", "expires_at", "expires_at_millis", "principal", "roles"],
+        "properties": {
+          "token": { "type": "string" },
+          "expires_at": { "type": "string" },
+          "expires_at_millis": { "type": "integer", "format": "uint64" },
+          "principal": { "type": "string" },
+          "roles": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AuthMeResponse": {
+        "type": "object",
+        "required": ["principal", "roles", "system_admin", "database_admin", "insecure_local_admin"],
+        "properties": {
+          "principal": { "type": "string" },
+          "roles": { "type": "array", "items": { "type": "string" } },
+          "system_admin": { "type": "boolean" },
+          "database_admin": { "type": "boolean" },
+          "insecure_local_admin": { "type": "boolean" }
+        }
+      },
+      "ChangePasswordRequest": {
+        "type": "object",
+        "required": ["current_password", "new_password"],
+        "properties": {
+          "current_password": { "type": "string", "format": "password" },
+          "new_password": { "type": "string", "format": "password" }
+        }
+      }
+    },
+    "examples": {
+      "SuccessEnvelope": {
+        "summary": "Successful enveloped response",
+        "value": { "ok": true, "data": {} }
+      },
+      "ErrorEnvelope": {
+        "summary": "Failed enveloped response",
+        "value": { "ok": false, "error": { "code": "unauthorized", "message": "unauthorized" } }
+      }
+    },
+    "parameters": {
+      "NamePath": { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+      "IdPath": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "OffsetQuery": { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0 } },
+      "LimitQuery": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+    },
+    "requestBodies": {
+      "JsonObject": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JsonObject" } } }
+      },
+      "SqlRequest": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["sql"],
+              "properties": { "sql": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "JsonObjectEnvelope": {
+        "description": "Enveloped JSON response",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/SuccessEnvelope" },
+            "examples": { "success": { "$ref": "#/components/examples/SuccessEnvelope" } }
+          }
+        }
+      },
+      "LoginEnvelope": {
+        "description": "Login response envelope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                { "$ref": "#/components/schemas/SuccessEnvelope" },
+                {
+                  "type": "object",
+                  "properties": { "data": { "$ref": "#/components/schemas/LoginResponse" } }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "AuthMeEnvelope": {
+        "description": "Auth principal response envelope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                { "$ref": "#/components/schemas/SuccessEnvelope" },
+                {
+                  "type": "object",
+                  "properties": { "data": { "$ref": "#/components/schemas/AuthMeResponse" } }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "description": "Enveloped error response",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" },
+            "examples": { "error": { "$ref": "#/components/examples/ErrorEnvelope" } }
+          }
+        }
+      }
+    },
+    "pathItems": {
+      "getCatalog": { "operationId": "getCatalog", "tags": ["Catalog"], "summary": "Return catalog objects.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "insertVector": { "operationId": "insertVector", "tags": ["Data"], "summary": "Insert a vector.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "parameters": [{ "$ref": "#/components/parameters/NamePath" }], "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "searchVector": { "operationId": "searchVector", "tags": ["Data"], "summary": "Search vectors.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "parameters": [{ "$ref": "#/components/parameters/NamePath" }], "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createTable": { "operationId": "createTable", "tags": ["Builder"], "summary": "Create a table.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createCollection": { "operationId": "createCollection", "tags": ["Builder"], "summary": "Create a document collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createVector": { "operationId": "createVector", "tags": ["Builder"], "summary": "Create a vector collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createTimeSeries": { "operationId": "createTimeSeries", "tags": ["Builder"], "summary": "Create a time-series collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createFullText": { "operationId": "createFullText", "tags": ["Builder"], "summary": "Create a full-text index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createGeoIndex": { "operationId": "createGeoIndex", "tags": ["Builder"], "summary": "Create a geo index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createGraph": { "operationId": "createGraph", "tags": ["Builder"], "summary": "Create a graph.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getAudit": { "operationId": "getAudit", "tags": ["Admin"], "summary": "Read audit events.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getConfig": { "operationId": "getConfig", "tags": ["Admin"], "summary": "Return current DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "validateConfig": { "operationId": "validateConfig", "tags": ["Admin"], "summary": "Validate a DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "planConfig": { "operationId": "planConfig", "tags": ["Admin"], "summary": "Plan a DatabaseSpec change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "applyConfig": { "operationId": "applyConfig", "tags": ["Admin"], "summary": "Confirm and audit a planned config change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getProfiles": { "operationId": "getProfiles", "tags": ["Admin"], "summary": "List built-in profiles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getRoles": { "operationId": "getRoles", "tags": ["Admin"], "summary": "List collection roles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getDomains": { "operationId": "getDomains", "tags": ["Admin"], "summary": "List consistency domains.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getExtensions": { "operationId": "getExtensions", "tags": ["Admin"], "summary": "List extension manifests.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getAdvice": { "operationId": "getAdvice", "tags": ["Advice"], "summary": "Return runtime advice.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "planAdvice": { "operationId": "planAdvice", "tags": ["Advice"], "summary": "Return the dry-run plan for an advice item.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "recordAdviceDecision": { "operationId": "recordAdviceDecision", "tags": ["Advice"], "summary": "Record an advice decision.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getStudioManifest": { "operationId": "getStudioManifest", "tags": ["Contract"], "summary": "Return Studio and client capability metadata.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } }
+    }
+  }
+}

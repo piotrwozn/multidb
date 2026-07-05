@@ -1,0 +1,61 @@
+name: nightly-verification
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  phase33:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - run: cargo test --locked --lib phase33 -- --nocapture
+      - run: cargo test --locked --lib verification -- --nocapture
+      - run: cargo test --locked --lib storage::conformance -- --nocapture
+      - run: cargo test --locked --lib repl::cp -- --nocapture
+      - run: cargo test --locked --lib repl::ap -- --nocapture
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
+        with:
+          toolchain: nightly
+      - name: Fuzz smoke
+        shell: pwsh
+        run: ./scripts/fuzz-smoke.ps1
+      - name: Performance gate self-test
+        shell: pwsh
+        run: ./scripts/perf_gate.ps1 -SelfTest
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - name: Miri smoke
+        shell: pwsh
+        run: ./scripts/miri-smoke.ps1
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - name: ThreadSanitizer smoke
+        shell: pwsh
+        run: ./scripts/tsan-smoke.ps1

@@ -1,0 +1,321 @@
+{
+  "$id": "https://multidb.dev/schemas/database-spec-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MultiDB DatabaseSpec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "name",
+    "profile",
+    "deployment",
+    "defaults",
+    "guarantees",
+    "domains",
+    "collections",
+    "extensions",
+    "overrides",
+    "operation_hints"
+  ],
+  "properties": {
+    "collections": {
+      "items": {
+        "$ref": "#/$defs/collection_role"
+      },
+      "type": "array"
+    },
+    "defaults": {
+      "$ref": "#/$defs/defaults"
+    },
+    "deployment": {
+      "$ref": "#/$defs/deployment"
+    },
+    "domains": {
+      "items": {
+        "$ref": "#/$defs/consistency_domain"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "items": {
+        "$ref": "#/$defs/extension_ref"
+      },
+      "type": "array"
+    },
+    "guarantees": {
+      "$ref": "#/$defs/guarantees"
+    },
+    "name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "operation_hints": {
+      "$ref": "#/$defs/string_map"
+    },
+    "overrides": {
+      "$ref": "#/$defs/string_map"
+    },
+    "profile": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "topology": {
+      "$ref": "#/$defs/topology"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "$defs": {
+    "collection_role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "role",
+        "domain",
+        "indexes"
+      ],
+      "properties": {
+        "domain": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "indexes": {
+          "items": {
+            "enum": [
+              "primary",
+              "document",
+              "vector",
+              "graph",
+              "full_text",
+              "columnar",
+              "time_series"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "document_entity",
+            "key_value",
+            "event_log",
+            "vector_memory",
+            "cache",
+            "audit",
+            "graph",
+            "analytics",
+            "time_series"
+          ],
+          "type": "string"
+        }
+      }
+    },
+    "consistency_domain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "local_snapshot",
+            "strong_cp",
+            "eventual_ap"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "consistency_domain",
+        "replication"
+      ],
+      "properties": {
+        "consistency_domain": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "replication": {
+          "enum": [
+            "cp",
+            "ap"
+          ],
+          "type": "string"
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "storage_path"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "embedded",
+            "single_node",
+            "cluster"
+          ],
+          "type": "string"
+        },
+        "storage_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "extension_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "stability"
+      ],
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stability": {
+          "enum": [
+            "stable",
+            "experimental"
+          ],
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      }
+    },
+    "guarantees": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "write_ack",
+        "conflict_resolution",
+        "backup",
+        "encryption",
+        "audit",
+        "sensitive_data",
+        "strict_cross_domain_transactions"
+      ],
+      "properties": {
+        "audit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "backup": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "pitr"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "pitr": {
+              "type": "boolean"
+            }
+          }
+        },
+        "conflict_resolution": {
+          "enum": [
+            "none",
+            "last_write_wins",
+            "vector_clock",
+            "crdt",
+            "custom"
+          ],
+          "type": "string"
+        },
+        "encryption": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "at_rest"
+          ],
+          "properties": {
+            "at_rest": {
+              "type": "boolean"
+            }
+          }
+        },
+        "sensitive_data": {
+          "type": "boolean"
+        },
+        "strict_cross_domain_transactions": {
+          "type": "boolean"
+        },
+        "write_ack": {
+          "enum": [
+            "local",
+            "quorum",
+            "all"
+          ],
+          "type": "string"
+        }
+      }
+    },
+    "string_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "propertyNames": {
+        "minLength": 1
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "replica_count",
+        "shard_count"
+      ],
+      "properties": {
+        "replica_count": {
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "shard_count": {
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

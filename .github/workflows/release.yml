@@ -1,0 +1,190 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            studio/package-lock.json
+            sdk/typescript/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go/go.mod
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Build reproducible Linux artifact
+        run: |
+          repro_dir="$(mktemp -d)"
+          cargo build --locked --release --all-features
+          cp target/release/multidb "$repro_dir/multidb.first"
+          cargo clean -p multidb
+          cargo build --locked --release --all-features
+          cmp "$repro_dir/multidb.first" target/release/multidb
+          cp target/release/multidb target/release/multidb-linux-x86_64
+
+      - name: Public preview smoke
+        shell: pwsh
+        run: ./scripts/preview-smoke.ps1 -Bin ./target/release/multidb -Output target/preview-smoke/summary.json
+
+      - name: SDK package smoke
+        shell: pwsh
+        run: ./scripts/sdk-smoke.ps1 -RequireGo
+
+      - name: Docker runtime smoke
+        shell: pwsh
+        run: ./scripts/docker-smoke.ps1
+
+      - name: SDK examples smoke
+        shell: pwsh
+        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo
+
+      - name: Release performance gate
+        shell: pwsh
+        run: |
+          ./scripts/perf.ps1 -Profile release-baseline -Rows 1000 -Output target/perf/release-candidate.json
+          ./scripts/perf_gate.ps1 -Baseline baselines/perf/release-baseline.json -Candidate target/perf/release-candidate.json -SummaryOutput target/perf/release-gate-summary.json
+          ./scripts/perf_trend.ps1 -Reports baselines/perf/release-baseline.json,target/perf/release-candidate.json -Output target/perf/release-trend.json
+
+      - name: Generate binary SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          mkdir -p target/sbom
+          cargo cyclonedx --locked --all --format json --output-cdx target/sbom/multidb
+          sbom="$(find target/sbom -name '*.json' | head -n 1)"
+          test -n "$sbom"
+          cp "$sbom" target/release/multidb.cdx.json
+
+      - name: Publish signed GHCR image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
+          metadata_file="target/release/image-metadata.json"
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx create --use --name multidb-release-builder
+          docker buildx inspect --bootstrap
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag "$image" \
+            --sbom=true \
+            --provenance=true \
+            --metadata-file "$metadata_file" \
+            --push .
+          digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
+          test -n "$digest"
+          test "$digest" != "null"
+          cosign sign --yes "$image@$digest"
+          printf '%s@%s\n' "$image" "$digest" > target/release/image-digest.txt
+
+      - name: Stage release evidence
+        run: |
+          cp target/preview-smoke/summary.json target/release/preview-smoke-summary.json
+          cp target/perf/release-candidate.json target/release/release-candidate.json
+          cp target/perf/release-gate-summary.json target/release/release-gate-summary.json
+          cp target/perf/release-trend.json target/release/release-trend.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-linux-release
+          path: |
+            target/release/multidb-linux-x86_64
+            target/release/multidb.cdx.json
+            target/release/image-digest.txt
+            target/release/image-metadata.json
+            target/release/preview-smoke-summary.json
+            target/release/release-candidate.json
+            target/release/release-gate-summary.json
+            target/release/release-trend.json
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+
+      - name: Build Windows artifact
+        shell: pwsh
+        run: |
+          cargo build --locked --release --all-features
+          Copy-Item target/release/multidb.exe target/release/multidb-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-windows-release
+          path: target/release/multidb-windows-x86_64.exe
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - linux-release
+      - windows-release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/release
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Checksums and signatures
+        run: |
+          sha256sum \
+            target/release/multidb-linux-x86_64 \
+            target/release/multidb-windows-x86_64.exe \
+            target/release/multidb.cdx.json \
+            target/release/image-digest.txt > target/release/SHA256SUMS
+          cosign sign-blob --yes target/release/multidb-linux-x86_64 \
+            --output-certificate target/release/multidb-linux-x86_64.pem \
+            --output-signature target/release/multidb-linux-x86_64.sig
+          cosign sign-blob --yes target/release/multidb-windows-x86_64.exe \
+            --output-certificate target/release/multidb-windows-x86_64.exe.pem \
+            --output-signature target/release/multidb-windows-x86_64.exe.sig
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: |
+            target/release/multidb-linux-x86_64
+            target/release/multidb-windows-x86_64.exe
+            target/release/multidb.cdx.json
+            target/release/image-digest.txt
+
+      - uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836
+        with:
+          files: |
+            target/release/multidb-linux-x86_64
+            target/release/multidb-linux-x86_64.pem
+            target/release/multidb-linux-x86_64.sig
+            target/release/multidb-windows-x86_64.exe
+            target/release/multidb-windows-x86_64.exe.pem
+            target/release/multidb-windows-x86_64.exe.sig
+            target/release/SHA256SUMS
+            target/release/multidb.cdx.json
+            target/release/image-digest.txt
+            target/release/image-metadata.json
+            target/release/preview-smoke-summary.json
+            target/release/release-candidate.json
+            target/release/release-gate-summary.json
+            target/release/release-trend.json

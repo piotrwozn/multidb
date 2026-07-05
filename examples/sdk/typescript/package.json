@@ -1,0 +1,11 @@
+{
+  "name": "multidb-typescript-sdk-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@multidb/client": "file:../../../sdk/typescript"
+  }
+}

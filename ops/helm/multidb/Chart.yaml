@@ -1,0 +1,6 @@
+apiVersion: v2
+name: multidb
+description: Docker-aligned runtime chart for MultiDB.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

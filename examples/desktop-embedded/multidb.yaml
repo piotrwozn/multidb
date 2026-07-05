@@ -1,0 +1,59 @@
+version: 1
+name: Desk Notes
+profile: desktop_app_embedded
+deployment:
+  mode: single_node
+  storage_path: desk_notes.redb
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: false
+    pitr: false
+  encryption:
+    at_rest: false
+  audit:
+    enabled: true
+  sensitive_data: false
+  strict_cross_domain_transactions: false
+domains:
+- name: primary
+  mode: local_snapshot
+collections:
+- name: documents
+  role: document_entity
+  domain: primary
+  indexes:
+  - document
+- name: settings
+  role: key_value
+  domain: primary
+  indexes:
+  - primary
+- name: audit_log
+  role: audit
+  domain: primary
+  indexes:
+  - primary
+- name: usage_metrics
+  role: time_series
+  domain: primary
+  indexes:
+  - time_series
+extensions:
+- name: audit
+  version: 1.0.0
+  stability: stable
+- name: document_index
+  version: 1.0.0
+  stability: stable
+- name: time_series
+  version: 1.0.0
+  stability: stable
+overrides: {}
+operation_hints:
+  template.profile_reason: Uses the certified embedded desktop profile to keep local durability, document data and audit visibility in one validated spec.
+  template.slug: desktop-embedded

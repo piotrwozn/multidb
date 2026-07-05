@@ -1,0 +1,12 @@
+[advisories]
+ignore = [
+    # hnsw_rs 0.3.4 transitively depends on bincode 1.3.3. The advisory is
+    # informational/unmaintained with no patched version.
+    "RUSTSEC-2025-0141",
+    # parquet 58.3.0 transitively depends on paste 1.0.15. The advisory is
+    # informational/unmaintained with no patched version.
+    "RUSTSEC-2024-0436",
+    # Present in Cargo.lock as an inactive transitive proc-macro dependency.
+    # The advisory is informational/unmaintained with no patched version.
+    "RUSTSEC-2026-0173",
+]

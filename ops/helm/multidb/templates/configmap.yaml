@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "multidb.fullname" . }}-config
+  labels:
+    app.kubernetes.io/name: {{ include "multidb.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  MULTIDB_RUNTIME_MODE: {{ .Values.runtime.mode | quote }}
+  MULTIDB_DB_PATH: {{ .Values.runtime.dbPath | quote }}
+  MULTIDB_BIND: {{ .Values.runtime.adminBind | quote }}
+  MULTIDB_PG_BIND: {{ .Values.runtime.pgBind | quote }}
+  MULTIDB_STUDIO_DIR: {{ .Values.runtime.studioDir | quote }}
+  MULTIDB_PROFILE: {{ .Values.config.profile | quote }}
+  MULTIDB_REPLICATION: {{ .Values.config.replication | quote }}
+  MULTIDB_AUDIT_JSONL_PATH: {{ .Values.config.auditJsonlPath | quote }}
+  MULTIDB_BACKUP_TARGET: {{ .Values.config.backupTarget | quote }}
+  MULTIDB_MINIO_ENDPOINT: {{ .Values.config.minioEndpoint | quote }}
+  MULTIDB_VAULT_ADDR: {{ .Values.config.vaultAddress | quote }}
+  MULTIDB_VAULT_KEK_PATH: {{ .Values.config.vaultKekPath | quote }}

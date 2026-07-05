@@ -1,0 +1,27 @@
+{
+  "records": {
+    "player_state": [
+      {
+        "key": "current_profile",
+        "value": {
+          "difficulty": "normal",
+          "display_name": "Ada"
+        }
+      }
+    ],
+    "saves": [
+      {
+        "level": "intro",
+        "playtime_seconds": 180,
+        "slot": "slot-1"
+      }
+    ],
+    "session_events": [
+      {
+        "event": "save_created",
+        "slot": "slot-1"
+      }
+    ]
+  },
+  "template": "game-save"
+}

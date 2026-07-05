@@ -1,0 +1,26 @@
+{
+  "records": {
+    "aggregates": [
+      {
+        "bucket": "2026-01-01",
+        "metric": "page_views",
+        "value": 1
+      }
+    ],
+    "events": [
+      {
+        "event": "page_view",
+        "path": "/docs",
+        "tenant": "demo"
+      }
+    ],
+    "metrics": [
+      {
+        "name": "latency_ms",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "value": 42
+      }
+    ]
+  },
+  "template": "analytics"
+}

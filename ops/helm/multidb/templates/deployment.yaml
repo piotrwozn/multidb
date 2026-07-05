@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "multidb.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "multidb.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "multidb.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "multidb.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        multidb.io/upgrade-policy: rolling-forward
+        multidb.io/downgrade-policy: reject-unless-explicit-rollback
+    spec:
+      containers:
+        - name: multidb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "multidb.fullname" . }}-config
+          env:
+            - name: MULTIDB_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.adminPassword.name | quote }}
+                  key: {{ .Values.secrets.adminPassword.key | quote }}
+            - name: MULTIDB_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.adminToken.name | quote }}
+                  key: {{ .Values.secrets.adminToken.key | quote }}
+            - name: MULTIDB_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.pgPassword.name | quote }}
+                  key: {{ .Values.secrets.pgPassword.key | quote }}
+            - name: MULTIDB_PG_TLS_CERT
+              value: {{ printf "%s/%s" .Values.secrets.pgTls.mountPath .Values.secrets.pgTls.certKey | quote }}
+            - name: MULTIDB_PG_TLS_KEY
+              value: {{ printf "%s/%s" .Values.secrets.pgTls.mountPath .Values.secrets.pgTls.privateKey | quote }}
+          ports:
+            - name: pgwire
+              containerPort: {{ .Values.service.pgwirePort }}
+            - name: admin
+              containerPort: {{ .Values.service.adminPort }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readinessPath }}
+              port: admin
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.livenessPath }}
+              port: admin
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/multidb
+            - name: pg-tls
+              mountPath: {{ .Values.secrets.pgTls.mountPath | quote }}
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{ if .Values.persistence.devEmptyDir }}
+          emptyDir: {}
+          {{ else }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "multidb.fullname" .)) .Values.persistence.existingClaim | quote }}
+          {{ end }}
+        - name: pg-tls
+          secret:
+            secretName: {{ .Values.secrets.pgTls.name | quote }}

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "profile": "release-baseline",
+  "generated_at_utc": "2026-07-04T00:00:00Z",
+  "git": {
+    "sha": "versioned-baseline",
+    "ref": "baselines/perf/release-baseline.json",
+    "dirty": "false"
+  },
+  "environment": {
+    "class": "release-workflow",
+    "runner": "github-actions",
+    "rows": "1000",
+    "benches": "performance_micro,columnar_aggregation",
+    "measurement": "release smoke minimum until dedicated hardware baselines are calibrated",
+    "release_blocker": "true",
+    "release_policy": "official release blocker until a calibrated dedicated-hardware baseline replaces it"
+  },
+  "thresholds": {
+    "throughput_regression_percent": 20,
+    "latency_regression_percent": 20
+  },
+  "calibration_status": "smoke-minimum",
+  "benchmarks": [
+    {
+      "name": "performance_micro_wall_clock",
+      "throughput_ops_per_sec": 1.0,
+      "p50_ms": 180000.0,
+      "p95_ms": 180000.0,
+      "p99_ms": 180000.0,
+      "metadata": {
+        "profile": "release-baseline",
+        "rows": "1000",
+        "measurement": "release smoke minimum until dedicated hardware baselines are calibrated",
+        "bench": "performance_micro"
+      }
+    },
+    {
+      "name": "columnar_aggregation_wall_clock",
+      "throughput_ops_per_sec": 1.0,
+      "p50_ms": 180000.0,
+      "p95_ms": 180000.0,
+      "p99_ms": 180000.0,
+      "metadata": {
+        "profile": "release-baseline",
+        "rows": "1000",
+        "measurement": "release smoke minimum until dedicated hardware baselines are calibrated",
+        "bench": "columnar_aggregation"
+      }
+    },
+    {
+      "name": "phase33_benchmark_harness",
+      "throughput_ops_per_sec": 1.0,
+      "p50_ms": 1.0,
+      "p95_ms": 1.0,
+      "p99_ms": 1.0,
+      "metadata": {
+        "profile": "release-baseline",
+        "rows": "1000",
+        "measurement": "harness presence marker"
+      }
+    }
+  ]
+}
