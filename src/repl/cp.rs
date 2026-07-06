@@ -1452,9 +1452,9 @@ mod tests {
 
     use super::{
         ClusterBootstrap, CpClusterConfig, CpClusterHandle, CpClusterRole, CpClusterStatus, CpRaft,
-        NodeId, RAFT_LOG_TABLE, RAFT_STATE_TABLE, RaftNode, change_membership, cluster_status,
-        shutdown_cp_cluster, start_cp_cluster, transfer_leader, validate_cp_cluster_config,
-        wait_for_recovery,
+        CpRecoveryStatus, NodeId, RAFT_LOG_TABLE, RAFT_STATE_TABLE, RaftNode, change_membership,
+        cluster_status, shutdown_cp_cluster, start_cp_cluster, transfer_leader,
+        validate_cp_cluster_config, wait_for_recovery,
     };
     use crate::{
         phase30::{InternalTransportConfig, InternalTransportSecurity, RaftRuntimeConfig},
@@ -1762,6 +1762,25 @@ mod tests {
             || message.contains("change_membership timed out")
     }
 
+    fn wait_for_live_recovery<S: StorageEngine>(
+        handle: &CpClusterHandle<S>,
+    ) -> Result<CpRecoveryStatus, ReplError> {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            match wait_for_recovery(handle) {
+                Ok(status) => return Ok(status),
+                Err(ReplError::Transport(message)) if is_retryable_live_raft_error(&message) => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(ReplError::Transport(
+                    "timed out waiting for live CP recovery".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn start_live_redb_cluster(
         configs: &[CpClusterConfig],
         paths: &[std::path::PathBuf],
@@ -1922,7 +1941,7 @@ mod tests {
                     node.id == status.node_id && node.role == CpClusterRole::Leader
                 }));
 
-                let recovery = wait_for_recovery(handle)?;
+                let recovery = wait_for_live_recovery(handle)?;
                 assert!(recovery.last_committed >= 1);
                 assert_eq!(recovery.in_doubt_dist_txns, 0);
                 Ok::<(), Box<dyn std::error::Error>>(())
@@ -1960,7 +1979,7 @@ mod tests {
                 write.commit()?;
             }
 
-            let recovery = wait_for_recovery(handle)?;
+            let recovery = wait_for_live_recovery(handle)?;
             assert_eq!(recovery.in_doubt_dist_txns, 0);
             let read_leader_idx = wait_for_live_leader(&handles)?;
             wait_for_live_value(
