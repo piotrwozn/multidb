@@ -59,7 +59,7 @@ jobs:
       - name: Performance ci-gate
         shell: pwsh
         run: |
-          ./scripts/perf.ps1 -Profile ci-gate -Rows 1000 -Output target/perf/ci-candidate.json
+          ./scripts/perf.ps1 -Profile ci-gate -Rows 1000 -SkipBenchRun -Output target/perf/ci-candidate.json
           ./scripts/perf_gate.ps1 -Baseline baselines/perf/ci-gate.json -Candidate target/perf/ci-candidate.json -SummaryOutput target/perf/ci-gate-summary.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

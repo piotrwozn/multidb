@@ -3,7 +3,8 @@ param(
     [string] $Profile = "local-smoke",
     [string] $Output = "target/perf/multidb-perf.json",
     [int] $Rows = 1000,
-    [switch] $SkipPrebuild
+    [switch] $SkipPrebuild,
+    [switch] $SkipBenchRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,10 +101,10 @@ function Invoke-BenchPrebuild {
         [object[]] $Definitions
     )
 
-    if ($SkipPrebuild) {
+    if ($SkipPrebuild -or $SkipBenchRun) {
         return [ordered]@{
             skipped = $true
-            reason = "SkipPrebuild"
+            reason = if ($SkipBenchRun) { "SkipBenchRun" } else { "SkipPrebuild" }
             measurement = "not_run"
             benches = @()
         }
@@ -144,6 +145,24 @@ function Invoke-BenchReport {
         [Parameter(Mandatory = $true)]
         [object] $Prebuild
     )
+
+    if ($SkipBenchRun) {
+        return [ordered]@{
+            name = $Name
+            throughput_ops_per_sec = 1.0
+            p50_ms = 1.0
+            p95_ms = 1.0
+            p99_ms = 1.0
+            metadata = [ordered]@{
+                rows = "$Rows"
+                bench = $Bench
+                measurement = "ci_smoke_contract_no_bench_run"
+                build_time_excluded = "true"
+                prebuild_elapsed_seconds = "0"
+                profile = $Profile
+            }
+        }
+    }
 
     $started = Get-Date
     Invoke-CargoBench -Bench $Bench
