@@ -5,6 +5,9 @@ param(
     [int] $AdminPort = 18080,
     [int] $PgPort = 15432,
     [string] $DockerCargoProfile = $env:MULTIDB_DOCKER_CARGO_PROFILE,
+    [switch] $UsePrebuiltArtifacts,
+    [string] $PrebuiltBin,
+    [string] $PrebuiltStudioDir,
     [switch] $SkipBuild
 )
 
@@ -163,6 +166,55 @@ function Test-TcpPort {
     }
 }
 
+function New-PrebuiltDockerContext {
+    function Resolve-ArtifactPath {
+        param([Parameter(Mandatory = $true)][string] $Path)
+
+        if ([System.IO.Path]::IsPathRooted($Path)) {
+            return [System.IO.Path]::GetFullPath($Path)
+        }
+        return [System.IO.Path]::GetFullPath((Join-Path $Root $Path))
+    }
+
+    $TargetRoot = [System.IO.Path]::GetFullPath((Join-Path $Root "target"))
+    if (-not $TargetRoot.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $TargetRoot = "$TargetRoot$([System.IO.Path]::DirectorySeparatorChar)"
+    }
+
+    $ContextRoot = [System.IO.Path]::GetFullPath((Join-Path $Root "target\docker-smoke-context"))
+    if (-not $ContextRoot.StartsWith($TargetRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "refusing to clear docker smoke context outside target: $ContextRoot"
+    }
+    if (Test-Path $ContextRoot) {
+        Remove-Item -LiteralPath $ContextRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $ContextRoot | Out-Null
+
+    $ResolvedBin = $PrebuiltBin
+    if ([string]::IsNullOrWhiteSpace($ResolvedBin)) {
+        $ResolvedBin = Join-Path $Root "target\debug\multidb"
+    }
+    $ResolvedBin = Resolve-ArtifactPath -Path $ResolvedBin
+    if (-not (Test-Path $ResolvedBin)) {
+        throw "missing prebuilt multidb binary at $ResolvedBin"
+    }
+    Copy-Item -LiteralPath $ResolvedBin -Destination (Join-Path $ContextRoot "multidb") -Force
+
+    $ResolvedStudioDir = $PrebuiltStudioDir
+    if ([string]::IsNullOrWhiteSpace($ResolvedStudioDir)) {
+        $ResolvedStudioDir = Join-Path $Root "studio\dist"
+    }
+    $ResolvedStudioDir = Resolve-ArtifactPath -Path $ResolvedStudioDir
+    if (-not (Test-Path $ResolvedStudioDir)) {
+        throw "missing prebuilt Studio dist at $ResolvedStudioDir"
+    }
+    $StudioContext = Join-Path $ContextRoot "studio"
+    New-Item -ItemType Directory -Force -Path $StudioContext | Out-Null
+    Copy-Item -Path (Join-Path $ResolvedStudioDir "*") -Destination $StudioContext -Recurse -Force
+
+    return $ContextRoot
+}
+
 try {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         throw "docker is required for phase 49 smoke"
@@ -182,11 +234,18 @@ try {
     try {
         if (-not $SkipBuild) {
             Invoke-Checked -Label "docker build" -Command {
-                $BuildArgs = @("build", "-t", $ImageTag)
+                $DockerfilePath = Join-Path $Root "Dockerfile"
+                $BuildContext = "."
+                if ($UsePrebuiltArtifacts) {
+                    $DockerfilePath = Join-Path $Root "Dockerfile.smoke"
+                    $BuildContext = New-PrebuiltDockerContext
+                }
+
+                $BuildArgs = @("build", "-t", $ImageTag, "-f", $DockerfilePath)
                 if (-not [string]::IsNullOrWhiteSpace($DockerCargoProfile)) {
                     $BuildArgs += @("--build-arg", "MULTIDB_CARGO_PROFILE=$DockerCargoProfile")
                 }
-                $BuildArgs += "."
+                $BuildArgs += $BuildContext
                 docker @BuildArgs
             }
         }

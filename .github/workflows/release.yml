@@ -53,9 +53,13 @@ jobs:
         shell: pwsh
         run: ./scripts/sdk-smoke.ps1 -RequireGo
 
+      - name: Studio check
+        shell: pwsh
+        run: ./scripts/studio-check.ps1
+
       - name: Docker runtime smoke
         shell: pwsh
-        run: ./scripts/docker-smoke.ps1 -DockerCargoProfile ci-docker
+        run: ./scripts/docker-smoke.ps1 -UsePrebuiltArtifacts -PrebuiltBin ./target/release/multidb
 
       - name: SDK examples smoke
         shell: pwsh
@@ -87,11 +91,12 @@ jobs:
           docker buildx inspect --bootstrap
           docker buildx build \
             --platform linux/amd64 \
+            --file Dockerfile.smoke \
             --tag "$image" \
             --sbom=true \
             --provenance=true \
             --metadata-file "$metadata_file" \
-            --push .
+            --push target/docker-smoke-context
           digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
           test -n "$digest"
           test "$digest" != "null"

@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 multidb \
+    && useradd --system --uid 10001 --gid multidb --home-dir /var/lib/multidb multidb \
+    && mkdir -p /var/lib/multidb /usr/share/multidb/studio \
+    && chown -R multidb:multidb /var/lib/multidb /usr/share/multidb
+
+COPY --chmod=0755 multidb /usr/local/bin/multidb
+COPY studio/ /usr/share/multidb/studio/
+
+ENV MULTIDB_BIND=0.0.0.0:8080 \
+    MULTIDB_PG_BIND=0.0.0.0:5432 \
+    MULTIDB_DB_PATH=/var/lib/multidb/multidb.redb \
+    MULTIDB_PROFILE=transactional \
+    MULTIDB_RUNTIME_MODE=production \
+    MULTIDB_STUDIO_DIR=/usr/share/multidb/studio
+
+USER multidb
+VOLUME ["/var/lib/multidb"]
+EXPOSE 5432 8080
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
+    CMD curl --fail --silent http://127.0.0.1:8080/health >/dev/null || exit 1
+
+ENTRYPOINT ["multidb", "serve"]
