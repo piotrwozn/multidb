@@ -72,7 +72,7 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           mkdir -p target/sbom
-          cargo cyclonedx --locked --all --format json --output-cdx target/sbom/multidb
+          cargo cyclonedx --all --format json --output-cdx target/sbom/multidb
           sbom="$(find target/sbom -name '*.json' | head -n 1)"
           test -n "$sbom"
           cp "$sbom" target/release/multidb.cdx.json
