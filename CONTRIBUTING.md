@@ -37,6 +37,12 @@ gate with `-SkipGo`; GitHub Actions runs the Go SDK checks.
   and storage corruption paths.
 - Treat `src/roadmap.rs` as the checked-in readiness source of truth.
 
+## Review And Merge Policy
+
+All pull requests require review from the repository owner before they can be
+merged into `main`. The repository uses CODEOWNERS so that changes across the
+tree request review from `@piotrwozn`.
+
 ## Development Notes
 
 The project is licensed under the MIT License. By contributing, you agree that
