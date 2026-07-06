@@ -102,6 +102,11 @@ tower = "0.5"
 # Avoid intermittent MSVC LNK1318 PDB failures when linking the large lib test binary.
 debug = 0
 
+[profile.ci-docker]
+inherits = "dev"
+debug = 0
+incremental = false
+
 [[bench]]
 name = "columnar_aggregation"
 harness = false

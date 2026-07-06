@@ -4,6 +4,7 @@ param(
     [string] $VolumeName = "multidb-phase49-smoke-data",
     [int] $AdminPort = 18080,
     [int] $PgPort = 15432,
+    [string] $DockerCargoProfile = $env:MULTIDB_DOCKER_CARGO_PROFILE,
     [switch] $SkipBuild
 )
 
@@ -181,7 +182,12 @@ try {
     try {
         if (-not $SkipBuild) {
             Invoke-Checked -Label "docker build" -Command {
-                docker build -t $ImageTag .
+                $BuildArgs = @("build", "-t", $ImageTag)
+                if (-not [string]::IsNullOrWhiteSpace($DockerCargoProfile)) {
+                    $BuildArgs += @("--build-arg", "MULTIDB_CARGO_PROFILE=$DockerCargoProfile")
+                }
+                $BuildArgs += "."
+                docker @BuildArgs
             }
         }
 

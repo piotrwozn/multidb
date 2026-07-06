@@ -55,7 +55,7 @@ jobs:
 
       - name: Docker runtime smoke
         shell: pwsh
-        run: ./scripts/docker-smoke.ps1
+        run: ./scripts/docker-smoke.ps1 -DockerCargoProfile ci-docker
 
       - name: SDK examples smoke
         shell: pwsh

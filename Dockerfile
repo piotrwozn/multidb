@@ -6,7 +6,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY benches ./benches
 COPY docs/openapi ./docs/openapi
-RUN cargo build --locked --release --bin multidb
+ARG MULTIDB_CARGO_PROFILE=release
+RUN if [ "$MULTIDB_CARGO_PROFILE" = "release" ]; then \
+        cargo build --locked --release --bin multidb && cp target/release/multidb /tmp/multidb; \
+    else \
+        cargo build --locked --profile "$MULTIDB_CARGO_PROFILE" --bin multidb && cp "target/$MULTIDB_CARGO_PROFILE/multidb" /tmp/multidb; \
+    fi
 
 FROM node:24-bookworm-slim AS studio-builder
 WORKDIR /studio
@@ -27,7 +32,7 @@ RUN apt-get update \
     && mkdir -p /var/lib/multidb /usr/share/multidb/studio \
     && chown -R multidb:multidb /var/lib/multidb /usr/share/multidb
 
-COPY --from=rust-builder /src/target/release/multidb /usr/local/bin/multidb
+COPY --from=rust-builder /tmp/multidb /usr/local/bin/multidb
 COPY --from=studio-builder /studio/dist/ /usr/share/multidb/studio/
 
 ENV MULTIDB_BIND=0.0.0.0:8080 \
