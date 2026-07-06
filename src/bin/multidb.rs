@@ -850,7 +850,7 @@ fn run_export(args: &[String]) -> Result<String, CliError> {
         ExportFormat::Jsonl => export_table_jsonl(&database, &table)?,
         ExportFormat::Parquet => {
             return Err(CliError::Usage(
-                "Parquet export is exposed through the library API in phase 22 v1".to_owned(),
+                "Parquet export is exposed through the library API in this preview".to_owned(),
             ));
         }
     };

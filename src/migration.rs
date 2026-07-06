@@ -599,7 +599,7 @@ pub fn import_pg_dump_plain(
         }
         if trimmed.to_ascii_uppercase().starts_with("CREATE TABLE") {
             report.warn(
-                "CREATE TABLE translation is reported but not applied by the phase 22 v1 importer",
+                "CREATE TABLE translation is reported but not applied by the preview importer",
             );
             continue;
         }

@@ -1,9 +1,9 @@
 # MultiDB Docker Runtime
 
-Phase 49 adds a Docker-first runtime for MultiDB. The image contains the
+The Docker runtime image contains the
 `multidb` server binary and the built MultiDB Studio app.
 
-Phase 53 release tags publish a signed GHCR image as
+Release tags publish a signed GHCR image as
 `ghcr.io/<owner>/<repo>:vX.Y.Z`. Pin the exact tag and verify the digest from
 the GitHub Release; `latest` is intentionally not published.
 
@@ -82,7 +82,7 @@ The image serves the same Control Plane API twice:
 - same-origin Studio endpoints under `/api/*`.
 
 Studio is served from `/` and calls `/api` by default. `/studio` remains the
-Phase 41 capability manifest endpoint, not the HTML app. Browser sessions are
+capability manifest endpoint, not the HTML app. Browser sessions are
 stored only in server memory and React state; restarting the server signs
 Studio users out without changing the durable admin password hash.
 
@@ -97,8 +97,8 @@ checks `/health`, verifies password login, session Bearer auth and logout,
 checks the legacy admin token, checks Studio HTML, opens the PostgreSQL TCP
 port, restarts with the same volume, and confirms the database file persisted.
 
-Phase 53 release candidates also run SDK package and example smokes against the
-Docker runtime before publishing the signed release image.
+Release candidates also run SDK package and example smokes against the Docker
+runtime before publishing the signed release image.
 
 ## Helm Parity
 

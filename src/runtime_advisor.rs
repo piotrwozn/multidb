@@ -744,7 +744,7 @@ fn advice_sources() -> Vec<AdviceSource> {
             "active",
             "system.workload observations",
         ),
-        source("index_advisor", "active", "phase 21 index advice"),
+        source("index_advisor", "active", "index advice"),
         source(
             "planner_feedback",
             "active",
@@ -753,13 +753,13 @@ fn advice_sources() -> Vec<AdviceSource> {
         source(
             "guarantee_validator",
             "active",
-            "phase 38 validation issues",
+            "configuration validation issues",
         ),
-        source("migration_planner", "active", "phase 39 dry-run plans"),
+        source("migration_planner", "active", "migration dry-run plans"),
         source(
             "performance_baselines",
             "metadata",
-            "baselines/perf profiles are referenced; phase 46 owns release governance",
+            "baselines/perf profiles are referenced by release governance",
         ),
     ]
 }

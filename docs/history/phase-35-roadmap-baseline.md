@@ -11,7 +11,7 @@ turning plans into product claims.
 - `src/roadmap.rs` is the source of truth for phase readiness metadata.
 - Local planning files are historical work packages and are intentionally kept
   outside the public source baseline.
-- `docs/phase-*.md` files are human-readable snapshots of implemented or
+- `docs/history/phase-*.md` files are human-readable snapshots of implemented or
   explicitly bounded phase contracts.
 - `target/perf/*.json` files are local or CI artifacts. They are not release
   baselines unless they are compared against the phase 46 versioned baseline

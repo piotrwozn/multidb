@@ -975,7 +975,7 @@ pub fn start_reprofile_job(
     }
     if !plan.reversible {
         return Err(TuningError::UnsupportedReprofile(
-            "phase 21 only accepts reversible reprofiling jobs".to_owned(),
+            "reprofiling jobs must be reversible".to_owned(),
         ));
     }
     let mut job = ReprofileJob::new(plan);

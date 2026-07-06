@@ -1,6 +1,6 @@
 # MultiDB SDK And Template Guide
 
-The Phase 47 starter path is:
+The starter path is:
 
 ```powershell
 multidb template list

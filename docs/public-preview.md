@@ -2,14 +2,14 @@
 
 Public preview means MultiDB has an installable, repeatable starter path with
 clear support boundaries. It is not a claim that every planned distributed
-feature is GA.
+feature is production-ready.
 
 ## Install And Verify
 
 Download the release binary for your platform, `SHA256SUMS`,
 `multidb.cdx.json` and the matching `.sig`/`.pem` files from a tagged GitHub
-Release. Phase 53 releases also include the signed GHCR image digest and build
-metadata.
+Release. Tagged releases also include the signed GHCR image digest and build
+metadata when a Docker image is published.
 
 On Linux/macOS:
 
@@ -65,8 +65,7 @@ To smoke a release binary directly:
 
 ## Docker Quickstart
 
-Phase 49 adds a Docker runtime for users who do not want to build Rust or Node
-locally:
+Use Docker Compose if you do not want to build Rust or Node locally:
 
 ```powershell
 docker compose up --build
@@ -89,7 +88,7 @@ Profile status:
 | `ai_agent_memory` | Stable | Vector/document/event memory for agents. |
 | `secure_app` | Stable | Audited transactional app state; can use CP semantics without claiming enterprise SLA. |
 | `analytics_columnar` | Stable | Analytics starter path with explicit extension limits. |
-| `production_cp` | Stable | CP OpenRaft cluster profile covered by the Phase 45 local/process smoke gate. |
+| `production_cp` | Stable | CP OpenRaft cluster profile covered by the local/process smoke gate. |
 
 Collection role status:
 
@@ -110,14 +109,13 @@ Consistency status:
 | Domain | Status | Limit |
 | --- | --- | --- |
 | `local_snapshot` | Certified | Single-process/local semantics only. |
-| `strong_cp` | Stable | CP quorum semantics covered by the Phase 45 local/process smoke gate. |
+| `strong_cp` | Stable | CP quorum semantics covered by the local/process smoke gate. |
 | `eventual_ap` | Experimental | Conflict policy requires workload review. |
 
 ## Known Limits
 
-- Phase 45 Cluster GA is complete for the local/process CP smoke contract; the
-  preview still does not claim Kubernetes automation, multi-region placement or
-  enterprise SLA.
+- The local/process CP smoke contract is covered; the preview still does not
+  claim Kubernetes automation, multi-region placement or enterprise SLA.
 - `config apply` is confirm/audit-only and does not perform physical data
   migrations.
 - Studio v1 is read-only plus validation, catalog, advice and migration dry-run.
@@ -140,11 +138,9 @@ Consistency status:
   limits visible in explain output, and treat release perf reports as gate
   evidence rather than capacity planning.
 
-## What Production Ready Means Here
+## What Public Preview Means Here
 
-For phase 53, production ready means the package is reproducible, signed,
+For this preview, production-shaped means the package is reproducible, signed,
 documented, smoke-tested, guarded by SDK/Docker/Studio/release gates and honest
-about limits. It does not mean every roadmap item is GA. The source of truth
-remains `src/roadmap.rs`: `Complete` entries have evidence and no gaps in that
-entry, `ProductionGap` entries have implemented surface with remaining
-production work, and `Deferred` entries are future work.
+about limits. It does not mean every planned item is finished or that MultiDB
+is ready for critical production data without a separate deployment review.

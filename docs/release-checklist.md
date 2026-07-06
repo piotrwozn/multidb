@@ -1,13 +1,11 @@
-# GA Release Checklist
+# Release Checklist
 
-Use this checklist for every Phase 53 release candidate.
+Use this checklist for every release candidate.
 
 ## Before Tagging
 
-- Run `.\scripts\phase53-ga-smoke.ps1`.
-- Confirm `cargo test --lib roadmap -- --nocapture` reports no production
-  gaps.
-- Review `docs/ga-support-matrix.md` and known limits against current tests.
+- Run `.\scripts\release-smoke.ps1`.
+- Review `docs/support-matrix.md` and known limits against current tests.
 - Confirm no `latest` Docker tag is configured in release workflows.
 - Confirm SDK compatibility constants still match OpenAPI v1.
 

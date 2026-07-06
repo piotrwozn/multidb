@@ -15,12 +15,8 @@ testing and operational ownership.
 - Rust MSRV: `1.89`
 - License: `MIT`
 - Crate publishing: disabled with `publish = false`
-- Readiness source of truth: `src/roadmap.rs`
-- Release contract: `docs/ga-support-matrix.md`
 - Public preview guide: `docs/public-preview.md`
-
-The local planning history is intentionally not part of the public source
-baseline. Checked-in roadmap evidence lives in source and docs.
+- Supported surfaces and limits: `docs/support-matrix.md`
 
 ## Quickstart With Docker
 
@@ -53,17 +49,17 @@ Run the repository gate:
 .\scripts\check.ps1
 ```
 
-Run the full Phase 53 public-preview/GA smoke:
+Run the full release smoke:
 
 ```powershell
-.\scripts\phase53-ga-smoke.ps1
+.\scripts\release-smoke.ps1
 ```
 
 If Go is not installed locally, this partial gate still verifies the rest of the
 stack:
 
 ```powershell
-.\scripts\phase53-ga-smoke.ps1 -SkipGo
+.\scripts\release-smoke.ps1 -SkipGo
 ```
 
 GitHub Actions runs the Go checks.
@@ -105,15 +101,15 @@ Preview gate:
 Release-sensitive gate:
 
 ```powershell
-.\scripts\phase53-ga-smoke.ps1
+.\scripts\release-smoke.ps1
 ```
 
 ## Known Limits
 
 - MultiDB is a public-preview engine, not a mature production database.
-- Phase 45 Cluster GA covers the local/process CP OpenRaft smoke contract; it
-  does not claim managed Kubernetes automation, multi-region placement or an
-  enterprise SLA.
+- The CP OpenRaft profile is covered by local/process smoke tests; it does not
+  claim managed Kubernetes automation, multi-region placement or an enterprise
+  SLA.
 - `config apply` is confirmation/audit-only for v1 and does not perform
   physical data migrations.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
@@ -125,7 +121,7 @@ Release-sensitive gate:
 ## Documentation
 
 - `docs/public-preview.md` - install, verify and first-use guide.
-- `docs/ga-support-matrix.md` - supported surfaces and out-of-scope claims.
+- `docs/support-matrix.md` - supported surfaces and out-of-scope claims.
 - `docs/release-and-versioning.md` - release/versioning policy.
 - `docs/release-checklist.md` - release checklist.
 - `docs/quality-and-performance.md` - benchmark and performance gate workflow.

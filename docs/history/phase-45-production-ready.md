@@ -19,7 +19,7 @@ Implemented in this phase:
 
 Current verification:
 
-- `scripts/cluster-ga-smoke.ps1` runs the focused Phase 45 smoke gate.
+- `scripts/cluster-smoke.ps1` runs the focused Phase 45 smoke gate.
 - The underlying live-cluster tests are ignored in the default cargo suite and
   run one scenario per process through the smoke script.
 - `scripts/check.ps1` remains the full local correctness gate.

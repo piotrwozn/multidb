@@ -12,5 +12,5 @@ All notable public changes will be recorded here.
 ## 0.1.0-preview.1
 
 - Initial public-preview target.
-- Includes the Phase 53 GA hardening surface documented in
-  `docs/phase-53-production-ready.md`.
+- Includes the public-preview support surface documented in
+  `docs/support-matrix.md`.

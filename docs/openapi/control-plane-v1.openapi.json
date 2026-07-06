@@ -3,7 +3,7 @@
   "info": {
     "title": "MultiDB Control Plane API",
     "version": "1.0.0",
-    "description": "Public Phase 52 HTTP contract for the MultiDB Control Plane API."
+    "description": "Public HTTP contract for the MultiDB Control Plane API v1."
   },
   "x-multidb-api-version": 1,
   "servers": [

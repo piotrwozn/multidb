@@ -2069,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "phase45 Cluster GA smoke runs through scripts/cluster-ga-smoke.ps1"]
+    #[ignore = "cluster smoke runs through scripts/cluster-smoke.ps1"]
     fn phase45_cluster_ga_transfers_leader_and_preserves_writes()
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = live_cluster_test_guard();
@@ -2130,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "phase45 Cluster GA smoke runs through scripts/cluster-ga-smoke.ps1"]
+    #[ignore = "cluster smoke runs through scripts/cluster-smoke.ps1"]
     fn phase45_cluster_ga_rejects_minority_write_after_quorum_loss()
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = live_cluster_test_guard();
@@ -2173,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "phase45 Cluster GA smoke runs through scripts/cluster-ga-smoke.ps1"]
+    #[ignore = "cluster smoke runs through scripts/cluster-smoke.ps1"]
     fn phase45_cluster_ga_persists_membership_metadata_and_read_index()
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = live_cluster_test_guard();

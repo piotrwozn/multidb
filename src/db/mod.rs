@@ -702,12 +702,11 @@ impl DatabaseRepl {
             Self::SingleNode(repl) => Ok(repl.commit_write_set(snapshot_id, write_set)?),
             Self::CpRaft(repl) => Ok(repl.commit_write_set(snapshot_id, write_set)?),
             Self::ApDynamo(_) => Err(ConfigError::Unsupported(
-                "AP replication does not support snapshot transactions in phase 11B".to_owned(),
+                "AP replication does not support snapshot transactions".to_owned(),
             )
             .into()),
             Self::Sharded(_) => Err(ConfigError::Unsupported(
-                "sharded replication does not support snapshot transactions in phase 13 v1"
-                    .to_owned(),
+                "sharded replication does not support snapshot transactions".to_owned(),
             )
             .into()),
         }
@@ -730,12 +729,11 @@ impl DatabaseRepl {
                 Ok(repl.commit_write_set_with_preflight(snapshot_id, write_set, preflight)?)
             }
             Self::ApDynamo(_) => Err(ConfigError::Unsupported(
-                "AP replication does not support snapshot transactions in phase 11B".to_owned(),
+                "AP replication does not support snapshot transactions".to_owned(),
             )
             .into()),
             Self::Sharded(_) => Err(ConfigError::Unsupported(
-                "sharded replication does not support snapshot transactions in phase 13 v1"
-                    .to_owned(),
+                "sharded replication does not support snapshot transactions".to_owned(),
             )
             .into()),
         }
@@ -3177,7 +3175,7 @@ impl Database {
                 sql,
                 started,
                 Err(QueryError::Unsupported(format!(
-                    "{kind} SQL DDL is outside the phase 32 GA SQL matrix; use the stable Database API"
+                    "{kind} SQL DDL is outside the current SQL support matrix; use the stable Database API"
                 ))
                 .into()),
             );
@@ -3649,15 +3647,14 @@ impl Database {
     ) -> Result<MultiModelTxn<'_>, DbError> {
         if self.repl.is_ap() {
             return Err(ConfigError::Unsupported(
-                "AP replication does not support snapshot transactions in phase 11B".to_owned(),
+                "AP replication does not support snapshot transactions".to_owned(),
             )
             .into());
         }
 
         if self.repl.is_sharded() {
             return Err(ConfigError::Unsupported(
-                "sharded replication does not support snapshot transactions in phase 13 v1"
-                    .to_owned(),
+                "sharded replication does not support snapshot transactions".to_owned(),
             )
             .into());
         }
@@ -6271,7 +6268,7 @@ fn phase19_arg_from_function_arg(arg: &FunctionArg) -> Result<Phase19Arg, QueryE
     match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => phase19_arg_from_expr(expr),
         _ => Err(QueryError::Unsupported(
-            "phase 19 functions require literal arguments".to_owned(),
+            "these SQL helper functions require literal arguments".to_owned(),
         )),
     }
 }
@@ -6290,7 +6287,7 @@ fn phase19_arg_from_expr(expr: &SqlExpr) -> Result<Phase19Arg, QueryError> {
         },
         SqlExpr::Nested(expr) => phase19_arg_from_expr(expr),
         _ => Err(QueryError::Unsupported(
-            "phase 19 functions require literal arguments".to_owned(),
+            "these SQL helper functions require literal arguments".to_owned(),
         )),
     }
 }
@@ -6303,7 +6300,7 @@ fn phase19_arg_from_sql_value(value: &SqlValue) -> Result<Phase19Arg, QueryError
         | SqlValue::EscapedStringLiteral(value)
         | SqlValue::UnicodeStringLiteral(value) => Ok(Phase19Arg::String(value.clone())),
         other => Err(QueryError::Unsupported(format!(
-            "unsupported phase 19 literal {other}"
+            "unsupported SQL helper literal {other}"
         ))),
     }
 }
@@ -6894,7 +6891,7 @@ fn ensure_cluster_supported(
 ) -> Result<(), ConfigError> {
     if config.replication == ReplicationKind::Ap {
         return Err(ConfigError::Unsupported(
-            "AP cluster replication is planned for phase 11B".to_owned(),
+            "AP cluster replication is not supported by this preview".to_owned(),
         ));
     }
 

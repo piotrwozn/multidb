@@ -1,7 +1,7 @@
 param(
-    [string] $ImageTag = "multidb:phase49-smoke",
-    [string] $ContainerName = "multidb-phase49-smoke",
-    [string] $VolumeName = "multidb-phase49-smoke-data",
+    [string] $ImageTag = "multidb:docker-smoke",
+    [string] $ContainerName = "multidb-docker-smoke",
+    [string] $VolumeName = "multidb-docker-smoke-data",
     [int] $AdminPort = 18080,
     [int] $PgPort = 15432,
     [string] $DockerCargoProfile = $env:MULTIDB_DOCKER_CARGO_PROFILE,
@@ -14,9 +14,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$AdminToken = "phase49-admin-token"
-$AdminPassword = "phase50-admin-password"
-$PgPassword = "phase49-pg-password"
+$AdminToken = "local-smoke-admin-token"
+$AdminPassword = "local-smoke-admin-password"
+$PgPassword = "local-smoke-pg-password"
 $DockerDaemonReady = $false
 
 function Invoke-Checked {
@@ -217,16 +217,16 @@ function New-PrebuiltDockerContext {
 
 try {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        throw "docker is required for phase 49 smoke"
+        throw "docker is required for Docker smoke"
     }
     try {
         docker info *> $null
     }
     catch {
-        throw "docker daemon is required for phase 49 smoke"
+        throw "docker daemon is required for Docker smoke"
     }
     if ($LASTEXITCODE -ne 0) {
-        throw "docker daemon is required for phase 49 smoke"
+        throw "docker daemon is required for Docker smoke"
     }
     $DockerDaemonReady = $true
 

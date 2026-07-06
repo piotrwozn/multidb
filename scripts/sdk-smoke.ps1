@@ -21,7 +21,7 @@ function Invoke-Checked {
 
 Push-Location (Join-Path $PSScriptRoot "..")
 try {
-    Invoke-Checked "phase52 OpenAPI contract tests" {
+    Invoke-Checked "OpenAPI contract tests" {
         cargo test --lib phase52 -- --nocapture
     }
 

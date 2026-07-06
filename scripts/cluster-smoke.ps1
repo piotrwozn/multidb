@@ -32,11 +32,11 @@ foreach ($test in $tests) {
     [void] $process.Start()
     if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
         Stop-ProcessTree -ProcessId $process.Id
-        throw "phase45 Cluster GA smoke timed out at $test after $timeoutSeconds seconds"
+        throw "cluster smoke timed out at $test after $timeoutSeconds seconds"
     }
     if ($process.ExitCode -ne 0) {
-        throw "phase45 Cluster GA smoke failed at $test with exit code $($process.ExitCode)"
+        throw "cluster smoke failed at $test with exit code $($process.ExitCode)"
     }
 }
 
-Write-Host "phase45 Cluster GA smoke passed"
+Write-Host "cluster smoke passed"

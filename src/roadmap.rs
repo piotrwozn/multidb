@@ -133,7 +133,7 @@ const PHASES: &[PhaseReadiness] = &[
             "scatter-gather tests",
             "2PC skeleton tests",
             "durable 2PC recovery tests",
-            "docs/phase-13-distributed-transaction-recovery.md",
+            "docs/history/phase-13-distributed-transaction-recovery.md",
         ],
         gaps: &[],
     },
@@ -146,7 +146,7 @@ const PHASES: &[PhaseReadiness] = &[
             "audit hash-chain tests",
             "encryption tests",
             "metrics tests",
-            "docs/phase-14-ops-ga.md",
+            "docs/history/phase-14-ops-ga.md",
             "ops/kind/multidb-kind.yaml",
             "ops/helm/multidb",
             "ops/vault/dev-policy.hcl",
@@ -299,7 +299,7 @@ const PHASES: &[PhaseReadiness] = &[
         evidence: &[
             "canonical value decode coverage",
             "key encoding helpers and fuzz target",
-            "docs/phase-25-canonical-format.md",
+            "docs/history/phase-25-canonical-format.md",
         ],
         gaps: &[],
     },
@@ -312,7 +312,7 @@ const PHASES: &[PhaseReadiness] = &[
             "storage conformance tests for stale-snapshot Conflict and writer serialization",
             "transaction facade tests for savepoints, retry loops, write skew and phantom rejection",
             "redb durability reopen tests and compressed decode-limit tests",
-            "docs/phase-26-transaction-core.md",
+            "docs/history/phase-26-transaction-core.md",
         ],
         gaps: &[],
     },
@@ -325,7 +325,7 @@ const PHASES: &[PhaseReadiness] = &[
             "audit integrity tests",
             "Vault dev KEK provider test",
             "key rotation and crypto-shred tests",
-            "docs/phase-27-cryptography-audit.md",
+            "docs/history/phase-27-cryptography-audit.md",
         ],
         gaps: &[],
     },
@@ -353,7 +353,7 @@ const PHASES: &[PhaseReadiness] = &[
         evidence: &[
             "phase29 catalog, parser, vector and hook tests",
             "WASM sandbox limit coverage",
-            "docs/phase-29-multi-model-consistency.md",
+            "docs/history/phase-29-multi-model-consistency.md",
         ],
         gaps: &[],
     },
@@ -374,7 +374,7 @@ const PHASES: &[PhaseReadiness] = &[
             "CP OpenRaft type config/read-index gate metadata and managed self-healing runner",
             "stable CP cluster APIs for start/shutdown/status/recovery/membership/leader transfer",
             "internal Raft append/vote/pre-vote/snapshot and cluster-admin RPC frames",
-            "docs/phase-30-production-ready.md",
+            "docs/history/phase-30-production-ready.md",
             "cargo test --lib",
         ],
         gaps: &[],
@@ -389,7 +389,7 @@ const PHASES: &[PhaseReadiness] = &[
             "filtered vector kNN, quantization, DiskANN-style rerank, and Euclidean L2 tests",
             "columnar segment metadata and zone-map skip tests",
             "Gorilla time-series compression ratio test",
-            "docs/phase-31-production-ready.md",
+            "docs/history/phase-31-production-ready.md",
             "scripts/perf.ps1 -Rows 1000 -Output target/perf/phase31.json",
         ],
         gaps: &[],
@@ -406,7 +406,7 @@ const PHASES: &[PhaseReadiness] = &[
             "continuous query and outbox metadata test",
             "WASM before/after trigger firing tests",
             "deterministic fail-closed SQL DDL declaration tests",
-            "docs/phase-32-production-ready.md",
+            "docs/history/phase-32-production-ready.md",
             "cargo test --lib",
         ],
         gaps: &[],
@@ -423,7 +423,7 @@ const PHASES: &[PhaseReadiness] = &[
             "Jepsen-style in-process linearizability checker catches injected split-brain",
             "pg_copy_text/keyenc_successor/internal_request_frame fuzz targets",
             "nightly-verification workflow for model/fuzz/Miri/TSan/perf-gate smoke",
-            "docs/phase-33-production-ready.md",
+            "docs/history/phase-33-production-ready.md",
         ],
         gaps: &[],
     },
@@ -437,7 +437,7 @@ const PHASES: &[PhaseReadiness] = &[
             "cloud lease/fencing, PITR GC and quota accounting tests",
             "tuning cooldown, max_changes and automatic rollback tests",
             "pinned CI with MSRV, audit, vet, SBOM and release attestation workflow",
-            "docs/phase-34-production-ready.md",
+            "docs/history/phase-34-production-ready.md",
         ],
         gaps: &[],
     },
@@ -446,7 +446,7 @@ const PHASES: &[PhaseReadiness] = &[
         title: "roadmap honesty and repo baseline",
         status: ReadinessStatus::Complete,
         evidence: &[
-            "docs/phase-35-roadmap-baseline.md",
+            "docs/history/phase-35-roadmap-baseline.md",
             "docs/source-baseline.md",
             "readiness metadata covers phases 0-48",
             "repo baseline and local artifact policy documented",
@@ -462,7 +462,7 @@ const PHASES: &[PhaseReadiness] = &[
             "DatabaseSpec JSON serde and structural validation tests",
             "DbConfig compatibility import tests",
             "docs/schemas/database-spec-v1.schema.json",
-            "docs/phase-36-configuration-spec.md",
+            "docs/history/phase-36-configuration-spec.md",
         ],
         gaps: &[],
     },
@@ -474,7 +474,7 @@ const PHASES: &[PhaseReadiness] = &[
             "public config_spec support catalog with ProfileSpec, CollectionRoleDefinition and ConsistencyDomainDefinition",
             "support status derivation tests for Certified, Custom, Invalid and Experimental outcomes",
             "legacy DbConfig profile aliases resolve through the product catalog",
-            "docs/phase-37-production-ready.md",
+            "docs/history/phase-37-production-ready.md",
         ],
         gaps: &[],
     },
@@ -487,7 +487,7 @@ const PHASES: &[PhaseReadiness] = &[
             "GuaranteeValidator validation matrix tests",
             "PolicyCompiler deterministic compile tests",
             "multidb config validate CLI tests",
-            "docs/phase-38-production-ready.md",
+            "docs/history/phase-38-production-ready.md",
         ],
         gaps: &[],
     },
@@ -499,7 +499,7 @@ const PHASES: &[PhaseReadiness] = &[
             "public config_spec ExplainConfigReport and MigrationPlan contracts",
             "deterministic migration dry-run and apply-confirmation tests",
             "multidb config explain/plan/apply CLI tests",
-            "docs/phase-39-production-ready.md",
+            "docs/history/phase-39-production-ready.md",
         ],
         gaps: &[],
     },
@@ -512,7 +512,7 @@ const PHASES: &[PhaseReadiness] = &[
             "multidb profile/role/domain list text and JSON tests",
             "multidb config validate/explain/plan YAML input tests",
             "multidb explain config alias and config plan --out tests",
-            "docs/phase-40-production-ready.md",
+            "docs/history/phase-40-production-ready.md",
         ],
         gaps: &[],
     },
@@ -524,7 +524,7 @@ const PHASES: &[PhaseReadiness] = &[
             "authenticated admin router for /config, /profiles, /roles, /domains, /extensions, /advice and /studio",
             "Database::confirm_config_apply_as audited no-op contract",
             "admin HTTP envelope, auth, RBAC and apply no-mutation tests",
-            "docs/phase-41-production-ready.md",
+            "docs/history/phase-41-production-ready.md",
         ],
         gaps: &[],
     },
@@ -537,7 +537,7 @@ const PHASES: &[PhaseReadiness] = &[
             "Studio API client, validation, migration dry-run, catalog, extensions and advice views",
             "Studio Vitest component tests and Playwright smoke test",
             "scripts/studio-check.ps1",
-            "docs/phase-42-production-ready.md",
+            "docs/history/phase-42-production-ready.md",
         ],
         gaps: &[],
     },
@@ -550,7 +550,7 @@ const PHASES: &[PhaseReadiness] = &[
             "built-in extension manifests and deterministic extension catalog compilation",
             "admin /extensions full manifest catalog",
             "Studio extension manifest registry and UI panel rendering",
-            "docs/phase-43-production-ready.md",
+            "docs/history/phase-43-production-ready.md",
         ],
         gaps: &[],
     },
@@ -564,7 +564,7 @@ const PHASES: &[PhaseReadiness] = &[
             "admin /advice, /advice/plan and /advice/decision endpoints",
             "multidb advice list/plan/reject CLI tests",
             "Studio Runtime Advisor recommendation cards",
-            "docs/phase-44-production-ready.md",
+            "docs/history/phase-44-production-ready.md",
         ],
         gaps: &[],
     },
@@ -575,9 +575,9 @@ const PHASES: &[PhaseReadiness] = &[
         evidence: &[
             "live OpenRaft runtime with durable log/state machine/snapshot storage",
             "CP internal transport Raft RPC and cluster-admin RPC frames",
-            "Phase 45 Cluster GA smoke for leader handoff, minority write rejection, durable membership metadata, and read-index",
-            "scripts/cluster-ga-smoke.ps1",
-            "docs/phase-45-production-ready.md",
+            "cluster smoke for leader handoff, minority write rejection, durable membership metadata, and read-index",
+            "scripts/cluster-smoke.ps1",
+            "docs/history/phase-45-production-ready.md",
         ],
         gaps: &[],
     },
@@ -594,7 +594,7 @@ const PHASES: &[PhaseReadiness] = &[
             "baselines/perf/ci-gate.json",
             "baselines/perf/release-baseline.json",
             "CI ci-gate artifact and release workflow performance blocker",
-            "docs/phase-46-production-ready.md",
+            "docs/history/phase-46-production-ready.md",
         ],
         gaps: &[],
     },
@@ -611,7 +611,7 @@ const PHASES: &[PhaseReadiness] = &[
             "examples/secure-saas",
             "examples/analytics",
             "scripts/templates-smoke.ps1",
-            "docs/phase-47-production-ready.md",
+            "docs/history/phase-47-production-ready.md",
             "docs/sdk-templates.md",
         ],
         gaps: &[],
@@ -621,11 +621,11 @@ const PHASES: &[PhaseReadiness] = &[
         title: "public preview packaging",
         status: ReadinessStatus::Complete,
         evidence: &[
-            "docs/phase-48-production-ready.md",
+            "docs/history/phase-48-production-ready.md",
             "docs/public-preview.md",
             "scripts/preview-smoke.ps1",
             ".github/workflows/release.yml public preview smoke",
-            "docs/phase-0-42-ga-support-matrix.md",
+            "docs/history/phase-0-42-support-matrix.md",
         ],
         gaps: &[],
     },
@@ -640,7 +640,7 @@ const PHASES: &[PhaseReadiness] = &[
             "scripts/docker-smoke.ps1 image build/run/restart smoke",
             "ops/helm/multidb Docker-aligned runtime values, PVC and Secret references",
             "docs/docker.md",
-            "docs/phase-49-production-ready.md",
+            "docs/history/phase-49-production-ready.md",
         ],
         gaps: &[],
     },
@@ -655,7 +655,7 @@ const PHASES: &[PhaseReadiness] = &[
             "legacy MULTIDB_ADMIN_TOKEN compatibility for automation",
             "Studio password login, logout and 401 session-expiry handling",
             "Docker Compose, Helm and docker smoke use admin password with legacy token check",
-            "docs/phase-50-production-ready.md",
+            "docs/history/phase-50-production-ready.md",
         ],
         gaps: &[],
     },
@@ -672,7 +672,7 @@ const PHASES: &[PhaseReadiness] = &[
             "Runtime Advisor plan and reject-decision UI over existing Control Plane endpoints",
             "Security RBAC dirty state, validation and broad-admin warnings",
             "desktop and mobile Playwright Studio operator flow",
-            "docs/phase-51-production-ready.md",
+            "docs/history/phase-51-production-ready.md",
         ],
         gaps: &[],
     },
@@ -690,7 +690,7 @@ const PHASES: &[PhaseReadiness] = &[
             "scripts/sdk-examples-smoke.ps1",
             "docs/sdk-api-ecosystem.md",
             "docs/sdk-generated-clients.md",
-            "docs/phase-52-production-ready.md",
+            "docs/history/phase-52-production-ready.md",
         ],
         gaps: &[],
     },
@@ -703,12 +703,12 @@ const PHASES: &[PhaseReadiness] = &[
             "MULTIDB_ADMIN_LOGIN_MAX_FAILURES, WINDOW_SECONDS and LOCKOUT_SECONDS runtime env contract",
             "release workflow builds Linux and Windows binaries, signs blobs, publishes checksums and provenance",
             "release workflow publishes signed GHCR Docker image without latest tag",
-            "scripts/phase53-ga-smoke.ps1",
+            "scripts/release-smoke.ps1",
             "SDK compatibility constants for Control Plane API v1 and minimum MultiDB version",
-            "docs/ga-support-matrix.md",
+            "docs/support-matrix.md",
             "docs/release-and-versioning.md",
             "docs/release-checklist.md",
-            "docs/phase-53-production-ready.md",
+            "docs/history/phase-53-production-ready.md",
         ],
         gaps: &[],
     },
@@ -952,7 +952,7 @@ mod tests {
             phase
                 .evidence
                 .iter()
-                .any(|entry| entry.contains("cluster-ga-smoke.ps1"))
+                .any(|entry| entry.contains("cluster-smoke.ps1"))
         );
     }
 
@@ -1086,7 +1086,7 @@ mod tests {
             phase
                 .evidence
                 .iter()
-                .any(|entry| entry.contains("phase53-ga-smoke.ps1"))
+                .any(|entry| entry.contains("release-smoke.ps1"))
         );
         assert!(
             phase
@@ -1103,8 +1103,8 @@ mod tests {
 
     #[test]
     fn public_docs_cover_phase_thirty_five_and_forty_eight() {
-        let phase_35 = include_str!("../docs/phase-35-roadmap-baseline.md");
-        let phase_48 = include_str!("../docs/phase-48-production-ready.md");
+        let phase_35 = include_str!("../docs/history/phase-35-roadmap-baseline.md");
+        let phase_48 = include_str!("../docs/history/phase-48-production-ready.md");
         assert!(phase_35.contains("Phase 35"));
         assert!(phase_35.contains("outside the public source baseline"));
         assert!(phase_48.contains("Phase 48"));
@@ -1113,11 +1113,11 @@ mod tests {
 
     #[test]
     fn post_preview_public_docs_cover_phase_forty_nine_through_fifty_three() {
-        let phase_49 = include_str!("../docs/phase-49-production-ready.md");
-        let phase_50 = include_str!("../docs/phase-50-production-ready.md");
-        let phase_51 = include_str!("../docs/phase-51-production-ready.md");
-        let phase_52 = include_str!("../docs/phase-52-production-ready.md");
-        let phase_53 = include_str!("../docs/phase-53-production-ready.md");
+        let phase_49 = include_str!("../docs/history/phase-49-production-ready.md");
+        let phase_50 = include_str!("../docs/history/phase-50-production-ready.md");
+        let phase_51 = include_str!("../docs/history/phase-51-production-ready.md");
+        let phase_52 = include_str!("../docs/history/phase-52-production-ready.md");
+        let phase_53 = include_str!("../docs/history/phase-53-production-ready.md");
         assert!(phase_49.contains("Phase 49"));
         assert!(phase_50.contains("Phase 50"));
         assert!(phase_51.contains("Phase 51"));

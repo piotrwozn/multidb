@@ -1,7 +1,7 @@
 # SDK And API Ecosystem
 
-Phase 52 makes the Control Plane API a stable developer contract. The HTTP
-source of truth is `docs/openapi/control-plane-v1.openapi.json`, served at
+The Control Plane API v1 is the stable developer contract for the current
+preview. The HTTP source of truth is `docs/openapi/control-plane-v1.openapi.json`, served at
 `GET /openapi.json` and `GET /api/openapi.json`.
 
 ## Official SDKs
@@ -54,5 +54,5 @@ Run the end-to-end examples against an isolated Docker Compose project:
 
 CI runs the same gates with Go required.
 
-Phase 53 release candidates run both SDK gates before publishing signed binary
-and Docker artifacts.
+Release candidates run both SDK gates before publishing signed binary and
+Docker artifacts.

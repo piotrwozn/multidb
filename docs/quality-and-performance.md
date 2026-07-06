@@ -77,21 +77,12 @@ Generate a trend dashboard from two or more reports:
 .\scripts\perf_trend.ps1 -Reports baselines/perf/release-baseline.json,target/perf/release-candidate.json -Output target/perf/release-trend.json
 ```
 
-## Readiness source of truth
+## Support Claims
 
-`src/roadmap.rs` is the source of truth for phase readiness. Documentation should
-describe the same status categories and should not claim the project is only a
-foundation skeleton while later-phase modules are present.
-
-Status categories have distinct meanings:
-
-- `Complete`: evidence is recorded and no known gaps remain in that roadmap
-  entry.
-- `ProductionGap`: implemented surface exists, but production work remains.
-- `Deferred`: future roadmap work, not a current implementation claim.
-
-The phase 35 baseline is documented in
-[`phase-35-roadmap-baseline.md`](phase-35-roadmap-baseline.md).
+`docs/support-matrix.md` is the user-facing source for supported surfaces,
+preview-only behavior and out-of-scope claims. Keep it aligned with release
+gates and avoid turning a local benchmark or smoke run into a broad production
+claim.
 
 ## Versioned Performance Baselines
 
@@ -119,5 +110,5 @@ blocker so threshold and baseline changes require review instead of relying on
 Local results are diagnostic. CI and release results are policy-bearing only
 when they compare a candidate envelope to the matching versioned baseline.
 
-The phase 46 production contract is documented in
-[`phase-46-production-ready.md`](phase-46-production-ready.md).
+Release performance claims should point to versioned baselines and release
+artifacts, not local `target/` output.

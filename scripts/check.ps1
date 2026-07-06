@@ -19,9 +19,9 @@ function Invoke-Cargo {
 Invoke-Cargo -Arguments @("fmt", "--check")
 Invoke-Cargo -Arguments @("clippy", "--all-targets", "--all-features", "--", "-D", "warnings")
 Invoke-Cargo -Arguments @("test", "--all-features")
-& (Join-Path $PSScriptRoot "cluster-ga-smoke.ps1")
+& (Join-Path $PSScriptRoot "cluster-smoke.ps1")
 if ($LASTEXITCODE -ne 0) {
-    throw "cluster-ga-smoke.ps1 failed with exit code $LASTEXITCODE"
+    throw "cluster-smoke.ps1 failed with exit code $LASTEXITCODE"
 }
 & (Join-Path $PSScriptRoot "templates-smoke.ps1")
 if ($LASTEXITCODE -ne 0) {

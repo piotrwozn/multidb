@@ -1774,7 +1774,7 @@ impl MigrationPlanner {
                 confirmation_matched: true,
                 audit_recorded: false,
                 data_mutated: false,
-                message: "plan is a dry-run/audit artifact; automatic apply is unsupported in phase 39 v1"
+                message: "plan is a dry-run/audit artifact; automatic apply is unsupported in config apply v1"
                     .to_owned(),
             };
         }
@@ -2096,7 +2096,9 @@ fn diff_top_level(current: &DatabaseSpec, desired: &DatabaseSpec, steps: &mut Ve
         &desired.deployment.mode,
         diff_metadata(
             MigrationStepKind::ChangeDeployment,
-            unsupported_impact("deployment mode changes are not physically switched by phase 39"),
+            unsupported_impact(
+                "deployment mode changes are not physically switched by config apply v1",
+            ),
             "Restore the previous deployment mode.",
             false,
         ),
@@ -2342,7 +2344,9 @@ fn diff_collections(
                     "add collection {} as {:?}",
                     collection.name, collection.role
                 ),
-                unsupported_impact("collection creation is outside phase 39 automatic apply"),
+                unsupported_impact(
+                    "collection creation is outside config apply v1 automatic changes",
+                ),
                 "Remove the new collection from the desired spec.",
                 false,
             ),
@@ -2617,7 +2621,7 @@ fn rollback_plan(steps: &[MigrationStep]) -> RollbackPlan {
             "All planned changes are metadata-level and can be reverted by restoring the previous spec."
                 .to_owned()
         } else {
-            "At least one step is operator-managed in phase 39 v1; rollback must be planned outside automatic apply."
+            "At least one step is operator-managed in config apply v1; rollback must be planned outside automatic apply."
                 .to_owned()
         },
         steps,
@@ -2684,7 +2688,7 @@ fn unsupported_impact(note: &str) -> PlanImpact {
         requires_downtime: true,
         notes: vec![
             note.to_owned(),
-            "automatic apply unsupported in phase 39 v1".to_owned(),
+            "automatic apply unsupported in config apply v1".to_owned(),
         ],
     }
 }
@@ -2835,7 +2839,7 @@ const BUILT_IN_PROFILES: &[ProfileSpec] = &[
         slug: "production_cp",
         aliases: &[],
         status: SupportStatus::Stable,
-        description: "CP OpenRaft cluster profile covered by the Phase 45 local/process smoke gate.",
+        description: "CP OpenRaft cluster profile covered by the local/process smoke gate.",
         default_domain: ConsistencyMode::StrongCp,
         compatible_roles: SECURE_APP_ROLES,
     },
@@ -2942,7 +2946,7 @@ const CONSISTENCY_DOMAIN_DEFINITIONS: &[ConsistencyDomainDefinition] = &[
         guarantees: &[
             "CP-side intent",
             "quorum-oriented consistency boundary",
-            "Phase 45 local/process Cluster GA smoke coverage",
+            "local/process cluster smoke coverage",
         ],
         limits: &["Kubernetes automation, multi-region placement and SLA are separate concerns"],
     },
@@ -2951,7 +2955,7 @@ const CONSISTENCY_DOMAIN_DEFINITIONS: &[ConsistencyDomainDefinition] = &[
         slug: "eventual_ap",
         status: SupportStatus::Experimental,
         guarantees: &["available-write intent", "eventual convergence boundary"],
-        limits: &["conflict policy must be validated by later phases"],
+        limits: &["conflict policy must be validated by workload-specific review"],
     },
 ];
 
@@ -3261,7 +3265,7 @@ static BUILT_IN_EXTENSION_MANIFESTS: LazyLock<Vec<ExtensionManifest>> = LazyLock
             },
             extension_manifest_details(
                 &["graph-index"],
-                &["Full GQL/Cypher compatibility is outside the Phase 43 contract."],
+                &["Full GQL/Cypher compatibility is outside the current extension contract."],
                 vec![extension_migration(
                     "graph-index-1",
                     "1.0.0",

@@ -22,7 +22,7 @@ Push-Location studio; npm run e2e; Pop-Location
 For release-sensitive changes, run:
 
 ```powershell
-.\scripts\phase53-ga-smoke.ps1
+.\scripts\release-smoke.ps1
 ```
 
 If Go is not installed locally, state that explicitly and run the rest of the
@@ -35,7 +35,7 @@ gate with `-SkipGo`; GitHub Actions runs the Go SDK checks.
 - Update docs and tests with behavior changes.
 - Preserve fail-closed behavior for auth, config validation, migration planning
   and storage corruption paths.
-- Treat `src/roadmap.rs` as the checked-in readiness source of truth.
+- Keep `docs/support-matrix.md` aligned with user-visible support claims.
 
 ## Review And Merge Policy
 

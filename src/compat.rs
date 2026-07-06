@@ -78,7 +78,7 @@ impl CompatibilityReport {
             ],
             known_gaps: vec![
                 "Mongo wire protocol is intentionally deferred".to_owned(),
-                "Full PostgreSQL catalog/rules/triggers compatibility is out of phase 22 scope"
+                "Full PostgreSQL catalog/rules/triggers compatibility is outside the current scope"
                     .to_owned(),
                 "Decimal/Numeric has no native engine type yet; Mongo Decimal128 imports as text"
                     .to_owned(),

@@ -1696,7 +1696,7 @@ impl SqlEngine {
     /// Fails when SQL is unsupported or execution fails under `ANALYZE`.
     pub fn explain(&self, sql: &str, options: ExplainOptions) -> Result<ExplainReport, QueryError> {
         let simple = self.simple_select_plan(sql)?.ok_or_else(|| {
-            QueryError::Unsupported("EXPLAIN supports simple SELECT in phase 15".to_owned())
+            QueryError::Unsupported("EXPLAIN supports simple SELECT in this preview".to_owned())
         })?;
         let table = self
             .tables
@@ -2938,7 +2938,7 @@ fn validate_layout(
 
     if !indexes.is_empty() {
         return Err(QueryError::InvalidSchema(
-            "columnar tables do not support B-tree indexes in phase 8".to_owned(),
+            "columnar tables do not support B-tree indexes".to_owned(),
         ));
     }
 

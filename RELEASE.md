@@ -15,7 +15,7 @@ git push origin v0.1.0-preview.1
 Before tagging:
 
 ```powershell
-.\scripts\phase53-ga-smoke.ps1
+.\scripts\release-smoke.ps1
 ```
 
 Do not publish a stable `v1.0.0` tag until the project has external soak time,

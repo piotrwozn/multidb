@@ -2615,7 +2615,7 @@ async fn phase32_sql_declarations_fail_closed() -> Result<(), Box<dyn std::error
     for sql in cases {
         match database.query(sql).await {
             Err(DbError::Query(QueryError::Unsupported(message))) => {
-                assert!(message.contains("phase 32 GA SQL matrix"));
+                assert!(message.contains("current SQL support matrix"));
             }
             other => panic!("expected deterministic unsupported error for {sql}: {other:?}"),
         }

@@ -37,7 +37,7 @@ Phase evidence:
 | 11 | CP/AP contract tests and internal transport fail-closed Raft/admin RPCs |
 | 12 | Health state, healing policies, CP membership adapter |
 | 13 | Durable 2PC recovery tests and phase 13 recovery doc |
-| 14 | `docs/phase-14-ops-ga.md`, kind, Helm, Vault, MinIO, ops smoke |
+| 14 | `docs/history/phase-14-ops-ga.md`, kind, Helm, Vault, MinIO, ops smoke |
 | 15 | ANALYZE stats, cost-based index-vs-scan, plan cache, EXPLAIN ANALYZE |
 | 16 | Versioned perf baselines and release perf gate |
 | 17 | Backup, incremental PITR, verify tests, local MinIO target |

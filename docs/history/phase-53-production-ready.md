@@ -22,7 +22,7 @@ multi-region guarantees or external compliance certification.
 - Release tags build Linux and Windows x86_64 binaries, publish checksums,
   sign binary blobs, attach provenance, publish a GHCR image tagged only with
   the Git tag, attach image SBOM/provenance and sign the image digest.
-- `scripts/phase53-ga-smoke.ps1` is the one-command GA gate over Rust, Studio,
+- `scripts/release-smoke.ps1` is the one-command GA gate over Rust, Studio,
   Playwright, Docker, SDKs, examples, release perf and supply-chain checks.
 
 ## Boundaries
@@ -49,7 +49,7 @@ cargo test --all-features
 .\scripts\studio-check.ps1
 Push-Location studio; npm run e2e; Pop-Location
 .\scripts\docker-smoke.ps1
-.\scripts\phase53-ga-smoke.ps1
+.\scripts\release-smoke.ps1
 ```
 
 The release workflow runs the same critical gates on tag pushes and publishes

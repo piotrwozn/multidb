@@ -63,7 +63,7 @@ jobs:
 
       - name: SDK examples smoke
         shell: pwsh
-        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo -ImageTag multidb:phase49-smoke
+        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo -ImageTag multidb:docker-smoke
 
       - name: Release performance gate
         shell: pwsh

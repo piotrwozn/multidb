@@ -34,7 +34,7 @@ keyless Sigstore. It does not publish a `latest` image tag.
 - Stable endpoints keep the enveloped JSON error shape and stable `code`
   values.
 - Preview endpoints, including `/metrics`, may change only with release notes.
-- `config apply` remains confirm/audit-only until a later phase implements
+- `config apply` remains confirm/audit-only until a later release implements
   physical migrations.
 - New durable formats must update the existing format registry and add
   migration or fail-closed compatibility tests.

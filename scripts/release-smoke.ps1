@@ -63,10 +63,10 @@ try {
     }
 
     Invoke-Checked "Release performance gate" {
-        & (Join-Path $PSScriptRoot "perf.ps1") -Profile release-baseline -Rows 1000 -Output target/perf/phase53-candidate.json
+        & (Join-Path $PSScriptRoot "perf.ps1") -Profile release-baseline -Rows 1000 -Output target/perf/release-candidate.json
     }
     Invoke-Checked "Release performance comparison" {
-        & (Join-Path $PSScriptRoot "perf_gate.ps1") -Baseline baselines/perf/release-baseline.json -Candidate target/perf/phase53-candidate.json -SummaryOutput target/perf/phase53-gate-summary.json
+        & (Join-Path $PSScriptRoot "perf_gate.ps1") -Baseline baselines/perf/release-baseline.json -Candidate target/perf/release-candidate.json -SummaryOutput target/perf/release-gate-summary.json
     }
 
     Invoke-Checked "cargo deny supply-chain gate" {
@@ -76,4 +76,4 @@ try {
     Pop-Location
 }
 
-Write-Host "phase 53 GA smoke ok"
+Write-Host "release smoke ok"

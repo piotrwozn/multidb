@@ -217,7 +217,7 @@ pub fn full_backup(
     fs::create_dir_all(&backup_path)?;
 
     let storage = database.local_storage().ok_or_else(|| {
-        BackupError::Unsupported("sharded backup must be taken per shard in phase 17".to_owned())
+        BackupError::Unsupported("sharded backup must be taken per shard".to_owned())
     })?;
     let read = storage.begin_read()?;
     let end_lsn = txn::current_txn_id_from(&read)?;
@@ -272,7 +272,7 @@ pub fn incremental_backup(
     let started = Instant::now();
     let parent = read_manifest(parent_backup_dir.as_ref())?;
     let storage = database.local_storage().ok_or_else(|| {
-        BackupError::Unsupported("sharded backup must be taken per shard in phase 17".to_owned())
+        BackupError::Unsupported("sharded backup must be taken per shard".to_owned())
     })?;
     let read = storage.begin_read()?;
     let end_lsn = txn::current_txn_id_from(&read)?;
