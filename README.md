@@ -133,7 +133,16 @@ Release-sensitive gate:
 
 ## Contributing And Security
 
-See `CONTRIBUTING.md` for local checks and pull request expectations.
+Contributions are welcome. Good places to start are issues labeled
+`good first issue`, `help wanted` or `contributor-friendly`.
+
+You can help with documentation, examples, SDKs, Studio, tests, fuzzing,
+benchmarks, operations docs and database internals. Open an issue for bugs,
+feature ideas or design questions, start a GitHub Discussion for broader
+proposals, or send a focused pull request.
+
+See `CONTRIBUTING.md` for local checks, review policy and pull request
+expectations.
 
 Report vulnerabilities privately through GitHub Security Advisories once the
 repository is published. See `SECURITY.md`.
