@@ -1851,14 +1851,15 @@ mod tests {
         let handles = start_live_cluster(3)?;
         let result =
             (|| {
-                let leader_idx = wait_for_live_leader(&handles)?;
+                let leader_idx = propose_on_current_leader(
+                    &handles,
+                    &Op::Put {
+                        table: "t".to_owned(),
+                        key: b"a".to_vec(),
+                        value: b"1".to_vec(),
+                    },
+                )?;
                 let handle = &handles[leader_idx];
-                let raft = handle.replication();
-                raft.propose(Op::Put {
-                    table: "t".to_owned(),
-                    key: b"a".to_vec(),
-                    value: b"1".to_vec(),
-                })?;
 
                 let status = cluster_status(handle)?;
                 assert_eq!(status.leader_id, Some(status.node_id));
