@@ -95,7 +95,8 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           mkdir -p target/sbom
-          cargo cyclonedx --all --format json --override-filename target/sbom/multidb
+          cargo cyclonedx --all --format json --override-filename multidb
+          mv multidb.json target/sbom/multidb.json
       - name: cargo-vet policy
         run: |
           cargo install cargo-vet --locked
