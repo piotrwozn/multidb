@@ -767,10 +767,16 @@ th {
   margin-top: 12px;
 }
 
+.step-item > div {
+  min-width: 0;
+}
+
 .step-item code {
   display: block;
   margin-top: 4px;
   color: #546678;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .row-item small {
@@ -804,6 +810,14 @@ code,
   padding: 12px;
   border: 1px solid #d7e1e9;
   border-radius: 8px;
+  overflow: hidden;
+}
+
+.advice-decision {
+  position: relative;
+  z-index: 1;
+  margin-top: 12px;
+  align-items: end;
 }
 
 .validation-ok {
@@ -1033,9 +1047,20 @@ code,
   .command-bar,
   .section-heading,
   .row-item,
+  .step-item,
+  .plan-header,
+  .advice-header,
   .audit-event summary {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .advice-decision .button-row {
+    align-self: stretch;
+  }
+
+  .advice-decision .danger-button {
+    width: 100%;
   }
 
   .workspace {
