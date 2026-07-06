@@ -1708,6 +1708,36 @@ mod tests {
         }
     }
 
+    fn prepare_dist_txn_on_current_leader<S: StorageEngine>(
+        handles: &[CpClusterHandle<S>],
+        txn_id: u64,
+        ops: &[Op],
+    ) -> Result<usize, ReplError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let leader_idx = wait_for_live_leader(handles)?;
+            match handles[leader_idx]
+                .replication()
+                .prepare_dist_txn(txn_id, ops.to_vec())
+            {
+                Ok(Vote::Yes) => return Ok(leader_idx),
+                Ok(Vote::No) => {
+                    return Err(ReplError::Transport(format!(
+                        "live CP dist txn {txn_id} voted no"
+                    )));
+                }
+                Err(ReplError::Transport(message)) if is_retryable_live_raft_error(&message) => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(ReplError::Transport(
+                    "timed out preparing dist txn on current leader".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn is_retryable_live_raft_error(message: &str) -> bool {
         message.contains("forward request")
             || message.contains("client_write timed out")
@@ -1889,20 +1919,14 @@ mod tests {
         let _guard = live_cluster_test_guard();
         let handles = start_live_cluster(3)?;
         let result = (|| {
-            let leader_idx = wait_for_live_leader(&handles)?;
+            let ops = vec![Op::Put {
+                table: "t".to_owned(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }];
+            let leader_idx = prepare_dist_txn_on_current_leader(&handles, 42, &ops)?;
             let handle = &handles[leader_idx];
             let raft = handle.replication();
-            assert_eq!(
-                raft.prepare_dist_txn(
-                    42,
-                    vec![Op::Put {
-                        table: "t".to_owned(),
-                        key: b"k".to_vec(),
-                        value: b"v".to_vec(),
-                    }],
-                )?,
-                Vote::Yes
-            );
             {
                 let mut write = raft.storage().begin_write()?;
                 write.put(
@@ -1919,10 +1943,13 @@ mod tests {
 
             let recovery = wait_for_recovery(handle)?;
             assert_eq!(recovery.in_doubt_dist_txns, 0);
-            assert_eq!(
-                raft.read("t", b"k", ReadConsistency::Strong)?,
-                Some(b"v".to_vec())
-            );
+            let read_leader_idx = wait_for_live_leader(&handles)?;
+            wait_for_live_value(
+                &handles[read_leader_idx],
+                b"k",
+                b"v",
+                ReadConsistency::Strong,
+            )?;
             Ok::<(), Box<dyn std::error::Error>>(())
         })();
         shutdown_all(handles);
