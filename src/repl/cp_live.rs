@@ -39,11 +39,9 @@ use crate::{
 
 use super::cp::{
     ClusterBootstrap, CpClusterConfig, CpOpenRaftTypeConfig, RAFT_LOG_TABLE, RAFT_SNAPSHOT_TABLE,
-    RAFT_STATE_TABLE, RAFT_VOTE_TABLE, RaftNode, ReplApplyResponse, ReplCommand,
+    RAFT_STATE_TABLE, RAFT_VOTE_TABLE, RaftNode, ReplApplyResponse, ReplCommand, command_write_set,
 };
-use super::{
-    DIST_TXN_FINISHED_TABLE, DIST_TXN_PARTICIPANT_TABLE, FinishedTxnRecord, PreparedTxnRecord,
-};
+use super::{DIST_TXN_FINISHED_TABLE, DIST_TXN_PARTICIPANT_TABLE};
 
 const LAST_APPLIED_KEY: &[u8] = b"last_applied";
 const LAST_COMMITTED_KEY: &[u8] = b"last_committed";
@@ -877,7 +875,6 @@ impl<S: StorageEngine> CpStateMachine<S> {
         log_id: &LogIdOf<CpOpenRaftTypeConfig>,
         command: &ReplCommand,
     ) -> Result<ReplApplyResponse, StorageError> {
-        let write_set = write_set_for_command(command)?;
         let mut write = self.storage.begin_write()?;
         if let ReplCommand::DistTxnPrepare { txn_id, ops, .. } = command {
             let key = dist_txn::txn_key(*txn_id);
@@ -915,6 +912,7 @@ impl<S: StorageEngine> CpStateMachine<S> {
             }
         }
 
+        let write_set = command_write_set(command, &write)?;
         let snapshot_id = match command {
             ReplCommand::TxnCommit { snapshot_id, .. } => *snapshot_id,
             _ => txn::current_txn_id_from(&write)?,
@@ -1203,54 +1201,6 @@ fn openraft_config_from_cluster(cluster: &CpClusterConfig) -> openraft::Config {
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(runtime.snapshot_threshold),
         ..openraft::Config::default()
     }
-}
-
-fn write_set_for_command(command: &ReplCommand) -> Result<WriteSet, StorageError> {
-    Ok(match command {
-        ReplCommand::Batch(ops) | ReplCommand::Conditional { ops, .. } => {
-            txn::ops_to_write_set(ops.clone())
-        }
-        ReplCommand::TxnCommit { writes, .. } => writes
-            .iter()
-            .cloned()
-            .map(|(table, key, value)| ((table, key), value))
-            .collect(),
-        ReplCommand::DistTxnPrepare {
-            txn_id,
-            ops,
-            deadline_ms,
-            ..
-        } => {
-            let record = PreparedTxnRecord::new(*txn_id, ops.clone(), *deadline_ms);
-            BTreeMap::from([(
-                (
-                    DIST_TXN_PARTICIPANT_TABLE.to_owned(),
-                    dist_txn::txn_key(*txn_id).to_vec(),
-                ),
-                Some(dist_txn::encode_prepared(&record)?),
-            )])
-        }
-        ReplCommand::DistTxnFinish {
-            txn_id, decision, ..
-        } => BTreeMap::from([
-            (
-                (
-                    DIST_TXN_FINISHED_TABLE.to_owned(),
-                    dist_txn::txn_key(*txn_id).to_vec(),
-                ),
-                Some(dist_txn::encode_finished(&FinishedTxnRecord::new(
-                    *txn_id, *decision,
-                ))?),
-            ),
-            (
-                (
-                    DIST_TXN_PARTICIPANT_TABLE.to_owned(),
-                    dist_txn::txn_key(*txn_id).to_vec(),
-                ),
-                None,
-            ),
-        ]),
-    })
 }
 
 fn apply_mirror<T: WriteTransaction>(txn: &mut T, write_set: WriteSet) -> Result<(), StorageError> {

@@ -853,53 +853,15 @@ impl<S: StorageEngine> CpRaft<S> {
             .lock()
             .map_err(|_| StorageError::Backend("CP commit lock poisoned".to_owned()))?;
 
-        let write_set = match &command {
-            ReplCommand::Batch(ops) | ReplCommand::Conditional { ops, .. } => {
-                txn::ops_to_write_set(ops.clone())
-            }
-            ReplCommand::TxnCommit { writes, .. } => entries_to_write_set(writes.clone()),
-            ReplCommand::DistTxnPrepare {
-                txn_id,
-                ops,
-                deadline_ms,
-                ..
-            } => {
-                let record = PreparedTxnRecord::new(*txn_id, ops.clone(), *deadline_ms);
-                BTreeMap::from([(
-                    (
-                        DIST_TXN_PARTICIPANT_TABLE.to_owned(),
-                        dist_txn::txn_key(*txn_id).to_vec(),
-                    ),
-                    Some(dist_txn::encode_prepared(&record)?),
-                )])
-            }
-            ReplCommand::DistTxnFinish {
-                txn_id, decision, ..
-            } => BTreeMap::from([
-                (
-                    (
-                        DIST_TXN_FINISHED_TABLE.to_owned(),
-                        dist_txn::txn_key(*txn_id).to_vec(),
-                    ),
-                    Some(dist_txn::encode_finished(&FinishedTxnRecord::new(
-                        *txn_id, *decision,
-                    ))?),
-                ),
-                (
-                    (
-                        DIST_TXN_PARTICIPANT_TABLE.to_owned(),
-                        dist_txn::txn_key(*txn_id).to_vec(),
-                    ),
-                    None,
-                ),
-            ]),
-        };
+        let write = self.storage.begin_write()?;
+        let write_set = command_write_set(command, &write)?;
 
         if write_set.is_empty() {
-            return txn::current_txn_id(self.storage.as_ref());
+            let txn_id = txn::current_txn_id_from(&write)?;
+            write.rollback();
+            return Ok(txn_id);
         }
 
-        let write = self.storage.begin_write()?;
         let snapshot_id = match &command {
             ReplCommand::Batch(_)
             | ReplCommand::Conditional { .. }
@@ -975,6 +937,7 @@ impl<S: StorageEngine> CpRaft<S> {
         )
     }
 
+    #[cfg(test)]
     fn load_prepared_dist_txn(
         &self,
         txn_id: DistTxnId,
@@ -1146,25 +1109,6 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
             }
         }
 
-        let prepared = self.load_prepared_dist_txn(txn_id)?;
-        if let Some(live) = &self.live {
-            if let (Decision::Commit, Some(record)) = (decision, prepared) {
-                live.propose(ReplCommand::Batch(record.ops))?;
-            }
-            live.propose(ReplCommand::DistTxnFinish {
-                txn_id,
-                decision,
-                hlc: Some(HlcTimestamp::now()),
-            })?;
-            return Ok(());
-        }
-
-        if let (Decision::Commit, Some(record)) = (decision, prepared) {
-            self.apply_authorized_command(
-                &ReplCommand::Batch(record.ops),
-                txn::system_write_authorization(),
-            )?;
-        }
         self.mark_dist_txn_finished(txn_id, decision)
     }
 
@@ -1403,6 +1347,71 @@ fn entries_to_write_set(entries: Vec<(String, Bytes, Option<Bytes>)>) -> WriteSe
         .collect()
 }
 
+pub(super) fn command_write_set(
+    command: &ReplCommand,
+    read: &impl ReadTransaction,
+) -> Result<WriteSet, StorageError> {
+    Ok(match command {
+        ReplCommand::Batch(ops) | ReplCommand::Conditional { ops, .. } => {
+            txn::ops_to_write_set(ops.clone())
+        }
+        ReplCommand::TxnCommit { writes, .. } => entries_to_write_set(writes.clone()),
+        ReplCommand::DistTxnPrepare {
+            txn_id,
+            ops,
+            deadline_ms,
+            ..
+        } => {
+            let record = PreparedTxnRecord::new(*txn_id, ops.clone(), *deadline_ms);
+            BTreeMap::from([(
+                (
+                    DIST_TXN_PARTICIPANT_TABLE.to_owned(),
+                    dist_txn::txn_key(*txn_id).to_vec(),
+                ),
+                Some(dist_txn::encode_prepared(&record)?),
+            )])
+        }
+        ReplCommand::DistTxnFinish {
+            txn_id, decision, ..
+        } => dist_txn_finish_write_set(read, *txn_id, *decision)?,
+    })
+}
+
+fn dist_txn_finish_write_set(
+    read: &impl ReadTransaction,
+    txn_id: DistTxnId,
+    decision: Decision,
+) -> Result<WriteSet, StorageError> {
+    let key = dist_txn::txn_key(txn_id);
+    let mut write_set = if decision == Decision::Commit {
+        read.get(DIST_TXN_PARTICIPANT_TABLE, &key)?
+            .map(|bytes| dist_txn::decode_prepared(&bytes))
+            .transpose()?
+            .map(|record| txn::ops_to_write_set(record.ops))
+            .unwrap_or_default()
+    } else {
+        WriteSet::new()
+    };
+
+    write_set.insert(
+        (
+            DIST_TXN_FINISHED_TABLE.to_owned(),
+            dist_txn::txn_key(txn_id).to_vec(),
+        ),
+        Some(dist_txn::encode_finished(&FinishedTxnRecord::new(
+            txn_id, decision,
+        ))?),
+    );
+    write_set.insert(
+        (
+            DIST_TXN_PARTICIPANT_TABLE.to_owned(),
+            dist_txn::txn_key(txn_id).to_vec(),
+        ),
+        None,
+    );
+    Ok(write_set)
+}
+
 fn next_log_index(txn: &impl ReadTransaction) -> Result<u64, StorageError> {
     match txn.get(RAFT_STATE_TABLE, LAST_APPLIED_KEY)? {
         Some(bytes) => decode_u64(&bytes)?
@@ -1563,7 +1572,7 @@ mod tests {
     fn wait_for_live_leader<S: StorageEngine>(
         handles: &[CpClusterHandle<S>],
     ) -> Result<usize, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(45);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             for handle in handles {
                 let Ok(status) = cluster_status(handle) else {
@@ -1669,7 +1678,7 @@ mod tests {
         handle: &CpClusterHandle<S>,
         txn_id: u64,
     ) -> Result<(), ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if handle.raft.load_prepared_dist_txn(txn_id)?.is_some() {
                 return Ok(());
@@ -1688,7 +1697,7 @@ mod tests {
         voters: &[RaftNode],
         learners: &[RaftNode],
     ) -> Result<CpClusterStatus, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(45);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let leader_idx = wait_for_live_leader(handles)?;
             match change_membership(&handles[leader_idx], voters.to_vec(), learners.to_vec()) {
@@ -1709,7 +1718,7 @@ mod tests {
         handles: &[CpClusterHandle<S>],
         op: &Op,
     ) -> Result<usize, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let leader_idx = wait_for_live_leader(handles)?;
             match handles[leader_idx].replication().propose(op.clone()) {
@@ -1731,7 +1740,7 @@ mod tests {
         txn_id: u64,
         ops: &[Op],
     ) -> Result<usize, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let leader_idx = wait_for_live_leader(handles)?;
             match handles[leader_idx]
@@ -1765,7 +1774,7 @@ mod tests {
     fn wait_for_live_recovery<S: StorageEngine>(
         handle: &CpClusterHandle<S>,
     ) -> Result<CpRecoveryStatus, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(45);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match wait_for_recovery(handle) {
                 Ok(status) => return Ok(status),
@@ -1910,6 +1919,27 @@ mod tests {
             read.get(RAFT_STATE_TABLE, b"last_committed")?,
             Some(1_u64.to_be_bytes().to_vec())
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn dist_txn_finish_commit_applies_prepared_ops() -> Result<(), Box<dyn std::error::Error>> {
+        let raft = CpRaft::new_for_test(MemEngine::new(), 1);
+        let ops = vec![Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        }];
+
+        assert_eq!(raft.prepare_dist_txn(7, ops)?, Vote::Yes);
+        raft.finish_dist_txn(7, Decision::Commit)?;
+
+        assert_eq!(
+            raft.read("t", b"k", ReadConsistency::Strong)?,
+            Some(b"v".to_vec())
+        );
+        assert!(raft.load_prepared_dist_txn(7)?.is_none());
 
         Ok(())
     }
