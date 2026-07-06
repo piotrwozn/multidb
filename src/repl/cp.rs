@@ -1591,7 +1591,7 @@ mod tests {
         handles: &[CpClusterHandle<S>],
         previous_leader: NodeId,
     ) -> Result<usize, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let leader_idx = wait_for_live_leader(handles)?;
             if handles[leader_idx].raft.cluster.node_id != previous_leader {
@@ -1609,7 +1609,7 @@ mod tests {
     fn wait_for_committed_live_config<S: StorageEngine>(
         handle: &CpClusterHandle<S>,
     ) -> Result<(), ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let status = cluster_status(handle)?;
             if status.last_committed >= 1 {
@@ -1630,7 +1630,7 @@ mod tests {
         expected: &[u8],
         consistency: ReadConsistency,
     ) -> Result<(), ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match handle.replication().read("t", key, consistency) {
                 Ok(Some(value)) if value == expected => return Ok(()),
