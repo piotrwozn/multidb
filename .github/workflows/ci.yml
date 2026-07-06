@@ -49,7 +49,7 @@ jobs:
         run: ./scripts/docker-smoke.ps1 -UsePrebuiltArtifacts -PrebuiltBin ./target/debug/multidb
       - name: SDK examples smoke
         shell: pwsh
-        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo
+        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo -ImageTag multidb:phase49-smoke
       - name: Fuzz smoke
         shell: pwsh
         run: ./scripts/fuzz-smoke.ps1

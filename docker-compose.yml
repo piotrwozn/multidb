@@ -2,7 +2,7 @@ services:
   multidb:
     build:
       context: .
-    image: multidb:local
+    image: ${MULTIDB_IMAGE:-multidb:local}
     environment:
       MULTIDB_RUNTIME_MODE: local-dev
       MULTIDB_PG_TLS_MODE: disabled

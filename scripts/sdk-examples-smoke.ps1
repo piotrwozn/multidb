@@ -1,4 +1,5 @@
 param(
+    [string] $ImageTag = $env:MULTIDB_SDK_EXAMPLES_IMAGE,
     [switch] $RequireGo
 )
 
@@ -44,12 +45,22 @@ try {
 
     $project = "multidb-sdk-smoke-$PID"
     $baseUrl = "http://127.0.0.1:8080"
+    $oldImage = $env:MULTIDB_IMAGE
     $env:MULTIDB_CONTROL_PLANE_URL = "$baseUrl/api"
     $env:MULTIDB_ADMIN_PASSWORD = "local-dev-admin-password"
+    if (-not [string]::IsNullOrWhiteSpace($ImageTag)) {
+        $env:MULTIDB_IMAGE = $ImageTag
+    }
 
     try {
         Invoke-Checked "Docker Compose up for SDK examples" {
-            docker compose -p $project up --build -d
+            $ComposeArgs = @("compose", "-p", $project, "up", "-d")
+            if ([string]::IsNullOrWhiteSpace($ImageTag)) {
+                $ComposeArgs = @("compose", "-p", $project, "up", "--build", "-d")
+            } else {
+                $ComposeArgs = @("compose", "-p", $project, "up", "--no-build", "-d")
+            }
+            docker @ComposeArgs
         }
         Wait-ForControlPlane -Url $baseUrl
 
@@ -86,6 +97,11 @@ try {
         }
     } finally {
         docker compose -p $project down --volumes --remove-orphans
+        if ($null -eq $oldImage) {
+            Remove-Item Env:\MULTIDB_IMAGE -ErrorAction SilentlyContinue
+        } else {
+            $env:MULTIDB_IMAGE = $oldImage
+        }
     }
 } finally {
     Pop-Location
