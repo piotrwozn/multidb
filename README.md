@@ -13,7 +13,7 @@ testing and operational ownership.
 
 - Current package version: `0.1.0`
 - Rust MSRV: `1.89`
-- License: `MIT OR Apache-2.0`
+- License: `MIT`
 - Crate publishing: disabled with `publish = false`
 - Readiness source of truth: `src/roadmap.rs`
 - Release contract: `docs/ga-support-matrix.md`

@@ -39,5 +39,5 @@ gate with `-SkipGo`; GitHub Actions runs the Go SDK checks.
 
 ## Development Notes
 
-The project is dual-licensed under MIT or Apache-2.0. By contributing, you
-agree that your contribution is available under both licenses.
+The project is licensed under the MIT License. By contributing, you agree that
+your contribution is available under the MIT License.

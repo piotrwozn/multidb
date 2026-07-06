@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Publish-ready TypeScript client for the MultiDB Control Plane API v1.",
   "type": "module",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
@@ -18,8 +18,7 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

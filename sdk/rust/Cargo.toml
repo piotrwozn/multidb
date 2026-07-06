@@ -3,7 +3,7 @@ name = "multidb-client"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.89"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Publish-ready blocking Rust client for the MultiDB Control Plane API v1."
 repository = "https://github.com/multidb/multidb"
 
