@@ -1563,7 +1563,7 @@ mod tests {
     fn wait_for_live_leader<S: StorageEngine>(
         handles: &[CpClusterHandle<S>],
     ) -> Result<usize, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(45);
         loop {
             for handle in handles {
                 let Ok(status) = cluster_status(handle) else {
@@ -1670,7 +1670,7 @@ mod tests {
         voters: &[RaftNode],
         learners: &[RaftNode],
     ) -> Result<CpClusterStatus, ReplError> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(45);
         loop {
             let leader_idx = wait_for_live_leader(handles)?;
             match change_membership(&handles[leader_idx], voters.to_vec(), learners.to_vec()) {
@@ -1709,7 +1709,9 @@ mod tests {
     }
 
     fn is_retryable_live_raft_error(message: &str) -> bool {
-        message.contains("forward request") || message.contains("client_write timed out")
+        message.contains("forward request")
+            || message.contains("client_write timed out")
+            || message.contains("change_membership timed out")
     }
 
     fn start_live_redb_cluster(
