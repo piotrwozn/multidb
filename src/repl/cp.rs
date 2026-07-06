@@ -1665,6 +1665,24 @@ mod tests {
         }
     }
 
+    fn wait_for_live_prepared_dist_txn<S: StorageEngine>(
+        handle: &CpClusterHandle<S>,
+        txn_id: u64,
+    ) -> Result<(), ReplError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if handle.raft.load_prepared_dist_txn(txn_id)?.is_some() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ReplError::Transport(format!(
+                    "timed out waiting for live prepared dist txn {txn_id}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn change_membership_on_current_leader<S: StorageEngine>(
         handles: &[CpClusterHandle<S>],
         voters: &[RaftNode],
@@ -1927,6 +1945,7 @@ mod tests {
             let leader_idx = prepare_dist_txn_on_current_leader(&handles, 42, &ops)?;
             let handle = &handles[leader_idx];
             let raft = handle.replication();
+            wait_for_live_prepared_dist_txn(handle, 42)?;
             {
                 let mut write = raft.storage().begin_write()?;
                 write.put(
