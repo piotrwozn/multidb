@@ -91,7 +91,7 @@ jobs:
           docker buildx inspect --bootstrap
           docker buildx build \
             --platform linux/amd64 \
-            --file Dockerfile.smoke \
+            --file Dockerfile.prebuilt \
             --tag "$image" \
             --sbom=true \
             --provenance=true \

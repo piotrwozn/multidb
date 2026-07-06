@@ -237,7 +237,7 @@ try {
                 $DockerfilePath = Join-Path $Root "Dockerfile"
                 $BuildContext = "."
                 if ($UsePrebuiltArtifacts) {
-                    $DockerfilePath = Join-Path $Root "Dockerfile.smoke"
+                    $DockerfilePath = Join-Path $Root "Dockerfile.prebuilt"
                     $BuildContext = New-PrebuiltDockerContext
                 }
 
