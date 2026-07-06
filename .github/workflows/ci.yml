@@ -6,6 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_DENY_VERSION: "0.19.9"
 
 jobs:
   check:
@@ -25,9 +26,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: sdk/go/go.mod
-      - uses: EmbarkStudios/cargo-deny-action@f9cc7aa250dec5698b425dc01fbf0d745fcd1b78
-        with:
-          command: check
+      - name: cargo-deny
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" |
+            tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+          cargo-deny --log-level warn --manifest-path ./Cargo.toml --all-features check
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --lib phase33 -- --nocapture
