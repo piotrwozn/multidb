@@ -71,7 +71,7 @@ enum CliError {
     Json(#[from] serde_json::Error),
 
     #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_norway::Error),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1408,7 +1408,7 @@ fn serialize_spec(spec: &DatabaseSpec, format: &str) -> Result<String, CliError>
     if format == "json" {
         serde_json::to_string_pretty(spec).map_err(Into::into)
     } else {
-        serde_yaml::to_string(spec).map_err(Into::into)
+        serde_norway::to_string(spec).map_err(Into::into)
     }
 }
 
@@ -1441,7 +1441,7 @@ fn output_format(args: &[String]) -> Result<String, CliError> {
 fn read_spec_file(path: &Path) -> Result<DatabaseSpec, CliError> {
     let input = std::fs::read_to_string(path)?;
     if is_yaml_path(path) {
-        serde_yaml::from_str(&input).map_err(Into::into)
+        serde_norway::from_str(&input).map_err(Into::into)
     } else {
         serde_json::from_str(&input).map_err(Into::into)
     }
@@ -1892,7 +1892,7 @@ mod tests {
         path: &std::path::Path,
         spec: &DatabaseSpec,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        std::fs::write(path, serde_yaml::to_string(spec)?)?;
+        std::fs::write(path, serde_norway::to_string(spec)?)?;
         Ok(())
     }
 
@@ -2412,7 +2412,7 @@ mod tests {
 
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.message.contains("created config"));
-        let spec = serde_yaml::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
         assert_eq!(spec.name, "Patchspire");
         assert_eq!(spec.profile, "desktop_app_embedded");
         assert_eq!(
@@ -2556,7 +2556,7 @@ mod tests {
         assert_eq!(summary["valid"], true);
 
         let spec_path = out_dir.join("multidb.yaml");
-        let spec = serde_yaml::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
         assert_eq!(spec.name, "Secure App");
         assert_eq!(spec.profile, "secure_app");
         assert!(spec.guarantees.encryption.at_rest);
