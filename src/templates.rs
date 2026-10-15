@@ -281,7 +281,7 @@ pub enum TemplateError {
     Json(#[from] serde_json::Error),
 
     #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_norway::Error),
 }
 
 impl TemplateOutputFormat {
@@ -320,7 +320,7 @@ pub fn materialize_template(
     let validation = GuaranteeValidator::validate(&spec);
     let spec_contents = match format {
         TemplateOutputFormat::Json => serde_json::to_string_pretty(&spec)?,
-        TemplateOutputFormat::Yaml => serde_yaml::to_string(&spec)?,
+        TemplateOutputFormat::Yaml => serde_norway::to_string(&spec)?,
     };
     let files = vec![
         TemplateFile {
