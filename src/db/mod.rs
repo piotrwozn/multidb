@@ -89,7 +89,7 @@ use crate::text::{FullTextIndex, FullTextIndexConfig, TextError};
 use crate::timeseries::{TimeSeriesCollection, TimeSeriesConfig, TimeSeriesError, time_bucket};
 use crate::tuning::{
     self, IndexAdviceReport, IndexAdvisor, ReprofileJob, ReprofilePlan, ReprofileStatus,
-    TuningDecision, TuningError, TuningLogEntry, TuningPolicy, TuningSystemView, WorkloadProfiler,
+    TuningDecision, TuningError, TuningLogEntry, TuningPolicy, TuningSystemView, WorkloadBuffer,
     WorkloadReport, WorkloadSample, WorkloadWindow,
 };
 use crate::txn::{self, IsolationLevel, TxnId, TxnOptions, WriteKey, WriteSet};
@@ -591,6 +591,7 @@ pub struct Database {
     tenant: Option<TenantRuntime>,
     wasm_runtime: WasmRuntime,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
+    workload: WorkloadBuffer,
 }
 
 pub type DatabaseSelfHealingController =
@@ -2127,17 +2128,37 @@ impl Database {
     }
 
     /// Records one workload observation from trusted code or tests.
+    ///
+    /// The sample is persisted, together with any buffered SQL observations, in one system
+    /// write before this returns.
     /// # Errors
     /// Fails when workload metadata cannot be persisted.
     pub fn record_workload_sample(&self, sample: &WorkloadSample) -> Result<(), DbError> {
-        Ok(WorkloadProfiler::record(self.replication_ref(), sample)?)
+        self.workload.record(self.replication_ref(), sample)?;
+        self.flush_workload_samples()
     }
 
-    /// Reads the persisted workload profile.
+    /// Persists buffered workload observations in one batched system write.
+    ///
+    /// SQL statements only aggregate workload samples in memory. The buffer is also flushed
+    /// once enough statements, distinct fingerprints or SQL text have accumulated, on the
+    /// first statement after the oldest buffered sample is 10 seconds old, best-effort before
+    /// index or runtime advice, and when a single-node database is dropped. Samples buffered
+    /// since the last flush are lost on crash.
+    /// # Errors
+    /// Fails when workload metadata cannot be read or persisted; the drained samples are
+    /// discarded.
+    pub fn flush_workload_samples(&self) -> Result<(), DbError> {
+        Ok(self.workload.flush(self.replication_ref())?)
+    }
+
+    /// Reads the workload profile, including SQL observations still buffered in memory.
+    ///
+    /// This performs no write.
     /// # Errors
     /// Fails when workload metadata cannot be read.
     pub fn workload_report(&self, window: WorkloadWindow) -> Result<WorkloadReport, DbError> {
-        Ok(WorkloadProfiler::report(self.replication_ref(), window)?)
+        Ok(self.workload.report(self.replication_ref(), window)?)
     }
 
     /// Reads workload profile after checking system read permission.
@@ -2158,9 +2179,12 @@ impl Database {
     }
 
     /// Builds and persists index recommendations from workload observations.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when workload metadata or advice storage fails.
     pub fn index_advice(&self) -> Result<IndexAdviceReport, DbError> {
+        self.flush_workload_samples_before_advice();
         Ok(IndexAdvisor::advise(
             self.replication_ref(),
             &self.catalog_index_map(),
@@ -2192,9 +2216,12 @@ impl Database {
     }
 
     /// Builds Runtime Advisor V2 recommendations from workload, planner feedback and config state.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when advisor metadata or dry-run planning cannot be read.
     pub fn runtime_advice(&self) -> Result<RuntimeAdviceReport, DbError> {
+        self.flush_workload_samples_before_advice();
         let current = DatabaseSpec::from_db_config("current", self.config());
         Ok(RuntimeAdvisor::advise(
             self.replication_ref(),
@@ -2229,9 +2256,12 @@ impl Database {
     }
 
     /// Returns the dry-run migration plan for a runtime advice id.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when the advice cannot be generated or the id is unknown.
     pub fn runtime_advice_plan(&self, advice_id: &str) -> Result<MigrationPlan, DbError> {
+        self.flush_workload_samples_before_advice();
         let current = DatabaseSpec::from_db_config("current", self.config());
         Ok(RuntimeAdvisor::plan_by_id(
             self.replication_ref(),
@@ -3261,7 +3291,15 @@ impl Database {
             return Ok(());
         }
         let sample = tuning::output_to_workload_sample(sql, elapsed, output);
-        self.record_workload_sample(&sample)
+        Ok(self.workload.record(self.replication_ref(), &sample)?)
+    }
+
+    fn flush_workload_samples_before_advice(&self) {
+        // Advice falls back to persisted statistics when the flush fails, as it did when
+        // per-statement workload writes failed.
+        if self.flush_workload_samples().is_err() {
+            tracing::debug!("failed to flush workload observations before advice");
+        }
     }
 
     fn execute_tuning_system_sql(&self, sql: &str) -> Result<Option<SqlOutput>, DbError> {
@@ -3780,6 +3818,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3810,6 +3849,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3840,6 +3880,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3869,6 +3910,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -5103,6 +5145,19 @@ fn trigger_event_name(event: TriggerEvent) -> &'static str {
         TriggerEvent::Insert => "insert",
         TriggerEvent::Update => "update",
         TriggerEvent::Delete => "delete",
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Workload statistics are advisory. Cluster backends are skipped so drop never blocks
+        // on Raft or quorum writes, and nothing is written when no sample is buffered.
+        if std::thread::panicking() || !matches!(self.repl, DatabaseRepl::SingleNode(_)) {
+            return;
+        }
+        if self.flush_workload_samples().is_err() {
+            tracing::debug!("failed to flush workload observations on drop");
+        }
     }
 }
 

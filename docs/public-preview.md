@@ -123,6 +123,12 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- Workload-profiler statistics (`system.workload`, index advice and the Runtime
+  Advisor) are advisory. They are buffered in memory and flushed in batches;
+  the 10-second age trigger is checked on the next statement, not by a
+  background task. Samples buffered since the last flush are lost on crash or
+  when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
+  AP and sharded databases do not flush on drop.
 
 ## Migration Guide
 
