@@ -13,7 +13,9 @@ use openraft::{
     EntryPayload, RaftLogReader, RaftNetworkFactory, RaftNetworkV2, RaftSnapshotBuilder,
     RaftTypeConfig,
     async_runtime::WatchReceiver,
-    error::{RPCError, StreamingError, Unreachable},
+    error::{
+        ChangeMembershipError, ClientWriteError, RPCError, RaftError, StreamingError, Unreachable,
+    },
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     },
@@ -53,6 +55,7 @@ const LAST_MEMBERSHIP_KEY: &[u8] = b"last_membership";
 const CURRENT_SNAPSHOT_META_KEY: &[u8] = b"current_snapshot_meta";
 const CURRENT_SNAPSHOT_DATA_KEY: &[u8] = b"current_snapshot_data";
 const VOTE_KEY: &[u8] = b"vote";
+const MEMBERSHIP_IN_PROGRESS_RETRY: Duration = Duration::from_millis(20);
 const RAFT_MIRROR_TABLE: &str = "__raft_state_machine_mirror";
 
 type CpOpenRaft<S> = openraft::Raft<CpOpenRaftTypeConfig, CpStateMachine<S>>;
@@ -358,9 +361,17 @@ impl<S: StorageEngine> LiveCpRuntime<S> {
                         .await
                         .map_err(map_raft_error)?;
                 }
-                raft.change_membership(voter_ids, false)
-                    .await
-                    .map_err(map_raft_error)?;
+                // A blocking add_learner returns once the learner has caught up, which can be
+                // before its membership entry is committed; retry while that change is in progress.
+                loop {
+                    match raft.change_membership(voter_ids.clone(), false).await {
+                        Ok(_) => break,
+                        Err(error) if is_membership_change_in_progress(&error) => {
+                            tokio::time::sleep(MEMBERSHIP_IN_PROGRESS_RETRY).await;
+                        }
+                        Err(error) => return Err(map_raft_error(error)),
+                    }
+                }
                 Ok::<(), ReplError>(())
             })
             .await
@@ -1406,6 +1417,17 @@ fn to_io(error: impl std::fmt::Display) -> io::Error {
 
 fn rpc_unreachable(error: impl std::fmt::Display) -> RPCError<CpOpenRaftTypeConfig> {
     RPCError::Unreachable(Unreachable::from_string(error.to_string()))
+}
+
+fn is_membership_change_in_progress<C: RaftTypeConfig>(
+    error: &RaftError<C, ClientWriteError<C>>,
+) -> bool {
+    matches!(
+        error.api_error(),
+        Some(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::InProgress(_)
+        ))
+    )
 }
 
 fn map_raft_error(error: impl std::fmt::Display) -> ReplError {
