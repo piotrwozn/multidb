@@ -1,3 +1,5 @@
+use std::time::UNIX_EPOCH;
+
 use crate::{
     keyenc,
     repl::{
@@ -5,11 +7,14 @@ use crate::{
         propose_system,
     },
     storage::{Bytes, StorageError},
+    txn::{Clock, SystemClock},
 };
 
 pub const TIME_SERIES_CHUNKS_TABLE: &str = "time_series_chunks";
 pub const TIME_SERIES_LATEST_TABLE: &str = "time_series_latest";
 pub const TIME_SERIES_META_TABLE: &str = "__time_series_meta";
+/// Default bound on how far ahead of the server clock an inserted point may be.
+pub const DEFAULT_MAX_FUTURE_SKEW_MILLIS: i64 = 300_000;
 const GORILLA_CHUNK_MAGIC: &[u8] = b"MDTSG1";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -17,6 +22,11 @@ pub struct TimeSeriesConfig {
     pub name: String,
     pub chunk_millis: i64,
     pub retention_millis: Option<i64>,
+    /// Largest distance a point's timestamp may lie ahead of the server clock. New collections
+    /// default to [`DEFAULT_MAX_FUTURE_SKEW_MILLIS`]; configs persisted before this field existed
+    /// keep accepting any future timestamp, so upgrades do not start rejecting their writes.
+    #[serde(default = "legacy_max_future_skew_millis")]
+    pub max_future_skew_millis: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -69,6 +79,7 @@ impl TimeSeriesConfig {
             name: name.into(),
             chunk_millis: 60_000,
             retention_millis: None,
+            max_future_skew_millis: DEFAULT_MAX_FUTURE_SKEW_MILLIS,
         }
     }
 
@@ -83,6 +94,16 @@ impl TimeSeriesConfig {
         self.retention_millis = Some(retention_millis);
         self
     }
+
+    #[must_use]
+    pub const fn with_max_future_skew_millis(mut self, max_future_skew_millis: i64) -> Self {
+        self.max_future_skew_millis = max_future_skew_millis;
+        self
+    }
+}
+
+const fn legacy_max_future_skew_millis() -> i64 {
+    i64::MAX
 }
 
 impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
@@ -109,8 +130,11 @@ impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
 
     /// Builds the system metadata write for atomic catalog DDL.
     /// # Errors
-    /// Fails when metadata cannot be serialized.
+    /// Fails when the config is invalid (including a non-positive `retention_millis` or one
+    /// shorter than `chunk_millis`) or when metadata cannot be serialized.
     pub fn metadata_op(config: &TimeSeriesConfig) -> Result<Op, TimeSeriesError> {
+        validate_config(config)?;
+        validate_retention(config)?;
         Ok(Op::Put {
             table: TIME_SERIES_META_TABLE.to_owned(),
             key: config.name.as_bytes().to_vec(),
@@ -120,11 +144,31 @@ impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
     }
 
     /// Inserts or replaces one point.
+    ///
+    /// Retention is evaluated against the server clock, never against the point's timestamp.
     /// # Errors
-    /// Fails when the point is invalid or the chunk cannot be written.
+    /// Fails when the point is invalid, lies more than `max_future_skew_millis` ahead of the
+    /// server clock, is older than the retention window or cannot be bucketed, when a persisted
+    /// `retention_millis` is not positive, or when the chunk cannot be written.
     pub fn insert_point(&self, series: &str, point: TimePoint) -> Result<(), TimeSeriesError> {
+        self.insert_point_with_clock(series, point, &SystemClock)
+    }
+
+    fn insert_point_with_clock(
+        &self,
+        series: &str,
+        point: TimePoint,
+        clock: &impl Clock,
+    ) -> Result<(), TimeSeriesError> {
         validate_point(point)?;
-        let bucket = bucket_start(point.timestamp_millis, self.config.chunk_millis);
+        let cutoff = check_point_time(&self.config, point.timestamp_millis, unix_millis(clock))?;
+        let bucket =
+            bucket_start(point.timestamp_millis, self.config.chunk_millis).ok_or_else(|| {
+                TimeSeriesError::InvalidPoint(format!(
+                    "timestamp {} cannot be bucketed by chunk_millis {} without overflow",
+                    point.timestamp_millis, self.config.chunk_millis
+                ))
+            })?;
         let key = chunk_key(&self.config.name, series, bucket);
         let old_chunk_bytes =
             self.repl
@@ -172,13 +216,9 @@ impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
                 value: encode_point(point),
             });
         }
-        append_retention_ops(
-            &self.config,
-            self.repl,
-            series,
-            point.timestamp_millis,
-            &mut ops,
-        )?;
+        if let Some(cutoff) = cutoff {
+            append_retention_ops(&self.config, self.repl, series, cutoff, &mut ops)?;
+        }
         let mut conditions = vec![WriteCondition::ValueEquals {
             table: TIME_SERIES_CHUNKS_TABLE.to_owned(),
             key,
@@ -213,8 +253,12 @@ impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
         if end <= start {
             return Ok(Vec::new());
         }
-        let start_bucket = bucket_start(start, self.config.chunk_millis);
-        let end_bucket = bucket_start(end.saturating_sub(1), self.config.chunk_millis);
+        // `chunk_key(i64::MIN)` is the smallest chunk key of the series, so an unrepresentable
+        // start bucket is clamped there; an unrepresentable end bucket lies below every chunk.
+        let start_bucket = bucket_start(start, self.config.chunk_millis).unwrap_or(i64::MIN);
+        let Some(end_bucket) = bucket_start(end.saturating_sub(1), self.config.chunk_millis) else {
+            return Ok(Vec::new());
+        };
         let start_key = chunk_key(&self.config.name, series, start_bucket);
         let end_key = keyenc::range_end(&chunk_key(&self.config.name, series, end_bucket));
         let rows = self.repl.range(
@@ -262,9 +306,10 @@ impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
     ) -> Result<TimeSeriesStats, TimeSeriesError> {
         let points = self.range(series, start, end)?;
         let raw_bytes = points.len().saturating_mul(16);
+        let anchor = points.first().map_or(start, |point| point.timestamp_millis);
         let chunk = TimeChunk {
             series: series.to_owned(),
-            bucket_start: bucket_start(start, self.config.chunk_millis),
+            bucket_start: bucket_start(anchor, self.config.chunk_millis).unwrap_or(i64::MIN),
             points,
         };
         let encoded_bytes = encode_chunk(&chunk)?.len();
@@ -280,14 +325,19 @@ impl<'repl, R: Replication + ?Sized> TimeSeriesCollection<'repl, R> {
 
 /// Returns the UTC bucket start for a timestamp.
 /// # Errors
-/// Fails when the interval is not positive.
+/// Fails when the interval is not positive or the bucket start does not fit in an `i64`.
 pub fn time_bucket(interval_millis: i64, timestamp_millis: i64) -> Result<i64, TimeSeriesError> {
     if interval_millis <= 0 {
         return Err(TimeSeriesError::InvalidConfig(
             "bucket interval must be positive".to_owned(),
         ));
     }
-    Ok(bucket_start(timestamp_millis, interval_millis))
+    bucket_start(timestamp_millis, interval_millis).ok_or_else(|| {
+        TimeSeriesError::InvalidPoint(format!(
+            "timestamp {timestamp_millis} cannot be bucketed by interval {interval_millis} \
+             without overflow"
+        ))
+    })
 }
 
 /// Encodes a chunk with Gorilla-style delta-of-delta timestamps and XOR float deltas.
@@ -413,7 +463,72 @@ fn validate_config(config: &TimeSeriesConfig) -> Result<(), TimeSeriesError> {
             "chunk_millis must be positive".to_owned(),
         ));
     }
+    if config.max_future_skew_millis < 0 {
+        return Err(TimeSeriesError::InvalidConfig(
+            "max_future_skew_millis cannot be negative".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn validate_retention(config: &TimeSeriesConfig) -> Result<(), TimeSeriesError> {
+    let Some(retention) = config.retention_millis else {
+        return Ok(());
+    };
+    if retention <= 0 {
+        return Err(TimeSeriesError::InvalidConfig(
+            "retention_millis must be positive".to_owned(),
+        ));
+    }
+    if retention < config.chunk_millis {
+        return Err(TimeSeriesError::InvalidConfig(
+            "retention_millis must be at least chunk_millis".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a point's timestamp against server time and returns the retention cutoff, if any.
+fn check_point_time(
+    config: &TimeSeriesConfig,
+    timestamp_millis: i64,
+    now: i64,
+) -> Result<Option<i64>, TimeSeriesError> {
+    if let Some(retention) = config.retention_millis
+        && retention <= 0
+    {
+        return Err(TimeSeriesError::InvalidConfig(format!(
+            "time series {} has non-positive retention_millis {retention}; writes are refused \
+             because they would delete existing chunks, create a new collection with a positive \
+             retention_millis",
+            config.name
+        )));
+    }
+    if timestamp_millis > now.saturating_add(config.max_future_skew_millis) {
+        return Err(TimeSeriesError::InvalidPoint(format!(
+            "timestamp {timestamp_millis} is more than {} ms ahead of server time {now}",
+            config.max_future_skew_millis
+        )));
+    }
+    let Some(retention) = config.retention_millis else {
+        return Ok(None);
+    };
+    let cutoff = now.saturating_sub(retention);
+    if timestamp_millis < cutoff {
+        return Err(TimeSeriesError::InvalidPoint(format!(
+            "timestamp {timestamp_millis} is older than the retention cutoff {cutoff}"
+        )));
+    }
+    Ok(Some(cutoff))
+}
+
+fn unix_millis(clock: &impl Clock) -> i64 {
+    clock
+        .now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 fn validate_point(point: TimePoint) -> Result<(), TimeSeriesError> {
@@ -429,14 +544,13 @@ fn append_retention_ops<R: Replication + ?Sized>(
     config: &TimeSeriesConfig,
     repl: &R,
     series: &str,
-    now: i64,
+    cutoff: i64,
     ops: &mut Vec<Op>,
 ) -> Result<(), TimeSeriesError> {
-    let Some(retention) = config.retention_millis else {
+    // Nothing storable lies below the lowest representable bucket.
+    let Some(end_bucket) = bucket_start(cutoff, config.chunk_millis) else {
         return Ok(());
     };
-    let cutoff = now.saturating_sub(retention);
-    let end_bucket = bucket_start(cutoff, config.chunk_millis);
     let start = chunk_prefix(&config.name, series);
     let end = chunk_key(&config.name, series, end_bucket);
     for (key, _) in repl.range(
@@ -453,8 +567,10 @@ fn append_retention_ops<R: Replication + ?Sized>(
     Ok(())
 }
 
-fn bucket_start(timestamp: i64, interval: i64) -> i64 {
-    timestamp.div_euclid(interval) * interval
+fn bucket_start(timestamp: i64, interval: i64) -> Option<i64> {
+    timestamp
+        .checked_div_euclid(interval)?
+        .checked_mul(interval)
 }
 
 fn chunk_prefix(name: &str, series: &str) -> Bytes {
@@ -593,18 +709,25 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, TimeSeriesError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use crate::{
-        db::{DbConfig, Profile, create_database},
+        db::{CatalogEntry, DbConfig, DbError, Profile, create_database},
         repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication},
         storage::Bytes,
         txn,
     };
 
     use super::{
-        TimeChunk, TimePoint, TimeSeriesCollection, TimeSeriesConfig, decode_chunk, encode_chunk,
+        DEFAULT_MAX_FUTURE_SKEW_MILLIS, TIME_SERIES_META_TABLE, TimeChunk, TimePoint,
+        TimeSeriesCollection, TimeSeriesConfig, TimeSeriesError, decode_chunk, encode_chunk,
+        time_bucket,
     };
+
+    const NOW: i64 = 1_700_000_000_000;
 
     #[test]
     fn time_series_chunks_round_trip_and_query_ranges() -> Result<(), Box<dyn std::error::Error>> {
@@ -737,6 +860,286 @@ mod tests {
         assert_eq!(decode_chunk(&encoded)?, chunk);
         assert!(ratio >= 8.0, "ratio was {ratio}");
         Ok(())
+    }
+
+    #[test]
+    fn retention_cutoff_uses_server_clock_not_point_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl: Arc<dyn Replication> = Arc::new(database);
+        let ts = TimeSeriesCollection::new(
+            repl.as_ref(),
+            TimeSeriesConfig::new("metrics")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(3_600_000),
+        )?;
+        let clock = FixedClock(NOW);
+        for timestamp in [NOW - 4_000, NOW - 3_000, NOW - 2_000, NOW - 1_000, NOW] {
+            ts.insert_point_with_clock("cpu", point(timestamp, 1.0), &clock)?;
+        }
+
+        // Microsecond- and nanosecond-scaled timestamps must not move the retention cutoff.
+        for scaled in [NOW * 1_000, NOW * 1_000_000] {
+            assert!(matches!(
+                ts.insert_point_with_clock("cpu", point(scaled, 2.0), &clock),
+                Err(TimeSeriesError::InvalidPoint(_))
+            ));
+        }
+
+        assert_eq!(ts.range("cpu", NOW - 10_000, NOW + 10_000)?.len(), 5);
+        assert_eq!(
+            ts.latest("cpu")?.map(|latest| latest.timestamp_millis),
+            Some(NOW)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_prunes_chunks_older_than_server_cutoff() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl: Arc<dyn Replication> = Arc::new(database);
+        let ts = TimeSeriesCollection::new(
+            repl.as_ref(),
+            TimeSeriesConfig::new("metrics")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(10_000),
+        )?;
+
+        ts.insert_point_with_clock("cpu", point(NOW - 20_000, 1.0), &FixedClock(NOW - 20_000))?;
+        assert_eq!(ts.range("cpu", NOW - 30_000, NOW + 1)?.len(), 1);
+
+        // Cutoff is NOW - 19_000, so the chunk at NOW - 20_000 is pruned in the same batch.
+        ts.insert_point_with_clock("cpu", point(NOW - 9_500, 2.0), &FixedClock(NOW - 9_000))?;
+        assert_eq!(
+            timestamps(&ts.range("cpu", NOW - 30_000, NOW + 1)?),
+            vec![NOW - 9_500]
+        );
+
+        // Cutoff is NOW - 10_000; the chunk starting exactly there is kept.
+        ts.insert_point_with_clock("cpu", point(NOW, 3.0), &FixedClock(NOW))?;
+        assert_eq!(
+            timestamps(&ts.range("cpu", NOW - 30_000, NOW + 1)?),
+            vec![NOW - 9_500, NOW]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn points_older_than_retention_window_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl: Arc<dyn Replication> = Arc::new(database);
+        let ts = TimeSeriesCollection::new(
+            repl.as_ref(),
+            TimeSeriesConfig::new("metrics")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(10_000),
+        )?;
+        let clock = FixedClock(NOW);
+
+        assert!(matches!(
+            ts.insert_point_with_clock("cpu", point(NOW - 10_001, 1.0), &clock),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        assert!(ts.range("cpu", NOW - 20_000, NOW + 1)?.is_empty());
+        assert!(ts.latest("cpu")?.is_none());
+
+        ts.insert_point_with_clock("cpu", point(NOW - 10_000, 2.0), &clock)?;
+        assert_eq!(
+            timestamps(&ts.range("cpu", NOW - 20_000, NOW + 1)?),
+            vec![NOW - 10_000]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn future_skew_is_bounded_and_configurable() -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl: Arc<dyn Replication> = Arc::new(database);
+        let clock = FixedClock(NOW);
+
+        let ts = TimeSeriesCollection::new(repl.as_ref(), TimeSeriesConfig::new("metrics"))?;
+        ts.insert_point_with_clock(
+            "cpu",
+            point(NOW + DEFAULT_MAX_FUTURE_SKEW_MILLIS, 1.0),
+            &clock,
+        )?;
+        assert!(matches!(
+            ts.insert_point_with_clock(
+                "cpu",
+                point(NOW + DEFAULT_MAX_FUTURE_SKEW_MILLIS + 1, 2.0),
+                &clock,
+            ),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        assert_eq!(
+            ts.latest("cpu")?.map(|latest| latest.timestamp_millis),
+            Some(NOW + DEFAULT_MAX_FUTURE_SKEW_MILLIS)
+        );
+
+        let strict = TimeSeriesCollection::new(
+            repl.as_ref(),
+            TimeSeriesConfig::new("strict").with_max_future_skew_millis(0),
+        )?;
+        assert!(matches!(
+            strict.insert_point_with_clock("cpu", point(NOW + 1, 1.0), &clock),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        strict.insert_point_with_clock("cpu", point(NOW, 1.0), &clock)?;
+
+        assert!(matches!(
+            TimeSeriesCollection::new(
+                repl.as_ref(),
+                TimeSeriesConfig::new("bad").with_max_future_skew_millis(-1),
+            ),
+            Err(TimeSeriesError::InvalidConfig(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn create_rejects_non_positive_and_sub_chunk_retention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        for config in [
+            TimeSeriesConfig::new("zero")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(0),
+            TimeSeriesConfig::new("negative")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(-1),
+            TimeSeriesConfig::new("short")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(500),
+        ] {
+            let name = config.name.clone();
+            assert!(TimeSeriesCollection::<dyn Replication>::metadata_op(&config).is_err());
+            assert!(matches!(
+                database.create_time_series(config),
+                Err(DbError::TimeSeries(TimeSeriesError::InvalidConfig(_)))
+            ));
+            assert!(!database.catalog().contains_key(&name));
+            assert!(
+                Replication::read(
+                    &database,
+                    TIME_SERIES_META_TABLE,
+                    name.as_bytes(),
+                    ReadConsistency::Strong,
+                )?
+                .is_none()
+            );
+        }
+
+        database.create_time_series(
+            TimeSeriesConfig::new("ok")
+                .with_chunk_millis(1_000)
+                .with_retention_millis(1_000),
+        )?;
+        assert!(database.catalog().contains_key("ok"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_non_positive_retention_fails_writes_closed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl: Arc<dyn Replication> = Arc::new(database);
+        let clock = FixedClock(NOW);
+        TimeSeriesCollection::new(
+            repl.as_ref(),
+            TimeSeriesConfig::new("metrics").with_chunk_millis(1_000),
+        )?
+        .insert_point_with_clock("cpu", point(NOW, 1.0), &clock)?;
+
+        for retention in [-1, 0] {
+            // Legacy configs stay readable, but every write is refused.
+            let legacy = TimeSeriesCollection::new(
+                repl.as_ref(),
+                TimeSeriesConfig::new("metrics")
+                    .with_chunk_millis(1_000)
+                    .with_retention_millis(retention),
+            )?;
+            assert!(matches!(
+                legacy.insert_point_with_clock("cpu", point(NOW + 1, 2.0), &clock),
+                Err(TimeSeriesError::InvalidConfig(_))
+            ));
+            assert_eq!(legacy.range("cpu", NOW - 1_000, NOW + 1_000)?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_config_json_defaults_future_skew() -> Result<(), Box<dyn std::error::Error>> {
+        let config: TimeSeriesConfig = serde_json::from_slice(
+            br#"{"name":"metrics","chunk_millis":60000,"retention_millis":null}"#,
+        )?;
+        assert_eq!(
+            config,
+            TimeSeriesConfig::new("metrics").with_max_future_skew_millis(i64::MAX)
+        );
+
+        let entry: CatalogEntry = serde_json::from_slice(
+            br#"{"TimeSeries":{"config":{"name":"metrics","chunk_millis":60000,"retention_millis":3600000}}}"#,
+        )?;
+        assert!(matches!(
+            entry,
+            CatalogEntry::TimeSeries { config }
+                if config.retention_millis == Some(3_600_000)
+                    && config.max_future_skew_millis == i64::MAX
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bucket_math_is_overflow_safe_at_i64_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            time_bucket(60_000, i64::MIN),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        assert!(matches!(
+            time_bucket(1_000, i64::MIN),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        assert_eq!(
+            time_bucket(60_000, i64::MAX)?,
+            i64::MAX - i64::MAX.rem_euclid(60_000)
+        );
+        assert_eq!(time_bucket(1_000, -1)?, -1_000);
+
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl: Arc<dyn Replication> = Arc::new(database);
+        let ts = TimeSeriesCollection::new(repl.as_ref(), TimeSeriesConfig::new("metrics"))?;
+        let clock = FixedClock(NOW);
+        assert!(matches!(
+            ts.insert_point_with_clock("cpu", point(i64::MIN, 1.0), &clock),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        ts.insert_point_with_clock("cpu", point(1_000, 1.0), &clock)?;
+        ts.insert_point_with_clock("cpu", point(NOW, 2.0), &clock)?;
+
+        assert_eq!(ts.range("cpu", i64::MIN, i64::MAX)?.len(), 2);
+        assert!(ts.range("cpu", i64::MIN, i64::MIN + 1)?.is_empty());
+        assert_eq!(ts.codec_stats("cpu", i64::MIN, i64::MAX)?.raw_bytes, 32);
+        Ok(())
+    }
+
+    fn point(timestamp_millis: i64, value: f64) -> TimePoint {
+        TimePoint {
+            timestamp_millis,
+            value,
+        }
+    }
+
+    fn timestamps(points: &[TimePoint]) -> Vec<i64> {
+        points.iter().map(|point| point.timestamp_millis).collect()
+    }
+
+    struct FixedClock(i64);
+
+    impl txn::Clock for FixedClock {
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(u64::try_from(self.0).unwrap_or(0))
+        }
     }
 
     struct NoConditionalRepl;

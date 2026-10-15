@@ -50,7 +50,7 @@ use crate::{
         Role,
     },
     text::FullTextIndexConfig,
-    timeseries::{TimePoint, TimeSeriesConfig},
+    timeseries::{DEFAULT_MAX_FUTURE_SKEW_MILLIS, TimePoint, TimeSeriesConfig, TimeSeriesError},
     vector::{HnswParams, VectorCollectionConfig, VectorHit, VectorMetric},
 };
 
@@ -821,6 +821,8 @@ pub struct CreateTimeSeriesRequest {
     pub name: String,
     pub chunk_millis: i64,
     pub retention_millis: Option<i64>,
+    #[serde(default)]
+    pub max_future_skew_millis: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -2199,6 +2201,9 @@ async fn create_time_series_handler(
         name: request.name.clone(),
         chunk_millis: request.chunk_millis,
         retention_millis: request.retention_millis,
+        max_future_skew_millis: request
+            .max_future_skew_millis
+            .unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MILLIS),
     };
     match database.create_time_series_as(&principal, &config) {
         Ok(series) => api_ok(
@@ -3016,6 +3021,12 @@ fn invalid_json_value(message: impl Into<String>) -> Response {
 fn db_error(error: &DbError) -> Response {
     if matches!(error, DbError::AuthzDenied(_)) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(
+        error,
+        DbError::TimeSeries(TimeSeriesError::InvalidConfig(_) | TimeSeriesError::InvalidPoint(_))
+    ) {
+        return invalid_json_value(error.to_string());
     }
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -4520,6 +4531,90 @@ mod tests {
         assert!(kinds.contains(&"full_text_index"));
         assert!(kinds.contains(&"geo_index"));
         assert!(kinds.contains(&"graph"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn time_series_http_rejects_invalid_retention_and_future_points()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+
+        for body in [
+            serde_json::json!({ "name": "negative", "chunk_millis": 1000, "retention_millis": -1 }),
+            serde_json::json!({ "name": "short", "chunk_millis": 60000, "retention_millis": 1000 }),
+            serde_json::json!({
+                "name": "skew",
+                "chunk_millis": 1000,
+                "retention_millis": null,
+                "max_future_skew_millis": -1
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/builder/time-series",
+                    Some(&body),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = json_body(response).await?;
+            assert_eq!(error["error"]["code"], "invalid_value", "{body}");
+        }
+
+        let create = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/builder/time-series",
+                Some(&serde_json::json!({
+                    "name": "metrics",
+                    "chunk_millis": 1000,
+                    "retention_millis": 3_600_000
+                })),
+            )?)
+            .await?;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let now = i64::try_from(super::now_millis())?;
+        for (timestamp, expected) in [
+            (now, StatusCode::OK),
+            (now * 1_000, StatusCode::BAD_REQUEST),
+            (now - 7_200_000, StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/data/time-series/metrics/points",
+                    Some(&serde_json::json!({
+                        "series": "cpu",
+                        "point": { "timestamp_millis": timestamp, "value": 0.5 }
+                    })),
+                )?)
+                .await?;
+            assert_eq!(response.status(), expected, "{timestamp}");
+            if expected == StatusCode::BAD_REQUEST {
+                let error = json_body(response).await?;
+                assert_eq!(error["error"]["code"], "invalid_value", "{timestamp}");
+            }
+        }
+
+        let points = app
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/time-series/metrics/points?series=cpu\
+                 &start=-9223372036854775808&end=9223372036854775807",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(points.status(), StatusCode::OK);
+        let body = json_body(points).await?;
+        let points = body["data"]["points"]
+            .as_array()
+            .ok_or("time-series points must be an array")?;
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["timestamp_millis"], now);
         Ok(())
     }
 
