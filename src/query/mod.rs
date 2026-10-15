@@ -16,16 +16,18 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     catalog::Session,
-    common::{Statistics, stats::Precision},
-    datasource::{MemTable, TableProvider, TableType},
+    common::{Statistics, stats::Precision, tree_node::TreeNodeRecursion},
+    datasource::{
+        MemTable, TableProvider, TableType, cte_worktable::CteWorkTable, source_as_provider,
+    },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{
         disk_manager::DiskManagerBuilder, memory_pool::GreedyMemoryPool,
         runtime_env::RuntimeEnvBuilder,
     },
-    logical_expr::{Expr as DfExpr, TableProviderFilterPushDown},
+    logical_expr::{Expr as DfExpr, LogicalPlan, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
-    prelude::{SessionConfig, SessionContext},
+    prelude::{SQLOptions, SessionConfig, SessionContext},
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use rayon::prelude::*;
@@ -50,6 +52,7 @@ use crate::{
         ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition,
         propose_system,
     },
+    security::AuthzError,
     storage::{Bytes, StorageError},
     temporal::{self, TemporalRetention},
 };
@@ -260,7 +263,54 @@ pub enum QueryError {
 
     #[error("metadata serialization: {0}")]
     Serde(String),
+
+    #[error("authorization denied: {0}")]
+    AuthzDenied(AuthzError),
 }
+
+/// A relation that a planned SQL statement reads.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SqlReadTarget {
+    /// A catalog object registered with the engine, named as it was registered.
+    Catalog(String),
+    /// A relation outside the catalog, such as `information_schema` or a table function.
+    Builtin(String),
+}
+
+/// Authorizes the relations of each SQL statement before any statement runs.
+pub trait SqlReadGuard: Send {
+    /// Checks every relation one planned statement reads.
+    /// An empty set means the statement reads no relation, for example `SELECT 1`.
+    /// # Errors
+    /// Fails when the caller may not read one of `reads`.
+    fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError>;
+}
+
+enum PreparedStatement {
+    Select(PreparedSelect),
+    Analyze(AnalyzeTarget),
+    Explain {
+        sql: String,
+        simple: Box<SimpleSelectPlan>,
+        options: ExplainOptions,
+    },
+    Insert(Box<sqlparser::ast::Insert>),
+}
+
+enum PreparedSelect {
+    Simple {
+        sql: String,
+        plan: Box<SimpleSelectPlan>,
+    },
+    DataFusion {
+        ctx: SessionContext,
+        plan: Box<LogicalPlan>,
+        /// Time already spent planning; execution gets the rest of the query timeout.
+        planning: std::time::Duration,
+    },
+}
+
+type RegisteredProviders = Vec<(String, Arc<dyn TableProvider>)>;
 
 #[derive(Clone)]
 pub struct RelTable {
@@ -1695,9 +1745,18 @@ impl SqlEngine {
     /// # Errors
     /// Fails when SQL is unsupported or execution fails under `ANALYZE`.
     pub fn explain(&self, sql: &str, options: ExplainOptions) -> Result<ExplainReport, QueryError> {
-        let simple = self.simple_select_plan(sql)?.ok_or_else(|| {
-            QueryError::Unsupported("EXPLAIN supports simple SELECT in this preview".to_owned())
-        })?;
+        let simple = self
+            .simple_select_plan(sql)?
+            .ok_or_else(explain_unsupported)?;
+        self.explain_simple(sql, &simple, options)
+    }
+
+    fn explain_simple(
+        &self,
+        sql: &str,
+        simple: &SimpleSelectPlan,
+        options: ExplainOptions,
+    ) -> Result<ExplainReport, QueryError> {
         let table = self
             .tables
             .get(&simple.table)
@@ -1754,6 +1813,20 @@ impl SqlEngine {
     /// # Errors
     /// Fails when SQL is unsupported, storage fails, or `DataFusion` fails.
     pub async fn execute(&self, sql: &str) -> Result<SqlOutput, QueryError> {
+        self.execute_with_read_guard(sql, None).await
+    }
+
+    /// Executes SQL after `guard` authorizes the relations each statement reads.
+    /// Every statement is planned and authorized before any statement runs, and
+    /// the plan that was authorized is the plan that executes.
+    /// # Errors
+    /// Fails when the guard denies a read, SQL is unsupported, storage fails, or
+    /// `DataFusion` fails.
+    pub async fn execute_with_read_guard(
+        &self,
+        sql: &str,
+        mut guard: Option<&mut dyn SqlReadGuard>,
+    ) -> Result<SqlOutput, QueryError> {
         if sql.len() > self.performance.query.max_sql_bytes {
             return Err(QueryError::InputLimit(format!(
                 "SQL text is {} bytes, limit is {} bytes",
@@ -1767,79 +1840,203 @@ impl SqlEngine {
         }
 
         let statements = parse_with_limits(sql, &self.performance.query)?;
-        let mut last = None;
-
+        let mut prepared = Vec::with_capacity(statements.len());
         for statement in statements {
-            last = Some(match statement {
-                Statement::Query(_) => self.execute_select(&statement.to_string()).await?,
-                Statement::Analyze(analyze) => {
-                    let target = analyze
-                        .table_name
-                        .as_ref()
-                        .map_or(Ok(AnalyzeTarget::All), |name| {
-                            object_name_to_string(name).map(AnalyzeTarget::Named)
-                        })?;
-                    self.analyze(target, AnalyzeMode::default())?
-                        .to_sql_output()
-                }
-                Statement::Explain {
-                    analyze, statement, ..
-                } => {
-                    let report =
-                        self.explain(&statement.to_string(), ExplainOptions { analyze })?;
-                    report.to_sql_output()
-                }
-                Statement::Insert(insert) => self.execute_insert(&insert)?,
-                other => return Err(QueryError::Unsupported(other.to_string())),
-            });
+            let (statement, reads) = self.prepare_statement(statement).await?;
+            if let Some(reads) = reads
+                && let Some(guard) = guard.as_deref_mut()
+            {
+                guard
+                    .authorize_reads(&reads)
+                    .map_err(QueryError::AuthzDenied)?;
+            }
+            prepared.push(statement);
+        }
+
+        let mut last = None;
+        for statement in prepared {
+            last = Some(self.run_statement(statement).await?);
         }
 
         last.ok_or_else(|| QueryError::Unsupported("empty SQL".to_owned()))
     }
 
-    async fn execute_select(&self, sql: &str) -> Result<SqlOutput, QueryError> {
+    /// Plans one statement without running it. Returns the relations it reads,
+    /// or `None` for statements that are authorized by their write/admin
+    /// requirements instead.
+    async fn prepare_statement(
+        &self,
+        statement: Statement,
+    ) -> Result<(PreparedStatement, Option<BTreeSet<SqlReadTarget>>), QueryError> {
+        match statement {
+            Statement::Query(_) => {
+                let (select, reads) = self.prepare_select(&statement.to_string()).await?;
+                Ok((PreparedStatement::Select(select), Some(reads)))
+            }
+            Statement::Analyze(analyze) => {
+                let target = analyze
+                    .table_name
+                    .as_ref()
+                    .map_or(Ok(AnalyzeTarget::All), |name| {
+                        object_name_to_string(name).map(AnalyzeTarget::Named)
+                    })?;
+                Ok((PreparedStatement::Analyze(target), None))
+            }
+            Statement::Explain {
+                analyze, statement, ..
+            } => {
+                let sql = statement.to_string();
+                let simple = self
+                    .simple_select_plan(&sql)?
+                    .ok_or_else(explain_unsupported)?;
+                let reads = BTreeSet::from([SqlReadTarget::Catalog(simple.table.clone())]);
+                Ok((
+                    PreparedStatement::Explain {
+                        sql,
+                        simple: Box::new(simple),
+                        options: ExplainOptions { analyze },
+                    },
+                    Some(reads),
+                ))
+            }
+            Statement::Insert(insert) => Ok((PreparedStatement::Insert(Box::new(insert)), None)),
+            other => Err(QueryError::Unsupported(other.to_string())),
+        }
+    }
+
+    async fn run_statement(&self, statement: PreparedStatement) -> Result<SqlOutput, QueryError> {
+        match statement {
+            PreparedStatement::Select(PreparedSelect::Simple { sql, plan }) => {
+                self.run_simple_select(&sql, &plan)
+            }
+            PreparedStatement::Select(PreparedSelect::DataFusion {
+                ctx,
+                plan,
+                planning,
+            }) => self.run_datafusion_select(&ctx, *plan, planning).await,
+            PreparedStatement::Analyze(target) => Ok(self
+                .analyze(target, AnalyzeMode::default())?
+                .to_sql_output()),
+            PreparedStatement::Explain {
+                sql,
+                simple,
+                options,
+            } => Ok(self.explain_simple(&sql, &simple, options)?.to_sql_output()),
+            PreparedStatement::Insert(insert) => self.execute_insert(&insert),
+        }
+    }
+
+    async fn prepare_select(
+        &self,
+        sql: &str,
+    ) -> Result<(PreparedSelect, BTreeSet<SqlReadTarget>), QueryError> {
         if self.snapshot_lsn.is_none()
-            && let Some(result) = self.execute_simple_select(sql)?
+            && let Some(simple) = self.simple_select_plan(sql)?
         {
-            return Ok(result);
+            let reads = BTreeSet::from([SqlReadTarget::Catalog(simple.table.clone())]);
+            return Ok((
+                PreparedSelect::Simple {
+                    sql: sql.to_owned(),
+                    plan: Box::new(simple),
+                },
+                reads,
+            ));
         }
 
+        let (ctx, providers) = self.datafusion_catalog_context()?;
+        let started = std::time::Instant::now();
+        let plan = self.plan_datafusion_select(&ctx, sql).await?;
+        let planning = started.elapsed();
+        let reads = planned_read_targets(&plan, &providers)?;
+        Ok((
+            PreparedSelect::DataFusion {
+                ctx,
+                plan: Box::new(plan),
+                planning,
+            },
+            reads,
+        ))
+    }
+
+    /// Registers every catalog object in a fresh `DataFusion` context and
+    /// returns the registered providers, so plan scans can be mapped back to
+    /// catalog names by provider identity.
+    fn datafusion_catalog_context(
+        &self,
+    ) -> Result<(SessionContext, RegisteredProviders), QueryError> {
         let ctx = self.datafusion_context()?;
+        let mut providers: RegisteredProviders = Vec::new();
 
         for (name, table) in &self.tables {
-            let provider = Arc::new(StorageTableProvider::new(
-                table.clone(),
-                self.performance.clone(),
-                self.snapshot_lsn,
+            providers.push((
+                name.clone(),
+                Arc::new(StorageTableProvider::new(
+                    table.clone(),
+                    self.performance.clone(),
+                    self.snapshot_lsn,
+                )),
             ));
-            ctx.register_table(name, provider)
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
         }
 
         for (name, provider) in &self.collections {
-            ctx.register_table(name, Arc::new(provider.clone()))
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
+            providers.push((name.clone(), Arc::new(provider.clone())));
         }
 
         for (name, provider) in &self.foreign_tables {
-            ctx.register_table(name, Arc::new(provider.clone()))
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
+            providers.push((name.clone(), Arc::new(provider.clone())));
         }
 
         for (name, provider) in &self.materialized_views {
-            ctx.register_table(name, Arc::new(provider.clone()))
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
+            providers.push((name.clone(), Arc::new(provider.clone())));
         }
 
         for (name, provider) in &self.temporal_tables {
-            ctx.register_table(name, Arc::new(provider.clone()))
+            providers.push((name.clone(), Arc::new(provider.clone())));
+        }
+
+        for (name, provider) in &providers {
+            ctx.register_table(name, Arc::clone(provider))
                 .map_err(|error| QueryError::DataFusion(error.to_string()))?;
         }
 
+        Ok((ctx, providers))
+    }
+
+    async fn plan_datafusion_select(
+        &self,
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> Result<LogicalPlan, QueryError> {
         let timeout = std::time::Duration::from_millis(self.performance.query.timeout_ms);
+        let state = ctx.state();
+        let plan = tokio::time::timeout(timeout, state.create_logical_plan(sql))
+            .await
+            .map_err(|_| self.timeout_error())?
+            .map_err(|error| datafusion_to_query_error(&error))?;
+
+        // DataFusion re-parses the statement text with its own dialect, so a
+        // read statement must not plan into anything that changes state.
+        SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false)
+            .verify_plan(&plan)
+            .map_err(|error| QueryError::Unsupported(error.strip_backtrace()))?;
+        Ok(plan)
+    }
+
+    async fn run_datafusion_select(
+        &self,
+        ctx: &SessionContext,
+        plan: LogicalPlan,
+        planning: std::time::Duration,
+    ) -> Result<SqlOutput, QueryError> {
+        // Planning and execution share one `timeout_ms` budget per statement.
+        let timeout = std::time::Duration::from_millis(self.performance.query.timeout_ms)
+            .saturating_sub(planning);
         let execution = async {
             let dataframe = ctx
-                .sql(sql)
+                .execute_logical_plan(plan)
                 .await
                 .map_err(|error| datafusion_to_query_error(&error))?;
             let columns = dataframe
@@ -1855,17 +2052,18 @@ impl SqlEngine {
             Ok::<_, QueryError>((columns, batches))
         };
 
-        let (columns, batches) =
-            tokio::time::timeout(timeout, execution)
-                .await
-                .map_err(|_| {
-                    QueryError::Timeout(format!(
-                        "query exceeded {} ms",
-                        self.performance.query.timeout_ms
-                    ))
-                })??;
+        let (columns, batches) = tokio::time::timeout(timeout, execution)
+            .await
+            .map_err(|_| self.timeout_error())??;
 
         Ok(SqlOutput::Rows(record_batches_to_rows(&batches, columns)?))
+    }
+
+    fn timeout_error(&self) -> QueryError {
+        QueryError::Timeout(format!(
+            "query exceeded {} ms",
+            self.performance.query.timeout_ms
+        ))
     }
 
     fn datafusion_context(&self) -> Result<SessionContext, QueryError> {
@@ -1909,11 +2107,11 @@ impl SqlEngine {
         Ok(SqlOutput::AffectedRows(affected_rows.len()))
     }
 
-    fn execute_simple_select(&self, sql: &str) -> Result<Option<SqlOutput>, QueryError> {
-        let Some(simple) = self.simple_select_plan(sql)? else {
-            return Ok(None);
-        };
-
+    fn run_simple_select(
+        &self,
+        sql: &str,
+        simple: &SimpleSelectPlan,
+    ) -> Result<SqlOutput, QueryError> {
         let table = self
             .tables
             .get(&simple.table)
@@ -1942,10 +2140,10 @@ impl SqlEngine {
             rows.truncate(limit);
         }
 
-        Ok(Some(SqlOutput::Rows(SqlRows {
-            columns: simple.projection_names,
+        Ok(SqlOutput::Rows(SqlRows {
+            columns: simple.projection_names.clone(),
             rows,
-        })))
+        }))
     }
 
     fn simple_select_plan(&self, sql: &str) -> Result<Option<SimpleSelectPlan>, QueryError> {
@@ -4306,6 +4504,58 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, QueryError> {
         ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
         ObjectNamePart::Function(_) => Err(QueryError::Unsupported(name.to_string())),
     }
+}
+
+fn explain_unsupported() -> QueryError {
+    QueryError::Unsupported("EXPLAIN supports simple SELECT in this preview".to_owned())
+}
+
+/// Collects every relation a `DataFusion` plan scans, including scans inside
+/// subqueries. Scans are mapped back to catalog names by provider identity, so
+/// a name is reported exactly as it was registered, whatever spelling the SQL
+/// used. Scans of unregistered providers are reported as builtin relations.
+fn planned_read_targets(
+    plan: &LogicalPlan,
+    providers: &[(String, Arc<dyn TableProvider>)],
+) -> Result<BTreeSet<SqlReadTarget>, QueryError> {
+    let mut reads = BTreeSet::new();
+    let mut extension = None;
+    plan.apply_with_subqueries(|node| {
+        match node {
+            LogicalPlan::Extension(node) => {
+                extension = Some(node.node.name().to_owned());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            LogicalPlan::TableScan(scan) => {
+                let target = match source_as_provider(&scan.source) {
+                    // Recursive CTE work tables only re-read the CTE's own
+                    // terms, which this walk visits anyway.
+                    Ok(provider) if provider.is::<CteWorkTable>() => None,
+                    Ok(provider) => Some(
+                        providers
+                            .iter()
+                            .find(|(_, registered)| Arc::ptr_eq(registered, &provider))
+                            .map_or_else(
+                                || SqlReadTarget::Builtin(scan.table_name.to_string()),
+                                |(name, _)| SqlReadTarget::Catalog(name.clone()),
+                            ),
+                    ),
+                    Err(_) => Some(SqlReadTarget::Builtin(scan.table_name.to_string())),
+                };
+                reads.extend(target);
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|error| datafusion_to_query_error(&error))?;
+
+    if let Some(name) = extension {
+        return Err(QueryError::Unsupported(format!(
+            "extension plan node {name} in a read query"
+        )));
+    }
+    Ok(reads)
 }
 
 fn datafusion_to_query_error(error: &DataFusionError) -> QueryError {

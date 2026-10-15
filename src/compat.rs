@@ -230,6 +230,7 @@ pub fn sqlstate_for_query(error: &QueryError) -> &'static str {
         }
         QueryError::MissingTable(_) => "42P01",
         QueryError::MissingColumn(_) => "42703",
+        QueryError::AuthzDenied(_) => "42501",
         QueryError::DuplicatePrimaryKey => "23505",
         QueryError::Storage(error) => sqlstate_for_storage(error),
         QueryError::Repl(error) => sqlstate_for_repl(error),
@@ -570,12 +571,13 @@ fn stable_oid(name: &str) -> i64 {
 mod tests {
     use super::{
         CatalogObject, CatalogObjectKind, PgCatalogSnapshot, SERVER_VERSION,
-        compat_sql_requirements, execute_compat_sql, sqlstate_for_query,
+        compat_sql_requirements, execute_compat_sql, sqlstate_for_db_error, sqlstate_for_query,
     };
     use crate::{
-        db::{DbConfig, Profile},
+        db::{DbConfig, DbError, Profile},
         model::Value,
         query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
+        security::{AuthzError, Permission, Resource},
     };
 
     #[test]
@@ -634,6 +636,17 @@ mod tests {
             sqlstate_for_query(&QueryError::MissingTable("users".to_owned())),
             "42P01"
         );
+        let denied = || {
+            QueryError::AuthzDenied(AuthzError::Denied {
+                principal: "alice".to_owned(),
+                resource: Resource::Table("secrets".to_owned()),
+                permission: Permission::Read,
+            })
+        };
+        assert_eq!(sqlstate_for_query(&denied()), "42501");
+        let db_error = DbError::from(denied());
+        assert!(matches!(db_error, DbError::AuthzDenied(_)));
+        assert_eq!(sqlstate_for_db_error(&db_error), "42501");
     }
 
     #[test]

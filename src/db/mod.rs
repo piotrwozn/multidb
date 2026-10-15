@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    ops::ControlFlow,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     thread,
@@ -10,10 +11,10 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use sqlparser::{
     ast::{
-        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-        JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query as SqlQuery, SelectItem,
-        SetExpr, Statement, TableFactor as SqlTableFactor, TableObject as SqlTableObject,
-        UnaryOperator, Value as SqlValue,
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+        ObjectNamePart, Query as SqlQuery, SelectItem, SetExpr, Statement,
+        TableFactor as SqlTableFactor, TableObject as SqlTableObject, UnaryOperator,
+        Value as SqlValue, Visit, Visitor,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -62,7 +63,8 @@ use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row, SqlEngine, SqlOutput,
-    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes, schema_put_op,
+    SqlReadGuard, SqlReadTarget, SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
+    schema_put_op,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -436,7 +438,7 @@ pub enum DbError {
     Config(#[from] ConfigError),
 
     #[error("query: {0}")]
-    Query(#[from] QueryError),
+    Query(#[source] QueryError),
 
     #[error("model: {0}")]
     Model(#[from] ModelError),
@@ -519,6 +521,15 @@ pub enum DbError {
 
     #[error("transaction aborted: {0}")]
     TransactionAborted(String),
+}
+
+impl From<QueryError> for DbError {
+    fn from(error: QueryError) -> Self {
+        match error {
+            QueryError::AuthzDenied(error) => Self::AuthzDenied(error),
+            error => Self::Query(error),
+        }
+    }
 }
 
 impl DbError {
@@ -3158,10 +3169,20 @@ impl Database {
     /// # Errors
     /// Fails when catalog metadata is invalid or query execution fails.
     pub async fn query(&self, sql: &str) -> Result<SqlOutput, DbError> {
+        self.query_with_read_guard(sql, None).await
+    }
+
+    async fn query_with_read_guard(
+        &self,
+        sql: &str,
+        guard: Option<&mut dyn SqlReadGuard>,
+    ) -> Result<SqlOutput, DbError> {
         let started = Instant::now();
         let _query_permit = self.acquire_query_permit().await.map_err(DbError::from)?;
         if let Some((rewritten, point)) = parse_as_of_query(sql)? {
-            let result = self.query_as_of(&rewritten, point).await;
+            let result = self
+                .query_as_of_with_read_guard(&rewritten, point, guard)
+                .await;
             return self.finish_query(sql, started, result);
         }
         if let Some((name, args)) = parse_call_procedure_sql(sql)? {
@@ -3207,7 +3228,10 @@ impl Database {
             return self.finish_query(sql, started, result);
         }
         let engine = self.sql_engine()?;
-        let result = engine.execute(sql).await.map_err(DbError::from);
+        let result = engine
+            .execute_with_read_guard(sql, guard)
+            .await
+            .map_err(DbError::from);
         self.finish_query(sql, started, result)
     }
 
@@ -3215,6 +3239,15 @@ impl Database {
     /// # Errors
     /// Fails when the temporal point is outside retention, unsupported, or execution fails.
     pub async fn query_as_of(&self, sql: &str, point: TemporalPoint) -> Result<SqlOutput, DbError> {
+        self.query_as_of_with_read_guard(sql, point, None).await
+    }
+
+    async fn query_as_of_with_read_guard(
+        &self,
+        sql: &str,
+        point: TemporalPoint,
+        guard: Option<&mut dyn SqlReadGuard>,
+    ) -> Result<SqlOutput, DbError> {
         if self.repl.is_ap() {
             return Err(TemporalError::Unsupported(
                 "AP replication does not support temporal AS OF".to_owned(),
@@ -3230,7 +3263,7 @@ impl Database {
         let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
         let engine = self.sql_engine()?.with_snapshot_lsn(lsn);
-        Ok(engine.execute(sql).await?)
+        Ok(engine.execute_with_read_guard(sql, guard).await?)
     }
 
     fn finish_query(
@@ -3389,10 +3422,11 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query")?;
         }
 
-        let result = self
-            .query(sql)
-            .await
-            .and_then(|output| self.apply_query_policies(principal, output, &requirements));
+        let mut authorizer = SqlReadAuthorizer::new(self, principal, "query");
+        let result = self.query_with_read_guard(sql, Some(&mut authorizer)).await;
+        let policy_requirements = authorizer.policy_requirements(&requirements);
+        let result = result
+            .and_then(|output| self.apply_query_policies(principal, output, &policy_requirements));
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3422,10 +3456,13 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
 
+        let mut authorizer = SqlReadAuthorizer::new(self, principal, "query_as_of");
         let result = self
-            .query_as_of(sql, point)
-            .await
-            .and_then(|output| self.apply_query_policies(principal, output, &requirements));
+            .query_as_of_with_read_guard(sql, point, Some(&mut authorizer))
+            .await;
+        let policy_requirements = authorizer.policy_requirements(&requirements);
+        let result = result
+            .and_then(|output| self.apply_query_policies(principal, output, &policy_requirements));
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -4071,6 +4108,17 @@ impl Database {
         permission: Permission,
         action: &str,
     ) -> Result<(), DbError> {
+        self.authorize_with_audit(principal, resource, permission, action)
+            .map_err(DbError::AuthzDenied)
+    }
+
+    fn authorize_with_audit(
+        &self,
+        principal: &Principal,
+        resource: &Resource,
+        permission: Permission,
+        action: &str,
+    ) -> Result<(), AuthzError> {
         match self.authz.authorize(principal, resource, permission) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -4086,7 +4134,7 @@ impl Database {
                     tracing::warn!("failed to write denied authorization audit event");
                 }
                 observability::record_authz_denied(action, resource, permission);
-                Err(DbError::AuthzDenied(error))
+                Err(error)
             }
         }
     }
@@ -5995,6 +6043,72 @@ pub fn profile_validation_report(
     })
 }
 
+/// Authorizes the relations of a planned SQL statement for one principal.
+/// It records every authorized resource so row and masking policies can see
+/// the tables the plan actually reads.
+struct SqlReadAuthorizer<'a> {
+    database: &'a Database,
+    principal: &'a Principal,
+    action: &'static str,
+    resources: BTreeSet<Resource>,
+}
+
+impl<'a> SqlReadAuthorizer<'a> {
+    const fn new(database: &'a Database, principal: &'a Principal, action: &'static str) -> Self {
+        Self {
+            database,
+            principal,
+            action,
+            resources: BTreeSet::new(),
+        }
+    }
+
+    /// Returns the pre-check requirements plus a `Read` for every resource
+    /// the plan read, sorted and deduplicated.
+    fn policy_requirements(
+        &self,
+        requirements: &[(Resource, Permission)],
+    ) -> Vec<(Resource, Permission)> {
+        let mut combined = requirements.to_vec();
+        combined.extend(
+            self.resources
+                .iter()
+                .map(|resource| (resource.clone(), Permission::Read)),
+        );
+        combined.sort();
+        combined.dedup();
+        combined
+    }
+}
+
+impl SqlReadGuard for SqlReadAuthorizer<'_> {
+    fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError> {
+        let resources = if reads.is_empty() {
+            BTreeSet::from([Resource::Database])
+        } else {
+            reads
+                .iter()
+                .map(|read| match read {
+                    SqlReadTarget::Catalog(name) => {
+                        resource_for_catalog_name(&self.database.catalog, name)
+                    }
+                    SqlReadTarget::Builtin(_) => Resource::Database,
+                })
+                .collect()
+        };
+        for resource in resources {
+            self.database.authorize_with_audit(
+                self.principal,
+                &resource,
+                Permission::Read,
+                self.action,
+            )?;
+            self.resources.insert(resource);
+        }
+        Ok(())
+    }
+}
+
 fn sql_requirements(
     sql: &str,
     catalog: &BTreeMap<String, CatalogEntry>,
@@ -6316,20 +6430,48 @@ fn collect_query_tables(query: &SqlQuery, names: &mut BTreeSet<String>) -> Resul
     collect_query_tables_scoped(query, names, &BTreeSet::new())
 }
 
+/// Collects the catalog names a query reads, skipping names that resolve to a
+/// CTE in scope. Every clause is walked; relation shapes that cannot be mapped
+/// to a catalog name fail closed with `Unsupported`.
 fn collect_query_tables_scoped(
     query: &SqlQuery,
     names: &mut BTreeSet<String>,
     cte_names: &BTreeSet<String>,
 ) -> Result<(), QueryError> {
+    let SqlQuery {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+
+    // CTE names are normalized like DataFusion does: quoted names keep their
+    // case, unquoted names are lowercased. A CTE is only in scope after its
+    // own body, so a self-reference (even under WITH RECURSIVE) still counts
+    // as a table read.
     let mut scoped_ctes = cte_names.clone();
-    if let Some(with) = &query.with {
+    if let Some(with) = with {
         for cte in &with.cte_tables {
             collect_query_tables_scoped(&cte.query, names, &scoped_ctes)?;
-            scoped_ctes.insert(cte.alias.name.value.to_ascii_lowercase());
+            scoped_ctes.insert(normalized_ident(&cte.alias.name));
         }
     }
 
-    collect_set_expr_tables(query.body.as_ref(), names, &scoped_ctes)
+    collect_set_expr_tables(body, names, &scoped_ctes)?;
+    collect_nested_tables(order_by, names, &scoped_ctes)?;
+    collect_nested_tables(limit_clause, names, &scoped_ctes)?;
+    collect_nested_tables(fetch, names, &scoped_ctes)?;
+    collect_nested_tables(locks, names, &scoped_ctes)?;
+    collect_nested_tables(for_clause, names, &scoped_ctes)?;
+    collect_nested_tables(settings, names, &scoped_ctes)?;
+    collect_nested_tables(format_clause, names, &scoped_ctes)?;
+    collect_nested_tables(pipe_operators, names, &scoped_ctes)
 }
 
 fn collect_set_expr_tables(
@@ -6338,237 +6480,92 @@ fn collect_set_expr_tables(
     cte_names: &BTreeSet<String>,
 ) -> Result<(), QueryError> {
     match expr {
-        SetExpr::Select(select) => {
-            for table in &select.from {
-                collect_table_factor(&table.relation, names, cte_names)?;
-                for join in &table.joins {
-                    collect_table_factor(&join.relation, names, cte_names)?;
-                    collect_join_operator_tables(&join.join_operator, names, cte_names)?;
-                }
-            }
-            for item in &select.projection {
-                collect_select_item_tables(item, names, cte_names)?;
-            }
-            if let Some(selection) = &select.selection {
-                collect_expr_tables(selection, names, cte_names)?;
-            }
-            if let GroupByExpr::Expressions(expressions, _) = &select.group_by {
-                for expression in expressions {
-                    collect_expr_tables(expression, names, cte_names)?;
-                }
-            }
-            if let Some(having) = &select.having {
-                collect_expr_tables(having, names, cte_names)?;
-            }
-        }
-        SetExpr::Query(query) => collect_query_tables_scoped(query, names, cte_names)?,
+        SetExpr::Select(select) => collect_nested_tables(select.as_ref(), names, cte_names),
+        SetExpr::Query(query) => collect_query_tables_scoped(query, names, cte_names),
         SetExpr::SetOperation { left, right, .. } => {
             collect_set_expr_tables(left, names, cte_names)?;
-            collect_set_expr_tables(right, names, cte_names)?;
+            collect_set_expr_tables(right, names, cte_names)
         }
-        SetExpr::Values(_) => {}
-        other => return Err(QueryError::Unsupported(other.to_string())),
-    }
-    Ok(())
-}
-
-fn collect_table_factor(
-    factor: &SqlTableFactor,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match factor {
-        SqlTableFactor::Table { name, .. } => {
-            let name = object_name_to_string(name)?;
-            if !cte_names.contains(&name.to_ascii_lowercase()) {
-                names.insert(name);
-            }
-            Ok(())
-        }
-        SqlTableFactor::Derived { subquery, .. } => {
-            collect_query_tables_scoped(subquery, names, cte_names)
-        }
+        SetExpr::Values(values) => collect_nested_tables(values, names, cte_names),
         other => Err(QueryError::Unsupported(other.to_string())),
     }
 }
 
-fn collect_select_item_tables(
-    item: &SelectItem,
+/// Walks every node of `node` and collects the relations it reads. Nested
+/// queries are handed to `collect_query_tables_scoped` so their WITH scopes are
+/// honoured.
+fn collect_nested_tables<T: Visit + ?Sized>(
+    node: &T,
     names: &mut BTreeSet<String>,
     cte_names: &BTreeSet<String>,
 ) -> Result<(), QueryError> {
-    match item {
-        SelectItem::UnnamedExpr(expr)
-        | SelectItem::ExprWithAlias { expr, .. }
-        | SelectItem::ExprWithAliases { expr, .. } => collect_expr_tables(expr, names, cte_names),
-        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => Ok(()),
+    let mut collector = NestedTableCollector {
+        names,
+        cte_names,
+        depth: 0,
+    };
+    match node.visit(&mut collector) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(*error),
     }
 }
 
-fn collect_join_operator_tables(
-    operator: &JoinOperator,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::StraightJoin(constraint) => {
-            collect_join_constraint_tables(constraint, names, cte_names)
-        }
-        JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => {
-            collect_expr_tables(match_condition, names, cte_names)?;
-            collect_join_constraint_tables(constraint, names, cte_names)
-        }
-        JoinOperator::CrossApply
-        | JoinOperator::OuterApply
-        | JoinOperator::ArrayJoin
-        | JoinOperator::LeftArrayJoin
-        | JoinOperator::InnerArrayJoin => Ok(()),
-    }
+struct NestedTableCollector<'a> {
+    names: &'a mut BTreeSet<String>,
+    cte_names: &'a BTreeSet<String>,
+    /// Number of enclosing nested queries. Relations inside a nested query
+    /// were already collected when that query was entered.
+    depth: usize,
 }
 
-fn collect_join_constraint_tables(
-    constraint: &JoinConstraint,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match constraint {
-        JoinConstraint::On(expr) => collect_expr_tables(expr, names, cte_names),
-        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
-    }
-}
+impl Visitor for NestedTableCollector<'_> {
+    type Break = Box<QueryError>;
 
-fn collect_expr_tables(
-    expr: &SqlExpr,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match expr {
-        SqlExpr::IsFalse(expr)
-        | SqlExpr::IsNotFalse(expr)
-        | SqlExpr::IsTrue(expr)
-        | SqlExpr::IsNotTrue(expr)
-        | SqlExpr::IsNull(expr)
-        | SqlExpr::IsNotNull(expr)
-        | SqlExpr::IsUnknown(expr)
-        | SqlExpr::IsNotUnknown(expr)
-        | SqlExpr::Nested(expr)
-        | SqlExpr::UnaryOp { expr, .. }
-        | SqlExpr::Cast { expr, .. }
-        | SqlExpr::AtTimeZone {
-            timestamp: expr, ..
+    fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+        if self.depth == 0
+            && let Err(error) = collect_query_tables_scoped(query, self.names, self.cte_names)
+        {
+            return ControlFlow::Break(Box::new(error));
         }
-        | SqlExpr::Extract { expr, .. }
-        | SqlExpr::Ceil { expr, .. }
-        | SqlExpr::Floor { expr, .. } => collect_expr_tables(expr, names, cte_names),
-        SqlExpr::IsDistinctFrom(left, right)
-        | SqlExpr::IsNotDistinctFrom(left, right)
-        | SqlExpr::BinaryOp { left, right, .. }
-        | SqlExpr::AnyOp { left, right, .. }
-        | SqlExpr::AllOp { left, right, .. } => {
-            collect_expr_tables(left, names, cte_names)?;
-            collect_expr_tables(right, names, cte_names)
-        }
-        SqlExpr::InList { expr, list, .. } => {
-            collect_expr_tables(expr, names, cte_names)?;
-            for item in list {
-                collect_expr_tables(item, names, cte_names)?;
-            }
-            Ok(())
-        }
-        SqlExpr::InSubquery { expr, subquery, .. } => {
-            collect_expr_tables(expr, names, cte_names)?;
-            collect_query_tables_scoped(subquery, names, cte_names)
-        }
-        SqlExpr::Between {
-            expr, low, high, ..
-        } => {
-            collect_expr_tables(expr, names, cte_names)?;
-            collect_expr_tables(low, names, cte_names)?;
-            collect_expr_tables(high, names, cte_names)
-        }
-        SqlExpr::Exists { subquery, .. } | SqlExpr::Subquery(subquery) => {
-            collect_query_tables_scoped(subquery, names, cte_names)
-        }
-        SqlExpr::Function(function) => {
-            collect_function_arguments_tables(&function.args, names, cte_names)
-        }
-        SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                collect_expr_tables(operand, names, cte_names)?;
-            }
-            for condition in conditions {
-                collect_expr_tables(&condition.condition, names, cte_names)?;
-                collect_expr_tables(&condition.result, names, cte_names)?;
-            }
-            if let Some(else_result) = else_result {
-                collect_expr_tables(else_result, names, cte_names)?;
-            }
-            Ok(())
-        }
-        SqlExpr::Tuple(expressions) => {
-            for expr in expressions {
-                collect_expr_tables(expr, names, cte_names)?;
-            }
-            Ok(())
-        }
-        SqlExpr::GroupingSets(groups) | SqlExpr::Cube(groups) | SqlExpr::Rollup(groups) => {
-            for expr in groups.iter().flatten() {
-                collect_expr_tables(expr, names, cte_names)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+        self.depth += 1;
+        ControlFlow::Continue(())
     }
-}
 
-fn collect_function_arguments_tables(
-    args: &FunctionArguments,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match args {
-        FunctionArguments::None => Ok(()),
-        FunctionArguments::Subquery(query) => collect_query_tables_scoped(query, names, cte_names),
-        FunctionArguments::List(list) => {
-            for arg in &list.args {
-                match arg {
-                    FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
-                        if let FunctionArgExpr::Expr(expr) = arg {
-                            collect_expr_tables(expr, names, cte_names)?;
-                        }
-                    }
-                    FunctionArg::ExprNamed { name, arg, .. } => {
-                        collect_expr_tables(name, names, cte_names)?;
-                        if let FunctionArgExpr::Expr(expr) = arg {
-                            collect_expr_tables(expr, names, cte_names)?;
-                        }
-                    }
+    fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.depth = self.depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &SqlTableFactor) -> ControlFlow<Self::Break> {
+        if self.depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        match factor {
+            SqlTableFactor::Table { name, .. } => {
+                let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+                    return ControlFlow::Break(Box::new(QueryError::Unsupported(name.to_string())));
+                };
+                if !self.cte_names.contains(&normalized_ident(ident)) {
+                    self.names.insert(ident.value.clone());
                 }
+                ControlFlow::Continue(())
             }
-            Ok(())
+            SqlTableFactor::Derived { .. } => ControlFlow::Continue(()),
+            other => ControlFlow::Break(Box::new(QueryError::Unsupported(other.to_string()))),
         }
+    }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        ControlFlow::Break(Box::new(QueryError::Unsupported(statement.to_string())))
+    }
+}
+
+/// Normalizes an identifier the way `DataFusion` resolves it.
+fn normalized_ident(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
     }
 }
 

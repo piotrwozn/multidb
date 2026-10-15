@@ -57,7 +57,7 @@ uuid = { version = "1", features = ["v7"] }
 datafusion = { version = "54.0.0", default-features = false, features = ["sql"] }
 parquet = "58.3.0"
 bytes = "1"
-sqlparser = "0.62.0"
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 async-trait = "0.1.89"
 hnsw_rs = "0.3.4"

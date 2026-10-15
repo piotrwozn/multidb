@@ -8,6 +8,14 @@ All notable public changes will be recorded here.
 - Added public repository hygiene files, security policy, contribution guide,
   issue templates and release notes.
 - Kept local planning history out of the public source baseline.
+- SQL read authorization (`query_as`, `query_as_of_as`, pgwire and the
+  Control Plane `/sql`) is now checked against every table the planned query
+  reads, including subqueries in any position, and the plan that was
+  authorized is the plan that runs. A multi-statement batch runs nothing until
+  all of its reads are authorized. Table reads are matched to the catalog name
+  the planner resolves (unquoted identifiers are lowercased), so a grant on a
+  differently-cased name no longer authorizes a table; `SELECT ... INTO`
+  returns `Unsupported`, and recursive CTEs need Database read.
 
 ## 0.1.0-preview.1
 

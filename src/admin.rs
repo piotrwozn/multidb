@@ -4557,6 +4557,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn sql_rbac_denies_tables_read_through_case_variant_grants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let schema = crate::query::TableSchema::new(
+            vec![
+                crate::query::ColumnDef::new("id", crate::query::ColumnType::Int, false),
+                crate::query::ColumnDef::new("amount", crate::query::ColumnType::Float, false),
+            ],
+            0,
+        );
+        database.create_table("users", Some(schema.clone()), Vec::new())?;
+        database.create_table("orders", Some(schema), Vec::new())?;
+        database.set_authz_policy(AuthzPolicy::new([Role::new("reader")
+            .grant(Resource::Table("users".to_owned()), Permission::Read)
+            .grant(Resource::Table("ORDERS".to_owned()), Permission::Read)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("reader")),
+        );
+
+        let response =
+            super::router(AdminState::from_database(database).with_admin_token("secret"))
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/sql",
+                    Some(&serde_json::json!({ "sql": "SELECT amount FROM ORDERS" })),
+                )?)
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await?;
+        assert_eq!(body["error"]["code"], "forbidden");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("lacks Read on Table(\"orders\")"),
+            "{message}"
+        );
+        Ok(())
+    }
+
     fn test_state() -> Result<AdminState, Box<dyn std::error::Error>> {
         Ok(AdminState::from_database(admin_database()?).with_admin_token("secret"))
     }

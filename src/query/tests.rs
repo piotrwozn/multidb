@@ -1,16 +1,20 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use super::{
     AccessPath, AnalyzeMode, AnalyzeTarget, CardinalityEstimator, ColumnDef, ColumnType,
     ExplainOptions, MostCommonValue, QueryError, QueryFingerprint, REL_COLUMNAR_SEGMENTS_TABLE,
     REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexExpression, RelIndexSpec, RelPlanKind, RelPredicate,
-    RelTable, SqlEngine, SqlOutput, StatsCatalog, TableLayout, TableSchema, Value, make_row_key,
-    parse,
+    RelTable, SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, StatsCatalog, TableLayout,
+    TableSchema, Value, make_row_key, parse,
 };
 use crate::{
     db::{DbConfig, Profile, create_database, open_database},
     model::{CollectionId, FieldPath},
     repl::{ReadConsistency, Replication},
+    security::{AuthzError, Permission, Resource},
 };
 
 fn user_schema() -> TableSchema {
@@ -1059,5 +1063,250 @@ async fn explain_analyze_records_feedback_for_bad_stats() -> Result<(), Box<dyn 
     let feedback = StatsCatalog::read_feedback(repl.as_ref())?;
     assert_eq!(feedback.len(), 1);
     assert!(feedback[0].ratio >= 10.0);
+    Ok(())
+}
+
+/// Records every read it is asked about and denies catalog reads outside
+/// `allowed`, unless `allow_all` is set.
+#[derive(Default)]
+struct RecordingReadGuard {
+    allow_all: bool,
+    allowed: BTreeSet<SqlReadTarget>,
+    seen: BTreeSet<SqlReadTarget>,
+}
+
+impl RecordingReadGuard {
+    fn allowing(names: &[&str]) -> Self {
+        Self {
+            allowed: names
+                .iter()
+                .map(|name| SqlReadTarget::Catalog((*name).to_owned()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn allowing_all() -> Self {
+        Self {
+            allow_all: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl SqlReadGuard for RecordingReadGuard {
+    fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError> {
+        self.seen.extend(reads.iter().cloned());
+        for read in reads {
+            if let SqlReadTarget::Catalog(name) = read
+                && !self.allow_all
+                && !self.allowed.contains(read)
+            {
+                return Err(AuthzError::Denied {
+                    principal: "tester".to_owned(),
+                    resource: Resource::Table(name.clone()),
+                    permission: Permission::Read,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn guarded_engine() -> Result<SqlEngine, Box<dyn std::error::Error>> {
+    let mut engine = SqlEngine::new(memory_repl()?);
+    engine.create_table("public_t", Some(user_schema()), Vec::new())?;
+    engine.create_table("secrets", Some(user_schema()), Vec::new())?;
+    engine
+        .execute("insert into secrets (id, name, age, active) values (1, 'TOPSECRET', 1, true)")
+        .await?;
+    Ok(engine)
+}
+
+#[tokio::test]
+async fn read_guard_reports_planned_tables_in_subqueries() -> Result<(), Box<dyn std::error::Error>>
+{
+    let engine = guarded_engine().await?;
+    let secrets = SqlReadTarget::Catalog("secrets".to_owned());
+
+    // DataFusion plans each of these, so the guard must see `secrets`.
+    for sql in [
+        "select trim((select name from secrets limit 1)) from public_t",
+        "select name from public_t where name like (select name from secrets limit 1)",
+        "select (select name from secrets limit 1) from public_t",
+        "select name from public_t where exists (select 1 from secrets)",
+        "select name from public_t where name in (select name from secrets)",
+        "select name from public_t order by (select count(*) from secrets)",
+        "select name from public_t union select name from secrets",
+        "select n from (select name as n from secrets) as d",
+        "with \"Secrets\" as (select 1 as id) select name from secrets",
+    ] {
+        let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+        let result = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(
+            matches!(result, Err(QueryError::AuthzDenied(_))),
+            "{sql}: {result:?}"
+        );
+        assert!(guard.seen.contains(&secrets), "{sql}: {:?}", guard.seen);
+    }
+
+    // DataFusion may reject these shapes while planning; either way nothing
+    // may run unless the guard saw `secrets`.
+    for sql in [
+        "select substring((select name from secrets limit 1) from 1 for 3) from public_t",
+        "select name from public_t limit (select count(*) from secrets)",
+        "select name from public_t limit 1 offset (select count(*) from secrets)",
+        "select count(*) from public_t group by (select name from secrets limit 1)",
+        "select * from (values ((select name from secrets limit 1))) as v(leak)",
+        "select row_number() over (partition by (select name from secrets limit 1)) from public_t",
+    ] {
+        let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+        let result = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(result.is_err(), "{sql}: {result:?}");
+        assert!(
+            guard.seen.is_empty() || guard.seen.contains(&secrets),
+            "{sql}: {:?}",
+            guard.seen
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_guard_maps_scans_to_registered_names() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = guarded_engine().await?;
+    engine.register_collection(
+        "profiles",
+        CollectionId::new(7),
+        vec![super::DocField::path(
+            "city",
+            FieldPath::new(["city"]),
+            ColumnType::Str,
+        )],
+        Vec::new(),
+    )?;
+    engine.create_table("Mixed", Some(status_schema()), Vec::new())?;
+    let catalog = |name: &str| BTreeSet::from([SqlReadTarget::Catalog(name.to_owned())]);
+
+    for (sql, expected) in [
+        (
+            "with c as (select * from public_t) select * from c",
+            catalog("public_t"),
+        ),
+        ("select city from profiles", catalog("profiles")),
+        ("select status from MIXED", catalog("Mixed")),
+        ("select status from mixed", catalog("Mixed")),
+        ("select 1", BTreeSet::new()),
+        (
+            "with recursive r as (select 1 as n union all select n + 1 from r where n < 3) \
+             select * from r",
+            BTreeSet::new(),
+        ),
+    ] {
+        let mut guard = RecordingReadGuard::allowing_all();
+        engine
+            .execute_with_read_guard(sql, Some(&mut guard))
+            .await?;
+        assert_eq!(guard.seen, expected, "{sql}");
+    }
+
+    for sql in [
+        "select table_name from information_schema.tables",
+        "select * from generate_series(1, 3)",
+    ] {
+        let mut guard = RecordingReadGuard::allowing_all();
+        engine
+            .execute_with_read_guard(sql, Some(&mut guard))
+            .await?;
+        assert!(!guard.seen.is_empty(), "{sql}");
+        assert!(
+            guard
+                .seen
+                .iter()
+                .all(|read| matches!(read, SqlReadTarget::Builtin(_))),
+            "{sql}: {:?}",
+            guard.seen
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_guard_denies_before_any_statement_runs() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    let result = engine
+        .execute_with_read_guard(
+            "insert into public_t (id, name, age, active) values (1, 'Ada', 37, true); \
+             select name from secrets",
+            Some(&mut guard),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(QueryError::AuthzDenied(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        engine.execute("select id from public_t").await?,
+        SqlOutput::Rows(super::SqlRows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        })
+    );
+
+    for sql in [
+        "explain select name from secrets where id = 1",
+        "explain analyze select name from secrets where id = 1",
+    ] {
+        let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+        let result = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(
+            matches!(result, Err(QueryError::AuthzDenied(_))),
+            "{sql}: {result:?}"
+        );
+    }
+
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    assert!(matches!(
+        engine
+            .execute_with_read_guard(
+                "explain select name from public_t where id = 1",
+                Some(&mut guard)
+            )
+            .await?,
+        SqlOutput::Rows(_)
+    ));
+    assert_eq!(
+        guard.seen,
+        BTreeSet::from([SqlReadTarget::Catalog("public_t".to_owned())])
+    );
+
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    match engine
+        .execute_with_read_guard(
+            "explain select name from public_t where name like (select name from secrets)",
+            Some(&mut guard),
+        )
+        .await
+    {
+        Err(QueryError::Unsupported(message)) => {
+            assert_eq!(message, "EXPLAIN supports simple SELECT in this preview");
+        }
+        other => panic!("non-simple EXPLAIN should be unsupported, got {other:?}"),
+    }
+    assert!(guard.seen.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn datafusion_read_plans_reject_non_read_nodes() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+
+    let result = engine.execute("select name into t2 from public_t").await;
+    assert!(
+        matches!(result, Err(QueryError::Unsupported(_))),
+        "{result:?}"
+    );
     Ok(())
 }

@@ -40,7 +40,7 @@ use crate::repl::{
     Replication, WriteCondition, propose_system,
 };
 use crate::security::{
-    AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditOutcome, AuthzPolicy, Permission, Principal,
+    AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditOutcome, AuthzError, AuthzPolicy, Permission, Principal,
     PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{EngineKind, RedbEngine, StorageEngine, StorageError, WriteTransaction};
@@ -645,6 +645,382 @@ async fn multi_resource_query_with_masking_policy_fails_closed()
         error,
         DbError::Extension(ExtensionError::PolicyDenied(message))
             if message.contains("multi-resource queries")
+    ));
+    Ok(())
+}
+
+/// Each statement reads `secrets` only through the named position.
+const SECRET_SUBQUERY_SQL: &[&str] = &[
+    // TRIM / SUBSTRING / POSITION / OVERLAY
+    "SELECT trim((SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    "SELECT trim(BOTH 'x' FROM (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    "SELECT substring((SELECT ssn FROM secrets LIMIT 1) FROM 1 FOR 3) FROM public_t",
+    "SELECT position('S' IN (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    "SELECT overlay(x PLACING (SELECT ssn FROM secrets LIMIT 1) FROM 1) FROM public_t",
+    // LIKE / ILIKE / SIMILAR TO, both sides
+    "SELECT x FROM public_t WHERE x LIKE (SELECT ssn FROM secrets LIMIT 1)",
+    "SELECT x FROM public_t WHERE (SELECT ssn FROM secrets LIMIT 1) LIKE 'TOP%'",
+    "SELECT x FROM public_t WHERE x ILIKE (SELECT ssn FROM secrets LIMIT 1)",
+    "SELECT x FROM public_t WHERE (SELECT ssn FROM secrets LIMIT 1) ILIKE 'top%'",
+    "SELECT x FROM public_t WHERE x SIMILAR TO (SELECT ssn FROM secrets LIMIT 1)",
+    "SELECT x FROM public_t WHERE (SELECT ssn FROM secrets LIMIT 1) SIMILAR TO 'TOP%'",
+    // CASE operand, WHEN, THEN, ELSE
+    "SELECT CASE (SELECT ssn FROM secrets LIMIT 1) WHEN 'a' THEN 1 ELSE 0 END FROM public_t",
+    "SELECT CASE WHEN (SELECT ssn FROM secrets LIMIT 1) = 'a' THEN 1 ELSE 0 END FROM public_t",
+    "SELECT CASE WHEN x = 'hello' THEN (SELECT ssn FROM secrets LIMIT 1) END FROM public_t",
+    "SELECT CASE WHEN x = 'no' THEN 'a' ELSE (SELECT ssn FROM secrets LIMIT 1) END FROM public_t",
+    // CAST
+    "SELECT CAST((SELECT ssn FROM secrets LIMIT 1) AS TEXT) FROM public_t",
+    // IN / EXISTS / ANY
+    "SELECT x FROM public_t WHERE x IN (SELECT ssn FROM secrets)",
+    "SELECT x FROM public_t WHERE EXISTS (SELECT 1 FROM secrets WHERE ssn LIKE 'TOP%')",
+    "SELECT x FROM public_t WHERE x = ANY (SELECT ssn FROM secrets)",
+    // scalar subquery in every clause
+    "SELECT (SELECT ssn FROM secrets LIMIT 1) FROM public_t",
+    "SELECT x FROM public_t WHERE (SELECT count(*) FROM secrets) > 0",
+    "SELECT x FROM public_t GROUP BY x HAVING (SELECT count(*) FROM secrets) > 0",
+    "SELECT count(*) FROM public_t GROUP BY (SELECT ssn FROM secrets LIMIT 1)",
+    "SELECT x FROM public_t ORDER BY (SELECT ssn FROM secrets LIMIT 1)",
+    "SELECT x FROM public_t LIMIT (SELECT count(*) FROM secrets)",
+    "SELECT x FROM public_t LIMIT 10 OFFSET (SELECT count(*) FROM secrets)",
+    "SELECT count(*) FILTER (WHERE x = (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    // joins and derived tables
+    "SELECT p.x FROM public_t AS p JOIN public_t AS q ON q.x = (SELECT ssn FROM secrets LIMIT 1)",
+    "SELECT leak FROM (SELECT ssn AS leak FROM secrets) AS d",
+    // set operations
+    "SELECT x FROM public_t UNION SELECT ssn FROM secrets",
+    "SELECT x FROM public_t INTERSECT SELECT ssn FROM secrets",
+    "SELECT x FROM public_t EXCEPT SELECT ssn FROM secrets",
+    // CTE scoping
+    "WITH outer_cte AS (WITH inner_cte AS (SELECT ssn FROM secrets) SELECT ssn FROM inner_cte) \
+     SELECT ssn FROM outer_cte",
+    "WITH \"Secrets\" AS (SELECT 1 AS id, 'decoy' AS ssn) SELECT ssn FROM secrets",
+    "WITH RECURSIVE secrets AS (SELECT ssn FROM secrets) SELECT ssn FROM secrets",
+    // function arguments
+    "SELECT coalesce(NULL, (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    "SELECT concat(x, (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    // window specifications
+    "SELECT row_number() OVER (PARTITION BY (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    "SELECT row_number() OVER (ORDER BY (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+    // VALUES, ARRAY, COLLATE
+    "SELECT * FROM (VALUES ((SELECT ssn FROM secrets LIMIT 1))) AS v(leak)",
+    "VALUES ((SELECT ssn FROM secrets LIMIT 1))",
+    "SELECT ARRAY[(SELECT ssn FROM secrets LIMIT 1)] FROM public_t",
+    "SELECT (SELECT ssn FROM secrets LIMIT 1) COLLATE \"C\" FROM public_t",
+];
+
+fn public_reader_database() -> Result<(Database, Principal), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_sql_authz_tables(&mut database)?;
+    database
+        .set_authz_policy(AuthzPolicy::new([Role::new("public_reader")
+            .grant(Resource::Table("public_t".to_owned()), Permission::Read)]));
+    Ok((database, Principal::new("alice").with_role("public_reader")))
+}
+
+#[tokio::test]
+async fn sql_read_authz_denies_secret_subqueries_in_every_position()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, reader) = public_reader_database()?;
+
+    for sql in SECRET_SUBQUERY_SQL {
+        assert_secrets_read_denied(sql, database.query_as(&reader, sql).await);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_denies_secret_subqueries_as_of() -> Result<(), Box<dyn std::error::Error>> {
+    let (database, reader) = public_reader_database()?;
+    let lsn = latest_lsn(&database)?;
+
+    for sql in SECRET_SUBQUERY_SQL {
+        assert_secrets_read_denied(
+            sql,
+            database
+                .query_as_of_as(&reader, sql, TemporalPoint::Lsn(lsn))
+                .await,
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_denies_secret_subqueries_in_explain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, reader) = public_reader_database()?;
+    let queries = [
+        "SELECT trim((SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+        "SELECT x FROM public_t WHERE x LIKE (SELECT ssn FROM secrets LIMIT 1)",
+        "SELECT x FROM public_t ORDER BY (SELECT ssn FROM secrets LIMIT 1)",
+        "SELECT x FROM public_t LIMIT (SELECT count(*) FROM secrets)",
+        "WITH \"Secrets\" AS (SELECT 1 AS id, 'decoy' AS ssn) SELECT ssn FROM secrets",
+        "SELECT x FROM public_t UNION SELECT ssn FROM secrets",
+        "SELECT x FROM public_t WHERE EXISTS (SELECT 1 FROM secrets)",
+        "SELECT * FROM (VALUES ((SELECT ssn FROM secrets LIMIT 1))) AS v(leak)",
+        "SELECT row_number() OVER (PARTITION BY (SELECT ssn FROM secrets LIMIT 1)) FROM public_t",
+        "SELECT ssn FROM secrets WHERE id = 1",
+    ];
+
+    for prefix in ["EXPLAIN ", "EXPLAIN ANALYZE "] {
+        for query in queries {
+            let sql = format!("{prefix}{query}");
+            assert_secrets_read_denied(&sql, database.query_as(&reader, &sql).await);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_checks_planned_tables_not_spelled_names()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_sql_authz_tables(&mut database)?;
+    // Grants keyed by a spelling DataFusion folds to another catalog name must
+    // not authorize the object the query actually reads.
+    database.set_authz_policy(AuthzPolicy::new([Role::new("spelled")
+        .grant(Resource::Table("public_t".to_owned()), Permission::Read)
+        .grant(Resource::Table("public_t".to_owned()), Permission::Write)
+        .grant(Resource::Table("SECRETS".to_owned()), Permission::Read)]));
+    let reader = Principal::new("alice").with_role("spelled");
+    let lsn = latest_lsn(&database)?;
+
+    let error = match database.query_as(&reader, "SELECT ssn FROM SECRETS").await {
+        Ok(output) => panic!("case-variant grant leaked secrets: {output:?}"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "authorization denied: principal alice lacks Read on Table(\"secrets\")"
+    );
+    assert_secrets_read_denied("SELECT ssn FROM SECRETS", Err(error));
+    assert_secrets_read_denied(
+        "SELECT ssn FROM SECRETS AS OF",
+        database
+            .query_as_of_as(&reader, "SELECT ssn FROM SECRETS", TemporalPoint::Lsn(lsn))
+            .await,
+    );
+
+    let audit = database.audit_events()?;
+    for action in ["query", "query_as_of"] {
+        assert!(audit.iter().any(|event| {
+            event.principal.as_deref() == Some("alice")
+                && event.action == action
+                && event.outcome == AuditOutcome::Denied
+                && event.resource == Resource::Table("secrets".to_owned())
+        }));
+    }
+
+    let batch = "INSERT INTO public_t (id, x) VALUES (2, 'new'); SELECT ssn FROM SECRETS";
+    assert_secrets_read_denied(batch, database.query_as(&reader, batch).await);
+    assert_eq!(
+        database.query("SELECT count(*) FROM public_t").await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["count(*)".to_owned()],
+            rows: vec![vec![Value::Int(1)]],
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_maps_catalog_object_kinds_through_plan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_sql_authz_tables(&mut database)?;
+    let profiles = database.create_collection(
+        "profiles",
+        CollectionId::new(7),
+        user_doc_fields(),
+        Vec::new(),
+    )?;
+    profiles.insert(&user_document(1, Some(Value::Str("Warsaw".to_owned()))))?;
+    database.enable_system_versioning("secrets", TemporalRetention::default())?;
+    let reader = Principal::new("alice").with_role("spelled");
+
+    database.set_authz_policy(AuthzPolicy::new([Role::new("spelled")
+        .grant(Resource::Table("PROFILES".to_owned()), Permission::Read)
+        .grant(
+            Resource::Table("SECRETS_HISTORY".to_owned()),
+            Permission::Read,
+        )]));
+    assert!(matches!(
+        database.query_as(&reader, "SELECT city FROM PROFILES").await,
+        Err(DbError::AuthzDenied(AuthzError::Denied {
+            resource: Resource::Collection(name),
+            permission: Permission::Read,
+            ..
+        })) if name == "profiles"
+    ));
+    assert!(matches!(
+        database.query_as(&reader, "SELECT * FROM SECRETS_HISTORY").await,
+        Err(DbError::AuthzDenied(AuthzError::Denied {
+            resource: Resource::Table(name),
+            permission: Permission::Read,
+            ..
+        })) if name == "secrets_history"
+    ));
+
+    database.set_authz_policy(AuthzPolicy::new([Role::new("spelled")
+        .grant(Resource::Table("PROFILES".to_owned()), Permission::Read)
+        .grant(
+            Resource::Collection("profiles".to_owned()),
+            Permission::Read,
+        )]));
+    assert_eq!(
+        database
+            .query_as(&reader, "SELECT city FROM PROFILES")
+            .await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["city".to_owned()],
+            rows: vec![vec![Value::Str("Warsaw".to_owned())]],
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_allows_authorized_queries() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_sql_authz_tables(&mut database)?;
+    let other = database.create_table("other_t", Some(public_schema()), Vec::new())?;
+    other.insert(vec![Value::Int(1), Value::Str("hello".to_owned())])?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("reader")
+        .grant(Resource::Table("public_t".to_owned()), Permission::Read)
+        .grant(Resource::Table("other_t".to_owned()), Permission::Read)]));
+    let reader = Principal::new("alice").with_role("reader");
+    let hello = vec![vec![Value::Str("hello".to_owned())]];
+
+    for sql in [
+        "SELECT x FROM public_t",
+        "SELECT x FROM public_t WHERE id = 1",
+        "SELECT public_t.x FROM public_t JOIN other_t ON public_t.id = other_t.id",
+        "WITH recent AS (SELECT id, x FROM public_t) \
+         SELECT recent.x FROM recent JOIN other_t ON recent.id = other_t.id",
+        "WITH \"Recent\" AS (SELECT x FROM public_t) SELECT x FROM \"Recent\"",
+        "WITH recent AS (SELECT x FROM public_t) SELECT x FROM RECENT",
+        "SELECT x FROM public_t WHERE x LIKE (SELECT x FROM other_t LIMIT 1)",
+        "SELECT x FROM public_t ORDER BY (SELECT count(*) FROM other_t)",
+    ] {
+        match database.query_as(&reader, sql).await {
+            Ok(SqlOutput::Rows(rows)) => assert_eq!(rows.rows, hello, "{sql}"),
+            other => panic!("{sql} should return rows, got {other:?}"),
+        }
+    }
+
+    assert!(matches!(
+        database
+            .query_as(&reader, "EXPLAIN SELECT x FROM public_t WHERE id = 1")
+            .await?,
+        SqlOutput::Rows(_)
+    ));
+    let lsn = latest_lsn(&database)?;
+    match database
+        .query_as_of_as(&reader, "SELECT x FROM public_t", TemporalPoint::Lsn(lsn))
+        .await?
+    {
+        SqlOutput::Rows(rows) => assert_eq!(rows.rows, hello),
+        SqlOutput::AffectedRows(rows) => panic!("expected rows, got {rows} affected rows"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_policies_see_subquery_tables() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut database)?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("reader")
+        .grant(Resource::Table("users".to_owned()), Permission::Read)
+        .grant(Resource::Table("orders".to_owned()), Permission::Read)]));
+    database.set_policy_config(&PolicyConfig {
+        validations: Vec::new(),
+        masking: vec![MaskingPolicy {
+            resource: Resource::Table("users".to_owned()),
+            paths: vec![FieldPath::new(["name"])],
+            replacement: Value::Str("***".to_owned()),
+        }],
+        row_policies: Vec::new(),
+        limits: LimitPolicy::default(),
+    })?;
+    let reader = Principal::new("alice").with_role("reader");
+
+    assert_eq!(
+        database
+            .query_as(
+                &reader,
+                "WITH c AS (SELECT name FROM users WHERE age = 37) SELECT name FROM c"
+            )
+            .await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["name".to_owned()],
+            rows: vec![vec![Value::Str("***".to_owned())]],
+        })
+    );
+
+    // `orders` is read only in a clause the old AST walk ignored.
+    let error = match database
+        .query_as(
+            &reader,
+            "SELECT name FROM users WHERE age = 37 ORDER BY (SELECT count(*) FROM orders)",
+        )
+        .await
+    {
+        Ok(output) => panic!("subquery read of another table should fail closed: {output:?}"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DbError::Extension(ExtensionError::PolicyDenied(message))
+            if message.contains("multi-resource queries")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_pre_check_fails_closed_on_unknown_relations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, reader) = public_reader_database()?;
+
+    assert!(matches!(
+        database
+            .query_as(
+                &reader,
+                "SELECT x FROM public_t WHERE x LIKE (SELECT u FROM UNNEST(ARRAY['a']) AS t(u))"
+            )
+            .await,
+        Err(DbError::Query(QueryError::Unsupported(_)))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn temporal_retention_sees_subquery_tables() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let users = database.create_table("users", Some(account_schema()), Vec::new())?;
+    users.insert(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(37),
+    ])?;
+    let lsn = latest_lsn(&database)?;
+    database.enable_system_versioning(
+        "users",
+        TemporalRetention {
+            min_lsn: lsn + 1,
+            keep_history: true,
+        },
+    )?;
+
+    assert!(matches!(
+        database
+            .query_as_of(
+                "SELECT trim((SELECT name FROM users LIMIT 1))",
+                TemporalPoint::Lsn(lsn)
+            )
+            .await,
+        Err(DbError::Temporal(
+            crate::temporal::TemporalError::RetentionExpired { .. }
+        ))
     ));
     Ok(())
 }
@@ -2935,6 +3311,46 @@ fn seed_orders(database: &mut Database) -> Result<(), Box<dyn std::error::Error>
     orders.insert(vec![Value::Int(12), Value::Int(2), Value::Float(3.0)])?;
 
     Ok(())
+}
+
+fn public_schema() -> TableSchema {
+    TableSchema::new(
+        vec![
+            ColumnDef::new("id", ColumnType::Int, false),
+            ColumnDef::new("x", ColumnType::Str, false),
+        ],
+        0,
+    )
+}
+
+fn secret_schema() -> TableSchema {
+    TableSchema::new(
+        vec![
+            ColumnDef::new("id", ColumnType::Int, false),
+            ColumnDef::new("ssn", ColumnType::Str, false),
+        ],
+        0,
+    )
+}
+
+fn seed_sql_authz_tables(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    let public = database.create_table("public_t", Some(public_schema()), Vec::new())?;
+    let secrets = database.create_table("secrets", Some(secret_schema()), Vec::new())?;
+    public.insert(vec![Value::Int(1), Value::Str("hello".to_owned())])?;
+    secrets.insert(vec![Value::Int(1), Value::Str("TOPSECRETVALUE".to_owned())])?;
+    Ok(())
+}
+
+fn assert_secrets_read_denied(sql: &str, result: Result<SqlOutput, DbError>) {
+    match result {
+        Err(DbError::AuthzDenied(AuthzError::Denied {
+            resource: Resource::Table(name),
+            permission: Permission::Read,
+            ..
+        })) if name == "secrets" => {}
+        Ok(output) => panic!("{sql} leaked data it may not read: {output:?}"),
+        Err(error) => panic!("{sql} should be denied Read on secrets, got {error}"),
+    }
 }
 
 fn city_path() -> FieldPath {

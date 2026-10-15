@@ -123,6 +123,18 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- SQL reads under RBAC (pgwire with RBAC, Control Plane `/sql`, `query_as`,
+  `query_as_of_as`) are authorized against the planned query, including every
+  subquery and CTE, before anything executes; a multi-statement batch runs
+  nothing until all of its reads are authorized. Collections need Collection
+  read; tables, foreign tables, materialized views and `*_history` tables need
+  Table read, keyed by the catalog name the query resolves to. Queries that
+  scan no catalog object (`SELECT 1`, `VALUES`), relations outside the catalog
+  (`information_schema`, table functions such as `generate_series`) and
+  recursive CTEs need Database read. SQL shapes the RBAC pre-check cannot
+  analyse fail closed as unsupported SQL, and row/masking policies cover every
+  table the plan reads, so a query touching a policy-protected resource plus
+  any other table is rejected.
 
 ## Migration Guide
 
