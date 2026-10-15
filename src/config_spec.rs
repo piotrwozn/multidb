@@ -2948,14 +2948,22 @@ const CONSISTENCY_DOMAIN_DEFINITIONS: &[ConsistencyDomainDefinition] = &[
             "quorum-oriented consistency boundary",
             "local/process cluster smoke coverage",
         ],
-        limits: &["Kubernetes automation, multi-region placement and SLA are separate concerns"],
+        limits: &[
+            "Kubernetes automation, multi-region placement and SLA are separate concerns",
+            "multi-node replication runs only through the live repl::start_cp_cluster runtime; \
+             embedded Database cluster constructors fail closed",
+        ],
     },
     ConsistencyDomainDefinition {
         mode: ConsistencyMode::EventualAp,
         slug: "eventual_ap",
         status: SupportStatus::Experimental,
         guarantees: &["available-write intent", "eventual convergence boundary"],
-        limits: &["conflict policy must be validated by workload-specific review"],
+        limits: &[
+            "conflict policy must be validated by workload-specific review",
+            "AP databases reject commit-log features: changefeeds, subscriptions, materialized \
+             views, system versioning and incremental backup",
+        ],
     },
 ];
 
