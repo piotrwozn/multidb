@@ -9,9 +9,10 @@ use serde::{
 };
 
 use super::{
-    CertificationImpact, CollectionRole, ConsistencyMode, DatabaseSpec, ProfileSpec, SupportStatus,
-    ValidationIssue, ValidationSeverity, built_in_profile, built_in_profiles, hex_prefix,
-    knobs::KNOB_REGISTRY, suggest, update_hash_with_json, validation_issue,
+    CertificationImpact, CollectionRole, ConsistencyMode, DATABASE_SPEC_VERSION_V2, DatabaseSpec,
+    ProfileSpec, SupportStatus, ValidationIssue, ValidationSeverity, built_in_profile,
+    built_in_profiles, hex_prefix, knobs::KNOB_REGISTRY, suggest, update_hash_with_json,
+    validation_issue,
 };
 use crate::{
     db::Profile,
@@ -19,8 +20,6 @@ use crate::{
     query::TableLayout,
 };
 
-/// First `DatabaseSpec` version whose profile checks are strict (Errors instead of Warnings).
-const STRICT_SPEC_VERSION: u32 = 2;
 /// Maximum length of `custom_profile.description`, in characters.
 const MAX_DESCRIPTION_CHARS: usize = 500;
 /// Maximum edit distance for did-you-mean suggestions.
@@ -792,7 +791,7 @@ pub const fn profile_variants() -> &'static [ProfileVariant] {
 #[must_use]
 pub fn resolve_profile(spec: &DatabaseSpec) -> ProfileResolution {
     let context = ResolveContext {
-        strict: spec.version >= STRICT_SPEC_VERSION,
+        strict: spec.version >= DATABASE_SPEC_VERSION_V2,
         storage_path: spec.deployment.storage_path.as_deref(),
     };
 

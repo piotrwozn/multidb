@@ -1,0 +1,82 @@
+version: 2
+name: orders
+profile: orders_durable
+custom_profile:
+  extends: high_durability
+  description: Durable order store with zstd and a larger cache.
+  knobs:
+    compression:
+      algorithm: zstd
+      zstd_level: 3
+      min_bytes: 512
+    cache:
+      max_entries: 8192
+    query:
+      max_concurrent_queries: auto
+      timeout_ms: 10000
+    history:
+      system_versioning: typed_tables
+      keep_history: true
+  floors:
+    audit: true
+    backup: true
+  compatible_roles:
+    add:
+    - time_series
+deployment:
+  mode: single_node
+  storage_path: orders.redb
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: true
+    pitr: false
+  encryption:
+    at_rest: false
+  audit:
+    enabled: true
+  sensitive_data: false
+  strict_cross_domain_transactions: false
+domains:
+- name: primary
+  mode: strong_cp
+collections:
+- name: orders
+  role: document_entity
+  domain: primary
+  indexes:
+  - document
+- name: order_events
+  role: event_log
+  domain: primary
+  indexes:
+  - primary
+- name: audit_log
+  role: audit
+  domain: primary
+  indexes:
+  - primary
+- name: order_metrics
+  role: time_series
+  domain: primary
+  indexes:
+  - time_series
+extensions:
+- name: audit
+  version: 1.0.0
+  stability: stable
+- name: cdc
+  version: 1.0.0
+  stability: stable
+- name: document_index
+  version: 1.0.0
+  stability: stable
+- name: time_series
+  version: 1.0.0
+  stability: stable
+overrides: {}
+operation_hints: {}

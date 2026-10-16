@@ -24,6 +24,7 @@ use multidb::{
         ReplicationMode, TopologySpec, ValidationReport, ValidationSeverity, built_in_profile,
         built_in_profiles, collection_role_definition, collection_role_definitions,
         consistency_domain_definition, consistency_domain_definitions,
+        spec_io::{self, SpecIoError},
     },
     db::{DbConfig, DbError, Profile, create_database, open_database},
     migration::{
@@ -197,7 +198,10 @@ fn run_config(args: &[String]) -> Result<CliRun, CliError> {
 fn run_config_validate(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
-    let spec = read_spec_file(&spec_path)?;
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
     let report = GuaranteeValidator::validate(&spec);
     let message = if output == "json" {
         serde_json::to_string_pretty(&report)?
@@ -211,7 +215,10 @@ fn run_config_validate(args: &[String]) -> Result<CliRun, CliError> {
 fn run_config_explain(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
-    let spec = read_spec_file(&spec_path)?;
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
     let report = ConfigExplainer::explain(&spec);
     let message = if output == "json" {
         serde_json::to_string_pretty(&report)?
@@ -226,8 +233,26 @@ fn run_config_plan(args: &[String]) -> Result<CliRun, CliError> {
     let current_path = PathBuf::from(required_value(args, "--current")?);
     let desired_path = PathBuf::from(required_value(args, "--desired")?);
     let output = output_format(args)?;
-    let current = read_spec_file(&current_path)?;
-    let desired = read_spec_file(&desired_path)?;
+    let current = match read_spec_file(&current_path)? {
+        Ok(spec) => spec,
+        Err(report) => {
+            return spec_report_run(
+                &report,
+                &output,
+                Some(("--current", current_path.as_path())),
+            );
+        }
+    };
+    let desired = match read_spec_file(&desired_path)? {
+        Ok(spec) => spec,
+        Err(report) => {
+            return spec_report_run(
+                &report,
+                &output,
+                Some(("--desired", desired_path.as_path())),
+            );
+        }
+    };
     let plan = MigrationPlanner::plan(&current, &desired);
     let message = if let Some(out_path) = optional_value(args, "--out") {
         let out_path = PathBuf::from(out_path);
@@ -1439,13 +1464,42 @@ fn output_format(args: &[String]) -> Result<String, CliError> {
     Ok(output)
 }
 
-fn read_spec_file(path: &Path) -> Result<DatabaseSpec, CliError> {
-    let input = std::fs::read_to_string(path)?;
-    if is_yaml_path(path) {
-        serde_norway::from_str(&input).map_err(Into::into)
-    } else {
-        serde_json::from_str(&input).map_err(Into::into)
+/// Reads a spec through `config_spec::spec_io` (1 MiB cap, version peek, bounded YAML aliases).
+/// Size and version problems come back as a validation report (exit 2); I/O, syntax and decode
+/// errors stay CLI errors (exit 1), as before.
+fn read_spec_file(path: &Path) -> Result<Result<DatabaseSpec, ValidationReport>, CliError> {
+    match spec_io::read_spec_file(path) {
+        Ok(spec) => Ok(Ok(spec)),
+        Err(error) => {
+            if let Some(report) = error.validation_report() {
+                return Ok(Err(report));
+            }
+            Err(match error {
+                SpecIoError::Io(error) => CliError::Io(error),
+                SpecIoError::Yaml(error) => CliError::Yaml(error),
+                SpecIoError::Json(error) => CliError::Json(error),
+                other => CliError::Runtime(other.to_string()),
+            })
+        }
     }
+}
+
+/// Prints the report of a spec that could not be decoded, with exit code 2.
+fn spec_report_run(
+    report: &ValidationReport,
+    output: &str,
+    source: Option<(&str, &Path)>,
+) -> Result<CliRun, CliError> {
+    let message = if output == "json" {
+        serde_json::to_string_pretty(report)?
+    } else {
+        let text = format_validation_report(report);
+        match source {
+            Some((flag, path)) => format!("{flag} {}\n{text}", path.display()),
+            None => text,
+        }
+    };
+    Ok(CliRun::validation(message, false))
 }
 
 fn read_json_file<T>(path: &Path) -> Result<T, CliError>
@@ -2258,6 +2312,127 @@ mod tests {
         let plan = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(out_path)?)?;
         assert!(plan["plan_id"].as_str().is_some());
         assert!(plan["steps"].as_array().is_some());
+        Ok(())
+    }
+
+    fn run_validate(path: &std::path::Path, json: bool) -> Result<super::CliRun, CliError> {
+        let mut args = vec![
+            "config".to_owned(),
+            "validate".to_owned(),
+            "--spec".to_owned(),
+            path.display().to_string(),
+        ];
+        if json {
+            args.push("--json".to_owned());
+        }
+        run(args)
+    }
+
+    #[test]
+    fn config_validate_reports_oversized_specs_as_invalid() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("huge.yaml");
+        let mut yaml = serde_norway::to_string(&DatabaseSpec::from_db_config(
+            "huge",
+            &DbConfig::on_disk(Profile::Balanced, "huge.redb"),
+        ))?;
+        yaml.push_str(&"#".repeat(multidb::config_spec::spec_io::MAX_SPEC_BYTES));
+        std::fs::write(&spec_path, yaml)?;
+
+        let text = run_validate(&spec_path, false)?;
+        let json = run_validate(&spec_path, true)?;
+
+        assert_eq!(text.exit_code, 2);
+        assert!(text.message.contains("valid=false"), "{}", text.message);
+        assert!(text.message.contains("SPEC_TOO_LARGE"), "{}", text.message);
+        assert_eq!(json.exit_code, 2);
+        let report = serde_json::from_str::<serde_json::Value>(&json.message)?;
+        assert_eq!(report["valid"], false);
+        assert_eq!(report["issues"][0]["code"], "SPEC_TOO_LARGE");
+        Ok(())
+    }
+
+    #[test]
+    fn config_commands_report_unsupported_versions() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let current_path = temp.path().join("current.json");
+        let desired_path = temp.path().join("desired.json");
+        let current = DatabaseSpec::from_db_config(
+            "versions",
+            &DbConfig::on_disk(Profile::Balanced, "versions.redb"),
+        );
+        let mut desired = serde_json::to_value(&current)?;
+        desired["version"] = serde_json::json!(3);
+        write_spec(&current_path, &current)?;
+        std::fs::write(&desired_path, serde_json::to_string_pretty(&desired)?)?;
+
+        let validate = run_validate(&desired_path, true)?;
+        assert_eq!(validate.exit_code, 2);
+        let report = serde_json::from_str::<serde_json::Value>(&validate.message)?;
+        assert_eq!(report["issues"][0]["code"], "UNSUPPORTED_VERSION");
+
+        let explain = run(vec![
+            "explain".to_owned(),
+            "config".to_owned(),
+            "--spec".to_owned(),
+            desired_path.display().to_string(),
+        ])?;
+        assert_eq!(explain.exit_code, 2);
+        assert!(explain.message.contains("UNSUPPORTED_VERSION"));
+
+        let plan = run(vec![
+            "config".to_owned(),
+            "plan".to_owned(),
+            "--current".to_owned(),
+            current_path.display().to_string(),
+            "--desired".to_owned(),
+            desired_path.display().to_string(),
+        ])?;
+        assert_eq!(plan.exit_code, 2);
+        assert!(plan.message.starts_with("--desired "), "{}", plan.message);
+        assert!(
+            plan.message.contains("UNSUPPORTED_VERSION"),
+            "{}",
+            plan.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_validate_accepts_v2_custom_profiles() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("custom.yaml");
+        let mut spec = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        spec.version = 2;
+        spec.profile = "orders_durable".to_owned();
+        spec.custom_profile = Some(serde_json::from_value(serde_json::json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        }))?);
+        write_yaml_spec(&spec_path, &spec)?;
+
+        let outcome = run_validate(&spec_path, false)?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        assert!(outcome.message.contains("valid=true status=Custom"));
+        assert!(outcome.message.contains("CUSTOM_PROFILE_DEFINED"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_validate_keeps_yaml_syntax_errors_as_cli_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("broken.yaml");
+        std::fs::write(&spec_path, "version: 1\nname: [unclosed\n")?;
+
+        let error = run_validate(&spec_path, false);
+
+        assert!(matches!(error, Err(CliError::Yaml(_))), "{error:?}");
         Ok(())
     }
 

@@ -35,8 +35,9 @@ use crate::{
     compat::SERVER_VERSION,
     config_spec::{
         ApplyCheckReport, ApplyStatus, DatabaseSpec, GuaranteeValidator, MigrationPlan,
-        MigrationPlanner, built_in_profiles, collection_role_definitions,
+        MigrationPlanner, ValidationReport, built_in_profiles, collection_role_definitions,
         consistency_domain_definition, consistency_domain_definitions, extension_catalog_entries,
+        spec_io::{self, SpecIoError},
     },
     db::{AdminCredentialRecord, CatalogEntry, Database, DbError, Profile, ReplicationKind},
     geo::GeoIndexConfig,
@@ -2358,14 +2359,23 @@ async fn audit_handler(State(state): State<AdminState>, headers: HeaderMap) -> R
 async fn config_validate_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<DatabaseSpec>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_token(&state, &headers) {
         return response;
     }
-    let Json(spec) = match body {
+    let Json(value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
+    };
+    let spec = match spec_io::decode_spec_value(value) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return match error.validation_report() {
+                Some(report) => api_ok(StatusCode::UNPROCESSABLE_ENTITY, report),
+                None => invalid_spec_json(&error),
+            };
+        }
     };
     let report = GuaranteeValidator::validate(&spec);
     let status = if report.valid {
@@ -2379,16 +2389,25 @@ async fn config_validate_handler(
 async fn config_plan_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<ConfigPlanRequest>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_token(&state, &headers) {
         return response;
     }
-    let Json(request) = match body {
+    let Json(mut value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let plan = MigrationPlanner::plan(&request.current, &request.desired);
+    // The body is a ConfigPlanRequest; each side is decoded through spec_io.
+    let current = match decode_plan_side(&mut value, "current") {
+        Ok(spec) => spec,
+        Err(error) => return plan_side_error("current", error),
+    };
+    let desired = match decode_plan_side(&mut value, "desired") {
+        Ok(spec) => spec,
+        Err(error) => return plan_side_error("desired", error),
+    };
+    let plan = MigrationPlanner::plan(&current, &desired);
     let status = if plan.valid {
         StatusCode::OK
     } else {
@@ -3007,6 +3026,53 @@ fn invalid_json(error: &JsonRejection) -> Response {
         "invalid_json",
         format!("invalid JSON request body: {error}"),
     )
+}
+
+/// A spec body that is valid JSON but not a `DatabaseSpec` keeps today's 400 `invalid_json`.
+fn invalid_spec_json(error: &SpecIoError) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+        format!("invalid JSON request body: {error}"),
+    )
+}
+
+/// Decodes one side of a `ConfigPlanRequest`; the error is `None` when the field is missing.
+fn decode_plan_side(
+    value: &mut JsonValue,
+    side: &str,
+) -> Result<DatabaseSpec, Option<SpecIoError>> {
+    let spec = value.get_mut(side).map(JsonValue::take).ok_or(None)?;
+    spec_io::decode_spec_value(spec).map_err(Some)
+}
+
+/// A missing side or a decode error is 400 `invalid_json`; a version error cannot become a
+/// `MigrationPlan`, so it is 422 `invalid_spec_version` carrying the report.
+fn plan_side_error(side: &str, error: Option<SpecIoError>) -> Response {
+    let Some(error) = error else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            format!("invalid JSON request body: missing field `{side}`"),
+        );
+    };
+    match error.validation_report() {
+        Some(report) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_spec_version",
+            format!("{side}: {}", describe_report(&report)),
+        ),
+        None => invalid_spec_json(&error),
+    }
+}
+
+fn describe_report(report: &ValidationReport) -> String {
+    report
+        .issues
+        .iter()
+        .map(|issue| format!("{} at {}: {}", issue.code, issue.path, issue.message))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn invalid_json_value(message: impl Into<String>) -> Response {
@@ -4005,6 +4071,119 @@ mod tests {
             )?)
             .await?;
         assert_eq!(plan.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_v2_and_reports_version_problems_as_422()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        let mut custom = serde_json::to_value(&base)?;
+        custom["version"] = serde_json::json!(2);
+        custom["profile"] = serde_json::json!("orders_durable");
+        custom["custom_profile"] = serde_json::json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        });
+        let mut version_3 = serde_json::to_value(&base)?;
+        version_3["version"] = serde_json::json!(3);
+        let mut missing = serde_json::to_value(&base)?;
+        missing
+            .as_object_mut()
+            .ok_or("spec must be an object")?
+            .remove("version");
+        let mut unknown_field = serde_json::to_value(&base)?;
+        unknown_field["unexpected"] = serde_json::json!(true);
+
+        let post = |body: serde_json::Value| async move {
+            super::router(test_state()?)
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/config/validate",
+                    Some(&body),
+                )?)
+                .await
+                .map_err(Box::<dyn std::error::Error>::from)
+        };
+
+        let accepted = post(custom).await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = json_body(accepted).await?;
+        assert_eq!(body["data"]["valid"], true);
+        assert_eq!(body["data"]["status"], "custom");
+
+        for (body, code) in [
+            (version_3, "UNSUPPORTED_VERSION"),
+            (missing, "MISSING_VERSION"),
+        ] {
+            let response = post(body).await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["data"]["valid"], false);
+            assert_eq!(body["data"]["issues"][0]["code"], code);
+        }
+
+        let rejected = post(unknown_field).await?;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(rejected).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_json");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_reports_unsupported_versions_and_missing_sides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = DatabaseSpec::from_db_config(
+            "current",
+            &DbConfig::on_disk(Profile::Balanced, "current.redb"),
+        );
+        let mut desired = serde_json::to_value(&current)?;
+        desired["version"] = serde_json::json!(3);
+
+        let response = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&serde_json::json!({ "current": current, "desired": desired })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_spec_version");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("desired: UNSUPPORTED_VERSION"),
+            "{message}"
+        );
+
+        let missing = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&serde_json::json!({ "current": current })),
+            )?)
+            .await?;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(missing).await?;
+        assert_eq!(body["error"]["code"], "invalid_json");
+
+        let same = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&ConfigPlanRequest {
+                    current: current.clone(),
+                    desired: current,
+                }),
+            )?)
+            .await?;
+        assert_eq!(same.status(), StatusCode::OK);
         Ok(())
     }
 

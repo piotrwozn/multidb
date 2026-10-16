@@ -7,11 +7,14 @@ knob registry and the resolver that turns a `DatabaseSpec` into concrete knobs.
 Status in this build: the model, the knob registry and the resolver are a Rust
 API in `multidb::config_spec` (`resolve_profile`, `resolve_named_profile`,
 `ResolvedProfile::performance_config`, `KNOB_REGISTRY`,
-`parse_knob_assignment`). Spec validation accepts only version 1 documents,
-and a version 1 document that sets `custom_profile` fails with
-`FIELD_REQUIRES_SPEC_V2`. Validation, explain, the CLI, `serve` and the
-Control Plane do not consume resolved knobs yet, so existing version 1 specs
-validate, explain and plan exactly as before.
+`parse_knob_assignment`). Specs may declare version 1 or 2; `custom_profile`
+is a version 2 field. `multidb config validate`, `config explain`,
+`config plan` and the Control Plane `/config/validate` and `/config/plan`
+resolve the profile of every spec, report its issues and explain every knob.
+Nothing in the CLI, `serve` or the Control Plane creates a database from a
+spec: resolved knobs are reported there, not applied. Existing version 1
+specs keep their validation issues, serialization and plan ids; they only gain
+new Advice and Warnings.
 
 ## Model
 
@@ -168,7 +171,8 @@ The resolver never touches a database. For a spec without `custom_profile`:
   with a did-you-mean suggestion (for example `secure-app` suggests
   `secure_app`).
 
-For a custom profile (version 2 only):
+For a custom profile (version 2 only; a version 1 document that sets
+`custom_profile` fails with `FIELD_REQUIRES_SPEC_V2` at `custom_profile`):
 
 | code | severity | rule |
 | --- | --- | --- |
@@ -197,3 +201,147 @@ variant columns (`storage.*`, `durability.*`, `cache.*`,
 `override` for leaves a custom profile sets. Its digest is `prof_` followed by
 32 hex characters of blake3 over the knobs and the storage `Profile`, so equal
 knobs always give the same digest on every machine.
+
+## Spec version 2 and `custom_profile`
+
+A version 2 `DatabaseSpec` is a version 1 spec with `version: 2` and an
+optional `custom_profile` block. The required fields are the same, and nothing
+else changes meaning. `examples/custom-profile/multidb.yaml` is a complete
+example:
+
+```yaml
+version: 2
+name: orders
+profile: orders_durable
+custom_profile:
+  extends: high_durability          # alias -> secure_app with two-phase commit
+  description: Durable order store with zstd and a larger cache.
+  knobs:
+    compression: { algorithm: zstd, zstd_level: 3, min_bytes: 512 }
+    cache: { max_entries: 8192 }
+    query: { max_concurrent_queries: auto, timeout_ms: 10000 }
+    history: { system_versioning: typed_tables, keep_history: true }
+  floors: { audit: true, backup: true }
+  compatible_roles: { add: [time_series] }
+deployment: { mode: single_node, storage_path: orders.redb }
+# defaults, guarantees, domains, collections, extensions, overrides and
+# operation_hints exactly as in version 1
+```
+
+It validates as `valid=true status=Custom`, with storage class
+HighDurability. Provenance marks compression, cache, query and history as
+`override` and the other leaves as `variant` or `preset`.
+
+- **`profile`** is the custom slug. It must match `^[a-z][a-z0-9_]{2,63}$` and
+  must not equal a built-in slug or alias after normalisation.
+- **`extends`** names one built-in product slug (its canonical variant) or
+  alias (that variant), in snake or kebab case. Custom profiles cannot extend
+  each other.
+- **`knobs`** overrides leaves of the knob reference above. Absent leaves
+  inherit the extended variant; an unknown leaf fails to decode and names its
+  path, for example `unknown field max_entires`.
+- **`floors`** may only raise the floors of the extended profile
+  (`PROFILE_FLOOR_WEAKENED` otherwise). Validation checks each floor against
+  its guarantee: `audit` against `guarantees.audit.enabled`, `backup` against
+  `guarantees.backup.enabled`, `pitr` against `guarantees.backup.pitr` and
+  `encryption_at_rest` against `guarantees.encryption.at_rest`. An unmet floor
+  is the Error `GUARANTEE_BELOW_PROFILE_FLOOR`; profiles of production_cp keep
+  the historic `PRODUCTION_BACKUP_DISABLED` for the backup floor.
+- **`compatible_roles`** adds and removes collection roles; collections with
+  other roles get `ROLE_OUTSIDE_PROFILE_CERTIFICATION`, as for built-ins.
+
+### Version 1 and version 2 severities
+
+New checks never make a version 1 document that decoded before invalid:
+
+| check | version 1 | version 2 |
+| --- | --- | --- |
+| unknown profile name | `CUSTOM_PROFILE` Warning (unchanged) plus `PROFILE_NOT_PROVISIONABLE` Advice | `PROFILE_UNKNOWN` Error with a did-you-mean |
+| volatile medium with a `storage_path` | `PROFILE_DEPLOYMENT_MISMATCH` Warning | `PROFILE_DEPLOYMENT_MISMATCH` Error |
+| knob-like `overrides` keys | `OVERRIDE_IS_METADATA_ONLY` Advice | `OVERRIDE_SHADOWS_TYPED_KNOB` Error |
+| `custom_profile` | `FIELD_REQUIRES_SPEC_V2` Error | resolved (codes above) |
+
+Version 1 issues keep their order: `PROFILE_NOT_PROVISIONABLE` follows
+`CUSTOM_PROFILE`, and other new version 1 issues come last.
+
+`overrides` and `operation_hints` stay metadata only. An `overrides` key in a
+knob namespace (`profile.`, `storage.`, `cache.`, `query.`, `limits.`,
+`compression.`, `durability.`) is flagged, because nothing at runtime reads
+it: the suggestion names the typed knob (for example
+`custom_profile.knobs.query.timeout_ms`), or `multidb config upgrade` for the
+Studio `profile.custom.*` convention. `operation_hints` are never flagged.
+
+### Spec validation codes
+
+These codes come from reading and validating a whole spec; the custom profile
+codes are in the table above.
+
+| code | severity | rule |
+| --- | --- | --- |
+| `SPEC_TOO_LARGE` | Error | the document is larger than 1 MiB |
+| `SPEC_TOO_COMPLEX` | Error | YAML anchors and aliases expand beyond the node or scalar-byte budget |
+| `MISSING_VERSION` | Error | no integer `version` at the root of a mapping |
+| `UNSUPPORTED_VERSION` | Error | `version` is not 1 or 2 |
+| `FIELD_REQUIRES_SPEC_V2` | Error | a version 2 field (`custom_profile`) in a version 1 document |
+| `PROFILE_UNKNOWN` | Error (version 2) | `profile` is no built-in slug or alias and there is no `custom_profile` |
+| `PROFILE_NOT_PROVISIONABLE` | Advice (version 1) | the same, in a version 1 document; follows `CUSTOM_PROFILE` |
+| `GUARANTEE_BELOW_PROFILE_FLOOR` | Error | a resolved floor is not met by its guarantee |
+| `OVERRIDE_IS_METADATA_ONLY` | Advice (version 1) | an `overrides` key in a knob namespace |
+| `OVERRIDE_SHADOWS_TYPED_KNOB` | Error (version 2) | the same, in a version 2 document |
+
+### Reading specs: size, version and YAML limits
+
+The CLI (`config validate`, `config explain`, `explain config`, `config plan`)
+and the Control Plane read every spec through `multidb::config_spec::spec_io`:
+
+- a spec is at most 1 MiB (`MAX_SPEC_BYTES`, the Control Plane body limit);
+  larger files are refused before parsing with `SPEC_TOO_LARGE`;
+- the version is read before the typed decode. A missing, non-integer or
+  non-mapping version is `MISSING_VERSION`; a version other than 1 or 2 is
+  `UNSUPPORTED_VERSION`, reported verbatim (`-1`, `3`);
+- YAML anchors and aliases are bounded. The version peek walks the document
+  without building it and expands aliases exactly as the typed decode does,
+  counting at most 2 097 152 nodes (`MAX_SPEC_NODES`) and 2 097 152 scalar
+  bytes (`MAX_SPEC_EXPANDED_BYTES`); beyond either budget the spec is
+  `SPEC_TOO_COMPLEX`. No alias-free spec of 1 MiB can reach these budgets.
+  The YAML parser's own repetition limit still applies;
+- the typed decode then reads the original text, so syntax and unknown-field
+  errors keep their line and column.
+
+Size, complexity and version problems are validation issues: the CLI exits 2
+(with `--json`, the report is printed as JSON) and the Control Plane answers
+422. `/config/validate` returns the report as `data`; `/config/plan` cannot
+build a plan from such a spec and answers with the error code
+`invalid_spec_version`. Syntax errors and decode errors keep exit code 1 and
+HTTP 400 `invalid_json`.
+
+### Compiled policy, explain and plans
+
+- `CompiledPolicy.resolved_profile` carries the resolved profile. It is
+  absent only for a version 1 profile string that is no built-in slug or
+  alias. `storage_profile` keeps its meaning (the product or custom slug).
+- `CompiledPolicy.runtime_limits` keeps its values. It is advisory catalog
+  guidance that this build does not enforce; the effective values are the
+  knobs.
+- `config explain` adds `$.profile.storage_profile` (the derived storage class
+  and its engine), one `$.profile.knobs.<path>` decision per knob with its
+  value, its source (`preset:<product>`, `variant:<variant>` or `override`)
+  and what takes effect when, and `$.profile.not_configurable.*` for what a
+  spec cannot set: MVCC and commit-log retention, cache TTL and eviction,
+  backup schedules, runtime write acknowledgement and conflict knobs, and a
+  per-collection consistency domain. Every-open knobs are applied only to
+  databases created with `db::create_database_with_profile`; explain says so,
+  and that the CLI, `serve` and the Control Plane do not create databases
+  from specs in this build.
+- `config plan` reports a `custom_profile` change as an unsupported
+  `change_profile` step at `$.custom_profile`, and a change of `version` alone
+  as one supported no-op step at `$.version`. Version 1 pairs plan exactly as
+  before, with the same plan ids.
+
+### JSON schema
+
+`docs/schemas/database-spec-v2.schema.json` (`database_spec_v2_schema()`) is
+the version 1 schema with `version: 2` and `custom_profile`. Its knob bounds,
+role enum and index enum are generated from `KNOB_REGISTRY` and the Rust
+enums; `auto` and `unlimited` are `oneOf` a constant or an integer range.
+`docs/schemas/database-spec-v1.schema.json` is unchanged.

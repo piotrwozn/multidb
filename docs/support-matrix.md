@@ -27,6 +27,7 @@ which claims are deliberately out of scope.
 | SDKs | Stable preview for API v1 client surface in repo packages | TypeScript, Python, Go and Rust package gates |
 | Metrics endpoint | Preview | Raw Prometheus text remains marked preview |
 | `config apply` | Audit/confirmation only | No physical data migration in v1 |
+| Composable profiles (`custom_profile`, spec v2) | Preview | resolver, schema v2 snapshot, v1 compatibility corpus |
 
 ## Profiles And Domains
 

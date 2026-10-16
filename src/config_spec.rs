@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::RangeInclusive,
     sync::LazyLock,
 };
 
@@ -17,6 +18,8 @@ use crate::db::{DbConfig, Profile, ReplicationKind};
 mod knobs;
 mod profile;
 mod schema;
+mod schema_v2;
+pub mod spec_io;
 mod suggest;
 
 pub use knobs::{
@@ -35,8 +38,15 @@ pub use profile::{
     profile_variants, resolve_named_profile, resolve_profile,
 };
 pub use schema::database_spec_v1_schema;
+pub use schema_v2::database_spec_v2_schema;
 
+/// The version v1 writers emit. Documents that need no version 2 field keep using it.
 pub const DATABASE_SPEC_VERSION: u32 = 1;
+/// The first version with `custom_profile`. Its new checks are Errors instead of Warnings.
+pub const DATABASE_SPEC_VERSION_V2: u32 = 2;
+/// Every `DatabaseSpec.version` this build reads.
+pub const SUPPORTED_SPEC_VERSIONS: RangeInclusive<u32> =
+    DATABASE_SPEC_VERSION..=DATABASE_SPEC_VERSION_V2;
 
 const DEFAULT_DOMAIN: &str = "primary";
 
@@ -236,6 +246,17 @@ pub enum CollectionIndexKind {
     TimeSeries,
 }
 
+/// Every `CollectionIndexKind` in declaration order; the v2 JSON schema enum is generated from it.
+pub(crate) const ALL_INDEX_KINDS: &[CollectionIndexKind] = &[
+    CollectionIndexKind::Primary,
+    CollectionIndexKind::Document,
+    CollectionIndexKind::Vector,
+    CollectionIndexKind::Graph,
+    CollectionIndexKind::FullText,
+    CollectionIndexKind::Columnar,
+    CollectionIndexKind::TimeSeries,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileSpec {
     pub slug: &'static str,
@@ -429,14 +450,22 @@ pub enum CertificationImpact {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompiledPolicy {
+    /// The product profile slug, or the custom profile slug.
     pub storage_profile: String,
     pub replication_kind: ReplicationMode,
     pub topology: TopologySpec,
     pub required_extensions: Vec<String>,
+    /// Advisory catalog guidance; see [`RuntimeLimits`].
     pub runtime_limits: RuntimeLimits,
     pub collections: Vec<CompiledCollectionPolicy>,
+    /// The resolved profile knobs. `None` only for a version 1 profile string that is neither a
+    /// built-in slug nor an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_profile: Option<ResolvedProfile>,
 }
 
+/// Advisory catalog guidance; not enforced by this build. The effective values are the
+/// resolved profile knobs, reported by explain under `$.profile.knobs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeLimits {
@@ -594,8 +623,11 @@ pub struct ExtensionManifestValidator;
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum ConfigSpecError {
-    #[error("unsupported DatabaseSpec version: {found}")]
-    UnsupportedVersion { found: u32 },
+    #[error("unsupported DatabaseSpec version: {found} (supported {supported:?})")]
+    UnsupportedVersion {
+        found: u32,
+        supported: RangeInclusive<u32>,
+    },
 
     #[error("field {field} must not be empty")]
     EmptyField { field: &'static str },
@@ -1144,9 +1176,10 @@ impl DatabaseSpec {
     }
 
     pub fn validate_structure(&self) -> Result<(), ConfigSpecError> {
-        if self.version != DATABASE_SPEC_VERSION {
+        if !SUPPORTED_SPEC_VERSIONS.contains(&self.version) {
             return Err(ConfigSpecError::UnsupportedVersion {
                 found: self.version,
+                supported: SUPPORTED_SPEC_VERSIONS,
             });
         }
 
@@ -1242,27 +1275,46 @@ impl DatabaseSpec {
 impl GuaranteeValidator {
     #[must_use]
     pub fn validate(spec: &DatabaseSpec) -> ValidationReport {
-        let mut issues = Vec::new();
+        validate_spec(spec).0
+    }
+}
 
-        if let Err(error) = spec.validate_structure() {
-            issues.push(validation_issue(
-                "STRUCTURE_INVALID",
-                ValidationSeverity::Error,
-                "$",
-                format!("DatabaseSpec structure is invalid: {error}"),
-                "Fix the structural DatabaseSpec error before checking product guarantees.",
-                CertificationImpact::BlocksCertified,
-            ));
-            return ValidationReport {
+/// Validates `spec` and also returns the profile resolution the report was built from, so the
+/// compiler and explainer resolve the profile once. The resolution is `None` only when the
+/// structure is invalid.
+fn validate_spec(spec: &DatabaseSpec) -> (ValidationReport, Option<ProfileResolution>) {
+    let mut issues = Vec::new();
+
+    if let Err(error) = spec.validate_structure() {
+        issues.push(validation_issue(
+            "STRUCTURE_INVALID",
+            ValidationSeverity::Error,
+            "$",
+            format!("DatabaseSpec structure is invalid: {error}"),
+            "Fix the structural DatabaseSpec error before checking product guarantees.",
+            CertificationImpact::BlocksCertified,
+        ));
+        return (
+            ValidationReport {
                 valid: false,
                 status: SupportStatus::Invalid,
                 issues,
-            };
-        }
-        issues.extend(spec_version_gate(spec));
+            },
+            None,
+        );
+    }
+    issues.extend(spec_version_gate(spec));
 
-        let mut status = spec.catalog_support_status_without_guarantees();
-        let profile = built_in_profile(&spec.profile);
+    let strict = spec.version >= DATABASE_SPEC_VERSION_V2;
+    let resolution = resolve_profile(spec);
+    let mut status = spec.catalog_support_status_without_guarantees();
+    let profile = built_in_profile(&spec.profile);
+    // Version 1 keeps every existing issue where it was: the resolver's new Warnings and
+    // Advice go last, except PROFILE_NOT_PROVISIONABLE, which explains CUSTOM_PROFILE.
+    let mut trailing_issues = Vec::new();
+    if strict {
+        issues.extend(resolution.issues().iter().cloned());
+    } else {
         if profile.is_none() {
             issues.push(validation_issue(
                 "CUSTOM_PROFILE",
@@ -1276,247 +1328,465 @@ impl GuaranteeValidator {
                 CertificationImpact::DowngradesToCustom,
             ));
         }
-
-        validate_topology(spec, &mut issues);
-
-        if let Some(profile) = profile {
-            for (index, collection) in spec.collections.iter().enumerate() {
-                if !profile.compatible_roles.contains(&collection.role) {
-                    issues.push(validation_issue(
-                        "ROLE_OUTSIDE_PROFILE_CERTIFICATION",
-                        ValidationSeverity::Warning,
-                        format!("collections[{index}].role"),
-                        format!(
-                            "collection {} uses role {:?}, which is outside profile {} certification",
-                            collection.name, collection.role, profile.slug
-                        ),
-                        "Move the collection to a compatible profile or accept Custom support status.",
-                        CertificationImpact::DowngradesToCustom,
-                    ));
-                }
+        for issue in resolution.issues() {
+            if issue.code == "PROFILE_NOT_PROVISIONABLE" {
+                issues.push(issue.clone());
+            } else {
+                trailing_issues.push(issue.clone());
             }
         }
+    }
 
-        let explicit_extensions = spec
-            .extensions
-            .iter()
-            .map(|extension| extension.name.as_str())
-            .collect::<BTreeSet<_>>();
-        for (index, extension) in spec.extensions.iter().enumerate() {
-            if extension.stability == ExtensionStability::Experimental {
-                status = status.weakest(SupportStatus::Experimental);
-                issues.push(validation_issue(
-                    "EXPERIMENTAL_EXTENSION",
-                    ValidationSeverity::Warning,
-                    format!("extensions[{index}].stability"),
-                    format!("extension {} is marked experimental", extension.name),
-                    "Use a stable extension for certified configurations, or accept Experimental support status.",
-                    CertificationImpact::DowngradesToExperimental,
-                ));
-            }
+    validate_topology(spec, &mut issues);
 
-            if let Some(manifest) = built_in_extension_manifest(&extension.name) {
-                status = status.weakest(manifest.status);
-                let manifest_report = ExtensionManifestValidator::validate(manifest);
-                if manifest_report.has_errors() {
-                    issues.push(validation_issue(
-                        "BUILTIN_EXTENSION_MANIFEST_INVALID",
-                        ValidationSeverity::Error,
-                        format!("extensions[{index}]"),
-                        format!(
-                            "built-in extension manifest {} failed validation",
-                            extension.name
-                        ),
-                        "Fix the built-in extension manifest before using this catalog.",
-                        CertificationImpact::BlocksCertified,
-                    ));
-                }
+    let certified_roles = match resolution.resolved() {
+        Some(resolved) => Some((
+            if resolved.kind == ResolvedProfileKind::Custom {
+                resolved.slug.clone()
             } else {
-                status = status.weakest(SupportStatus::Custom);
+                resolved.product_profile.clone()
+            },
+            resolved.kind == ResolvedProfileKind::Custom,
+            resolved.knobs.compatible_roles.clone(),
+        )),
+        None => profile.map(|profile| {
+            (
+                profile.slug.to_owned(),
+                false,
+                profile.compatible_roles.iter().copied().collect(),
+            )
+        }),
+    };
+    if let Some((slug, custom, roles)) = certified_roles {
+        for (index, collection) in spec.collections.iter().enumerate() {
+            if !roles.contains(&collection.role) {
                 issues.push(validation_issue(
-                    "CUSTOM_EXTENSION",
+                    "ROLE_OUTSIDE_PROFILE_CERTIFICATION",
                     ValidationSeverity::Warning,
-                    format!("extensions[{index}].name"),
+                    format!("collections[{index}].role"),
                     format!(
-                        "extension {} is not part of the built-in extension manifest catalog",
-                        extension.name
+                        "collection {} uses role {:?}, which is outside profile {slug} certification",
+                        collection.name, collection.role
                     ),
-                    "Provide an extension manifest and treat the configuration as Custom.",
+                    if custom {
+                        "Add the role to custom_profile.compatible_roles.add, or move the collection to a compatible profile."
+                    } else {
+                        "Move the collection to a compatible profile or accept Custom support status."
+                    },
                     CertificationImpact::DowngradesToCustom,
                 ));
             }
         }
+    }
 
-        let mut required_extensions = BTreeSet::new();
-        for collection in &spec.collections {
-            for extension in role_required_extensions(collection.role) {
-                required_extensions.insert((*extension).to_owned());
-            }
-            for extension in index_required_extensions(&collection.indexes) {
-                required_extensions.insert(extension);
-            }
+    let explicit_extensions = spec
+        .extensions
+        .iter()
+        .map(|extension| extension.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for (index, extension) in spec.extensions.iter().enumerate() {
+        if extension.stability == ExtensionStability::Experimental {
+            status = status.weakest(SupportStatus::Experimental);
+            issues.push(validation_issue(
+                "EXPERIMENTAL_EXTENSION",
+                ValidationSeverity::Warning,
+                format!("extensions[{index}].stability"),
+                format!("extension {} is marked experimental", extension.name),
+                "Use a stable extension for certified configurations, or accept Experimental support status.",
+                CertificationImpact::DowngradesToExperimental,
+            ));
         }
-        for extension in required_extensions {
-            if built_in_extension_manifest(&extension).is_some()
-                && !explicit_extensions.contains(extension.as_str())
-            {
+
+        if let Some(manifest) = built_in_extension_manifest(&extension.name) {
+            status = status.weakest(manifest.status);
+            let manifest_report = ExtensionManifestValidator::validate(manifest);
+            if manifest_report.has_errors() {
                 issues.push(validation_issue(
-                    "IMPLICIT_EXTENSION_REQUIRED",
-                    ValidationSeverity::Advice,
-                    "$.collections",
-                    format!("collection roles or indexes require extension {extension}"),
-                    "The policy compiler will include this built-in extension in the runtime requirements.",
-                    CertificationImpact::None,
+                    "BUILTIN_EXTENSION_MANIFEST_INVALID",
+                    ValidationSeverity::Error,
+                    format!("extensions[{index}]"),
+                    format!(
+                        "built-in extension manifest {} failed validation",
+                        extension.name
+                    ),
+                    "Fix the built-in extension manifest before using this catalog.",
+                    CertificationImpact::BlocksCertified,
                 ));
             }
-        }
-
-        let has_strong_cp = spec.defaults.replication == ReplicationMode::Cp
-            || spec
-                .domains
-                .iter()
-                .any(|domain| domain.mode == ConsistencyMode::StrongCp);
-        if has_strong_cp && spec.guarantees.write_ack == WriteAck::Local {
+        } else {
+            status = status.weakest(SupportStatus::Custom);
             issues.push(validation_issue(
-                "CP_LOCAL_ACK",
-                ValidationSeverity::Error,
-                "guarantees.write_ack",
-                "strong CP cannot be certified with local write acknowledgement",
-                "Use write_ack=quorum or write_ack=all for strong CP guarantees.",
-                CertificationImpact::BlocksCertified,
+                "CUSTOM_EXTENSION",
+                ValidationSeverity::Warning,
+                format!("extensions[{index}].name"),
+                format!(
+                    "extension {} is not part of the built-in extension manifest catalog",
+                    extension.name
+                ),
+                "Provide an extension manifest and treat the configuration as Custom.",
+                CertificationImpact::DowngradesToCustom,
             ));
         }
+    }
 
-        let has_eventual_ap = spec.defaults.replication == ReplicationMode::Ap
-            || spec
-                .domains
-                .iter()
-                .any(|domain| domain.mode == ConsistencyMode::EventualAp);
-        if has_eventual_ap && spec.guarantees.conflict_resolution == ConflictResolution::None {
-            issues.push(validation_issue(
-                "AP_MISSING_CONFLICT_POLICY",
-                ValidationSeverity::Error,
-                "guarantees.conflict_resolution",
-                "AP/eventual consistency requires an explicit conflict resolution policy",
-                "Set conflict_resolution to vector_clock, last_write_wins, crdt, or custom.",
-                CertificationImpact::BlocksCertified,
-            ));
+    let mut required_extensions = BTreeSet::new();
+    for collection in &spec.collections {
+        for extension in role_required_extensions(collection.role) {
+            required_extensions.insert((*extension).to_owned());
         }
-
-        if profile.is_some_and(|profile| profile.slug == "production_cp")
-            && !spec.guarantees.backup.enabled
+        for extension in index_required_extensions(&collection.indexes) {
+            required_extensions.insert(extension);
+        }
+    }
+    for extension in required_extensions {
+        if built_in_extension_manifest(&extension).is_some()
+            && !explicit_extensions.contains(extension.as_str())
         {
             issues.push(validation_issue(
-                "PRODUCTION_BACKUP_DISABLED",
-                ValidationSeverity::Error,
-                "guarantees.backup.enabled",
-                "production_cp requires backup to be enabled",
-                "Enable backup before using the production_cp profile.",
-                CertificationImpact::BlocksCertified,
+                "IMPLICIT_EXTENSION_REQUIRED",
+                ValidationSeverity::Advice,
+                "$.collections",
+                format!("collection roles or indexes require extension {extension}"),
+                "The policy compiler will include this built-in extension in the runtime requirements.",
+                CertificationImpact::None,
             ));
         }
+    }
 
-        if spec.guarantees.sensitive_data && !spec.guarantees.encryption.at_rest {
-            issues.push(validation_issue(
-                "SENSITIVE_WITHOUT_ENCRYPTION",
-                ValidationSeverity::Error,
-                "guarantees.encryption.at_rest",
-                "sensitive data requires encryption at rest",
-                "Enable encryption.at_rest or mark the data as non-sensitive.",
-                CertificationImpact::BlocksCertified,
-            ));
-        }
+    let has_strong_cp = spec.defaults.replication == ReplicationMode::Cp
+        || spec
+            .domains
+            .iter()
+            .any(|domain| domain.mode == ConsistencyMode::StrongCp);
+    if has_strong_cp && spec.guarantees.write_ack == WriteAck::Local {
+        issues.push(validation_issue(
+            "CP_LOCAL_ACK",
+            ValidationSeverity::Error,
+            "guarantees.write_ack",
+            "strong CP cannot be certified with local write acknowledgement",
+            "Use write_ack=quorum or write_ack=all for strong CP guarantees.",
+            CertificationImpact::BlocksCertified,
+        ));
+    }
 
-        for (index, collection) in spec.collections.iter().enumerate() {
-            match collection.role {
-                CollectionRole::VectorMemory
-                    if !collection.indexes.contains(&CollectionIndexKind::Vector) =>
-                {
-                    issues.push(validation_issue(
-                        "VECTOR_INDEX_REQUIRED",
-                        ValidationSeverity::Error,
-                        format!("collections[{index}].indexes"),
-                        format!(
-                            "vector_memory collection {} requires a vector index",
-                            collection.name
-                        ),
-                        "Add vector to the collection indexes.",
-                        CertificationImpact::BlocksCertified,
-                    ));
-                }
-                CollectionRole::Graph
-                    if !collection.indexes.contains(&CollectionIndexKind::Graph) =>
-                {
-                    issues.push(validation_issue(
-                        "GRAPH_INDEX_REQUIRED",
-                        ValidationSeverity::Error,
-                        format!("collections[{index}].indexes"),
-                        format!(
-                            "graph collection {} requires a graph index",
-                            collection.name
-                        ),
-                        "Add graph to the collection indexes.",
-                        CertificationImpact::BlocksCertified,
-                    ));
-                }
-                CollectionRole::Audit if !spec.guarantees.audit.enabled => {
-                    issues.push(validation_issue(
-                        "AUDIT_DISABLED",
-                        ValidationSeverity::Error,
-                        "guarantees.audit.enabled",
-                        format!(
-                            "audit collection {} requires audit to be enabled",
-                            collection.name
-                        ),
-                        "Enable audit guarantees or change the collection role.",
-                        CertificationImpact::BlocksCertified,
-                    ));
-                }
-                _ => {}
+    let has_eventual_ap = spec.defaults.replication == ReplicationMode::Ap
+        || spec
+            .domains
+            .iter()
+            .any(|domain| domain.mode == ConsistencyMode::EventualAp);
+    if has_eventual_ap && spec.guarantees.conflict_resolution == ConflictResolution::None {
+        issues.push(validation_issue(
+            "AP_MISSING_CONFLICT_POLICY",
+            ValidationSeverity::Error,
+            "guarantees.conflict_resolution",
+            "AP/eventual consistency requires an explicit conflict resolution policy",
+            "Set conflict_resolution to vector_clock, last_write_wins, crdt, or custom.",
+            CertificationImpact::BlocksCertified,
+        ));
+    }
+
+    match resolution.resolved() {
+        Some(resolved) => check_profile_floors(spec, resolved, &mut issues),
+        None => {
+            if profile.is_some_and(|profile| profile.slug == "production_cp")
+                && !spec.guarantees.backup.enabled
+            {
+                issues.push(production_backup_disabled());
             }
         }
+    }
 
-        if spec.guarantees.strict_cross_domain_transactions
-            && spec
-                .domains
-                .iter()
-                .any(|domain| domain.mode == ConsistencyMode::StrongCp)
-            && spec
-                .domains
-                .iter()
-                .any(|domain| domain.mode == ConsistencyMode::EventualAp)
-        {
-            issues.push(validation_issue(
-                "STRICT_CP_AP_CROSS_DOMAIN_TXN",
-                ValidationSeverity::Error,
-                "guarantees.strict_cross_domain_transactions",
-                "strict cross-domain transactions cannot span CP and AP consistency domains",
-                "Use one consistency mode for strict transactions or disable strict cross-domain transactions.",
-                CertificationImpact::BlocksCertified,
-            ));
+    if spec.guarantees.sensitive_data && !spec.guarantees.encryption.at_rest {
+        issues.push(validation_issue(
+            "SENSITIVE_WITHOUT_ENCRYPTION",
+            ValidationSeverity::Error,
+            "guarantees.encryption.at_rest",
+            "sensitive data requires encryption at rest",
+            "Enable encryption.at_rest or mark the data as non-sensitive.",
+            CertificationImpact::BlocksCertified,
+        ));
+    }
+
+    for (index, collection) in spec.collections.iter().enumerate() {
+        match collection.role {
+            CollectionRole::VectorMemory
+                if !collection.indexes.contains(&CollectionIndexKind::Vector) =>
+            {
+                issues.push(validation_issue(
+                    "VECTOR_INDEX_REQUIRED",
+                    ValidationSeverity::Error,
+                    format!("collections[{index}].indexes"),
+                    format!(
+                        "vector_memory collection {} requires a vector index",
+                        collection.name
+                    ),
+                    "Add vector to the collection indexes.",
+                    CertificationImpact::BlocksCertified,
+                ));
+            }
+            CollectionRole::Graph if !collection.indexes.contains(&CollectionIndexKind::Graph) => {
+                issues.push(validation_issue(
+                    "GRAPH_INDEX_REQUIRED",
+                    ValidationSeverity::Error,
+                    format!("collections[{index}].indexes"),
+                    format!(
+                        "graph collection {} requires a graph index",
+                        collection.name
+                    ),
+                    "Add graph to the collection indexes.",
+                    CertificationImpact::BlocksCertified,
+                ));
+            }
+            CollectionRole::Audit if !spec.guarantees.audit.enabled => {
+                issues.push(validation_issue(
+                    "AUDIT_DISABLED",
+                    ValidationSeverity::Error,
+                    "guarantees.audit.enabled",
+                    format!(
+                        "audit collection {} requires audit to be enabled",
+                        collection.name
+                    ),
+                    "Enable audit guarantees or change the collection role.",
+                    CertificationImpact::BlocksCertified,
+                ));
+            }
+            _ => {}
         }
+    }
 
-        let valid = !issues
+    if spec.guarantees.strict_cross_domain_transactions
+        && spec
+            .domains
             .iter()
-            .any(|issue| issue.severity == ValidationSeverity::Error);
-        if !valid {
-            status = SupportStatus::Invalid;
-        }
+            .any(|domain| domain.mode == ConsistencyMode::StrongCp)
+        && spec
+            .domains
+            .iter()
+            .any(|domain| domain.mode == ConsistencyMode::EventualAp)
+    {
+        issues.push(validation_issue(
+            "STRICT_CP_AP_CROSS_DOMAIN_TXN",
+            ValidationSeverity::Error,
+            "guarantees.strict_cross_domain_transactions",
+            "strict cross-domain transactions cannot span CP and AP consistency domains",
+            "Use one consistency mode for strict transactions or disable strict cross-domain transactions.",
+            CertificationImpact::BlocksCertified,
+        ));
+    }
 
+    issues.extend(trailing_issues);
+    check_override_keys(spec, strict, &mut issues);
+
+    let valid = !issues
+        .iter()
+        .any(|issue| issue.severity == ValidationSeverity::Error);
+    if !valid {
+        status = SupportStatus::Invalid;
+    }
+
+    (
         ValidationReport {
             valid,
             status,
             issues,
+        },
+        Some(resolution),
+    )
+}
+
+fn production_backup_disabled() -> ValidationIssue {
+    validation_issue(
+        "PRODUCTION_BACKUP_DISABLED",
+        ValidationSeverity::Error,
+        "guarantees.backup.enabled",
+        "production_cp requires backup to be enabled",
+        "Enable backup before using the production_cp profile.",
+        CertificationImpact::BlocksCertified,
+    )
+}
+
+/// Checks the resolved profile floors against the guarantees. `production_cp` keeps its historic
+/// `PRODUCTION_BACKUP_DISABLED` code for the backup floor.
+fn check_profile_floors(
+    spec: &DatabaseSpec,
+    resolved: &ResolvedProfile,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let floors = resolved.knobs.floors;
+    let guarantees = &spec.guarantees;
+    for (floor, required, met, path) in [
+        (
+            "audit",
+            floors.audit,
+            guarantees.audit.enabled,
+            "guarantees.audit.enabled",
+        ),
+        (
+            "backup",
+            floors.backup,
+            guarantees.backup.enabled,
+            "guarantees.backup.enabled",
+        ),
+        (
+            "pitr",
+            floors.pitr,
+            guarantees.backup.pitr,
+            "guarantees.backup.pitr",
+        ),
+        (
+            "encryption_at_rest",
+            floors.encryption_at_rest,
+            guarantees.encryption.at_rest,
+            "guarantees.encryption.at_rest",
+        ),
+    ] {
+        if !required || met {
+            continue;
         }
+        if floor == "backup" && resolved.product_profile == "production_cp" {
+            issues.push(production_backup_disabled());
+            continue;
+        }
+        issues.push(validation_issue(
+            "GUARANTEE_BELOW_PROFILE_FLOOR",
+            ValidationSeverity::Error,
+            path,
+            format!(
+                "profile {} requires {path} (floor floors.{floor}), but the spec sets it to false",
+                resolved.slug
+            ),
+            format!("Set {path} to true, or extend a profile without the {floor} floor."),
+            CertificationImpact::BlocksCertified,
+        ));
+    }
+}
+
+/// `overrides` key prefixes that look like typed profile knobs.
+const KNOB_LIKE_OVERRIDE_PREFIXES: &[&str] = &[
+    "profile.",
+    "storage.",
+    "cache.",
+    "query.",
+    "limits.",
+    "compression.",
+    "durability.",
+];
+
+/// Flags `overrides` keys that look like knobs: overrides are metadata only, so an opaque string
+/// must never look like a working knob. Advice in version 1, an Error in version 2.
+/// `operation_hints` are hints by definition and are never checked.
+fn check_override_keys(spec: &DatabaseSpec, strict: bool, issues: &mut Vec<ValidationIssue>) {
+    for key in spec.overrides.keys() {
+        if !KNOB_LIKE_OVERRIDE_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            continue;
+        }
+        let suggestion = override_suggestion(key);
+        if strict {
+            issues.push(validation_issue(
+                "OVERRIDE_SHADOWS_TYPED_KNOB",
+                ValidationSeverity::Error,
+                format!("overrides.{key}"),
+                format!(
+                    "overrides.{key} looks like a profile knob, but overrides are metadata only; \
+                     a version 2 spec sets typed knobs in custom_profile"
+                ),
+                suggestion,
+                CertificationImpact::BlocksCertified,
+            ));
+        } else {
+            issues.push(validation_issue(
+                "OVERRIDE_IS_METADATA_ONLY",
+                ValidationSeverity::Advice,
+                format!("overrides.{key}"),
+                format!(
+                    "overrides.{key} looks like a profile knob, but overrides are metadata only \
+                     and nothing at runtime reads them"
+                ),
+                suggestion,
+                CertificationImpact::None,
+            ));
+        }
+    }
+}
+
+/// Runtime `PerformanceConfig` field names whose typed knob has another name.
+const RUNTIME_FIELD_KNOBS: &[(&str, &str)] = &[("cache.max_capacity", "cache.max_entries")];
+
+/// The registry knob an `overrides` key most likely means: the key itself, the key without its
+/// first namespace (`profile.cache.max_entries`), a runtime field name, or a near miss.
+fn override_knob(key: &str) -> Option<&'static str> {
+    let unprefixed = key.split_once('.').map(|(_, rest)| rest);
+    [Some(key), unprefixed]
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| {
+            knob_definition(candidate)
+                .map(|definition| definition.path)
+                .or_else(|| {
+                    RUNTIME_FIELD_KNOBS
+                        .iter()
+                        .find(|(field, _)| *field == candidate)
+                        .map(|(_, knob)| *knob)
+                })
+        })
+        .or_else(|| {
+            suggest::closest(
+                key,
+                KNOB_REGISTRY.iter().map(|definition| definition.path),
+                2,
+            )
+        })
+}
+
+fn override_suggestion(key: &str) -> String {
+    if key.starts_with("profile.custom.") {
+        return "Run multidb config upgrade to turn the profile.custom.* convention into a \
+                version 2 custom_profile."
+            .to_owned();
+    }
+    override_knob(key).map_or_else(
+        || {
+            "Set typed profile knobs in custom_profile.knobs of a version 2 spec, or keep \
+             this key outside the knob namespaces."
+                .to_owned()
+        },
+        |path| {
+            format!(
+                "Did you mean {}? Typed knobs need a version 2 spec with custom_profile.",
+                knob_spec_path(path)
+            )
+        },
+    )
+}
+
+/// Where a registry knob lives in a spec document.
+fn knob_spec_path(path: &str) -> String {
+    if path.starts_with("floors.") || path == "compatible_roles" {
+        format!("custom_profile.{path}")
+    } else {
+        format!("custom_profile.knobs.{path}")
     }
 }
 
 impl PolicyCompiler {
     pub fn compile(spec: &DatabaseSpec) -> Result<CompiledPolicy, ValidationReport> {
-        let report = GuaranteeValidator::validate(spec);
+        let (report, resolution) = validate_spec(spec);
         if report.has_errors() {
             return Err(report);
         }
+        Ok(Self::compile_valid(spec, resolution.as_ref()))
+    }
+
+    /// Compiles a spec whose validation report has no errors, from the profile resolution that
+    /// validation produced.
+    fn compile_valid(
+        spec: &DatabaseSpec,
+        resolution: Option<&ProfileResolution>,
+    ) -> CompiledPolicy {
+        let resolved_profile = resolution.and_then(ProfileResolution::resolved).cloned();
 
         let storage_profile = built_in_profile(&spec.profile)
             .map_or_else(|| spec.profile.clone(), |profile| profile.slug.to_owned());
@@ -1553,14 +1823,15 @@ impl PolicyCompiler {
             });
         }
 
-        Ok(CompiledPolicy {
+        CompiledPolicy {
             storage_profile: storage_profile.clone(),
             replication_kind: spec.defaults.replication,
             topology: spec.topology,
             required_extensions: required_extensions.into_iter().collect(),
             runtime_limits: RuntimeLimits::for_profile(&storage_profile),
             collections,
-        })
+            resolved_profile,
+        }
     }
 }
 
@@ -1648,8 +1919,9 @@ fn validate_topology(spec: &DatabaseSpec, issues: &mut Vec<ValidationIssue>) {
 impl ConfigExplainer {
     #[must_use]
     pub fn explain(spec: &DatabaseSpec) -> ExplainConfigReport {
-        let validation = GuaranteeValidator::validate(spec);
-        let compiled_policy = PolicyCompiler::compile(spec).ok();
+        let (validation, resolution) = validate_spec(spec);
+        let compiled_policy = (!validation.has_errors())
+            .then(|| PolicyCompiler::compile_valid(spec, resolution.as_ref()));
         let mut decisions = Vec::new();
 
         push_decision(
@@ -1686,6 +1958,7 @@ impl ConfigExplainer {
                 ),
             );
         }
+        explain_profile_decisions(resolution.as_ref(), &mut decisions);
 
         ExplainConfigReport {
             validation,
@@ -1747,6 +2020,20 @@ impl MigrationPlanner {
             );
         }
 
+        if steps.is_empty() && current.version != desired.version {
+            push_step(
+                &mut steps,
+                MigrationStepKind::Noop,
+                "$.version",
+                format!(
+                    "spec version {} -> {}; no runtime effect",
+                    current.version, desired.version
+                ),
+                impact_none(),
+                "Restore the previous spec version.",
+                true,
+            );
+        }
         if steps.is_empty() {
             push_step(
                 &mut steps,
@@ -1834,15 +2121,23 @@ impl MigrationPlanner {
 
 fn explain_catalog_decisions(spec: &DatabaseSpec, decisions: &mut Vec<ExplainDecision>) {
     let profile = built_in_profile(&spec.profile);
+    let custom_reason = spec.custom_profile.as_ref().map(|custom| {
+        format!(
+            "The profile is a custom profile extending {}; its knobs are under $.profile.knobs.",
+            custom.extends
+        )
+    });
     push_decision(
         decisions,
         "$.profile",
         describe_value(&spec.profile),
         "ProfileCatalog",
-        profile.map_or(
-            "The profile is custom and outside the built-in support matrix.",
-            |profile| profile.description,
-        ),
+        custom_reason.as_deref().unwrap_or_else(|| {
+            profile.map_or(
+                "The profile is custom and outside the built-in support matrix.",
+                |profile| profile.description,
+            )
+        }),
         profile.map_or("custom support status", |profile| profile.slug),
         if profile.is_some() {
             impact_none()
@@ -1931,7 +2226,7 @@ fn explain_guarantee_decisions(spec: &DatabaseSpec, decisions: &mut Vec<ExplainD
         "GuaranteeValidator",
         "Sensitive data requires encryption at rest.",
         if spec.guarantees.encryption.at_rest {
-            "encrypted storage required"
+            "requested; enforced only on the Rust API with an encryption config in this build"
         } else {
             "unencrypted storage allowed only for non-sensitive data"
         },
@@ -2037,13 +2332,27 @@ fn explain_extension_decisions(spec: &DatabaseSpec, decisions: &mut Vec<ExplainD
 }
 
 fn explain_compiled_policy(policy: &CompiledPolicy, decisions: &mut Vec<ExplainDecision>) {
+    let storage_outcome = policy.resolved_profile.as_ref().map_or_else(
+        || {
+            "no storage class resolved: the profile is neither a built-in slug, an alias nor a \
+             custom_profile"
+                .to_owned()
+        },
+        |resolved| {
+            format!(
+                "storage class {} for profile {}",
+                describe_storage_class(resolved.storage_profile),
+                resolved.slug
+            )
+        },
+    );
     push_decision(
         decisions,
         "$.compiled_policy.storage_profile",
         describe_value(&policy.storage_profile),
         "PolicyCompiler",
-        "The profile alias is resolved to the runtime storage profile.",
-        "storage profile selected",
+        "The profile is resolved to a concrete storage class and engine.",
+        &storage_outcome,
         impact_none(),
     );
     push_decision(
@@ -2069,8 +2378,9 @@ fn explain_compiled_policy(policy: &CompiledPolicy, decisions: &mut Vec<ExplainD
         "$.compiled_policy.runtime_limits",
         describe_value(&policy.runtime_limits),
         "PolicyCompiler",
-        "Runtime limits are derived from the resolved storage profile.",
-        "limits selected",
+        "Advisory catalog guidance derived from the product profile; not enforced by this \
+         build. The effective values are under $.profile.knobs.",
+        "advisory only; not enforced",
         impact_none(),
     );
     push_decision(
@@ -2116,6 +2426,174 @@ fn explain_compiled_policy(policy: &CompiledPolicy, decisions: &mut Vec<ExplainD
     }
 }
 
+/// Outcome of every knob applied at each open.
+const EVERY_OPEN_OUTCOME: &str = "persisted in __meta.profile_manifest and applied at every open of \
+     a database created with db::create_database_with_profile; the CLI, serve and Control Plane \
+     do not create databases from specs in this build";
+
+/// What a spec cannot configure in this build, reported by explain under
+/// `$.profile.not_configurable`.
+const NOT_CONFIGURABLE: &[(&str, &str)] = &[
+    (
+        "mvcc_retention",
+        "MVCC and commit-log retention are not profile knobs; history.mvcc_retention_millis is \
+         reserved until MVCC and commit-log GC (#12) lands.",
+    ),
+    (
+        "cache_ttl",
+        "Cache TTL and eviction policy have no runtime implementation; cache.ttl_millis is \
+         reserved.",
+    ),
+    (
+        "backup_schedule",
+        "Backup schedules are operator-managed; guarantees.backup and floors.backup only record \
+         the requirement.",
+    ),
+    (
+        "write_ack_and_conflict_resolution",
+        "guarantees.write_ack and guarantees.conflict_resolution are validated guarantees, not \
+         runtime knobs.",
+    ),
+    (
+        "collection_consistency_domain",
+        "Collections name a consistency domain, but the runtime applies no per-collection \
+         consistency domain.",
+    ),
+];
+
+/// One decision per knob of the resolved profile, its derived storage class, and what is not
+/// configurable. Explain never claims an effect this build does not have.
+fn explain_profile_decisions(
+    resolution: Option<&ProfileResolution>,
+    decisions: &mut Vec<ExplainDecision>,
+) {
+    let Some(resolved) = resolution.and_then(ProfileResolution::resolved) else {
+        let reason = match resolution {
+            Some(ProfileResolution::Unresolved { reason, .. }) => reason.as_str(),
+            _ => "The profile did not resolve; see the validation issues.",
+        };
+        push_decision(
+            decisions,
+            "$.profile.knobs",
+            "null".to_owned(),
+            "ProfileResolver",
+            reason,
+            "no profile knobs resolved",
+            impact_none(),
+        );
+        return;
+    };
+
+    let fixed_at_creation = format!(
+        "fixed at creation (storage class {:?}, {})",
+        resolved.storage_profile,
+        storage_engine(resolved.storage_profile)
+    );
+    push_decision(
+        decisions,
+        "$.profile.storage_profile",
+        describe_value(&resolved.storage_profile),
+        "derived:storage_class",
+        "The storage class is derived from storage.medium, storage.layout and durability.commit \
+         (capability matrix in docs/profiles.md).",
+        &fixed_at_creation,
+        impact_none(),
+    );
+
+    let knobs = serde_json::to_value(&resolved.knobs).unwrap_or(JsonValue::Null);
+    for definition in KNOB_REGISTRY {
+        let pointer = format!("/{}", definition.path.replace('.', "/"));
+        let value = knobs
+            .pointer(&pointer)
+            .map_or_else(|| "null".to_owned(), describe_value);
+        let source = match resolved.provenance.get(definition.path) {
+            Some(KnobSource::Override) => "override".to_owned(),
+            Some(KnobSource::Variant) => format!("variant:{}", resolved.variant),
+            Some(KnobSource::Derived) => "derived:storage_class".to_owned(),
+            Some(KnobSource::Preset) | None => format!("preset:{}", resolved.product_profile),
+        };
+        let framing = definition.path == "compression.algorithm"
+            && resolved.knobs.compression.algorithm != CompressionKnob::None;
+        push_decision(
+            decisions,
+            format!("$.profile.knobs.{}", definition.path),
+            value,
+            &source,
+            definition.description,
+            &knob_outcome(definition, resolved, &fixed_at_creation),
+            if framing {
+                low_risk_impact("forward-only format change: older binaries refuse the database")
+            } else {
+                impact_none()
+            },
+        );
+    }
+
+    for (name, reason) in NOT_CONFIGURABLE {
+        push_decision(
+            decisions,
+            format!("$.profile.not_configurable.{name}"),
+            describe_value(&"not configurable"),
+            "ProfileResolver",
+            reason,
+            "not configurable in this build",
+            impact_none(),
+        );
+    }
+}
+
+/// What a knob does in this build, from its registry timing and enforcement.
+fn knob_outcome(
+    definition: &KnobDefinition,
+    resolved: &ResolvedProfile,
+    fixed_at_creation: &str,
+) -> String {
+    if let KnobEnforcement::Planned { tracking } = definition.enforcement {
+        return format!("planned: not enforced until the single write pipeline lands ({tracking})");
+    }
+    match definition.timing {
+        KnobTiming::Creation if definition.path == "compression.algorithm" => {
+            if resolved.knobs.compression.algorithm == CompressionKnob::None {
+                "no value framing: the database keeps schema_version 1".to_owned()
+            } else {
+                "forward-only format change: schema_version 2 (value framing, refused by older \
+                 binaries); applied only by db::create_database_with_profile in this build"
+                    .to_owned()
+            }
+        }
+        KnobTiming::Creation => fixed_at_creation.to_owned(),
+        KnobTiming::EveryOpen => EVERY_OPEN_OUTCOME.to_owned(),
+        KnobTiming::Provisioning => {
+            "recorded only; applied by provisioning, which is not available in this build"
+                .to_owned()
+        }
+        KnobTiming::GenerationDefault => {
+            "default for generated specs (guided init and templates); no runtime effect".to_owned()
+        }
+        KnobTiming::Validation => format!("checked by validation: {}", definition.sink),
+    }
+}
+
+/// A storage class with the engine it selects, for example `HighDurability (redb engine with
+/// two-phase commit)`.
+fn describe_storage_class(profile: Profile) -> String {
+    format!("{profile:?} ({})", storage_engine(profile))
+}
+
+/// The engine a storage class selects.
+const fn storage_engine(profile: Profile) -> &'static str {
+    match profile {
+        Profile::InMemory => "in-memory engine",
+        Profile::HighDurability => "redb engine with two-phase commit",
+        Profile::Analytical => "redb engine with columnar table layout",
+        Profile::Transactional
+        | Profile::Document
+        | Profile::Vector
+        | Profile::TimeSeries
+        | Profile::Balanced => "redb engine",
+    }
+}
+
 fn diff_top_level(current: &DatabaseSpec, desired: &DatabaseSpec, steps: &mut Vec<MigrationStep>) {
     record_diff(
         steps,
@@ -2126,6 +2604,20 @@ fn diff_top_level(current: &DatabaseSpec, desired: &DatabaseSpec, steps: &mut Ve
             MigrationStepKind::ChangeProfile,
             unsupported_impact("profile changes can alter storage, replication and runtime limits"),
             "Restore the previous profile and re-run validation.",
+            false,
+        ),
+    );
+    record_diff(
+        steps,
+        "$.custom_profile",
+        &current.custom_profile,
+        &desired.custom_profile,
+        diff_metadata(
+            MigrationStepKind::ChangeProfile,
+            unsupported_impact(
+                "custom profile changes are applied by provisioning, not by config apply v1",
+            ),
+            "Restore the previous custom_profile.",
             false,
         ),
     );
@@ -3747,14 +4239,14 @@ mod tests {
     use super::{
         ApplyStatus, CollectionIndexKind, CollectionRole, CollectionRoleSpec, ConfigExplainer,
         ConfigSpecError, ConsistencyDomainSpec, ConsistencyMode, DATABASE_SPEC_VERSION,
-        DatabaseSpec, DeploymentMode, ExtensionCoreOwner, ExtensionManifestRef,
-        ExtensionManifestValidator, ExtensionStability, GuaranteeValidator, MigrationPlanner,
-        MigrationStepKind, PolicyCompiler, ReplicationMode, SupportStatus, TopologySpec,
-        ValidationSeverity, WriteAck, built_in_extension_manifest, built_in_extension_manifests,
-        built_in_profile, built_in_profile_normalized, built_in_profiles,
-        collection_role_definition, collection_role_definitions, compile_extension_catalog,
-        consistency_domain_definition, consistency_domain_definitions, database_spec_v1_schema,
-        extension_capability_definitions,
+        DATABASE_SPEC_VERSION_V2, DatabaseSpec, DeploymentMode, ExtensionCoreOwner,
+        ExtensionManifestRef, ExtensionManifestValidator, ExtensionStability, GuaranteeValidator,
+        MigrationPlanner, MigrationStepKind, PolicyCompiler, ReplicationMode,
+        SUPPORTED_SPEC_VERSIONS, SupportStatus, TopologySpec, ValidationSeverity, WriteAck,
+        built_in_extension_manifest, built_in_extension_manifests, built_in_profile,
+        built_in_profile_normalized, built_in_profiles, collection_role_definition,
+        collection_role_definitions, compile_extension_catalog, consistency_domain_definition,
+        consistency_domain_definitions, database_spec_v1_schema, extension_capability_definitions,
     };
     use crate::db::{DbConfig, Profile, ReplicationKind};
 
@@ -3898,12 +4390,37 @@ mod tests {
             "accounts",
             &DbConfig::on_disk(Profile::Balanced, "accounts.redb"),
         );
-        spec.version = 2;
+        spec.version = 3;
 
+        let error = spec.validate_structure();
         assert_eq!(
-            spec.validate_structure(),
-            Err(ConfigSpecError::UnsupportedVersion { found: 2 })
+            error,
+            Err(ConfigSpecError::UnsupportedVersion {
+                found: 3,
+                supported: 1..=2,
+            })
         );
+        assert_eq!(
+            error.err().map(|error| error.to_string()),
+            Some("unsupported DatabaseSpec version: 3 (supported 1..=2)".to_owned())
+        );
+    }
+
+    #[test]
+    fn version_2_validates_structurally() -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = DatabaseSpec::from_db_config(
+            "accounts",
+            &DbConfig::on_disk(Profile::Balanced, "accounts.redb"),
+        );
+        let v1_report = GuaranteeValidator::validate(&spec);
+        spec.version = DATABASE_SPEC_VERSION_V2;
+
+        spec.validate_structure()?;
+        let report = GuaranteeValidator::validate(&spec);
+        assert!(report.valid, "{:?}", report.issues);
+        assert_eq!(report, v1_report);
+        assert_eq!(SUPPORTED_SPEC_VERSIONS, 1..=2);
+        Ok(())
     }
 
     #[test]
@@ -4723,16 +5240,23 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         for (slug, yaml, validation, reserialized) in V1_CORPUS {
             let decoded = serde_norway::from_str::<DatabaseSpec>(yaml)?;
+            let through_spec_io = super::spec_io::decode_spec_bytes(
+                yaml.as_bytes(),
+                super::spec_io::SpecFormat::Yaml,
+            )?;
             let expected_validation = serde_json::from_str::<serde_json::Value>(validation)?;
 
-            assert_eq!(decoded.topology, TopologySpec::default(), "{slug}");
-            assert_eq!(decoded.custom_profile, None, "{slug}");
-            assert_eq!(
-                serde_json::to_value(GuaranteeValidator::validate(&decoded))?,
-                expected_validation,
-                "{slug}"
-            );
-            assert_eq!(serde_norway::to_string(&decoded)?, reserialized, "{slug}");
+            assert_eq!(through_spec_io, decoded, "{slug}");
+            for spec in [&decoded, &through_spec_io] {
+                assert_eq!(spec.topology, TopologySpec::default(), "{slug}");
+                assert_eq!(spec.custom_profile, None, "{slug}");
+                assert_eq!(
+                    serde_json::to_value(GuaranteeValidator::validate(spec))?,
+                    expected_validation,
+                    "{slug}"
+                );
+                assert_eq!(serde_norway::to_string(spec)?, reserialized, "{slug}");
+            }
         }
         Ok(())
     }
@@ -4793,5 +5317,618 @@ mod tests {
         );
         assert!(built_in_profile_normalized("unknown").is_none());
         assert!(CollectionRole::DocumentEntity < CollectionRole::TimeSeries);
+    }
+
+    fn codes_in_order(report: &super::ValidationReport) -> Vec<&str> {
+        report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect()
+    }
+
+    /// A version 2 spec whose `custom_profile` is `custom` (JSON) with `extends` set.
+    fn v2_custom_spec(
+        extends: &str,
+        mut custom: serde_json::Value,
+    ) -> Result<DatabaseSpec, Box<dyn std::error::Error>> {
+        let mut spec = catalog_spec("orders_durable", ConsistencyMode::StrongCp);
+        spec.version = DATABASE_SPEC_VERSION_V2;
+        custom["extends"] = json!(extends);
+        spec.custom_profile = Some(serde_json::from_value(custom)?);
+        Ok(spec)
+    }
+
+    #[test]
+    fn v2_custom_profile_validates_as_custom() -> Result<(), Box<dyn std::error::Error>> {
+        let spec = v2_custom_spec(
+            "high_durability",
+            json!({ "knobs": { "cache": { "max_entries": 8192 } } }),
+        )?;
+
+        let report = GuaranteeValidator::validate(&spec);
+
+        assert!(report.valid, "{:?}", report.issues);
+        assert_eq!(report.status, SupportStatus::Custom);
+        let codes = issue_codes(&report);
+        assert!(codes.contains("CUSTOM_PROFILE_DEFINED"), "{codes:?}");
+        assert!(!codes.contains("CUSTOM_PROFILE"), "{codes:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn v2_unknown_profiles_are_errors_with_suggestions() {
+        for (profile, suggestion) in [
+            ("secure-app", "Did you mean secure_app?"),
+            ("high_durabilty", "Did you mean high_durability?"),
+        ] {
+            let mut spec = catalog_spec(profile, ConsistencyMode::StrongCp);
+            spec.version = DATABASE_SPEC_VERSION_V2;
+
+            let report = GuaranteeValidator::validate(&spec);
+
+            assert!(!report.valid);
+            assert_eq!(report.status, SupportStatus::Invalid);
+            let Some(unknown) = report
+                .issues
+                .iter()
+                .find(|issue| issue.code == "PROFILE_UNKNOWN")
+            else {
+                panic!("missing PROFILE_UNKNOWN for {profile}: {:?}", report.issues);
+            };
+            assert!(unknown.suggestion.contains(suggestion), "{unknown:?}");
+            assert!(!issue_codes(&report).contains("CUSTOM_PROFILE"));
+        }
+    }
+
+    #[test]
+    fn v1_unknown_profiles_keep_custom_profile_first_and_add_advice() {
+        let mut spec = catalog_spec("unknown_profile", ConsistencyMode::LocalSnapshot);
+        spec.collections.push(collection(
+            "graph",
+            CollectionRole::Graph,
+            vec![CollectionIndexKind::Graph],
+        ));
+        spec.extensions.push(ExtensionManifestRef {
+            name: "lab-index".to_owned(),
+            version: "0.1.0".to_owned(),
+            stability: ExtensionStability::Experimental,
+        });
+
+        let report = GuaranteeValidator::validate(&spec);
+        let codes = codes_in_order(&report);
+
+        assert!(report.valid);
+        assert_eq!(report.status, SupportStatus::Custom);
+        assert_eq!(
+            codes,
+            [
+                "CUSTOM_PROFILE",
+                "PROFILE_NOT_PROVISIONABLE",
+                "EXPERIMENTAL_EXTENSION",
+                "CUSTOM_EXTENSION",
+                "IMPLICIT_EXTENSION_REQUIRED",
+            ]
+        );
+        assert_eq!(report.issues[0].severity, ValidationSeverity::Warning);
+        assert_eq!(report.issues[1].severity, ValidationSeverity::Advice);
+    }
+
+    #[test]
+    fn production_cp_backup_floor_keeps_its_code_and_position()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = catalog_spec("production_cp", ConsistencyMode::StrongCp);
+        spec.guarantees.write_ack = WriteAck::Local;
+        spec.guarantees.sensitive_data = true;
+
+        let report = GuaranteeValidator::validate(&spec);
+
+        assert_eq!(
+            codes_in_order(&report),
+            [
+                "CP_LOCAL_ACK",
+                "PRODUCTION_BACKUP_DISABLED",
+                "SENSITIVE_WITHOUT_ENCRYPTION"
+            ]
+        );
+        let backup = &report.issues[1];
+        assert_eq!(backup.path, "guarantees.backup.enabled");
+        assert_eq!(
+            backup.message,
+            "production_cp requires backup to be enabled"
+        );
+        assert_eq!(
+            backup.suggestion,
+            "Enable backup before using the production_cp profile."
+        );
+
+        let custom = GuaranteeValidator::validate(&v2_custom_spec("production_cp", json!({}))?);
+        let codes = codes_in_order(&custom);
+        assert!(codes.contains(&"PRODUCTION_BACKUP_DISABLED"), "{codes:?}");
+        assert!(
+            !codes.contains(&"GUARANTEE_BELOW_PROFILE_FLOOR"),
+            "{codes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unmet_custom_floors_are_errors_at_their_guarantee() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut spec = v2_custom_spec(
+            "secure_app",
+            json!({ "floors": { "audit": true, "backup": true, "pitr": true, "encryption_at_rest": true } }),
+        )?;
+        spec.guarantees.audit.enabled = false;
+
+        let report = GuaranteeValidator::validate(&spec);
+        let floors = report
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "GUARANTEE_BELOW_PROFILE_FLOOR")
+            .map(|issue| issue.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!report.valid);
+        assert_eq!(
+            floors,
+            [
+                "guarantees.audit.enabled",
+                "guarantees.backup.enabled",
+                "guarantees.backup.pitr",
+                "guarantees.encryption.at_rest"
+            ]
+        );
+
+        spec.guarantees.audit.enabled = true;
+        spec.guarantees.backup.enabled = true;
+        spec.guarantees.backup.pitr = true;
+        spec.guarantees.encryption.at_rest = true;
+        let met = GuaranteeValidator::validate(&spec);
+        assert!(met.valid, "{:?}", met.issues);
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_roles_add_extends_profile_certification() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let series = collection(
+            "metrics",
+            CollectionRole::TimeSeries,
+            vec![CollectionIndexKind::TimeSeries],
+        );
+        let mut without = v2_custom_spec("secure_app", json!({}))?;
+        without.collections.push(series.clone());
+        let mut with = v2_custom_spec(
+            "secure_app",
+            json!({ "compatible_roles": { "add": ["time_series"] } }),
+        )?;
+        with.collections.push(series);
+
+        let without_report = GuaranteeValidator::validate(&without);
+        let with_report = GuaranteeValidator::validate(&with);
+
+        let outside = without_report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "ROLE_OUTSIDE_PROFILE_CERTIFICATION")
+            .ok_or("missing ROLE_OUTSIDE_PROFILE_CERTIFICATION")?;
+        assert!(outside.message.contains("orders_durable"), "{outside:?}");
+        assert!(
+            outside.suggestion.contains("compatible_roles.add"),
+            "{outside:?}"
+        );
+        assert!(!issue_codes(&with_report).contains("ROLE_OUTSIDE_PROFILE_CERTIFICATION"));
+        assert!(with_report.valid, "{:?}", with_report.issues);
+        Ok(())
+    }
+
+    #[test]
+    fn knob_like_overrides_are_flagged_by_version() {
+        let mut v1 = catalog_spec("secure_app", ConsistencyMode::StrongCp);
+        v1.overrides
+            .insert("cache.max_capacity".to_owned(), "4096".to_owned());
+        v1.overrides
+            .insert("profile.custom.base".to_owned(), "secure_app".to_owned());
+        v1.overrides
+            .insert("query.timeout_ms".to_owned(), "1000".to_owned());
+        v1.overrides
+            .insert("durability.comit".to_owned(), "two_phase".to_owned());
+        v1.overrides
+            .insert("team.owner".to_owned(), "payments".to_owned());
+        v1.operation_hints
+            .insert("cache.max_entries".to_owned(), "8192".to_owned());
+
+        let report = GuaranteeValidator::validate(&v1);
+        let flagged = report
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "OVERRIDE_IS_METADATA_ONLY")
+            .collect::<Vec<_>>();
+
+        assert!(report.valid, "{:?}", report.issues);
+        assert_eq!(flagged.len(), 4, "{flagged:?}");
+        assert!(
+            flagged
+                .iter()
+                .all(|issue| issue.severity == ValidationSeverity::Advice)
+        );
+        let by_path = |path: &str| flagged.iter().find(|issue| issue.path == path).copied();
+        assert!(
+            by_path("overrides.profile.custom.base")
+                .is_some_and(|issue| { issue.suggestion.contains("multidb config upgrade") })
+        );
+        assert!(by_path("overrides.query.timeout_ms").is_some_and(|issue| {
+            issue
+                .suggestion
+                .contains("custom_profile.knobs.query.timeout_ms")
+        }));
+        assert!(by_path("overrides.durability.comit").is_some_and(|issue| {
+            issue
+                .suggestion
+                .contains("Did you mean custom_profile.knobs.durability.commit?")
+        }));
+        assert!(
+            by_path("overrides.cache.max_capacity").is_some_and(|issue| {
+                issue
+                    .suggestion
+                    .contains("Did you mean custom_profile.knobs.cache.max_entries?")
+            })
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.path.starts_with("operation_hints"))
+        );
+
+        let mut v2 = v1.clone();
+        v2.version = DATABASE_SPEC_VERSION_V2;
+        let strict = GuaranteeValidator::validate(&v2);
+        let shadows = strict
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "OVERRIDE_SHADOWS_TYPED_KNOB")
+            .collect::<Vec<_>>();
+        assert!(!strict.valid);
+        assert_eq!(shadows.len(), 4);
+        assert!(
+            shadows
+                .iter()
+                .all(|issue| issue.severity == ValidationSeverity::Error)
+        );
+        assert!(!issue_codes(&strict).contains("OVERRIDE_IS_METADATA_ONLY"));
+    }
+
+    #[test]
+    fn compiler_carries_the_resolved_profile() -> Result<(), Box<dyn std::error::Error>> {
+        let built_in =
+            PolicyCompiler::compile(&catalog_spec("high_durability", ConsistencyMode::StrongCp))
+                .map_err(|report| format!("{:?}", report.issues))?;
+        let resolved = built_in
+            .resolved_profile
+            .as_ref()
+            .ok_or("built-in profiles resolve")?;
+        assert_eq!(built_in.storage_profile, "secure_app");
+        assert_eq!(resolved.storage_profile, Profile::HighDurability);
+        assert_eq!(resolved.kind, super::ResolvedProfileKind::Variant);
+
+        let custom_spec = v2_custom_spec(
+            "high_durability",
+            json!({ "knobs": { "cache": { "max_entries": 8192 } } }),
+        )?;
+        let custom = PolicyCompiler::compile(&custom_spec)
+            .map_err(|report| format!("{:?}", report.issues))?;
+        let again = PolicyCompiler::compile(&custom_spec)
+            .map_err(|report| format!("{:?}", report.issues))?;
+        assert_eq!(custom, again);
+        assert_eq!(custom.storage_profile, "orders_durable");
+        let custom_profile = custom
+            .resolved_profile
+            .as_ref()
+            .ok_or("custom profiles resolve")?;
+        assert_eq!(custom_profile.knobs.cache.max_entries, 8192);
+        assert_eq!(
+            custom.runtime_limits,
+            super::RuntimeLimits::for_profile("orders_durable")
+        );
+
+        let legacy = PolicyCompiler::compile(&catalog_spec(
+            "unknown_profile",
+            ConsistencyMode::LocalSnapshot,
+        ))
+        .map_err(|report| format!("{:?}", report.issues))?;
+        assert!(legacy.resolved_profile.is_none());
+        assert!(
+            serde_json::to_value(&legacy)?
+                .get("resolved_profile")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_limits_keep_their_catalog_values() -> Result<(), Box<dyn std::error::Error>> {
+        let expected = |slug: &str| match slug {
+            "production_cp" => (4 * 1_024 * 1_024, 2_048, 16),
+            "analytics_columnar" => (2 * 1_024 * 1_024, 4_096, 16),
+            _ => (1_048_576, 1_024, 8),
+        };
+        for profile in built_in_profiles() {
+            let mut spec = catalog_spec(profile.slug, ConsistencyMode::StrongCp);
+            spec.guarantees.backup.enabled = true;
+            let policy =
+                PolicyCompiler::compile(&spec).map_err(|report| format!("{:?}", report.issues))?;
+            let limits = policy.runtime_limits;
+            assert_eq!(
+                (
+                    limits.max_value_bytes,
+                    limits.max_batch_ops,
+                    limits.max_concurrent_queries
+                ),
+                expected(profile.slug),
+                "{}",
+                profile.slug
+            );
+        }
+        let custom = PolicyCompiler::compile(&v2_custom_spec("production_cp", json!({}))?);
+        assert!(custom.is_err(), "backup floor applies to custom profiles");
+        let mut spec = v2_custom_spec("production_cp", json!({}))?;
+        spec.guarantees.backup.enabled = true;
+        let limits = PolicyCompiler::compile(&spec)
+            .map_err(|report| format!("{:?}", report.issues))?
+            .runtime_limits;
+        assert_eq!(
+            (
+                limits.max_value_bytes,
+                limits.max_batch_ops,
+                limits.max_concurrent_queries
+            ),
+            (1_048_576, 1_024, 8)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explain_reports_one_decision_per_knob() -> Result<(), Box<dyn std::error::Error>> {
+        let spec = v2_custom_spec(
+            "high_durability",
+            json!({ "knobs": {
+                "cache": { "max_entries": 8192 },
+                "compression": { "algorithm": "zstd" }
+            } }),
+        )?;
+
+        let report = ConfigExplainer::explain(&spec);
+        let decision = |path: &str| {
+            report
+                .decisions
+                .iter()
+                .find(|decision| decision.path == path)
+                .ok_or_else(|| format!("missing decision {path}"))
+        };
+
+        assert!(report.validation.valid, "{:?}", report.validation.issues);
+        let knob_paths = report
+            .decisions
+            .iter()
+            .filter_map(|decision| decision.path.strip_prefix("$.profile.knobs."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            knob_paths,
+            super::KNOB_REGISTRY
+                .iter()
+                .map(|definition| definition.path)
+                .collect::<Vec<_>>()
+        );
+        for definition in super::KNOB_REGISTRY {
+            let knob = decision(&format!("$.profile.knobs.{}", definition.path))?;
+            assert!(!knob.outcome.is_empty());
+            match definition.enforcement {
+                super::KnobEnforcement::Planned { .. } => {
+                    assert!(knob.outcome.starts_with("planned:"), "{knob:?}");
+                }
+                _ if definition.timing == super::KnobTiming::EveryOpen => {
+                    assert!(
+                        knob.outcome.contains("db::create_database_with_profile")
+                            && knob.outcome.contains("do not create databases from specs"),
+                        "{knob:?}"
+                    );
+                }
+                _ if definition.timing == super::KnobTiming::Provisioning => {
+                    assert!(knob.outcome.starts_with("recorded only"), "{knob:?}");
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            decision("$.profile.knobs.durability.commit")?.value,
+            "\"two_phase\""
+        );
+        assert_eq!(
+            decision("$.profile.knobs.durability.commit")?.source,
+            "variant:high_durability"
+        );
+        assert_eq!(
+            decision("$.profile.knobs.cache.max_entries")?.source,
+            "override"
+        );
+        assert_eq!(decision("$.profile.knobs.cache.max_entries")?.value, "8192");
+        assert_eq!(
+            decision("$.profile.knobs.query.timeout_ms")?.source,
+            "preset:secure_app"
+        );
+        assert!(
+            decision("$.profile.knobs.compression.algorithm")?
+                .outcome
+                .contains("schema_version 2")
+        );
+        let storage = decision("$.profile.storage_profile")?;
+        assert_eq!(storage.source, "derived:storage_class");
+        assert_eq!(
+            storage.outcome,
+            "fixed at creation (storage class HighDurability, redb engine with two-phase commit)"
+        );
+        assert_eq!(
+            decision("$.profile.knobs.storage.layout")?.outcome,
+            storage.outcome
+        );
+        assert_eq!(
+            report
+                .decisions
+                .iter()
+                .filter(|decision| decision.path.starts_with("$.profile.not_configurable."))
+                .count(),
+            5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explain_wording_is_corrected() -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = catalog_spec("secure_app", ConsistencyMode::StrongCp);
+        spec.guarantees.encryption.at_rest = true;
+
+        let report = ConfigExplainer::explain(&spec);
+        let outcome = |path: &str| {
+            report
+                .decisions
+                .iter()
+                .find(|decision| decision.path == path)
+                .map(|decision| decision.outcome.clone())
+                .ok_or_else(|| format!("missing decision {path}"))
+        };
+
+        assert_eq!(
+            outcome("$.guarantees.encryption.at_rest")?,
+            "requested; enforced only on the Rust API with an encryption config in this build"
+        );
+        assert_eq!(
+            outcome("$.compiled_policy.storage_profile")?,
+            "storage class Transactional (redb engine) for profile secure_app"
+        );
+        let limits = report
+            .decisions
+            .iter()
+            .find(|decision| decision.path == "$.compiled_policy.runtime_limits")
+            .ok_or("missing runtime_limits decision")?;
+        assert_eq!(limits.outcome, "advisory only; not enforced");
+        assert!(limits.reason.contains("$.profile.knobs"));
+        for old in [
+            "storage profile selected",
+            "encrypted storage required",
+            "limits selected",
+        ] {
+            assert!(
+                report
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.outcome != old),
+                "{old}"
+            );
+        }
+
+        let legacy = ConfigExplainer::explain(&catalog_spec(
+            "unknown_profile",
+            ConsistencyMode::LocalSnapshot,
+        ));
+        let knobs = legacy
+            .decisions
+            .iter()
+            .find(|decision| decision.path == "$.profile.knobs")
+            .ok_or("missing unresolved knob decision")?;
+        assert_eq!(knobs.value, "null");
+        assert!(
+            !legacy
+                .decisions
+                .iter()
+                .any(|decision| decision.path.starts_with("$.profile.knobs."))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_handles_custom_profiles_and_version_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = v2_custom_spec(
+            "high_durability",
+            json!({ "knobs": { "cache": { "max_entries": 4096 } } }),
+        )?;
+        let desired = v2_custom_spec(
+            "high_durability",
+            json!({ "knobs": { "cache": { "max_entries": 8192 } } }),
+        )?;
+        let plan = MigrationPlanner::plan(&current, &desired);
+        assert!(plan.valid, "{:?}", plan.desired_validation.issues);
+        assert!(!plan.apply_supported);
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.steps);
+        assert_eq!(plan.steps[0].path, "$.custom_profile");
+        assert_eq!(plan.steps[0].kind, MigrationStepKind::ChangeProfile);
+        assert!(!plan.steps[0].supported);
+
+        let v1 = catalog_spec("secure_app", ConsistencyMode::StrongCp);
+        let mut v2 = v1.clone();
+        v2.version = DATABASE_SPEC_VERSION_V2;
+        let upgrade = MigrationPlanner::plan(&v1, &v2);
+        assert!(upgrade.valid && upgrade.apply_supported);
+        assert_eq!(upgrade.steps.len(), 1, "{:?}", upgrade.steps);
+        assert_eq!(upgrade.steps[0].path, "$.version");
+        assert_eq!(upgrade.steps[0].kind, MigrationStepKind::Noop);
+        assert!(upgrade.steps[0].supported);
+        assert_eq!(
+            upgrade.steps[0].action,
+            "spec version 1 -> 2; no runtime effect"
+        );
+
+        let same = MigrationPlanner::plan(&v1, &v1);
+        assert_eq!(same.steps.len(), 1);
+        assert_eq!(same.steps[0].path, "$");
+        assert_eq!(
+            same.steps[0].action,
+            "current and desired specs are identical"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_profile_example_validates_as_custom() -> Result<(), Box<dyn std::error::Error>> {
+        let spec = super::spec_io::decode_spec_bytes(
+            include_bytes!("../examples/custom-profile/multidb.yaml"),
+            super::spec_io::SpecFormat::Yaml,
+        )?;
+
+        let report = GuaranteeValidator::validate(&spec);
+        let policy =
+            PolicyCompiler::compile(&spec).map_err(|report| format!("{:?}", report.issues))?;
+        let resolved = policy
+            .resolved_profile
+            .ok_or("the example profile resolves")?;
+
+        assert!(report.valid, "{:?}", report.issues);
+        assert_eq!(report.status, SupportStatus::Custom);
+        assert_eq!(spec.version, DATABASE_SPEC_VERSION_V2);
+        assert_eq!(resolved.slug, "orders_durable");
+        assert_eq!(resolved.storage_profile, Profile::HighDurability);
+        assert_eq!(resolved.product_profile, "secure_app");
+        for (path, source) in [
+            ("compression.algorithm", super::KnobSource::Override),
+            ("cache.max_entries", super::KnobSource::Override),
+            ("query.timeout_ms", super::KnobSource::Override),
+            ("history.system_versioning", super::KnobSource::Override),
+            ("durability.commit", super::KnobSource::Variant),
+            ("query.batch_rows", super::KnobSource::Preset),
+        ] {
+            assert_eq!(resolved.provenance.get(path), Some(&source), "{path}");
+        }
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.severity == ValidationSeverity::Advice),
+            "{:?}",
+            report.issues
+        );
+        Ok(())
     }
 }

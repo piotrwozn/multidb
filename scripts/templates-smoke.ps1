@@ -76,12 +76,37 @@ function Test-TemplateDirectory {
     Get-Content $Seed -Raw | ConvertFrom-Json | Out-Null
 }
 
+function Test-SpecFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Bin,
+        [Parameter(Mandatory = $true)]
+        [string] $Spec
+    )
+
+    if (-not (Test-Path $Spec)) {
+        throw "missing spec file $Spec"
+    }
+
+    Invoke-Checked -Label "spec validate $Spec" -Command {
+        & $Bin config validate --spec $Spec
+    }
+
+    $ExplainJson = & $Bin config explain --spec $Spec --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "spec explain $Spec failed with exit code $LASTEXITCODE"
+    }
+    $ExplainJson | ConvertFrom-Json | Out-Null
+}
+
 $Bin = Resolve-MultiDbBinary
 $ExamplesRoot = Join-Path $RepoRoot "examples"
 
 foreach ($Template in $TemplateNames) {
     Test-TemplateDirectory -Bin $Bin -TemplateDir (Join-Path $ExamplesRoot $Template)
 }
+
+Test-SpecFile -Bin $Bin -Spec (Join-Path (Join-Path $ExamplesRoot "custom-profile") "multidb.yaml")
 
 $TargetRoot = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "target"))
 if (-not $TargetRoot.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
