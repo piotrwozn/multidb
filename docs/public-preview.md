@@ -93,9 +93,10 @@ multidb profile knobs
   of a non-canonical variant (for example `high_durability`) gets a warning,
   because a version 1 spec records the product slug.
 - `config upgrade --spec <file> [--out <file>] [--force]` converts a spec to
-  version 2 and turns Studio's `profile.custom.*` keys into a real
-  `custom_profile`. It is idempotent, keeps the input format, does not keep
-  YAML comments and refuses to overwrite a file without `--force`.
+  version 2 and turns the `profile.custom.*` keys of older Studio specs into
+  a real `custom_profile` (the current Studio builder writes `custom_profile`
+  itself). It is idempotent, keeps the input format, does not keep YAML
+  comments and refuses to overwrite a file without `--force`.
 - Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
   (as before), a product slug or alias in snake or kebab case, or `auto`,
   which reads the storage profile and replication of the existing database.

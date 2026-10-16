@@ -80,6 +80,12 @@ All notable public changes will be recorded here.
   that extends `<p>`. Without `--override` guided init is unchanged.
 - `config_spec::suggest_profile_name`, the did-you-mean lookup over built-in
   profile slugs and aliases.
+- Control Plane `GET /profiles` adds `variants` (`name`, `storage_profile`,
+  `canonical`) and the canonical variant's preset `knobs` to every entry. The
+  fields are additive; the OpenAPI snapshot is unchanged.
+- TypeScript SDK types: `DatabaseSpec.custom_profile` (`CustomProfileSpec`),
+  `ProfileVariantSummary`, and optional `variants` and `knobs` on
+  `ProfileSummary`. `DatabaseSpec.version` stays `number` (1 or 2).
 
 ### Changed
 
@@ -124,6 +130,15 @@ All notable public changes will be recorded here.
   `high_durability` or `time-series`) prints a warning that the version 1
   spec records the product slug; `--json` adds `warnings`, `variant` and
   `storage_profile` to the summary object.
+- The Studio custom-profile builder emits a version 2 spec with a real
+  `custom_profile` (`extends` a product slug or variant, plus optional
+  `durability.commit`, `storage.layout`, `compression.algorithm` and
+  `cache.max_entries` knobs) instead of the `overrides["profile.custom.*"]`
+  and `operation_hints["profile.custom.slug"]` keys; an in-memory base gives
+  an embedded deployment without a storage path. Studio still validates and
+  dry-run plans these specs only. Run `multidb config upgrade` on specs saved
+  by older Studio builds. Studio's fallback for a spec without `profile` is
+  `balanced` instead of the unknown `durable`.
 
 ### Breaking
 

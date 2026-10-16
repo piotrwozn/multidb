@@ -27,7 +27,7 @@ which claims are deliberately out of scope.
 | SDKs | Stable preview for API v1 client surface in repo packages | TypeScript, Python, Go and Rust package gates |
 | Metrics endpoint | Preview | Raw Prometheus text remains marked preview |
 | `config apply` | Audit/confirmation only | No physical data migration in v1 |
-| Composable profiles (`custom_profile`, spec v2) | Preview; single-node profile manifests through the Rust API only; compression is forward-only and needs `schema_version` 2; CLI `profile show/explain/knobs`, `config upgrade`, `init --override` and `--profile auto` | resolver, schema v2 snapshot, v1 compatibility corpus, profile manifest open/refusal and backup/restore tests, CLI profile command tests |
+| Composable profiles (`custom_profile`, spec v2) | Preview; single-node profile manifests through the Rust API only; compression is forward-only and needs `schema_version` 2; CLI `profile show/explain/knobs`, `config upgrade`, `init --override` and `--profile auto`; `GET /profiles` variants and knobs; Studio custom-profile builder (validate and dry-run only) | resolver, schema v2 snapshot, v1 compatibility corpus, profile manifest open/refusal and backup/restore tests, CLI profile command tests, Control Plane `/profiles` and Studio builder tests |
 
 ## Profiles And Domains
 

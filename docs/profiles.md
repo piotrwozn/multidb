@@ -19,8 +19,12 @@ Nothing in the CLI, `serve` or the Control Plane creates a database from a
 spec. The CLI inspects profiles and specs (`multidb profile show`, `profile
 explain`, `profile knobs`), writes version 2 specs (`init --override`,
 `config upgrade`) and reads a database's own profile with `--profile auto`
-(see [CLI](#cli)). Existing version 1 specs keep their validation issues,
-serialization and plan ids; they only gain new Advice and Warnings.
+(see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and
+the Studio custom-profile builder writes version 2 `custom_profile` specs for
+validation and dry-run plans (see
+[Control Plane and Studio](#control-plane-and-studio)). Existing version 1
+specs keep their validation issues, serialization and plan ids; they only
+gain new Advice and Warnings.
 
 ## Model
 
@@ -558,3 +562,23 @@ Every `--profile` flag (`backup`, `restore`, `advice`, `cdc`, `view`,
 `ProfileMismatch` on a database of another storage class, such as a manifest
 database built with a non-default profile; set `MULTIDB_PROFILE=auto` or the
 exact profile.
+
+## Control Plane and Studio
+
+`GET /profiles` lists the six product profiles. Each entry carries
+`variants` (`name`, `storage_profile`, `canonical`; exactly one variant is
+canonical) and `knobs`, the preset knobs of the canonical variant, in the
+same JSON form as `custom_profile.knobs`. `/config/validate` and
+`/config/plan` accept version 1 and version 2 specs (see
+[Reading specs](#reading-specs-size-version-and-yaml-limits)). No Control
+Plane endpoint creates a database from a spec in this build.
+
+The Studio custom-profile builder writes a version 2 spec: `profile` is the
+custom slug and `custom_profile` extends a product slug or a variant, with
+optional `durability.commit`, `storage.layout`, `compression.algorithm` and
+`cache.max_entries` knobs (an empty field inherits the base value). A base
+whose variant is in memory gives an embedded deployment without a storage
+path. Studio validates and dry-run plans the spec; it does not create
+databases from it. Specs saved by older Studio builds carry
+`overrides["profile.custom.*"]` keys instead; `multidb config upgrade`
+converts them.

@@ -104,7 +104,7 @@ export const auditFixture: AuditResponse = {
 export const configFixture: DatabaseSpec = {
   version: 1,
   name: "studio-test",
-  profile: "durable",
+  profile: "balanced",
   deployment: {
     mode: "single_node",
     storage_path: null,
@@ -274,12 +274,21 @@ export const adviceFixture: RuntimeAdviceReport = {
 
 export const profilesFixture: ProfileSummary[] = [
   {
-    slug: "durable",
-    aliases: ["default"],
+    slug: "game_local_balanced",
+    aliases: ["balanced", "in_memory"],
     status: "Certified",
-    description: "Local durable profile",
+    description: "Local game profile",
     default_domain: "local_snapshot",
     compatible_roles: ["document_entity"],
+    variants: [
+      { name: "balanced", storage_profile: "Balanced", canonical: true },
+      { name: "in_memory", storage_profile: "InMemory", canonical: false },
+    ],
+    knobs: {
+      storage: { medium: "durable", layout: "row" },
+      durability: { commit: "immediate", group_commit_window_ms: 2 },
+      cache: { enabled: true, max_entries: 2048 },
+    },
   },
 ];
 

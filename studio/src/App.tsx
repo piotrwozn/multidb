@@ -42,6 +42,7 @@ import type {
   CollectionRole,
   ConflictResolution,
   ConsistencyMode,
+  CustomProfileSpec,
   DatabaseSpec,
   DeploymentMode,
   DocumentListResponse,
@@ -49,6 +50,7 @@ import type {
   JsonValue,
   LoadedStudioData,
   MigrationPlan,
+  ProfileSummary,
   ReplicationMode,
   Row,
   SecurityState,
@@ -279,7 +281,7 @@ const normalizeDatabaseSpec = (spec: DatabaseSpec): DatabaseSpec => ({
   ...spec,
   version: spec.version ?? 1,
   name: spec.name ?? "database",
-  profile: spec.profile ?? "durable",
+  profile: spec.profile ?? "balanced",
   deployment: spec.deployment ?? { mode: "single_node", storage_path: null },
   topology: spec.topology ?? { replica_count: 1, shard_count: 1 },
   defaults: spec.defaults ?? { consistency_domain: "primary", replication: "cp" },
@@ -363,6 +365,72 @@ const controlPlaneErrorMessage = (error: unknown): string => {
     return `${error.code}: ${error.message}`;
   }
   return errorMessage(error);
+};
+
+// Knob values the custom-profile builder offers; an empty selection inherits the base value.
+const commitModeKnobs = ["immediate", "two_phase"];
+const layoutKnobs = ["row", "columnar"];
+const compressionKnobs = ["none", "lz4", "zstd"];
+
+type ExtendsOption = {
+  value: string;
+  label: string;
+  storageProfile?: string;
+};
+
+// `custom_profile.extends` accepts a product slug (its canonical variant) or a variant name.
+const extendsOptionsFor = (profiles: ProfileSummary[]): ExtendsOption[] => {
+  const options: ExtendsOption[] = [];
+  const seen = new Set<string>();
+  const push = (option: ExtendsOption) => {
+    if (seen.has(option.value)) return;
+    seen.add(option.value);
+    options.push(option);
+  };
+  for (const profile of profiles) {
+    const variants = profile.variants ?? [];
+    push({
+      value: profile.slug,
+      label: `${profile.slug} - ${profile.status}`,
+      storageProfile: variants.find((variant) => variant.canonical)?.storage_profile,
+    });
+    for (const variant of variants) {
+      push({
+        value: variant.name,
+        label: `${variant.name} - ${profile.slug} variant, ${variant.storage_profile}${
+          variant.canonical ? " (canonical)" : ""
+        }`,
+        storageProfile: variant.storage_profile,
+      });
+    }
+  }
+  return options;
+};
+
+const customProfileKnobs = ({
+  commit,
+  layout,
+  compression,
+  cacheMaxEntries,
+}: {
+  commit: string;
+  layout: string;
+  compression: string;
+  cacheMaxEntries: string;
+}): JsonObject => {
+  const knobs: JsonObject = {};
+  if (commit.length > 0) knobs.durability = { commit };
+  if (layout.length > 0) knobs.storage = { layout };
+  if (compression.length > 0) knobs.compression = { algorithm: compression };
+  const entries = cacheMaxEntries.trim();
+  if (entries.length > 0) {
+    const parsed = Number(entries);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error("cache.max_entries must be a whole number, or empty to inherit.");
+    }
+    knobs.cache = { max_entries: parsed };
+  }
+  return knobs;
 };
 
 const databaseSpecForBuilder = ({
@@ -1669,7 +1737,21 @@ function Builder({
   const [customProfileDescription, setCustomProfileDescription] = useState(
     "Custom operator-managed profile for this environment.",
   );
-  const [customProfileBase, setCustomProfileBase] = useState(data.config.profile);
+  const extendsOptions = useMemo(() => extendsOptionsFor(data.profiles), [data.profiles]);
+  const [customProfileExtends, setCustomProfileExtends] = useState(() =>
+    extendsOptions.some((option) => option.value === data.config.profile)
+      ? data.config.profile
+      : (extendsOptions[0]?.value ?? "balanced"),
+  );
+  const [customCommit, setCustomCommit] = useState("");
+  const [customLayout, setCustomLayout] = useState("");
+  const [customCompression, setCustomCompression] = useState("");
+  const [customCacheEntries, setCustomCacheEntries] = useState("");
+  const extendsStorageProfile = extendsOptions.find(
+    (option) => option.value === customProfileExtends,
+  )?.storageProfile;
+  // An in-memory base keeps nothing on disk, so the spec runs embedded without a storage path.
+  const customProfileVolatile = extendsStorageProfile === "InMemory";
   const [result, setResult] = useState<JsonObject>();
 
   const request = useMemo<JsonObject>(() => {
@@ -1736,31 +1818,37 @@ function Builder({
         const spec = databaseSpecForBuilder({
           name: `${customProfileSlug}_example`,
           profile: customProfileSlug,
-          deploymentMode: databaseDeployment,
-          storagePath: databaseStoragePath,
+          deploymentMode: customProfileVolatile ? "embedded" : databaseDeployment,
+          storagePath: customProfileVolatile ? "" : databaseStoragePath,
           replication: databaseReplication,
           replicaCount: databaseReplicas,
           shardCount: databaseShards,
           backupEnabled: databaseBackup,
           auditEnabled: databaseAudit,
         });
-        spec.overrides = {
-          ...spec.overrides,
-          "profile.custom.base": customProfileBase,
-          "profile.custom.description": customProfileDescription,
-        };
+        const customProfile: CustomProfileSpec = { extends: customProfileExtends };
+        const description = customProfileDescription.trim();
+        if (description.length > 0) customProfile.description = description;
+        const knobs = customProfileKnobs({
+          commit: customCommit,
+          layout: customLayout,
+          compression: customCompression,
+          cacheMaxEntries: customCacheEntries,
+        });
+        if (Object.keys(knobs).length > 0) customProfile.knobs = knobs;
+        spec.version = 2;
+        spec.custom_profile = customProfile;
         spec.operation_hints = {
           ...spec.operation_hints,
           "studio.builder": "custom_profile",
-          "profile.custom.slug": customProfileSlug,
         };
         return {
           profile: {
-            slug: customProfileSlug,
-            base_profile: customProfileBase,
-            description: customProfileDescription,
+            slug: spec.profile,
+            extends: customProfileExtends,
+            storage_profile: extendsStorageProfile ?? null,
             status: "Custom",
-            note: "Custom profiles are validated as operator-managed DatabaseSpec metadata.",
+            note: "Studio validates and dry-run plans custom profiles; databases are created from them by provisioning, which this Studio build does not perform.",
           },
           example_database_spec: spec,
         } as unknown as JsonObject;
@@ -1773,9 +1861,14 @@ function Builder({
     chunkMillis,
     collectionId,
     columns,
-    customProfileBase,
+    customCacheEntries,
+    customCommit,
+    customCompression,
+    customLayout,
     customProfileDescription,
+    customProfileExtends,
     customProfileSlug,
+    customProfileVolatile,
     databaseAudit,
     databaseBackup,
     databaseDeployment,
@@ -1785,6 +1878,7 @@ function Builder({
     databaseShards,
     databaseStoragePath,
     dimension,
+    extendsStorageProfile,
     fieldPath,
     fields,
     geoPrecision,
@@ -1824,7 +1918,9 @@ function Builder({
           physical_create_supported: false,
           kind,
           message:
-            "Spec prepared, validated and dry-run planned. Physical database/profile switching is not enabled in this runtime.",
+            kind === "database"
+              ? "Spec prepared, validated and dry-run planned. Physical database/profile switching is not enabled in this runtime."
+              : "Custom profile spec prepared, validated and dry-run planned. Databases are created from custom profiles by provisioning, which this Studio build does not perform.",
           validation: validation as unknown as JsonValue,
           plan: plan as unknown as JsonValue,
           spec: spec as unknown as JsonValue,
@@ -2075,7 +2171,7 @@ function Builder({
           <>
             <HelpText
               title="Custom profile"
-              text="Defines an operator-managed profile as DatabaseSpec metadata. Validation will mark it Custom, and dry-run records the profile change without physical runtime switching."
+              text="Builds a version 2 DatabaseSpec whose custom_profile extends a built-in profile or variant; empty knobs inherit the base value. Studio validates and dry-run plans custom profiles; databases are created from them by provisioning, which this Studio build does not perform."
             />
             <div className="form-grid two-columns">
               <label>
@@ -2086,14 +2182,14 @@ function Builder({
                 />
               </label>
               <label>
-                <span>Base profile</span>
+                <span>Extends</span>
                 <select
-                  value={customProfileBase}
-                  onChange={(event) => setCustomProfileBase(event.target.value)}
+                  value={customProfileExtends}
+                  onChange={(event) => setCustomProfileExtends(event.target.value)}
                 >
-                  {data.profiles.map((profile) => (
-                    <option key={profile.slug} value={profile.slug}>
-                      {profile.slug} - {profile.status}
+                  {extendsOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
                     </option>
                   ))}
                 </select>
@@ -2109,9 +2205,64 @@ function Builder({
             </label>
             <div className="form-grid two-columns">
               <label>
+                <span>Commit (durability.commit)</span>
+                <select value={customCommit} onChange={(event) => setCustomCommit(event.target.value)}>
+                  <option value="">Inherit</option>
+                  {commitModeKnobs.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Layout (storage.layout)</span>
+                <select value={customLayout} onChange={(event) => setCustomLayout(event.target.value)}>
+                  <option value="">Inherit</option>
+                  {layoutKnobs.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Compression (compression.algorithm)</span>
+                <select
+                  value={customCompression}
+                  onChange={(event) => setCustomCompression(event.target.value)}
+                >
+                  <option value="">Inherit</option>
+                  {compressionKnobs.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Cache entries (cache.max_entries)</span>
+                <input
+                  type="number"
+                  min={0}
+                  placeholder="Inherit"
+                  value={customCacheEntries}
+                  onChange={(event) => setCustomCacheEntries(event.target.value)}
+                />
+              </label>
+            </div>
+            {customProfileVolatile && (
+              <Notice
+                tone="info"
+                message="In-memory profiles keep no files: the spec uses an embedded deployment without a storage path."
+              />
+            )}
+            <div className="form-grid two-columns">
+              <label>
                 <span>Deployment</span>
                 <select
-                  value={databaseDeployment}
+                  value={customProfileVolatile ? "embedded" : databaseDeployment}
+                  disabled={customProfileVolatile}
                   onChange={(event) => setDatabaseDeployment(event.target.value as DeploymentMode)}
                 >
                   {deploymentModes.map((mode) => (

@@ -35,8 +35,9 @@ use crate::{
     compat::SERVER_VERSION,
     config_spec::{
         ApplyCheckReport, ApplyStatus, DatabaseSpec, GuaranteeValidator, MigrationPlan,
-        MigrationPlanner, ValidationReport, built_in_profiles, collection_role_definitions,
-        consistency_domain_definition, consistency_domain_definitions, extension_catalog_entries,
+        MigrationPlanner, ProfileKnobOverrides, ProfileKnobs, ValidationReport, built_in_profiles,
+        collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
+        extension_catalog_entries, profile_variants, resolve_named_profile,
         spec_io::{self, SpecIoError},
     },
     db::{AdminCredentialRecord, CatalogEntry, Database, DbError, Profile, ReplicationKind},
@@ -2463,10 +2464,29 @@ async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -
                             .map(|definition| definition.slug)
                     })
                     .collect::<Vec<_>>(),
+                "variants": profile_variants()
+                    .iter()
+                    .filter(|variant| variant.product == profile.slug)
+                    .map(|variant| {
+                        json!({
+                            "name": variant.name,
+                            "storage_profile": variant.storage_profile,
+                            "canonical": variant.canonical,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "knobs": canonical_profile_knobs(profile.slug),
             })
         })
         .collect::<Vec<_>>();
     api_ok(StatusCode::OK, profiles)
+}
+
+/// The preset knobs of a product profile's canonical variant, as `GET /profiles` lists them.
+fn canonical_profile_knobs(slug: &str) -> Option<ProfileKnobs> {
+    resolve_named_profile(slug, &ProfileKnobOverrides::default())
+        .resolved()
+        .map(|resolved| resolved.knobs.clone())
 }
 
 async fn roles_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
@@ -3917,6 +3937,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profiles_endpoint_lists_variants_and_canonical_knobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = super::router(test_state()?)
+            .oneshot(authed_request(Method::GET, "/profiles", None::<&()>)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let profiles = body["data"].as_array().ok_or("profiles is not an array")?;
+        assert_eq!(profiles.len(), 6);
+        for profile in profiles {
+            let variants = profile["variants"]
+                .as_array()
+                .ok_or("variants is not an array")?;
+            assert_eq!(
+                variants
+                    .iter()
+                    .filter(|variant| variant["canonical"] == true)
+                    .count(),
+                1,
+                "{}",
+                profile["slug"]
+            );
+            assert!(profile["knobs"].is_object(), "{}", profile["slug"]);
+        }
+
+        let find = |slug: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile["slug"] == slug)
+                .ok_or(format!("missing profile {slug}"))
+        };
+        let game = find("game_local_balanced")?;
+        assert_eq!(
+            game["variants"],
+            serde_json::json!([
+                { "name": "balanced", "storage_profile": "Balanced", "canonical": true },
+                { "name": "in_memory", "storage_profile": "InMemory", "canonical": false },
+            ])
+        );
+        assert_eq!(game["knobs"]["durability"]["commit"], "immediate");
+        assert_eq!(game["knobs"]["storage"]["medium"], "durable");
+        assert_eq!(game["knobs"]["limits"]["max_value_bytes"], "unlimited");
+
+        let secure = find("secure_app")?;
+        let high_durability = secure["variants"]
+            .as_array()
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find(|variant| variant["name"] == "high_durability")
+            })
+            .ok_or("missing high_durability variant")?;
+        assert_eq!(high_durability["storage_profile"], "HighDurability");
+        assert_eq!(high_durability["canonical"], false);
+        // The listed knobs are the canonical variant's: transactional commits immediately.
+        assert_eq!(secure["knobs"]["durability"]["commit"], "immediate");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn advice_endpoint_returns_runtime_advisor_report()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = Arc::new(Mutex::new(admin_database()?));
@@ -4132,6 +4212,92 @@ mod tests {
         let body = json_body(rejected).await?;
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"]["code"], "invalid_json");
+        Ok(())
+    }
+
+    /// The spec shape Studio's custom-profile builder posts (`studio/src/App.tsx`).
+    fn studio_custom_profile_spec(
+        extends: &str,
+        deployment: &serde_json::Value,
+        knobs: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut custom_profile = serde_json::json!({
+            "extends": extends,
+            "description": "Custom operator-managed profile for this environment.",
+        });
+        if let Some(knobs) = knobs {
+            custom_profile["knobs"] = knobs;
+        }
+        serde_json::json!({
+            "version": 2,
+            "name": "ops_custom_profile_example",
+            "profile": "ops_custom_profile",
+            "deployment": deployment,
+            "topology": { "replica_count": 1, "shard_count": 1 },
+            "defaults": { "consistency_domain": "primary", "replication": "cp" },
+            "guarantees": {
+                "write_ack": "quorum",
+                "conflict_resolution": "none",
+                "backup": { "enabled": false, "pitr": false },
+                "encryption": { "at_rest": false },
+                "audit": { "enabled": true },
+                "sensitive_data": false,
+                "strict_cross_domain_transactions": true
+            },
+            "domains": [{ "name": "primary", "mode": "strong_cp" }],
+            "collections": [],
+            "extensions": [],
+            "overrides": {},
+            "operation_hints": { "studio.builder": "custom_profile" },
+            "custom_profile": custom_profile
+        })
+    }
+
+    #[tokio::test]
+    async fn studio_custom_profile_builder_specs_validate() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let durable = studio_custom_profile_spec(
+            "balanced",
+            &serde_json::json!({ "mode": "single_node", "storage_path": "target/new-database.redb" }),
+            Some(serde_json::json!({
+                "durability": { "commit": "immediate" },
+                "compression": { "algorithm": "zstd" },
+                "cache": { "max_entries": 8192 }
+            })),
+        );
+        let in_memory = studio_custom_profile_spec(
+            "in_memory",
+            &serde_json::json!({ "mode": "embedded", "storage_path": null }),
+            None,
+        );
+        for spec in [durable, in_memory] {
+            let response = super::router(test_state()?)
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/config/validate",
+                    Some(&spec),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "{spec}");
+            let body = json_body(response).await?;
+            assert_eq!(body["data"]["valid"], true, "{body}");
+            assert_eq!(body["data"]["status"], "custom", "{body}");
+            let issues = body["data"]["issues"]
+                .as_array()
+                .ok_or("issues is not an array")?;
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue["code"] == "CUSTOM_PROFILE_DEFINED"),
+                "{body}"
+            );
+            assert!(
+                !issues.iter().any(|issue| issue["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("OVERRIDE_"))),
+                "{body}"
+            );
+        }
         Ok(())
     }
 
