@@ -1557,10 +1557,23 @@ mod tests {
     }
 
     fn start_live_cluster(node_count: usize) -> Result<Vec<CpClusterHandle<MemEngine>>, ReplError> {
-        live_cluster_configs(node_count)
-            .into_iter()
-            .map(|config| start_cp_cluster(MemEngine::new(), config))
-            .collect()
+        // `unused_addr` releases its port before the cluster binds it, so another process can
+        // take it in between; retry with fresh ports instead of failing the test.
+        let mut attempts = 0;
+        loop {
+            let started = live_cluster_configs(node_count)
+                .into_iter()
+                .map(|config| start_cp_cluster(MemEngine::new(), config))
+                .collect::<Result<Vec<_>, _>>();
+            match started {
+                Err(ReplError::Transport(message))
+                    if message.contains("Address already in use") && attempts < 5 =>
+                {
+                    attempts += 1;
+                }
+                other => return other,
+            }
+        }
     }
 
     fn shutdown_all<S: StorageEngine>(handles: Vec<CpClusterHandle<S>>) {
@@ -1763,6 +1776,30 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Builds a three-voter target that keeps `leader_id` and node 1 (or another original
+    /// voter) and adds node 4.
+    fn membership_target_keeping<S: StorageEngine>(
+        handles: &[CpClusterHandle<S>],
+        leader_id: NodeId,
+    ) -> Result<Vec<RaftNode>, ReplError> {
+        let original = &handles[0].raft.cluster.voters;
+        let mut voters = original
+            .iter()
+            .filter(|node| node.id == leader_id || node.id == 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        if voters.len() < 2 {
+            let second = original
+                .iter()
+                .find(|node| node.id != leader_id)
+                .ok_or_else(|| ReplError::Transport("missing second voter".to_owned()))?;
+            voters.push(second.clone());
+        }
+        voters.push(RaftNode::new(4, handles[3].raft.cluster.bind_addr.clone()));
+        voters.sort_by_key(|node| node.id);
+        Ok(voters)
     }
 
     fn is_retryable_live_raft_error(message: &str) -> bool {
@@ -2031,33 +2068,29 @@ mod tests {
         let handles = start_live_cluster(4)?;
         let result = (|| {
             let leader_idx = wait_for_live_leader(&handles)?;
-            let handle = &handles[leader_idx];
-            wait_for_committed_live_config(handle)?;
-            let leader_id = handle.raft.cluster.node_id;
-            let mut next_voters = handles[0]
-                .raft
-                .cluster
-                .voters
-                .iter()
-                .filter(|node| node.id == leader_id || node.id == 1)
-                .cloned()
-                .collect::<Vec<_>>();
-            if next_voters.len() < 2 {
-                let Some(second_voter) = handles[0]
-                    .raft
-                    .cluster
-                    .voters
-                    .iter()
-                    .find(|node| node.id != leader_id)
-                else {
-                    return Err(ReplError::Transport("missing second voter".to_owned()).into());
-                };
-                next_voters.push(second_voter.clone());
-            }
-            next_voters.push(RaftNode::new(4, handles[3].raft.cluster.bind_addr.clone()));
-            next_voters.sort_by_key(|node| node.id);
-            let expected_voters = next_voters.iter().map(|node| node.id).collect::<Vec<_>>();
-            let status = change_membership_on_current_leader(&handles, &next_voters, &[])?;
+            wait_for_committed_live_config(&handles[leader_idx])?;
+            // The target set keeps whichever node leads when the change is applied, so a
+            // leader change between attempts never asks a node to remove itself.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let (status, expected_voters) = loop {
+                let leader_idx = wait_for_live_leader(&handles)?;
+                let leader_id = handles[leader_idx].raft.cluster.node_id;
+                let next_voters = membership_target_keeping(&handles, leader_id)?;
+                let expected = next_voters.iter().map(|node| node.id).collect::<Vec<_>>();
+                match change_membership(&handles[leader_idx], next_voters, Vec::new()) {
+                    Ok(status) => break (status, expected),
+                    Err(ReplError::Transport(message))
+                        if is_retryable_live_raft_error(&message) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                if Instant::now() >= deadline {
+                    return Err(ReplError::Transport(
+                        "timed out applying membership on current leader".to_owned(),
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
 
             assert_eq!(status.voters, expected_voters);
             assert_eq!(status.quorum_size, 2);
