@@ -36,6 +36,7 @@ which claims are deliberately out of scope.
 | `strong_cp` local/process cluster contract | Stable preview for local/process smoke semantics |
 | `eventual_ap` conflict policy | Experimental; workload review required |
 | Graph role | Experimental |
+| Full-text (`match`) and geo (`within_radius`) indexes | Experimental; backfilled on create and maintained synchronously with document writes through collection handles, transactions and Control Plane CRUD; raw key writes need `refresh_full`/`refresh_incremental`; searches need Read on the source collection and are denied under its row or masking policies |
 
 ## Out Of Scope
 

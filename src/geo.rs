@@ -16,6 +16,13 @@ pub const GEO_INDEX_TABLE: &str = "geo_indexes";
 pub const GEO_META_TABLE: &str = "__geo_meta";
 
 const EARTH_RADIUS_METERS: f64 = 6_371_000.0;
+/// Source documents read per page, and indexed documents buffered per batch, while
+/// rebuilding an index.
+const REFRESH_PAGE_ROWS: usize = 256;
+/// Index writes buffered before a rebuild flushes a batch.
+const REFRESH_PAGE_OPS: usize = 4_096;
+/// Index keys deleted per batch while clearing an index.
+const CLEAR_PAGE_KEYS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct GeoPoint {
@@ -41,7 +48,12 @@ pub struct GeoHit {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct GeoIndexState {
     pub refreshed_to: ResumeToken,
+    /// Number of indexed points at the last rebuild, backfill or incremental refresh.
     pub indexed_points: usize,
+    /// Documents skipped by the last rebuild or backfill because the indexed field held
+    /// something other than a valid lon/lat point. Missing and `Null` fields are not counted.
+    #[serde(default)]
+    pub skipped_documents: usize,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -115,50 +127,126 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
     /// # Errors
     /// Fails when metadata cannot be serialized.
     pub fn metadata_ops(config: &GeoIndexConfig) -> Result<Vec<Op>, GeoError> {
-        let state = GeoIndexState {
-            refreshed_to: ResumeToken::default(),
-            indexed_points: 0,
-        };
+        Self::metadata_ops_with_state(config, &GeoIndexState::default())
+    }
+
+    /// Builds system metadata writes that publish `state` together with the config.
+    /// # Errors
+    /// Fails when metadata cannot be serialized.
+    pub(crate) fn metadata_ops_with_state(
+        config: &GeoIndexConfig,
+        state: &GeoIndexState,
+    ) -> Result<Vec<Op>, GeoError> {
         Ok(vec![
             put_json_op(GEO_META_TABLE, meta_config_key(&config.name), config)?,
-            put_json_op(GEO_META_TABLE, meta_state_key(&config.name), &state)?,
+            put_json_op(GEO_META_TABLE, meta_state_key(&config.name), state)?,
         ])
     }
 
-    /// Rebuilds the derived geo index from documents.
+    /// Rebuilds the derived geo index from documents and records the refresh state.
+    /// Returns the number of indexed points.
+    ///
+    /// This is a repair tool: document writes made through `Database::collection` handles
+    /// already maintain the index in their own batch. The rebuild clears and rewrites the
+    /// index in bounded batches, so readers can see partial results while it runs. The
+    /// resume token is taken before the scan, so `refresh_incremental` replays writes that
+    /// land during the rebuild. Documents with an invalid point are skipped and counted in
+    /// `GeoIndexState::skipped_documents`.
     /// # Errors
-    /// Fails when documents cannot be read or index writes fail.
+    /// Fails when documents cannot be read or decoded, or index writes fail.
     pub fn refresh_full(&self) -> Result<usize, GeoError> {
-        let (prefix, end) = keyenc::u32_prefix_range(self.config.collection_id.as_u32());
-        let rows = self
-            .repl
-            .range(DOCUMENT_TABLE, &prefix, &end, ReadConsistency::Strong)?;
+        let state = self.rebuild_entries()?;
+        propose_system_batch(
+            self.repl,
+            vec![put_json_op(
+                GEO_META_TABLE,
+                meta_state_key(&self.config.name),
+                &state,
+            )?],
+        )?;
+        Ok(state.indexed_points)
+    }
+
+    /// Clears and rebuilds the index entries in bounded batches without writing the
+    /// refresh state.
+    /// # Errors
+    /// Fails when documents cannot be read or decoded, or index writes fail.
+    pub(crate) fn rebuild_entries(&self) -> Result<GeoIndexState, GeoError> {
+        // Take the token before scanning: a write that commits during the scan is then
+        // replayed by `refresh_incremental` instead of being lost.
         let refreshed_to = cdc::current_resume_token(self.repl)?;
-        let mut ops = clear_index_ops(self.repl, &self.config.name)?;
-        let mut indexed = 0_usize;
-        for (key, value) in rows {
-            let Some(id) = document_id_from_key(&key) else {
-                continue;
+        clear_index_entries(self.repl, &self.config.name)?;
+
+        let (mut cursor, end) = keyenc::u32_prefix_range(self.config.collection_id.as_u32());
+        let mut state = GeoIndexState {
+            refreshed_to,
+            ..GeoIndexState::default()
+        };
+        let mut ops = Vec::new();
+        let mut buffered_docs = 0_usize;
+        loop {
+            let page = scan_page(self.repl, DOCUMENT_TABLE, &cursor, &end, REFRESH_PAGE_ROWS)?;
+            for (key, value) in &page {
+                let Some(id) = document_id_from_key(key) else {
+                    continue;
+                };
+                if !self.append_rebuild_ops(id, value, &mut state, &mut ops)? {
+                    continue;
+                }
+                buffered_docs += 1;
+                if buffered_docs >= REFRESH_PAGE_ROWS || ops.len() >= REFRESH_PAGE_OPS {
+                    propose_system_batch(self.repl, std::mem::take(&mut ops))?;
+                    buffered_docs = 0;
+                }
+            }
+            let Some(next) = next_page_start(&page, REFRESH_PAGE_ROWS, &end) else {
+                break;
             };
-            if let Some(point) = document_point(&value, &self.config.path)? {
-                append_point_ops(&self.config, id, point, &mut ops)?;
-                indexed += 1;
+            cursor = next;
+        }
+        if !ops.is_empty() {
+            propose_system_batch(self.repl, ops)?;
+        }
+        if state.skipped_documents > 0 {
+            tracing::warn!(
+                index = %self.config.name,
+                skipped = state.skipped_documents,
+                "geo rebuild skipped documents with invalid points"
+            );
+        }
+        Ok(state)
+    }
+
+    /// Queues the entries of one source document during a rebuild and returns whether a
+    /// point was indexed. Invalid points are counted instead of aborting the rebuild.
+    fn append_rebuild_ops(
+        &self,
+        id: DocumentId,
+        bytes: &[u8],
+        state: &mut GeoIndexState,
+        ops: &mut Vec<Op>,
+    ) -> Result<bool, GeoError> {
+        let doc = decode_value(bytes)?;
+        match extract_path(&doc, &self.config.path) {
+            None | Some(Value::Null) => Ok(false),
+            Some(value) => {
+                let Some(point) = value_to_point(value) else {
+                    state.skipped_documents += 1;
+                    return Ok(false);
+                };
+                append_point_ops(&self.config, id, point, ops)?;
+                state.indexed_points += 1;
+                Ok(true)
             }
         }
-        let state = GeoIndexState {
-            refreshed_to,
-            indexed_points: indexed,
-        };
-        ops.push(put_json_op(
-            GEO_META_TABLE,
-            meta_state_key(&self.config.name),
-            &state,
-        )?);
-        propose_system_batch(self.repl, ops)?;
-        Ok(indexed)
     }
 
     /// Replays committed document changes after the stored LSN.
+    ///
+    /// This is a catch-up/repair tool for raw-key writes that bypass `Database::collection`
+    /// handles (stored procedures, raw batches). Changes to the same document within one
+    /// changefeed page are coalesced, so only its final point is indexed; invalid points
+    /// are not indexed.
     /// # Errors
     /// Fails when CDC, document decoding, or index writes fail.
     pub fn refresh_incremental(
@@ -189,23 +277,12 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
             }
 
             let mut ops = Vec::new();
-            for event in events {
-                match event.op {
-                    ChangeOp::Upsert { key, value_after } => {
-                        let Some(id) = document_id_from_key(&key) else {
-                            continue;
-                        };
-                        remove_existing_point_ops(self.repl, &self.config, id, &mut ops)?;
-                        if let Some(point) = document_point(&value_after, &self.config.path)? {
-                            append_point_ops(&self.config, id, point, &mut ops)?;
-                        }
-                    }
-                    ChangeOp::Delete { key } => {
-                        if let Some(id) = document_id_from_key(&key) {
-                            remove_existing_point_ops(self.repl, &self.config, id, &mut ops)?;
-                        }
-                    }
-                    ChangeOp::TxBegin | ChangeOp::TxCommit | ChangeOp::Ddl { .. } => {}
+            for (id, value_after) in coalesce_document_changes(events) {
+                remove_existing_point_ops(self.repl, &self.config, id, &mut ops)?;
+                if let Some(value_after) = value_after
+                    && let Some(point) = document_point(&value_after, &self.config.path)?
+                {
+                    append_point_ops(&self.config, id, point, &mut ops)?;
                 }
             }
             state.refreshed_to = next;
@@ -246,6 +323,9 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
     }
 
     /// Finds points in a bounding box and computes distance from the box center.
+    ///
+    /// Each candidate cell entry is verified against the document's stored point row, so
+    /// stale cell entries never produce hits.
     /// # Errors
     /// Fails when storage cannot be read.
     pub fn within_bbox(&self, min: GeoPoint, max: GeoPoint) -> Result<Vec<GeoHit>, GeoError> {
@@ -265,24 +345,26 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
             let Some(id) = trailing_doc_id(&key) else {
                 continue;
             };
-            let point = if value.is_empty() {
-                self.read_point(id)?
-            } else {
-                Some(
-                    serde_json::from_slice(&value)
-                        .map_err(|error| GeoError::Serde(error.to_string()))?,
-                )
-            };
-            let Some(point) = point else {
+            if !value.is_empty() {
+                let cell_point: GeoPoint = serde_json::from_slice(&value)
+                    .map_err(|error| GeoError::Serde(error.to_string()))?;
+                if !point_in_bbox(cell_point, min, max) {
+                    continue;
+                }
+            }
+            // Only trust a cell entry while the point row still maps to it; a stale entry
+            // left by a bypassing write or an interrupted rebuild is skipped.
+            let Some(point) = self.read_point(id)? else {
                 continue;
             };
-            if point_in_bbox(point, min, max) {
-                hits.push(GeoHit {
-                    id,
-                    point,
-                    distance_meters: haversine_meters(center, point),
-                });
+            if geo_index_key(&self.config, point, id) != key || !point_in_bbox(point, min, max) {
+                continue;
             }
+            hits.push(GeoHit {
+                id,
+                point,
+                distance_meters: haversine_meters(center, point),
+            });
         }
         Ok(hits)
     }
@@ -317,26 +399,72 @@ pub fn haversine_meters(a: GeoPoint, b: GeoPoint) -> f64 {
     2.0 * EARTH_RADIUS_METERS * h.sqrt().asin()
 }
 
-fn document_point(bytes: &[u8], path: &FieldPath) -> Result<Option<GeoPoint>, GeoError> {
-    let value = decode_value(bytes)?;
-    match extract_path(&value, path) {
-        Some(value) => value_to_point(value),
-        None => Ok(None),
+/// Appends the index writes for one document change.
+///
+/// The writes are a diff between the `old` and `new` document values, so they can be
+/// queued in the same batch as the document write itself. Nothing is emitted when the
+/// indexed point is unchanged; invalid points are not indexed.
+/// # Errors
+/// Fails when the point cannot be serialized.
+pub(crate) fn append_document_change_ops(
+    config: &GeoIndexConfig,
+    id: DocumentId,
+    old: Option<&Value>,
+    new: Option<&Value>,
+    ops: &mut Vec<Op>,
+) -> Result<(), GeoError> {
+    let old_point = old.and_then(|doc| value_point(doc, &config.path));
+    let new_point = new.and_then(|doc| value_point(doc, &config.path));
+    if old_point == new_point {
+        return Ok(());
     }
+
+    if let Some(old_point) = old_point {
+        let old_key = geo_index_key(config, old_point, id);
+        if new_point.is_none_or(|new_point| geo_index_key(config, new_point, id) != old_key) {
+            ops.push(Op::Delete {
+                table: GEO_INDEX_TABLE.to_owned(),
+                key: old_key,
+            });
+        }
+        if new_point.is_none() {
+            ops.push(Op::Delete {
+                table: GEO_POINTS_TABLE.to_owned(),
+                key: point_key(&config.name, id),
+            });
+        }
+    }
+    if let Some(new_point) = new_point {
+        append_point_ops(config, id, new_point, ops)?;
+    }
+    Ok(())
 }
 
-fn value_to_point(value: &Value) -> Result<Option<GeoPoint>, GeoError> {
+fn document_point(bytes: &[u8], path: &FieldPath) -> Result<Option<GeoPoint>, GeoError> {
+    let value = decode_value(bytes)?;
+    Ok(value_point(&value, path))
+}
+
+fn value_point(doc: &Value, path: &FieldPath) -> Option<GeoPoint> {
+    extract_path(doc, path).and_then(value_to_point)
+}
+
+/// Reads a `Value::GeoPoint` or a `{lon, lat}` object with integer or float coordinates.
+/// Returns `None` for any other value and for out-of-range or non-finite coordinates.
+fn value_to_point(value: &Value) -> Option<GeoPoint> {
+    let (lon, lat) = match value {
+        Value::GeoPoint { lon, lat } => (*lon, *lat),
+        Value::Object(map) => (coordinate(map.get("lon")?)?, coordinate(map.get("lat")?)?),
+        _ => return None,
+    };
+    GeoPoint::new(lon, lat).ok()
+}
+
+fn coordinate(value: &Value) -> Option<f64> {
     match value {
-        Value::GeoPoint { lon, lat } => GeoPoint::new(*lon, *lat).map(Some),
-        Value::Object(map) => {
-            let (Some(Value::Float(lon)), Some(Value::Float(lat))) =
-                (map.get("lon"), map.get("lat"))
-            else {
-                return Ok(None);
-            };
-            GeoPoint::new(*lon, *lat).map(Some)
-        }
-        _ => Ok(None),
+        Value::Float(value) => Some(*value),
+        Value::Int(value) => i32::try_from(*value).ok().map(f64::from),
+        _ => None,
     }
 }
 
@@ -384,19 +512,91 @@ fn remove_existing_point_ops<R: Replication + ?Sized>(
     Ok(())
 }
 
-fn clear_index_ops<R: Replication + ?Sized>(repl: &R, index: &str) -> Result<Vec<Op>, GeoError> {
-    let mut ops = Vec::new();
-    for table in [GEO_POINTS_TABLE, GEO_INDEX_TABLE] {
-        let prefix = index_prefix(index);
-        let end = keyenc::range_end(&prefix);
-        for (key, _) in repl.range(table, &prefix, &end, ReadConsistency::Strong)? {
-            ops.push(Op::Delete {
-                table: table.to_owned(),
-                key,
-            });
+/// Keeps the final version of each document changed in one changefeed page; `None`
+/// marks a delete.
+fn coalesce_document_changes(
+    events: impl IntoIterator<Item = cdc::ChangeEvent>,
+) -> BTreeMap<DocumentId, Option<Bytes>> {
+    let mut changes = BTreeMap::new();
+    for event in events {
+        match event.op {
+            ChangeOp::Upsert { key, value_after } => {
+                if let Some(id) = document_id_from_key(&key) {
+                    changes.insert(id, Some(value_after));
+                }
+            }
+            ChangeOp::Delete { key } => {
+                if let Some(id) = document_id_from_key(&key) {
+                    changes.insert(id, None);
+                }
+            }
+            ChangeOp::TxBegin | ChangeOp::TxCommit | ChangeOp::Ddl { .. } => {}
         }
     }
-    Ok(ops)
+    changes
+}
+
+/// Deletes every entry of `index` in bounded batches.
+fn clear_index_entries<R: Replication + ?Sized>(repl: &R, index: &str) -> Result<(), GeoError> {
+    let prefix = index_prefix(index);
+    let end = keyenc::range_end(&prefix);
+    for table in [GEO_POINTS_TABLE, GEO_INDEX_TABLE] {
+        let mut cursor = prefix.clone();
+        loop {
+            let page = scan_page(repl, table, &cursor, &end, CLEAR_PAGE_KEYS)?;
+            let next = next_page_start(&page, CLEAR_PAGE_KEYS, &end);
+            let ops = page
+                .into_iter()
+                .map(|(key, _)| Op::Delete {
+                    table: table.to_owned(),
+                    key,
+                })
+                .collect::<Vec<_>>();
+            if !ops.is_empty() {
+                propose_system_batch(repl, ops)?;
+            }
+            let Some(next) = next else {
+                break;
+            };
+            cursor = next;
+        }
+    }
+    Ok(())
+}
+
+/// Reads at most `rows` entries starting at `start`.
+fn scan_page<R: Replication + ?Sized>(
+    repl: &R,
+    table: &str,
+    start: &[u8],
+    end: &[u8],
+    rows: usize,
+) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+    let mut page = Vec::new();
+    repl.scan_range_batches(
+        table,
+        start,
+        end,
+        ReadConsistency::Strong,
+        rows,
+        &|| false,
+        &mut |batch| {
+            page.extend_from_slice(batch);
+            Ok(false)
+        },
+    )?;
+    Ok(page)
+}
+
+/// Returns the first key after a full page, or `None` when the range is exhausted.
+fn next_page_start(page: &[(Bytes, Bytes)], rows: usize, end: &[u8]) -> Option<Bytes> {
+    if page.len() < rows {
+        return None;
+    }
+    let (last, _) = page.last()?;
+    let mut next = last.clone();
+    next.push(0);
+    (end.is_empty() || next.as_slice() < end).then_some(next)
 }
 
 fn count_points_after_ops<R: Replication + ?Sized>(
@@ -577,15 +777,31 @@ fn document_id_from_key(key: &[u8]) -> Option<DocumentId> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
-
-    use crate::{
-        db::{DbConfig, Profile, create_database},
-        model::{DocumentCollection, FieldPath, Value},
-        repl::Replication,
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
     };
 
-    use super::{GeoIndex, GeoIndexConfig, GeoPoint, haversine_meters};
+    use crate::{
+        db::{Database, DbConfig, Profile, create_database},
+        keyenc,
+        model::{CollectionId, DocumentCollection, DocumentId, FieldPath, Value},
+        query::{ColumnType, DocField},
+        repl::{Op, ReadConsistency, Replication},
+    };
+
+    use super::{
+        GEO_INDEX_TABLE, GEO_POINTS_TABLE, GeoHit, GeoIndex, GeoIndexConfig, GeoPoint,
+        geo_index_key, haversine_meters, index_prefix,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const WARSAW: (f64, f64) = (21.0122, 52.2297);
+    const LONDON: (f64, f64) = (-0.1276, 51.5072);
+    const PARIS: (f64, f64) = (2.3522, 48.8566);
+    const BERLIN: (f64, f64) = (13.405, 52.52);
+    const ROME: (f64, f64) = (12.4964, 41.9028);
 
     #[test]
     fn geo_radius_uses_haversine_and_handles_antimeridian() -> Result<(), Box<dyn std::error::Error>>
@@ -620,10 +836,170 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn geo_index_tracks_point_moves_without_refresh() -> TestResult {
+        let mut database = places_database()?;
+        let id = database
+            .collection("places")?
+            .insert(&doc(WARSAW.0, WARSAW.1))?;
+        database.create_geo_index(places_geo_config())?;
+        let index = database.geo_index("places_geo")?;
+        assert_eq!(near(&index, WARSAW)?, BTreeSet::from([id]));
+
+        let places = database.collection("places")?;
+        places.update(id, &doc(LONDON.0, LONDON.1))?;
+        places.update(id, &doc(PARIS.0, PARIS.1))?;
+        assert!(near(&index, WARSAW)?.is_empty());
+        assert!(near(&index, LONDON)?.is_empty());
+        assert_eq!(near(&index, PARIS)?, BTreeSet::from([id]));
+        assert_eq!(entries_for(&database, id)?, (1, 1));
+
+        database.transaction(|txn| {
+            txn.update_document("places", id, &doc(BERLIN.0, BERLIN.1))?;
+            txn.update_document("places", id, &doc(ROME.0, ROME.1))
+        })?;
+        assert!(near(&index, BERLIN)?.is_empty());
+        assert!(near(&index, PARIS)?.is_empty());
+        assert_eq!(near(&index, ROME)?, BTreeSet::from([id]));
+        assert_eq!(entries_for(&database, id)?, (1, 1));
+
+        database.transaction(|txn| txn.delete_document("places", id))?;
+        assert_eq!(entries_for(&database, id)?, (0, 0));
+        assert!(near(&index, ROME)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn geo_index_accepts_int_coordinates_and_skips_invalid_points() -> TestResult {
+        let mut database = places_database()?;
+        let int_id = {
+            let places = database.collection("places")?;
+            let int_id = places.insert(&point_doc(lon_lat(Value::Int(21), Value::Int(52))))?;
+            places.insert(&point_doc(lon_lat(Value::Float(500.0), Value::Float(0.0))))?;
+            places.insert(&point_doc(Value::Str("nowhere".to_owned())))?;
+            places.insert(&point_doc(Value::Null))?;
+            int_id
+        };
+        database.create_geo_index(places_geo_config())?;
+        let index = database.geo_index("places_geo")?;
+        assert_eq!(near(&index, (21.0, 52.0))?, BTreeSet::from([int_id]));
+        assert_eq!(index.state()?.map(|state| state.skipped_documents), Some(2));
+
+        assert_eq!(index.refresh_full()?, 1);
+        assert_eq!(index.state()?.map(|state| state.skipped_documents), Some(2));
+
+        let out_of_range = database
+            .collection("places")?
+            .insert(&point_doc(lon_lat(Value::Float(0.0), Value::Float(95.0))))?;
+        assert_eq!(entries_for(&database, out_of_range)?, (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn within_radius_ignores_ghost_cell_entries() -> TestResult {
+        let mut database = places_database()?;
+        let id = database
+            .collection("places")?
+            .insert(&doc(PARIS.0, PARIS.1))?;
+        database.create_geo_index(places_geo_config())?;
+        let warsaw = GeoPoint::new(WARSAW.0, WARSAW.1)?;
+        Replication::propose_batch(
+            &database,
+            vec![Op::Put {
+                table: GEO_INDEX_TABLE.to_owned(),
+                key: geo_index_key(&places_geo_config(), warsaw, id),
+                value: serde_json::to_vec(&warsaw)?,
+            }],
+        )?;
+        let index = database.geo_index("places_geo")?;
+        assert!(near(&index, WARSAW)?.is_empty());
+        assert_eq!(near(&index, PARIS)?, BTreeSet::from([id]));
+        Ok(())
+    }
+
+    #[test]
+    fn geo_refresh_incremental_coalesces_repeated_moves() -> TestResult {
+        let mut database = places_database()?;
+        database.create_geo_index(places_geo_config())?;
+        // A bare handle has no derived indexes attached, like a raw-key writer.
+        let raw = DocumentCollection::new(&database, CollectionId::new(9));
+        let id = raw.insert(&doc(WARSAW.0, WARSAW.1))?;
+        raw.update(id, &doc(LONDON.0, LONDON.1))?;
+        raw.update(id, &doc(PARIS.0, PARIS.1))?;
+
+        let index = database.geo_index("places_geo")?;
+        index.refresh_incremental(database.catalog())?;
+        assert_eq!(entries_for(&database, id)?, (1, 1));
+        assert!(near(&index, WARSAW)?.is_empty());
+        assert!(near(&index, LONDON)?.is_empty());
+        assert_eq!(near(&index, PARIS)?, BTreeSet::from([id]));
+
+        raw.delete(id)?;
+        index.refresh_incremental(database.catalog())?;
+        assert_eq!(entries_for(&database, id)?, (0, 0));
+        Ok(())
+    }
+
+    fn places_database() -> Result<Database, Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_collection(
+            "places",
+            CollectionId::new(9),
+            vec![DocField::path(
+                "name",
+                FieldPath::new(["name"]),
+                ColumnType::Str,
+            )],
+            Vec::new(),
+        )?;
+        Ok(database)
+    }
+
+    fn places_geo_config() -> GeoIndexConfig {
+        GeoIndexConfig::new(
+            "places_geo",
+            CollectionId::new(9),
+            FieldPath::new(["point"]),
+        )
+    }
+
+    fn near<R: Replication + ?Sized>(
+        index: &GeoIndex<'_, R>,
+        (lon, lat): (f64, f64),
+    ) -> Result<BTreeSet<DocumentId>, Box<dyn std::error::Error>> {
+        let hits: Vec<GeoHit> = index.within_radius(GeoPoint::new(lon, lat)?, 1_000.0)?;
+        Ok(hits.into_iter().map(|hit| hit.id).collect())
+    }
+
+    /// Counts the `GEO_POINTS_TABLE` and `GEO_INDEX_TABLE` entries of one document.
+    fn entries_for(
+        database: &Database,
+        id: DocumentId,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let prefix = index_prefix("places_geo");
+        let end = keyenc::range_end(&prefix);
+        let mut counts = [0_usize; 2];
+        for (count, table) in counts.iter_mut().zip([GEO_POINTS_TABLE, GEO_INDEX_TABLE]) {
+            *count = Replication::range(database, table, &prefix, &end, ReadConsistency::Strong)?
+                .into_iter()
+                .filter(|(key, _)| key.ends_with(&id.as_bytes()))
+                .count();
+        }
+        Ok((counts[0], counts[1]))
+    }
+
+    fn lon_lat(lon: Value, lat: Value) -> Value {
+        Value::Object(BTreeMap::from([
+            ("lon".to_owned(), lon),
+            ("lat".to_owned(), lat),
+        ]))
+    }
+
+    fn point_doc(point: Value) -> Value {
+        Value::Object(BTreeMap::from([("point".to_owned(), point)]))
+    }
+
     fn doc(lon: f64, lat: f64) -> Value {
-        Value::Object(BTreeMap::from([(
-            "point".to_owned(),
-            Value::GeoPoint { lon, lat },
-        )]))
+        point_doc(Value::GeoPoint { lon, lat })
     }
 }
