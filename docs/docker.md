@@ -49,7 +49,7 @@ Environment:
 | --- | --- | --- | --- |
 | `MULTIDB_RUNTIME_MODE` | no | `production` | Use `local-dev` only for local plaintext PG smoke. |
 | `MULTIDB_DB_PATH` | no | `/var/lib/multidb/multidb.redb` | Must live on the mounted volume. |
-| `MULTIDB_PROFILE` | no | `transactional` | Any existing CLI profile name. |
+| `MULTIDB_PROFILE` | no | `transactional` | Storage profile name, product slug, alias, or `auto` (probe the existing database; required for manifest databases built with a non-default profile). `auto` fails when the database does not exist yet, so the first start of a fresh volume needs an explicit profile. |
 | `MULTIDB_BIND` | no | `0.0.0.0:8080` | HTTP API and Studio bind. |
 | `MULTIDB_PG_BIND` | no | `0.0.0.0:5432` | PostgreSQL wire bind. |
 | `MULTIDB_STUDIO_DIR` | no | `/usr/share/multidb/studio` | Built Studio asset directory. |

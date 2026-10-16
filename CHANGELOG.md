@@ -63,6 +63,23 @@ All notable public changes will be recorded here.
   `docs/profiles.md`.
 - `AnyEngine::is_value_framed` and `AnyEngine::with_value_framing`, which
   wraps an open engine in compression framing without reopening it.
+- CLI profile commands: `multidb profile show <profile> [--override
+  path=value]...` (resolved knobs with source, timing, enforcement and sink,
+  plus what-if overrides with did-you-mean suggestions), `profile show --db
+  <path>` (the persisted profile manifest, or "legacy database"), `profile
+  explain --spec <file>` (exit 2 when the profile is invalid) and `profile
+  knobs` (the knob registry and reserved knobs). `profile list --json` adds
+  `variants` and the canonical variant's `knobs`; the text output adds
+  `variants=`.
+- `multidb config upgrade --spec <in> [--out <file>] [--force] [--json]`
+  converts a spec to version 2 and turns Studio's `profile.custom.*` keys into
+  `custom_profile`; it is idempotent and refuses to overwrite files without
+  `--force`.
+- `multidb init --guided --profile <p> --override path=value...
+  [--profile-name <slug>]` writes a version 2 spec with a `custom_profile`
+  that extends `<p>`. Without `--override` guided init is unchanged.
+- `config_spec::suggest_profile_name`, the did-you-mean lookup over built-in
+  profile slugs and aliases.
 
 ### Changed
 
@@ -98,6 +115,15 @@ All notable public changes will be recorded here.
   Restore now reads the full backup payload before it creates the target, so
   a full payload that fails its checksum or decryption no longer leaves an
   empty initialized target behind.
+- Every CLI `--profile` flag and `MULTIDB_PROFILE` also accept product slugs
+  (their canonical variant), aliases in snake or kebab case, and `auto`,
+  which reads the storage profile and replication of the existing database
+  (`restore` refuses `auto`). Every value accepted before keeps its meaning.
+  Guided init accepts profile names in any case.
+- Guided init with an alias of a non-canonical variant (for example
+  `high_durability` or `time-series`) prints a warning that the version 1
+  spec records the product slug; `--json` adds `warnings`, `variant` and
+  `storage_profile` to the summary object.
 
 ### Breaking
 

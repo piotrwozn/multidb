@@ -74,6 +74,18 @@ multidb config validate --spec .\agent-memory\multidb.yaml
 multidb config explain --spec .\agent-memory\multidb.yaml
 ```
 
+Profiles have typed knobs. Inspect them, or write a version 2 spec with a
+custom profile that extends a built-in one:
+
+```powershell
+multidb profile show high_durability
+multidb profile show high_durability --override cache.max_entries=8192
+multidb init --guided --profile high_durability --name Orders --override cache.max_entries=8192 --out .\orders.yaml
+multidb profile explain --spec .\orders.yaml
+```
+
+See `docs/profiles.md` for the knob reference and the profile commands.
+
 Checked-in examples are under `examples/`, with SDK examples under
 `examples/sdk/`.
 

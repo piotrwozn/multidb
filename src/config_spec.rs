@@ -35,7 +35,7 @@ pub use profile::{
     ProfileKnobOverrides, ProfileKnobs, ProfileResolution, ProfileVariant, QueryKnobs,
     QueryOverrides, ResolvedProfile, ResolvedProfileKind, RoleSetDelta, StorageKnobs,
     StorageMedium, StorageOverrides, SystemVersioningKnob, TimeSeriesKnobs, TimeSeriesOverrides,
-    profile_variants, resolve_named_profile, resolve_profile,
+    profile_variants, resolve_named_profile, resolve_profile, suggest_profile_name,
 };
 pub(crate) use profile::{check_knob_ranges, derive_storage_profile, product_variant};
 pub use schema::database_spec_v1_schema;

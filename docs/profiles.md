@@ -16,8 +16,11 @@ Only the Rust API builds a database from a resolved profile:
 `__meta.profile_manifest`, and every single-node opener, `serve` included,
 re-applies them (see [Persistence and format](#persistence-and-format)).
 Nothing in the CLI, `serve` or the Control Plane creates a database from a
-spec. Existing version 1 specs keep their validation issues, serialization and
-plan ids; they only gain new Advice and Warnings.
+spec. The CLI inspects profiles and specs (`multidb profile show`, `profile
+explain`, `profile knobs`), writes version 2 specs (`init --override`,
+`config upgrade`) and reads a database's own profile with `--profile auto`
+(see [CLI](#cli)). Existing version 1 specs keep their validation issues,
+serialization and plan ids; they only gain new Advice and Warnings.
 
 ## Model
 
@@ -149,7 +152,8 @@ runtime; they always come from `PerformanceConfig::for_profile`.
 parses one `path=value` against the registry: enum names, integers, `auto`,
 `unlimited`, `true` / `false`, and `null` (inherit) for the retention. A
 misspelled path gets a did-you-mean suggestion; ranges are checked by the
-resolver.
+resolver. The CLI `--override` flag uses it, and `multidb profile knobs`
+prints this registry.
 
 ## Reserved knobs
 
@@ -389,7 +393,8 @@ the runtime performance is rebuilt from the knobs at every open, so cache,
 query and group-commit knobs survive a restart and a tuning rollback returns
 to the manifest values. `multidb serve` and the CLI open databases through
 these openers, so they honour the manifest too; their `--profile` or
-`MULTIDB_PROFILE` must still name the database's storage class. An explicit
+`MULTIDB_PROFILE` must name the database's storage class, or be `auto` to read
+it from the database (see [CLI](#cli)). An explicit
 `OperationalConfig.performance` wins for that session and logs one warning.
 No opener writes security because of a manifest. Databases without a manifest
 open exactly as before; plain `create_database` and `serve` never write one.
@@ -474,3 +479,82 @@ without creating anything:
 
 It opens an existing file with redb, which may run redb's own crash repair
 exactly as a normal open would, and drops the handle before returning.
+
+## CLI
+
+`multidb profile` inspects profiles without touching any database:
+
+| command | output | exit code |
+| --- | --- | --- |
+| `profile list [--json]` | the six product profiles; JSON adds `variants` (`name`, `storage_profile`, `canonical`) and the canonical variant's `knobs`, text adds `variants=` | 0 |
+| `profile show <profile> [--override path=value]... [--json]` | the resolved profile: a header naming the product, variant, status and storage profile, the digest, and one row per knob with its value, source (`preset`, `variant`, `override`), timing, enforcement and sink | 0, or 2 when the profile is invalid |
+| `profile show --db <path> [--json]` | the profile manifest of the database, or `legacy database: storage profile X, no manifest`; JSON prints the `inspect_database_metadata` result | 0, or 1 when nothing, an uninitialized file, a locked or an unreadable database is found |
+| `profile explain --spec <file> [--json]` | `resolve_profile` for a spec read through `spec_io`; JSON has `resolution` (`resolved`, `unresolved`, `invalid`), `profile`, `rows` and `issues` | 0 for resolved and version 1 unresolved profiles, 2 when invalid or when the spec cannot be read (`SPEC_TOO_LARGE`, `UNSUPPORTED_VERSION`, ...) |
+| `profile knobs [--json]` | every `KNOB_REGISTRY` entry, then the reserved knobs marked `reserved` | 0 |
+
+`--override path=value` may be repeated or hold a comma-separated list. It
+accepts every registry path, including `floors.*`; `compatible_roles` is a
+set and is refused with a hint to edit `custom_profile.compatible_roles` in a
+spec, and reserved knobs are refused as not supported by this runtime. A
+misspelled path is a usage error with a did-you-mean suggestion. With
+overrides, `profile show` resolves the what-if custom profile
+`<profile>_custom` that extends `<profile>`.
+
+`multidb init --guided --profile <profile> --name <name>` writes the same
+version 1 spec as before. With `--override path=value`, it writes a version 2
+spec instead: `custom_profile` extends the normalised `<profile>` with the
+given knobs and floors, and `profile` is `--profile-name <slug>` or
+`<profile>_custom`. Raised floors also raise the matching guarantees
+(`floors.pitr` raises `backup.enabled` and `backup.pitr`), a volatile
+`storage.medium` gives an embedded deployment without a storage path, and
+`consistency.default_domain` sets the domain mode and replication.
+`--profile-name` without `--override` is a usage error. Without `--override`,
+an alias whose variant is not the product's canonical one, such as
+`high_durability` or `time-series`, gets a warning, because a version 1 spec
+records the product slug and so resolves to the canonical variant; `--json`
+adds `warnings`, `variant` and `storage_profile` to the summary object.
+
+`multidb config upgrade --spec <in> [--out <file>] [--force] [--json]`
+converts a spec to version 2:
+
+- it sets `version: 2`;
+- Studio's convention, `overrides["profile.custom.base"]`,
+  `overrides["profile.custom.description"]` and
+  `operation_hints["profile.custom.slug"]`, becomes
+  `custom_profile { extends, description }` with the slug as `profile`, and
+  those keys are removed; every other key, `studio.builder` included, stays;
+- it is deterministic and idempotent: upgrading the output again gives the
+  same bytes;
+- the output keeps the input's format and goes to stdout without `--out`
+  (notes and an invalid validation report go to stderr then); `--json` prints
+  `{spec, notes, validation}`;
+- it refuses to overwrite an existing file, the input included, without
+  `--force`, and replaces files by writing a sibling file and renaming it;
+- the result is validated: exit 2 when it is invalid, for example
+  `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
+  `profile.custom.base`.
+
+It re-serializes the spec, so YAML comments and formatting are not kept and
+defaulted fields such as `topology` are written out. Knob-like `overrides`
+keys are not converted; version 2 validation reports them as
+`OVERRIDE_SHADOWS_TYPED_KNOB` with the `custom_profile.knobs` path to use.
+
+Every `--profile` flag (`backup`, `restore`, `advice`, `cdc`, `view`,
+`import`, `export`, `migrate`, `admin`) and `MULTIDB_PROFILE` for
+`multidb serve` accept:
+
+- the storage profile spellings accepted before (`InMemory`, `in-memory`,
+  `memory`, `Transactional`, `transactional`, ... `Balanced`, `balanced`),
+  which keep their meaning;
+- a product slug, which selects its canonical variant's storage profile, or
+  an alias, which selects its variant's, in snake or kebab case;
+- `auto`, which reads the storage profile and replication of the existing
+  database with `inspect_database_metadata`. It is a usage error when nothing
+  exists at the path, the file holds no database metadata, the database is
+  locked by another process or its metadata cannot be read. `restore` refuses
+  `auto`, because its target must be absent or empty.
+
+`multidb serve` defaults to `MULTIDB_PROFILE=transactional`, so it fails with
+`ProfileMismatch` on a database of another storage class, such as a manifest
+database built with a non-default profile; set `MULTIDB_PROFILE=auto` or the
+exact profile.

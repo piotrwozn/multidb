@@ -18,15 +18,24 @@ use multidb::{
         SubscriptionConfig,
     },
     config_spec::{
-        ApplyCheckReport, ApplyStatus, ConfigExplainer, ConsistencyDomainSpec, ConsistencyMode,
+        ApplyCheckReport, ApplyStatus, ChangePolicy, CommitMode, CompressionKnob, ConfigExplainer,
+        ConsistencyDomainSpec, ConsistencyMode, CustomProfileSpec, DATABASE_SPEC_VERSION_V2,
         DatabaseDefaults, DatabaseSpec, DeploymentMode, DeploymentSpec, ExplainConfigReport,
-        GuaranteeSpec, GuaranteeValidator, MigrationPlan, MigrationPlanner, ProfileSpec,
-        ReplicationMode, TopologySpec, ValidationReport, ValidationSeverity, built_in_profile,
-        built_in_profiles, collection_role_definition, collection_role_definitions,
-        consistency_domain_definition, consistency_domain_definitions,
-        spec_io::{self, SpecIoError},
+        FloorOverrides, GuaranteeSpec, GuaranteeValidator, KNOB_REGISTRY, KnobDefinition,
+        KnobEnforcement, KnobSource, KnobTiming, LayoutKnob, MigrationPlan, MigrationPlanner,
+        ProfileKnobOverrides, ProfileKnobs, ProfileResolution, ProfileSpec, ProfileVariant,
+        RESERVED_KNOBS, ReplicationMode, ResolvedProfile, ResolvedProfileKind, RoleSetDelta,
+        StorageMedium, TopologySpec, ValidationIssue, ValidationReport, ValidationSeverity,
+        built_in_profile_normalized, built_in_profiles, collection_role_definition,
+        collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
+        parse_knob_assignment, profile_variants, resolve_named_profile, resolve_profile,
+        spec_io::{self, SpecFormat, SpecIoError},
+        suggest_profile_name,
     },
-    db::{DbConfig, DbError, Profile, create_database, open_database},
+    db::{
+        DbConfig, DbError, MetadataProbe, PersistedProfileManifest, Profile, create_database,
+        inspect_database_metadata, open_database,
+    },
     migration::{
         ExportFormat, ImportOptions, MigrationError, export_table_csv, export_table_jsonl,
         import_pg_dump_plain, import_table_csv, import_table_jsonl, migrate_value_codec,
@@ -98,7 +107,7 @@ struct ServeConfig {
     admin_bind: SocketAddr,
     pg_bind: SocketAddr,
     db_path: PathBuf,
-    profile: Profile,
+    profile: ProfileSelection,
     admin_token: Option<String>,
     admin_password: Option<String>,
     admin_password_reset: bool,
@@ -110,11 +119,26 @@ struct ServeConfig {
     studio_dir: PathBuf,
 }
 
+/// What a `--profile` flag or `MULTIDB_PROFILE` selects: a storage profile, or `auto`, which
+/// reads the storage profile and replication of an existing database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileSelection {
+    Fixed(Profile),
+    Auto,
+}
+
 impl CliRun {
     fn success(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             exit_code: 0,
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: 1,
         }
     }
 
@@ -191,6 +215,7 @@ fn run_config(args: &[String]) -> Result<CliRun, CliError> {
         "explain" => run_config_explain(&args[1..]),
         "plan" => run_config_plan(&args[1..]),
         "apply" => run_config_apply(&args[1..]),
+        "upgrade" => run_config_upgrade(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -301,6 +326,185 @@ fn run_config_apply(args: &[String]) -> Result<CliRun, CliError> {
     ))
 }
 
+/// `config upgrade`: converts a spec to version 2 (see `upgrade_spec`), writes it in the input's
+/// format to `--out` or stdout, and exits 2 when the upgraded spec does not validate.
+fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
+    let spec_path = PathBuf::from(required_value(args, "--spec")?);
+    let output = output_format(args)?;
+    let out_path = optional_value(args, "--out").map(PathBuf::from);
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
+    if let Some(out_path) = &out_path {
+        ensure_upgrade_target(&spec_path, out_path, has_flag(args, "--force"))?;
+    }
+
+    let (upgraded, notes) = upgrade_spec(spec);
+    let report = GuaranteeValidator::validate(&upgraded);
+    let format = match spec_io::spec_format_for_path(&spec_path) {
+        SpecFormat::Yaml => "yaml",
+        SpecFormat::Json => "json",
+    };
+    let content = serialize_spec(&upgraded, format)?;
+    if let Some(out_path) = &out_path {
+        write_file_replacing(out_path, &content)?;
+    }
+
+    let message = if output == "json" {
+        let mut summary = json!({
+            "spec": upgraded,
+            "notes": notes,
+            "validation": report,
+        });
+        if let Some(out_path) = &out_path {
+            summary["path"] = json!(out_path.display().to_string());
+        }
+        serde_json::to_string_pretty(&summary)?
+    } else if let Some(out_path) = &out_path {
+        let mut lines = vec![format!(
+            "upgraded config path={} version={} profile={} status={:?} valid={}",
+            out_path.display(),
+            upgraded.version,
+            upgraded.profile,
+            report.status,
+            report.valid
+        )];
+        lines.extend(notes.iter().map(|note| format!("note: {note}")));
+        lines.extend(report.issues.iter().map(format_issue));
+        lines.join("\n")
+    } else {
+        // stdout carries only the spec, so it can be redirected into a file.
+        for note in &notes {
+            eprintln!("note: {note}");
+        }
+        if !report.valid {
+            eprintln!("{}", format_validation_report(&report));
+        }
+        content.trim_end_matches('\n').to_owned()
+    };
+    Ok(CliRun::validation(message, report.valid))
+}
+
+/// Studio's version 1 custom-profile convention, converted by `config upgrade`.
+const STUDIO_PROFILE_BASE: &str = "profile.custom.base";
+const STUDIO_PROFILE_DESCRIPTION: &str = "profile.custom.description";
+const STUDIO_PROFILE_SLUG: &str = "profile.custom.slug";
+
+/// Converts a spec to version 2. Studio's custom-profile convention
+/// (`overrides["profile.custom.base"]`, `overrides["profile.custom.description"]` and
+/// `operation_hints["profile.custom.slug"]`) becomes `custom_profile { extends, description }`
+/// with the slug as `profile`, and those three keys are removed. Every other key is left as it
+/// is. Deterministic and idempotent: upgrading an upgraded spec changes nothing.
+fn upgrade_spec(mut spec: DatabaseSpec) -> (DatabaseSpec, Vec<String>) {
+    let mut notes = Vec::new();
+    if spec.version == DATABASE_SPEC_VERSION_V2 {
+        notes.push("the spec is already version 2".to_owned());
+    } else {
+        notes.push(format!(
+            "version {} -> {DATABASE_SPEC_VERSION_V2}",
+            spec.version
+        ));
+        spec.version = DATABASE_SPEC_VERSION_V2;
+    }
+
+    if spec.custom_profile.is_none()
+        && let Some(extends) = spec.overrides.remove(STUDIO_PROFILE_BASE)
+    {
+        let description = spec
+            .overrides
+            .remove(STUDIO_PROFILE_DESCRIPTION)
+            .filter(|description| !description.trim().is_empty());
+        if let Some(slug) = spec.operation_hints.remove(STUDIO_PROFILE_SLUG) {
+            notes.push(format!(
+                "operation_hints[{STUDIO_PROFILE_SLUG}] = {slug} became profile"
+            ));
+            spec.profile = slug;
+        }
+        notes.push(format!(
+            "overrides[{STUDIO_PROFILE_BASE}] = {extends} became custom_profile.extends{}",
+            if description.is_some() {
+                format!(
+                    ", and overrides[{STUDIO_PROFILE_DESCRIPTION}] became custom_profile.description"
+                )
+            } else {
+                String::new()
+            }
+        ));
+        spec.custom_profile = Some(CustomProfileSpec {
+            extends,
+            description,
+            knobs: ProfileKnobOverrides::default(),
+            floors: FloorOverrides::default(),
+            compatible_roles: RoleSetDelta::default(),
+        });
+    } else if spec.overrides.contains_key(STUDIO_PROFILE_BASE)
+        || spec.overrides.contains_key(STUDIO_PROFILE_DESCRIPTION)
+        || spec.operation_hints.contains_key(STUDIO_PROFILE_SLUG)
+    {
+        notes.push(format!(
+            "{} so the profile.custom.* keys were left in place; move them into custom_profile \
+             by hand",
+            if spec.custom_profile.is_some() {
+                "custom_profile is already set,"
+            } else {
+                "there is no overrides[profile.custom.base],"
+            }
+        ));
+    }
+
+    notes.push(
+        "the spec is re-serialized: comments and formatting are not preserved, and defaulted \
+         fields such as topology are written out"
+            .to_owned(),
+    );
+    (spec, notes)
+}
+
+/// Refuses to replace an existing file, and in particular the input spec, without `--force`.
+fn ensure_upgrade_target(input: &Path, out: &Path, force: bool) -> Result<(), CliError> {
+    if force {
+        return Ok(());
+    }
+    let same_file = match (std::fs::canonicalize(input), std::fs::canonicalize(out)) {
+        (Ok(input), Ok(out)) => input == out,
+        _ => input == out,
+    };
+    if same_file {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite the input spec {}; pass --force to replace it",
+            out.display()
+        )));
+    }
+    if out.exists() {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite {}; pass --force to replace it",
+            out.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes `content` next to `path` and renames it into place, so a failed write never leaves a
+/// half-written file where the old one was (`config upgrade --force` may replace its input).
+fn write_file_replacing(path: &Path, content: &str) -> Result<(), CliError> {
+    let Some(file_name) = path.file_name() else {
+        return Err(CliError::Usage(format!(
+            "--out {} must name a file",
+            path.display()
+        )));
+    };
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(".upgrade-tmp");
+    let temp_path = path.with_file_name(temp_name);
+    std::fs::write(&temp_path, content.as_bytes())?;
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn run_explain(args: &[String]) -> Result<CliRun, CliError> {
     let Some(command) = args.first() else {
         return Err(usage());
@@ -329,18 +533,36 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
             "use either --profile or --template, not both".to_owned(),
         ));
     }
+    let customize = has_flag(args, "--override");
     if let Some(template_name) = template_arg {
+        if customize || has_flag(args, "--profile-name") {
+            return Err(CliError::Usage(
+                "--override and --profile-name apply to init --guided --profile, not --template"
+                    .to_owned(),
+            ));
+        }
         return run_init_template(args, &template_name, &name);
+    }
+    if !customize && has_flag(args, "--profile-name") {
+        return Err(CliError::Usage(
+            "--profile-name names the custom profile that --override defines; pass at least one \
+             --override <knob>=<value>"
+                .to_owned(),
+        ));
     }
 
     let profile_name = profile_arg.ok_or_else(|| {
         CliError::Usage("missing --profile or --template for guided init".to_owned())
     })?;
-    let profile = resolve_built_in_profile(&profile_name).ok_or_else(|| {
-        CliError::Usage(format!(
-            "unknown profile {profile_name}; run multidb profile list"
-        ))
-    })?;
+    let (profile, base) = resolve_built_in_profile(&profile_name)
+        .zip(named_profile(&profile_name))
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "unknown profile {profile_name}{}; run multidb profile list",
+                did_you_mean(&profile_name)
+            ))
+        })?;
+    let (knobs, floors) = parse_knob_overrides(args)?;
     let file_format = init_file_format(args)?;
     let out_path = optional_value(args, "--out")
         .map(PathBuf::from)
@@ -352,32 +574,113 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
         )));
     }
 
-    let spec = guided_spec(profile, &name);
+    let (spec, warning) = if customize {
+        let slug = optional_value(args, "--profile-name")
+            .unwrap_or_else(|| format!("{}_custom", base.slug));
+        let spec = custom_guided_spec(
+            profile,
+            &base,
+            CustomProfileSpec {
+                extends: base.slug.clone(),
+                description: None,
+                knobs,
+                floors,
+                compatible_roles: RoleSetDelta::default(),
+            },
+            &slug,
+            &name,
+        );
+        (spec, None)
+    } else {
+        (
+            guided_spec(profile, &name),
+            variant_warning(&profile_name, &base, profile),
+        )
+    };
     let report = GuaranteeValidator::validate(&spec);
     let content = serialize_spec(&spec, &file_format)?;
     std::fs::write(&out_path, content.as_bytes())?;
 
     let output = output_format(args)?;
+    let extends = spec
+        .custom_profile
+        .as_ref()
+        .map(|custom| custom.extends.as_str());
     let message = if output == "json" {
-        serde_json::to_string_pretty(&json!({
+        let mut summary = json!({
             "path": out_path.display().to_string(),
             "name": spec.name,
             "profile": spec.profile,
             "status": report.status,
             "valid": report.valid,
-        }))?
+        });
+        if let Some(extends) = extends {
+            summary["version"] = json!(spec.version);
+            summary["extends"] = json!(extends);
+        }
+        if let Some(warning) = &warning {
+            summary["warnings"] = json!([warning.message]);
+            summary["variant"] = json!(warning.variant);
+            summary["storage_profile"] = json!(warning.storage_profile);
+        }
+        serde_json::to_string_pretty(&summary)?
     } else {
-        format!(
+        let mut message = format!(
             "created config path={} name={} profile={} status={:?} valid={}",
             out_path.display(),
             spec.name,
             spec.profile,
             report.status,
             report.valid
-        )
+        );
+        if let Some(extends) = extends {
+            message.push_str(&format!(" version={} extends={extends}", spec.version));
+        }
+        if let Some(warning) = &warning {
+            message.push_str("\nwarning: ");
+            message.push_str(&warning.message);
+        }
+        message
     };
 
     Ok(CliRun::validation(message, report.valid))
+}
+
+/// Warns that a version 1 guided spec records the product slug, so an alias that names a
+/// non-canonical variant (for example `high_durability`) does not select that variant.
+struct VariantWarning {
+    message: String,
+    /// The variant the written spec resolves to: the product's canonical one.
+    variant: &'static str,
+    storage_profile: Profile,
+}
+
+fn variant_warning(
+    typed: &str,
+    base: &ResolvedProfile,
+    product: &ProfileSpec,
+) -> Option<VariantWarning> {
+    let canonical = product_variants(product.slug).find(|variant| variant.canonical)?;
+    if canonical.name == base.variant {
+        return None;
+    }
+    Some(VariantWarning {
+        message: format!(
+            "profile {typed} is the {} variant (storage profile {:?}) of {}, but a version 1 \
+             spec records the product slug {}, whose canonical variant is {} (storage profile \
+             {:?}); pass --override <knob>=<value> to write a version 2 custom_profile that \
+             extends {}",
+            base.variant,
+            base.storage_profile,
+            product.slug,
+            product.slug,
+            canonical.name,
+            canonical.storage_profile,
+            base.variant
+        ),
+        variant: canonical.name,
+        storage_profile: canonical.storage_profile,
+    })
 }
 
 fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result<CliRun, CliError> {
@@ -421,7 +724,19 @@ fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result
 }
 
 fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
-    require_list_command(args)?;
+    let Some(command) = args.first() else {
+        return Err(usage());
+    };
+    match command.as_str() {
+        "list" => run_profile_list(args),
+        "show" => run_profile_show(&args[1..]),
+        "explain" => run_profile_explain(&args[1..]),
+        "knobs" => run_profile_knobs(&args[1..]),
+        _ => Err(usage()),
+    }
+}
+
+fn run_profile_list(args: &[String]) -> Result<CliRun, CliError> {
     let message = if output_format(args)? == "json" {
         let profiles = built_in_profiles()
             .iter()
@@ -437,6 +752,16 @@ fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
                         .iter()
                         .map(|role| role_slug(*role))
                         .collect::<Vec<_>>(),
+                    "variants": product_variants(profile.slug)
+                        .map(|variant| {
+                            json!({
+                                "name": variant.name,
+                                "storage_profile": variant.storage_profile,
+                                "canonical": variant.canonical,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "knobs": named_profile(profile.slug).map(|resolved| resolved.knobs),
                 })
             })
             .collect::<Vec<_>>();
@@ -445,6 +770,177 @@ fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
         format_profiles()
     };
     Ok(CliRun::success(message))
+}
+
+/// `profile show <name> [--override path=value]...` resolves a built-in slug or alias as a
+/// what-if; `profile show --db <path>` reports the profile persisted in a database.
+fn run_profile_show(args: &[String]) -> Result<CliRun, CliError> {
+    let output = output_format(args)?;
+    let name = args.first().filter(|value| !value.starts_with("--"));
+    match (name, optional_value(args, "--db")) {
+        (Some(_), Some(_)) => Err(CliError::Usage(
+            "use either a profile name or --db with profile show, not both".to_owned(),
+        )),
+        (None, Some(db)) => {
+            if has_flag(args, "--override") {
+                return Err(CliError::Usage(
+                    "--override applies to profile show <profile>, not to --db".to_owned(),
+                ));
+            }
+            run_profile_show_db(Path::new(&db), &output)
+        }
+        (Some(name), None) => {
+            let (knobs, floors) = parse_knob_overrides(args)?;
+            let resolution = resolve_what_if(name, &knobs, floors);
+            resolution_run(&resolution, &output)
+        }
+        (None, None) => Err(CliError::Usage(
+            "missing profile name or --db; run multidb profile list".to_owned(),
+        )),
+    }
+}
+
+fn run_profile_show_db(path: &Path, output: &str) -> Result<CliRun, CliError> {
+    let probe = inspect_database_metadata(path);
+    let initialized = matches!(probe, MetadataProbe::Initialized(_));
+    let message = if output == "json" {
+        serde_json::to_string_pretty(&probe)?
+    } else {
+        format_metadata_probe(path, &probe)?
+    };
+    Ok(if initialized {
+        CliRun::success(message)
+    } else {
+        CliRun::failure(message)
+    })
+}
+
+/// `profile explain --spec <file>`: the resolver result for a spec. Exit 2 when the profile is
+/// invalid; a version 1 spec whose profile cannot be resolved is reported, with exit 0.
+fn run_profile_explain(args: &[String]) -> Result<CliRun, CliError> {
+    let spec_path = PathBuf::from(required_value(args, "--spec")?);
+    let output = output_format(args)?;
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
+    resolution_run(&resolve_profile(&spec), &output)
+}
+
+/// `profile knobs`: every `KNOB_REGISTRY` entry, then the reserved knobs.
+fn run_profile_knobs(args: &[String]) -> Result<CliRun, CliError> {
+    let message = if output_format(args)? == "json" {
+        let mut knobs = Vec::with_capacity(KNOB_REGISTRY.len() + RESERVED_KNOBS.len());
+        for definition in KNOB_REGISTRY {
+            let mut entry = serde_json::to_value(definition)?;
+            entry["reserved"] = json!(false);
+            knobs.push(entry);
+        }
+        for reserved in RESERVED_KNOBS {
+            knobs.push(json!({
+                "path": reserved.path,
+                "reserved": true,
+                "reason": reserved.reason,
+            }));
+        }
+        serde_json::to_string_pretty(&knobs)?
+    } else {
+        let mut rows = vec![
+            [
+                "path",
+                "values",
+                "timing",
+                "enforcement",
+                "after creation",
+                "sink",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ];
+        rows.extend(KNOB_REGISTRY.iter().map(|definition| {
+            vec![
+                definition.path.to_owned(),
+                definition.value_type.describe(),
+                timing_label(definition.timing).to_owned(),
+                enforcement_label(definition.enforcement),
+                change_policy_label(definition.after_creation).to_owned(),
+                definition.sink.to_owned(),
+            ]
+        }));
+        rows.extend(RESERVED_KNOBS.iter().map(|reserved| {
+            vec![
+                reserved.path.to_owned(),
+                "reserved".to_owned(),
+                "-".to_owned(),
+                "not supported".to_owned(),
+                "-".to_owned(),
+                reserved.reason.to_owned(),
+            ]
+        }));
+        align_rows(&rows)
+    };
+    Ok(CliRun::success(message))
+}
+
+/// Resolves a what-if profile. Knob overrides go through `resolve_named_profile`; floors need a
+/// version 2 `custom_profile`, so with floors the same custom profile is resolved from a guided
+/// spec.
+fn resolve_what_if(
+    name: &str,
+    knobs: &ProfileKnobOverrides,
+    floors: FloorOverrides,
+) -> ProfileResolution {
+    if floors.is_empty() {
+        return resolve_named_profile(name, knobs);
+    }
+    let Some(product) = built_in_profile_normalized(name) else {
+        return resolve_named_profile(name, knobs);
+    };
+    let base = match resolve_named_profile(name, &ProfileKnobOverrides::default()) {
+        ProfileResolution::Resolved { profile, .. } => profile,
+        other => return other,
+    };
+    let custom = CustomProfileSpec {
+        extends: name.trim().to_owned(),
+        description: None,
+        knobs: knobs.clone(),
+        floors,
+        compatible_roles: RoleSetDelta::default(),
+    };
+    let slug = format!("{}_custom", base.slug);
+    resolve_profile(&custom_guided_spec(
+        product, &base, custom, &slug, "what_if",
+    ))
+}
+
+/// Prints a resolver result; exit 2 when it is invalid.
+fn resolution_run(resolution: &ProfileResolution, output: &str) -> Result<CliRun, CliError> {
+    let message = if output == "json" {
+        let value = match resolution {
+            ProfileResolution::Resolved { profile, issues } => json!({
+                "resolution": "resolved",
+                "profile": profile,
+                "rows": knob_rows_json(&profile.knobs, Some(&profile.provenance))?,
+                "issues": issues,
+            }),
+            ProfileResolution::Unresolved { reason, issues } => json!({
+                "resolution": "unresolved",
+                "reason": reason,
+                "issues": issues,
+            }),
+            ProfileResolution::Invalid(issues) => json!({
+                "resolution": "invalid",
+                "issues": issues,
+            }),
+        };
+        serde_json::to_string_pretty(&value)?
+    } else {
+        format_resolution(resolution)?
+    };
+    Ok(CliRun::validation(
+        message,
+        !matches!(resolution, ProfileResolution::Invalid(_)),
+    ))
 }
 
 fn run_role(args: &[String]) -> Result<CliRun, CliError> {
@@ -668,8 +1164,8 @@ fn run_backup(args: &[String]) -> Result<String, CliError> {
     };
     let db = PathBuf::from(required_value(args, "--db")?);
     let dest = PathBuf::from(required_value(args, "--dest")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
-    let database = open_database(DbConfig::on_disk(profile, db))?;
+    let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
+    let database = open_database(cli_db_config(selection, db)?)?;
     let config = BackupConfig::default();
 
     match kind.as_str() {
@@ -700,7 +1196,16 @@ fn run_backup(args: &[String]) -> Result<String, CliError> {
 fn run_restore(args: &[String]) -> Result<String, CliError> {
     let backup = PathBuf::from(required_value(args, "--backup")?);
     let dest_db = PathBuf::from(required_value(args, "--dest-db")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
+    let ProfileSelection::Fixed(profile) =
+        parse_profile_selection(&required_value(args, "--profile")?)?
+    else {
+        return Err(CliError::Usage(
+            "restore does not accept --profile auto: the restore target must be absent or \
+             empty, so there is no database to inspect; pass the storage profile the backed-up \
+             database was created with"
+                .to_owned(),
+        ));
+    };
     let target = match optional_value(args, "--to-lsn") {
         Some(value) => RestoreTarget::Lsn(
             value
@@ -916,7 +1421,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let database = create_database(DbConfig::on_disk(config.profile, &config.db_path))?;
+    let database = create_database(cli_db_config(config.profile, config.db_path.clone())?)?;
     let database = Arc::new(tokio::sync::Mutex::new(database));
 
     let mut admin_state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
@@ -1074,17 +1579,276 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
 
 fn format_validation_report(report: &ValidationReport) -> String {
     let mut lines = vec![format!("valid={} status={:?}", report.valid, report.status)];
-    for issue in &report.issues {
-        lines.push(format!(
-            "{} {} {}: {} suggestion: {}",
-            severity_label(issue.severity),
-            issue.code,
-            issue.path,
-            issue.message,
-            issue.suggestion
-        ));
-    }
+    lines.extend(report.issues.iter().map(format_issue));
     lines.join("\n")
+}
+
+fn format_issue(issue: &ValidationIssue) -> String {
+    format!(
+        "{} {} {}: {} suggestion: {}",
+        severity_label(issue.severity),
+        issue.code,
+        issue.path,
+        issue.message,
+        issue.suggestion
+    )
+}
+
+/// The text form of a resolver result: a header, one aligned row per knob and the issues.
+fn format_resolution(resolution: &ProfileResolution) -> Result<String, CliError> {
+    let mut lines = match resolution {
+        ProfileResolution::Resolved { profile, .. } => {
+            let identity = match (&profile.kind, &profile.extends) {
+                (ResolvedProfileKind::Custom, Some(extends)) => {
+                    format!("{} extends {extends}", profile.slug)
+                }
+                _ => profile.slug.clone(),
+            };
+            vec![
+                format!(
+                    "{identity} -> {} variant {} ({:?}), storage profile {:?} ({})",
+                    profile.product_profile,
+                    profile.variant,
+                    profile.status,
+                    profile.storage_profile,
+                    storage_summary(&profile.knobs)
+                ),
+                format!(
+                    "kind={} digest={}",
+                    kind_label(profile.kind),
+                    profile.digest
+                ),
+                knob_table(&profile.knobs, Some(&profile.provenance))?,
+            ]
+        }
+        ProfileResolution::Unresolved { reason, .. } => vec![format!("unresolved: {reason}")],
+        ProfileResolution::Invalid(_) => vec!["invalid profile".to_owned()],
+    };
+    lines.extend(resolution.issues().iter().map(format_issue));
+    Ok(lines.join("\n"))
+}
+
+/// The text form of `profile show --db`.
+fn format_metadata_probe(path: &Path, probe: &MetadataProbe) -> Result<String, CliError> {
+    Ok(match probe {
+        MetadataProbe::Initialized(metadata) => {
+            let details = format!(
+                "schema_version={} replication={:?} layout={:?} values_framed={}",
+                metadata.schema_version,
+                metadata.replication,
+                metadata.layout,
+                metadata.values_framed
+            );
+            match &metadata.manifest {
+                Some(manifest) => format_manifest(manifest, &details)?,
+                None => format!(
+                    "legacy database: storage profile {:?}, no manifest\n{details}",
+                    metadata.storage_profile
+                ),
+            }
+        }
+        MetadataProbe::NotFound => format!("no database at {}", path.display()),
+        MetadataProbe::Uninitialized => {
+            format!("{} holds no database metadata", path.display())
+        }
+        MetadataProbe::Locked => format!(
+            "{} is locked: another handle holds the database open",
+            path.display()
+        ),
+        MetadataProbe::Unreadable { reason } => {
+            format!("{} cannot be read: {reason}", path.display())
+        }
+    })
+}
+
+fn format_manifest(manifest: &PersistedProfileManifest, details: &str) -> Result<String, CliError> {
+    let identity = match (&manifest.kind, &manifest.extends) {
+        (ResolvedProfileKind::Custom, Some(extends)) => {
+            format!("{} extends {extends}", manifest.profile)
+        }
+        _ => manifest.profile.clone(),
+    };
+    Ok([
+        format!(
+            "profile manifest: {identity} -> {} variant {}, storage profile {:?} ({})",
+            manifest.product_profile,
+            manifest.variant,
+            manifest.storage_profile,
+            storage_summary(&manifest.knobs)
+        ),
+        format!(
+            "{details} kind={} digest={} written_by={}",
+            kind_label(manifest.kind),
+            manifest.digest,
+            manifest.written_by
+        ),
+        knob_table(&manifest.knobs, None)?,
+    ]
+    .join("\n"))
+}
+
+/// One row per `KNOB_REGISTRY` path: the value, where it came from (when known) and the
+/// registry's timing, sink and enforcement.
+fn knob_rows_json(
+    knobs: &ProfileKnobs,
+    provenance: Option<&std::collections::BTreeMap<String, KnobSource>>,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    let values = serde_json::to_value(knobs)?;
+    Ok(KNOB_REGISTRY
+        .iter()
+        .map(|definition| {
+            json!({
+                "path": definition.path,
+                "value": knob_value(&values, definition),
+                "source": provenance.and_then(|provenance| provenance.get(definition.path)),
+                "timing": definition.timing,
+                "sink": definition.sink,
+                "enforcement": definition.enforcement,
+            })
+        })
+        .collect())
+}
+
+fn knob_table(
+    knobs: &ProfileKnobs,
+    provenance: Option<&std::collections::BTreeMap<String, KnobSource>>,
+) -> Result<String, CliError> {
+    let values = serde_json::to_value(knobs)?;
+    let rows = KNOB_REGISTRY
+        .iter()
+        .map(|definition| {
+            let source = provenance
+                .and_then(|provenance| provenance.get(definition.path))
+                .map_or("-", |source| source_label(*source));
+            vec![
+                definition.path.to_owned(),
+                display_knob_value(&knob_value(&values, definition)),
+                source.to_owned(),
+                timing_label(definition.timing).to_owned(),
+                enforcement_label(definition.enforcement),
+                definition.sink.to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    Ok(align_rows(&rows))
+}
+
+fn knob_value(values: &serde_json::Value, definition: &KnobDefinition) -> serde_json::Value {
+    values
+        .pointer(&format!("/{}", definition.path.replace('.', "/")))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn display_knob_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(display_knob_value)
+            .collect::<Vec<_>>()
+            .join(","),
+        other => other.to_string(),
+    }
+}
+
+/// Pads every column but the last to its widest cell.
+fn align_rows(rows: &[Vec<String>]) -> String {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (column, cell) in row.iter().enumerate() {
+                if column + 1 == row.len() {
+                    line.push_str(cell);
+                } else {
+                    let width = widths.get(column).copied().unwrap_or(0);
+                    line.push_str(&format!("{cell:<width$}  "));
+                }
+            }
+            line.trim_end().to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The engine, layout, commit protocol and compression the knobs select, for example
+/// `redb, row, two-phase commit`.
+fn storage_summary(knobs: &ProfileKnobs) -> String {
+    let mut parts = vec![
+        match knobs.storage.medium {
+            StorageMedium::Durable => "redb",
+            StorageMedium::Volatile => "memory",
+        },
+        match knobs.storage.layout {
+            LayoutKnob::Row => "row",
+            LayoutKnob::Columnar => "columnar",
+        },
+        match knobs.durability.commit {
+            CommitMode::Immediate => "immediate commit",
+            CommitMode::TwoPhase => "two-phase commit",
+        },
+    ];
+    match knobs.compression.algorithm {
+        CompressionKnob::None => {}
+        CompressionKnob::Lz4 => parts.push("lz4 value framing"),
+        CompressionKnob::Zstd => parts.push("zstd value framing"),
+    }
+    parts.join(", ")
+}
+
+const fn kind_label(kind: ResolvedProfileKind) -> &'static str {
+    match kind {
+        ResolvedProfileKind::BuiltIn => "built_in",
+        ResolvedProfileKind::Variant => "variant",
+        ResolvedProfileKind::Custom => "custom",
+    }
+}
+
+const fn source_label(source: KnobSource) -> &'static str {
+    match source {
+        KnobSource::Preset => "preset",
+        KnobSource::Variant => "variant",
+        KnobSource::Override => "override",
+        KnobSource::Derived => "derived",
+    }
+}
+
+const fn timing_label(timing: KnobTiming) -> &'static str {
+    match timing {
+        KnobTiming::Creation => "creation",
+        KnobTiming::EveryOpen => "every open",
+        KnobTiming::Provisioning => "provisioning",
+        KnobTiming::GenerationDefault => "generation default",
+        KnobTiming::Validation => "validation",
+    }
+}
+
+fn enforcement_label(enforcement: KnobEnforcement) -> String {
+    match enforcement {
+        KnobEnforcement::Enforced => "enforced".to_owned(),
+        KnobEnforcement::Planned { tracking } => format!("planned ({tracking})"),
+        KnobEnforcement::Declarative => "declarative".to_owned(),
+    }
+}
+
+const fn change_policy_label(policy: ChangePolicy) -> &'static str {
+    match policy {
+        ChangePolicy::Unsupported => "fixed",
+        ChangePolicy::Retune => "retune",
+        ChangePolicy::FormatUpgrade => "format upgrade",
+        ChangePolicy::Provisioning => "provisioning",
+        ChangePolicy::NotApplicable => "not applicable",
+    }
 }
 
 fn format_explain_report(report: &ExplainConfigReport) -> String {
@@ -1187,13 +1951,25 @@ fn format_profiles() -> String {
                 .map(|role| role_slug(*role))
                 .collect::<Vec<_>>()
                 .join(",");
+            let variants = product_variants(profile.slug)
+                .map(|variant| {
+                    format!(
+                        "{}({:?}{})",
+                        variant.name,
+                        variant.storage_profile,
+                        if variant.canonical { ",canonical" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "slug={} status={:?} aliases={} default_domain={} roles={} description={}",
+                "slug={} status={:?} aliases={} default_domain={} roles={} variants={} description={}",
                 profile.slug,
                 profile.status,
                 aliases,
                 domain_slug(profile.default_domain),
                 roles,
+                variants,
                 profile.description
             )
         })
@@ -1264,7 +2040,64 @@ fn format_domains() -> String {
 }
 
 fn guided_spec(profile: &ProfileSpec, name: &str) -> DatabaseSpec {
-    let replication = replication_for_domain(profile.default_domain);
+    guided_spec_for_domain(profile, name, profile.default_domain)
+}
+
+/// The guided spec for `init --override`: version 2 with `custom`, the profile it extends. The
+/// resolved storage medium and default domain shape the deployment, the domain and the
+/// replication, and every required floor raises the matching guarantee.
+fn custom_guided_spec(
+    product: &ProfileSpec,
+    base: &ResolvedProfile,
+    custom: CustomProfileSpec,
+    slug: &str,
+    name: &str,
+) -> DatabaseSpec {
+    let medium = custom
+        .knobs
+        .storage
+        .and_then(|storage| storage.medium)
+        .unwrap_or(base.knobs.storage.medium);
+    let domain = custom
+        .knobs
+        .consistency
+        .and_then(|consistency| consistency.default_domain)
+        .unwrap_or(base.knobs.consistency.default_domain);
+    let mut spec = guided_spec_for_domain(product, name, domain);
+    spec.version = DATABASE_SPEC_VERSION_V2;
+    spec.profile = slug.to_owned();
+    if medium == StorageMedium::Volatile {
+        spec.deployment = DeploymentSpec {
+            mode: DeploymentMode::Embedded,
+            storage_path: None,
+        };
+    }
+    let preset = base.knobs.floors;
+    let raised = custom.floors;
+    if preset.audit || raised.audit == Some(true) {
+        spec.guarantees.audit.enabled = true;
+    }
+    if preset.backup || raised.backup == Some(true) {
+        spec.guarantees.backup.enabled = true;
+    }
+    if preset.pitr || raised.pitr == Some(true) {
+        // Point-in-time recovery is restored from backups.
+        spec.guarantees.backup.enabled = true;
+        spec.guarantees.backup.pitr = true;
+    }
+    if preset.encryption_at_rest || raised.encryption_at_rest == Some(true) {
+        spec.guarantees.encryption.at_rest = true;
+    }
+    spec.custom_profile = Some(custom);
+    spec
+}
+
+fn guided_spec_for_domain(
+    profile: &ProfileSpec,
+    name: &str,
+    domain: ConsistencyMode,
+) -> DatabaseSpec {
+    let replication = replication_for_domain(domain);
     let mut guarantees = GuaranteeSpec::for_replication(replication);
     if profile.slug == "production_cp" {
         guarantees.backup.enabled = true;
@@ -1291,7 +2124,7 @@ fn guided_spec(profile: &ProfileSpec, name: &str) -> DatabaseSpec {
         guarantees,
         domains: vec![ConsistencyDomainSpec {
             name: "primary".to_owned(),
-            mode: profile.default_domain,
+            mode: domain,
         }],
         collections: Vec::new(),
         extensions: Vec::new(),
@@ -1349,10 +2182,7 @@ const fn template_index_slug(index: multidb::config_spec::CollectionIndexKind) -
 }
 
 fn resolve_built_in_profile(value: &str) -> Option<&'static ProfileSpec> {
-    built_in_profile(value).or_else(|| {
-        let normalized = value.replace('-', "_");
-        built_in_profile(&normalized)
-    })
+    built_in_profile_normalized(value)
 }
 
 fn require_list_command(args: &[String]) -> Result<(), CliError> {
@@ -1558,7 +2388,7 @@ where
         "MULTIDB_DB_PATH",
         "/var/lib/multidb/multidb.redb",
     ));
-    let profile = parse_profile(&env_or_default(
+    let profile = parse_profile_selection(&env_or_default(
         &get_env,
         "MULTIDB_PROFILE",
         "transactional",
@@ -1825,6 +2655,19 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|value| value == flag)
 }
 
+/// Every value of a repeatable flag, in order. Each occurrence may also hold a comma-separated
+/// list, so `--override a=1 --override b=2` and `--override a=1,b=2` are the same.
+fn values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|window| window.first().is_some_and(|value| value == flag))
+        .filter_map(|window| window.get(1))
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn parse_export_format(value: &str) -> Result<ExportFormat, CliError> {
     match value {
         "csv" => Ok(ExportFormat::Csv),
@@ -1838,14 +2681,14 @@ fn parse_export_format(value: &str) -> Result<ExportFormat, CliError> {
 
 fn open_cli_database(args: &[String]) -> Result<multidb::db::Database, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
-    Ok(open_database(DbConfig::on_disk(profile, db))?)
+    let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
+    Ok(open_database(cli_db_config(selection, db)?)?)
 }
 
 fn create_cli_database(args: &[String]) -> Result<multidb::db::Database, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
-    Ok(create_database(DbConfig::on_disk(profile, db))?)
+    let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
+    Ok(create_database(cli_db_config(selection, db)?)?)
 }
 
 fn resume_token(args: &[String]) -> Result<ResumeToken, CliError> {
@@ -1868,29 +2711,130 @@ fn changefeed_filter(args: &[String]) -> ChangefeedFilter {
     ChangefeedFilter { target }
 }
 
-fn parse_profile(value: &str) -> Result<Profile, CliError> {
-    match value {
-        "InMemory" | "in-memory" | "memory" => Ok(Profile::InMemory),
-        "Transactional" | "transactional" => Ok(Profile::Transactional),
-        "Analytical" | "analytical" => Ok(Profile::Analytical),
-        "Document" | "document" => Ok(Profile::Document),
-        "Vector" | "vector" => Ok(Profile::Vector),
-        "TimeSeries" | "time-series" | "time_series" => Ok(Profile::TimeSeries),
-        "HighDurability" | "high-durability" => Ok(Profile::HighDurability),
-        "Balanced" | "balanced" => Ok(Profile::Balanced),
-        _ => Err(CliError::Usage(format!("unknown profile {value}"))),
+/// Parses a `--profile` value or `MULTIDB_PROFILE`: today's storage profile spellings (unchanged),
+/// `auto`, then a built-in product slug (its canonical variant) or alias (its variant), in snake
+/// or kebab case.
+fn parse_profile_selection(value: &str) -> Result<ProfileSelection, CliError> {
+    if let Some(profile) = storage_profile_name(value) {
+        return Ok(ProfileSelection::Fixed(profile));
     }
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Ok(ProfileSelection::Auto);
+    }
+    if let Some(resolved) = named_profile(value) {
+        return Ok(ProfileSelection::Fixed(resolved.storage_profile));
+    }
+    Err(CliError::Usage(format!(
+        "unknown profile {value}{}; expected a storage profile (InMemory, Transactional, \
+         Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product profile \
+         slug or alias (run multidb profile list), or auto",
+        did_you_mean(value)
+    )))
+}
+
+/// The storage profile spellings `--profile` accepted before product slugs and aliases.
+fn storage_profile_name(value: &str) -> Option<Profile> {
+    match value {
+        "InMemory" | "in-memory" | "memory" => Some(Profile::InMemory),
+        "Transactional" | "transactional" => Some(Profile::Transactional),
+        "Analytical" | "analytical" => Some(Profile::Analytical),
+        "Document" | "document" => Some(Profile::Document),
+        "Vector" | "vector" => Some(Profile::Vector),
+        "TimeSeries" | "time-series" | "time_series" => Some(Profile::TimeSeries),
+        "HighDurability" | "high-durability" => Some(Profile::HighDurability),
+        "Balanced" | "balanced" => Some(Profile::Balanced),
+        _ => None,
+    }
+}
+
+/// The `DbConfig` of the database at `path`. `auto` reads the storage profile and replication
+/// of the existing database without creating anything, and is an error for anything else.
+fn cli_db_config(selection: ProfileSelection, path: PathBuf) -> Result<DbConfig, CliError> {
+    let ProfileSelection::Fixed(profile) = selection else {
+        return match inspect_database_metadata(&path) {
+            MetadataProbe::Initialized(metadata) => {
+                Ok(DbConfig::on_disk(metadata.storage_profile, path)
+                    .with_replication(metadata.replication))
+            }
+            MetadataProbe::NotFound => Err(CliError::Usage(format!(
+                "profile auto reads the profile of an existing database, but nothing exists at \
+                 {}; name a profile to create a database",
+                path.display()
+            ))),
+            MetadataProbe::Uninitialized => Err(CliError::Usage(format!(
+                "profile auto found no database metadata in {}; name a profile to initialize it",
+                path.display()
+            ))),
+            MetadataProbe::Locked => Err(CliError::Usage(format!(
+                "profile auto cannot inspect {}: another process holds the database open; stop \
+                 it or name the profile",
+                path.display()
+            ))),
+            MetadataProbe::Unreadable { reason } => Err(CliError::Usage(format!(
+                "profile auto cannot read the metadata of {}: {reason}; name the profile",
+                path.display()
+            ))),
+        };
+    };
+    Ok(DbConfig::on_disk(profile, path))
+}
+
+/// Resolves a built-in product slug or alias (snake or kebab case) without overrides.
+fn named_profile(name: &str) -> Option<ResolvedProfile> {
+    match resolve_named_profile(name, &ProfileKnobOverrides::default()) {
+        ProfileResolution::Resolved { profile, .. } => Some(*profile),
+        ProfileResolution::Unresolved { .. } | ProfileResolution::Invalid(_) => None,
+    }
+}
+
+fn product_variants(product: &'static str) -> impl Iterator<Item = &'static ProfileVariant> {
+    profile_variants()
+        .iter()
+        .filter(move |variant| variant.product == product)
+}
+
+/// ` (did you mean <slug>?)` for the closest built-in profile name, or nothing.
+fn did_you_mean(value: &str) -> String {
+    suggest_profile_name(value).map_or_else(String::new, |candidate| {
+        format!(" (did you mean {candidate}?)")
+    })
+}
+
+/// Parses every `--override path=value` into knob and floor overrides.
+fn parse_knob_overrides(
+    args: &[String],
+) -> Result<(ProfileKnobOverrides, FloorOverrides), CliError> {
+    let assignments = values(args, "--override");
+    if assignments.is_empty() && has_flag(args, "--override") {
+        return Err(CliError::Usage(
+            "missing value for --override; use --override <knob>=<value> (multidb profile knobs \
+             lists the knobs)"
+                .to_owned(),
+        ));
+    }
+    let mut knobs = ProfileKnobOverrides::default();
+    let mut floors = FloorOverrides::default();
+    for input in &assignments {
+        parse_knob_assignment(input)
+            .and_then(|assignment| assignment.apply(&mut knobs, &mut floors))
+            .map_err(|error| CliError::Usage(format!("--override {input}: {error}")))?;
+    }
+    Ok((knobs, floors))
 }
 
 fn usage() -> CliError {
     CliError::Usage(
         "multidb serve\n\
          multidb backup full --db <path> --profile <profile> --dest <dir>\n\
-         multidb init --guided --profile <profile> --name <name> [--out <path>] [--format yaml|json] [--force] [--json]\n\
+         multidb init --guided --profile <profile> --name <name> [--override <knob>=<value>]... [--profile-name <slug>] [--out <path>] [--format yaml|json] [--force] [--json]\n\
          multidb init --guided --template <template> --name <name> [--out <dir>] [--format yaml|json] [--force] [--json]\n\
          multidb template list [--json]\n\
          multidb template explain <template> [--name <name>] [--output text|json] [--json]\n\
          multidb profile list [--json]\n\
+         multidb profile show <profile> [--override <knob>=<value>]... [--output text|json] [--json]\n\
+         multidb profile show --db <path> [--output text|json] [--json]\n\
+         multidb profile explain --spec <json|yaml> [--output text|json] [--json]\n\
+         multidb profile knobs [--output text|json] [--json]\n\
          multidb role list [--json]\n\
          multidb domain list [--json]\n\
          multidb config validate --spec <json|yaml> [--output text|json] [--json]\n\
@@ -1898,6 +2842,7 @@ fn usage() -> CliError {
          multidb explain config --spec <json|yaml> [--output text|json] [--json]\n\
          multidb config plan --current <json|yaml> --desired <json|yaml> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb config apply --plan <json> --confirm <plan_id> [--output text|json]\n\
+         multidb config upgrade --spec <json|yaml> [--out <path>] [--force] [--output text|json] [--json]\n\
          multidb advice list --db <path> --profile <profile> [--output text|json] [--json]\n\
          multidb advice plan --db <path> --profile <profile> --advice-id <id> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb advice reject --db <path> --profile <profile> --advice-id <id> --reason <reason> [--output text|json] [--json]\n\
@@ -1915,7 +2860,9 @@ fn usage() -> CliError {
          multidb import <csv|jsonl|pg> --db <path> --profile <profile> --file <path> [--table <name>] [--batch-size <n>] [--resume-token <path>] [--reject-file <path>]\n\
          multidb admin status --db <path> --profile <profile>\n\
          multidb admin serve --db <path> --profile <profile> [--bind <addr>] [--admin-password <password>|--admin-password-file <path>|--admin-token <token>|--insecure-local-admin]\n\
-         multidb migrate value-codec --db <path> --profile <profile>"
+         multidb migrate value-codec --db <path> --profile <profile>\n\
+         <profile> on --profile and MULTIDB_PROFILE: a storage profile (InMemory, Transactional, Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product slug or alias from multidb profile list (snake or kebab case), or auto to read an existing database (not accepted by restore)\n\
+         --override takes a knob path from multidb profile knobs; repeat it or separate assignments with commas"
             .to_owned(),
     )
 }
@@ -1924,15 +2871,23 @@ fn usage() -> CliError {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{CliError, ServePgTls, run, serve_config_from_sources};
+    use super::{
+        CliError, ProfileSelection, ServePgTls, cli_db_config, parse_profile_selection, run,
+        serve_config_from_sources, values,
+    };
     use multidb::{
         config_spec::{
-            CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, MigrationPlanner,
-            WriteAck,
+            CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, DeploymentMode,
+            GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, ProfileResolution, RESERVED_KNOBS,
+            WriteAck, resolve_named_profile,
         },
-        db::{DbConfig, Profile, create_database},
+        db::{
+            DbConfig, OperationalConfig, Profile, ReplicationKind, create_database,
+            create_database_with_profile,
+        },
         tuning::WorkloadSample,
     };
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
 
     fn write_spec(
@@ -2003,7 +2958,7 @@ mod tests {
 
         assert_eq!(config.admin_token.as_deref(), Some("admin-secret"));
         assert_eq!(config.pg_password, "pg-secret");
-        assert_eq!(config.profile, Profile::Balanced);
+        assert_eq!(config.profile, ProfileSelection::Fixed(Profile::Balanced));
         assert_eq!(config.pg_tls, ServePgTls::DisabledForLocalDev);
         assert_eq!(config.admin_bind.port(), 18_080);
         assert_eq!(config.pg_bind.port(), 15_432);
@@ -2636,6 +3591,15 @@ mod tests {
         let report = serde_json::from_str::<serde_json::Value>(&outcome.message)?;
         assert_eq!(report["profile"], "analytics_columnar");
         assert_eq!(report["valid"], true);
+        // `time-series` names the non-canonical time_series variant: the warning is a JSON field.
+        assert_eq!(report["variant"], "analytical");
+        assert_eq!(report["storage_profile"], "Analytical");
+        assert!(
+            report["warnings"][0]
+                .as_str()
+                .is_some_and(|warning| warning.contains("time_series variant")),
+            "{report}"
+        );
         let spec = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(spec_path)?)?;
         assert_eq!(spec.profile, "analytics_columnar");
         Ok(())
@@ -2812,6 +3776,902 @@ mod tests {
             matches!(error, Err(CliError::Usage(ref message)) if message.contains("profile list")),
             "unexpected error: {error:?}"
         );
+        Ok(())
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn path_arg(path: &std::path::Path) -> String {
+        path.display().to_string()
+    }
+
+    fn json_message(outcome: &super::CliRun) -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_str::<Value>(&outcome.message)?)
+    }
+
+    fn knob_row<'a>(
+        report: &'a Value,
+        path: &str,
+    ) -> Result<&'a Value, Box<dyn std::error::Error>> {
+        report["rows"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["path"] == path))
+            .ok_or_else(|| format!("missing knob row {path}: {report}").into())
+    }
+
+    fn has_issue(report: &Value, code: &str) -> bool {
+        report["issues"]
+            .as_array()
+            .is_some_and(|issues| issues.iter().any(|issue| issue["code"] == code))
+    }
+
+    #[test]
+    fn values_collects_repeated_and_comma_separated_flags() {
+        let args = strings(&[
+            "show",
+            "secure_app",
+            "--override",
+            "cache.max_entries=1,query.timeout_ms=2",
+            "--json",
+            "--override",
+            " floors.audit=true ",
+        ]);
+
+        assert_eq!(
+            values(&args, "--override"),
+            strings(&[
+                "cache.max_entries=1",
+                "query.timeout_ms=2",
+                "floors.audit=true"
+            ])
+        );
+        assert!(values(&args, "--missing").is_empty());
+    }
+
+    #[test]
+    fn parse_profile_selection_keeps_storage_names_and_adds_slugs_aliases_and_auto()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage_names = [
+            ("InMemory", Profile::InMemory),
+            ("in-memory", Profile::InMemory),
+            ("memory", Profile::InMemory),
+            ("Transactional", Profile::Transactional),
+            ("transactional", Profile::Transactional),
+            ("Analytical", Profile::Analytical),
+            ("analytical", Profile::Analytical),
+            ("Document", Profile::Document),
+            ("document", Profile::Document),
+            ("Vector", Profile::Vector),
+            ("vector", Profile::Vector),
+            ("TimeSeries", Profile::TimeSeries),
+            ("time-series", Profile::TimeSeries),
+            ("time_series", Profile::TimeSeries),
+            ("HighDurability", Profile::HighDurability),
+            ("high-durability", Profile::HighDurability),
+            ("Balanced", Profile::Balanced),
+            ("balanced", Profile::Balanced),
+        ];
+        let aliases = [
+            ("in_memory", Profile::InMemory),
+            ("high_durability", Profile::HighDurability),
+            ("High-Durability", Profile::HighDurability),
+        ];
+        for (value, profile) in storage_names.into_iter().chain(aliases) {
+            assert_eq!(
+                parse_profile_selection(value)?,
+                ProfileSelection::Fixed(profile),
+                "{value}"
+            );
+        }
+
+        let products = [
+            ("game_local_balanced", Profile::Balanced),
+            ("desktop_app_embedded", Profile::Document),
+            ("ai_agent_memory", Profile::Vector),
+            ("secure_app", Profile::Transactional),
+            ("production_cp", Profile::Transactional),
+            ("analytics_columnar", Profile::Analytical),
+        ];
+        for (slug, profile) in products {
+            for value in [slug.to_owned(), slug.replace('_', "-")] {
+                assert_eq!(
+                    parse_profile_selection(&value)?,
+                    ProfileSelection::Fixed(profile),
+                    "{value}"
+                );
+            }
+        }
+
+        assert_eq!(parse_profile_selection("auto")?, ProfileSelection::Auto);
+        let unknown = parse_profile_selection("secure_ap");
+        assert!(
+            matches!(unknown, Err(CliError::Usage(ref message))
+                if message.starts_with("unknown profile secure_ap")
+                    && message.contains("did you mean secure_app?")),
+            "unexpected result: {unknown:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_auto_reads_an_existing_database_and_refuses_missing_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("vectors.redb");
+        let ap_config =
+            DbConfig::on_disk(Profile::Vector, &db_path).with_replication(ReplicationKind::Ap);
+        drop(create_database(ap_config.clone())?);
+
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, db_path.clone())?,
+            ap_config
+        );
+        let advice = run(strings(&[
+            "advice",
+            "list",
+            "--db",
+            &path_arg(&db_path),
+            "--profile",
+            "auto",
+            "--json",
+        ]))?;
+        assert_eq!(advice.exit_code, 0, "{}", advice.message);
+
+        let missing = temp.path().join("missing.redb");
+        let error = cli_db_config(ProfileSelection::Auto, missing.clone());
+        assert!(
+            matches!(error, Err(CliError::Usage(ref message)) if message.contains("nothing exists")),
+            "unexpected result: {error:?}"
+        );
+        let admin = run(strings(&[
+            "admin",
+            "status",
+            "--db",
+            &path_arg(&missing),
+            "--profile",
+            "auto",
+        ]));
+        assert!(
+            matches!(admin, Err(CliError::Usage(_))),
+            "unexpected result: {admin:?}"
+        );
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn backup_accepts_profile_auto_and_restore_refuses_it() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        drop(create_database(DbConfig::on_disk(
+            Profile::Document,
+            &db_path,
+        ))?);
+
+        let backup = run(strings(&[
+            "backup",
+            "full",
+            "--db",
+            &path_arg(&db_path),
+            "--profile",
+            "auto",
+            "--dest",
+            &path_arg(&temp.path().join("backups")),
+        ]))?;
+        assert_eq!(backup.exit_code, 0);
+        let backup_dir = backup
+            .message
+            .split("path=")
+            .nth(1)
+            .ok_or("missing backup path")?
+            .trim()
+            .to_owned();
+
+        let restored = temp.path().join("restored.redb");
+        let refused = run(strings(&[
+            "restore",
+            "--backup",
+            &backup_dir,
+            "--dest-db",
+            &path_arg(&restored),
+            "--profile",
+            "auto",
+        ]));
+        assert!(
+            matches!(refused, Err(CliError::Usage(ref message))
+                if message.contains("restore does not accept --profile auto")),
+            "unexpected result: {refused:?}"
+        );
+        assert!(!restored.exists());
+
+        let restore = run(strings(&[
+            "restore",
+            "--backup",
+            &backup_dir,
+            "--dest-db",
+            &path_arg(&restored),
+            "--profile",
+            "desktop-app-embedded",
+        ]))?;
+        assert_eq!(restore.exit_code, 0, "{}", restore.message);
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, restored.clone())?,
+            DbConfig::on_disk(Profile::Document, &restored)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serve_config_accepts_product_slugs_aliases_and_auto()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (value, expected) in [
+            (
+                "secure_app",
+                ProfileSelection::Fixed(Profile::Transactional),
+            ),
+            (
+                "high_durability",
+                ProfileSelection::Fixed(Profile::HighDurability),
+            ),
+            ("auto", ProfileSelection::Auto),
+        ] {
+            let env = env_map(&[
+                ("MULTIDB_RUNTIME_MODE", "local-dev"),
+                ("MULTIDB_PG_TLS_MODE", "disabled"),
+                ("MULTIDB_PG_PASSWORD", "pg-secret"),
+                ("MULTIDB_PROFILE", value),
+            ]);
+
+            let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+
+            assert_eq!(config.profile, expected, "{value}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_list_json_adds_variants_and_knobs() -> Result<(), Box<dyn std::error::Error>> {
+        let outcome = run(strings(&["profile", "list", "--json"]))?;
+        let report = json_message(&outcome)?;
+        let profiles = report.as_array().ok_or("profile list is not an array")?;
+
+        assert_eq!(profiles.len(), 6);
+        for profile in profiles {
+            let variants = profile["variants"].as_array().ok_or("missing variants")?;
+            assert_eq!(
+                variants
+                    .iter()
+                    .filter(|variant| variant["canonical"] == true)
+                    .count(),
+                1,
+                "{profile}"
+            );
+            assert!(
+                profile["knobs"]["durability"]["commit"].is_string(),
+                "{profile}"
+            );
+        }
+        let game = profiles
+            .iter()
+            .find(|profile| profile["slug"] == "game_local_balanced")
+            .ok_or("missing game_local_balanced")?;
+        assert_eq!(
+            game["variants"],
+            json!([
+                { "name": "balanced", "storage_profile": "Balanced", "canonical": true },
+                { "name": "in_memory", "storage_profile": "InMemory", "canonical": false },
+            ])
+        );
+        assert_eq!(game["knobs"]["storage"]["medium"], "durable");
+
+        let text = run(strings(&["profile", "list"]))?;
+        assert!(
+            text.message
+                .contains("variants=balanced(Balanced,canonical),in_memory(InMemory)"),
+            "{}",
+            text.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_reports_resolved_knobs_with_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let json = run(strings(&["profile", "show", "high_durability", "--json"]))?;
+        assert_eq!(json.exit_code, 0);
+        let report = json_message(&json)?;
+        assert_eq!(report["resolution"], "resolved");
+        assert_eq!(report["profile"]["storage_profile"], "HighDurability");
+        assert_eq!(report["profile"]["product_profile"], "secure_app");
+        assert_eq!(report["profile"]["kind"], "variant");
+        assert_eq!(
+            report["rows"].as_array().map(Vec::len),
+            Some(KNOB_REGISTRY.len())
+        );
+        let commit = knob_row(&report, "durability.commit")?;
+        assert_eq!(commit["value"], "two_phase");
+        assert_eq!(commit["source"], "variant");
+        assert_eq!(commit["timing"], "creation");
+        assert_eq!(
+            knob_row(&report, "limits.max_value_bytes")?["enforcement"]["planned"]["tracking"],
+            "#11 single write pipeline"
+        );
+
+        let text = run(strings(&["profile", "show", "high_durability"]))?;
+        assert_eq!(text.exit_code, 0);
+        assert!(
+            text.message.starts_with(
+                "high_durability -> secure_app variant high_durability (Stable), storage profile \
+                 HighDurability (redb, row, two-phase commit)"
+            ),
+            "{}",
+            text.message
+        );
+        for needle in ["HighDurability", "two_phase", "planned"] {
+            assert!(text.message.contains(needle), "{needle}: {}", text.message);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_overrides_are_a_what_if() -> Result<(), Box<dyn std::error::Error>> {
+        let custom = run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "cache.max_entries=8192",
+            "--json",
+        ]))?;
+        assert_eq!(custom.exit_code, 0);
+        let report = json_message(&custom)?;
+        assert_eq!(report["profile"]["kind"], "custom");
+        assert_eq!(report["profile"]["slug"], "high_durability_custom");
+        let cache = knob_row(&report, "cache.max_entries")?;
+        assert_eq!(cache["value"], 8192);
+        assert_eq!(cache["source"], "override");
+
+        let typo = run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "cache.max_entires=1",
+        ]));
+        assert!(
+            matches!(typo, Err(CliError::Usage(ref message)) if message.contains("cache.max_entries")),
+            "unexpected result: {typo:?}"
+        );
+
+        let volatile = run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "storage.medium=volatile",
+            "--json",
+        ]))?;
+        assert_eq!(volatile.exit_code, 2);
+        let report = json_message(&volatile)?;
+        assert_eq!(report["resolution"], "invalid");
+        assert!(
+            has_issue(&report, "PROFILE_KNOB_COMBINATION_UNSUPPORTED"),
+            "{report}"
+        );
+
+        let floors = run(strings(&[
+            "profile",
+            "show",
+            "secure-app",
+            "--override",
+            "floors.audit=true,cache.max_entries=4096",
+            "--json",
+        ]))?;
+        assert_eq!(floors.exit_code, 0, "{}", floors.message);
+        let report = json_message(&floors)?;
+        assert_eq!(report["profile"]["slug"], "secure_app_custom");
+        assert_eq!(report["profile"]["knobs"]["floors"]["audit"], true);
+        assert_eq!(knob_row(&report, "floors.audit")?["source"], "override");
+        assert_eq!(knob_row(&report, "cache.max_entries")?["value"], 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_db_prints_the_manifest_or_legacy() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let manifest_path = temp.path().join("orders.redb");
+        let overrides = serde_json::from_value(json!({ "cache": { "max_entries": 8192 } }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with a cache override must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(manifest_path.clone()))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::default(),
+        )?);
+
+        let json = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&manifest_path),
+            "--json",
+        ]))?;
+        assert_eq!(json.exit_code, 0);
+        let report = json_message(&json)?;
+        assert_eq!(report["state"], "initialized");
+        assert_eq!(report["manifest"]["profile"], "high_durability_custom");
+        assert_eq!(report["manifest"]["knobs"]["cache"]["max_entries"], 8192);
+        let text = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&manifest_path),
+        ]))?;
+        assert!(
+            text.message.starts_with(
+                "profile manifest: high_durability_custom extends high_durability -> secure_app"
+            ),
+            "{}",
+            text.message
+        );
+        assert!(text.message.contains("HighDurability"), "{}", text.message);
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, manifest_path.clone())?,
+            DbConfig::on_disk(Profile::HighDurability, &manifest_path)
+        );
+
+        let legacy_path = temp.path().join("legacy.redb");
+        drop(create_database(DbConfig::on_disk(
+            Profile::Transactional,
+            &legacy_path,
+        ))?);
+        let legacy = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&legacy_path),
+        ]))?;
+        assert_eq!(legacy.exit_code, 0);
+        assert!(
+            legacy
+                .message
+                .starts_with("legacy database: storage profile Transactional, no manifest"),
+            "{}",
+            legacy.message
+        );
+
+        let missing = temp.path().join("missing.redb");
+        let not_found = run(strings(&["profile", "show", "--db", &path_arg(&missing)]))?;
+        assert_eq!(not_found.exit_code, 1);
+        assert!(not_found.message.starts_with("no database at"));
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn profile_explain_reports_the_resolver_result_of_a_spec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("custom.yaml");
+        let mut spec = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        spec.version = 2;
+        spec.profile = "orders_durable".to_owned();
+        spec.custom_profile = Some(serde_json::from_value(json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        }))?);
+        write_yaml_spec(&spec_path, &spec)?;
+        let explain = |json: bool| {
+            let mut args = strings(&["profile", "explain", "--spec", &path_arg(&spec_path)]);
+            if json {
+                args.push("--json".to_owned());
+            }
+            run(args)
+        };
+
+        let resolved = explain(true)?;
+        assert_eq!(resolved.exit_code, 0);
+        let report = json_message(&resolved)?;
+        assert_eq!(report["resolution"], "resolved");
+        assert_eq!(report["profile"]["kind"], "custom");
+        assert_eq!(report["profile"]["storage_profile"], "HighDurability");
+
+        spec.custom_profile = Some(serde_json::from_value(
+            json!({ "extends": "high_durabilty" }),
+        )?);
+        write_yaml_spec(&spec_path, &spec)?;
+        let invalid = explain(true)?;
+        assert_eq!(invalid.exit_code, 2);
+        let report = json_message(&invalid)?;
+        assert_eq!(report["resolution"], "invalid");
+        assert!(
+            has_issue(&report, "CUSTOM_PROFILE_EXTENDS_UNKNOWN"),
+            "{report}"
+        );
+        let text = explain(false)?;
+        assert_eq!(text.exit_code, 2);
+        assert!(
+            text.message.starts_with("invalid profile"),
+            "{}",
+            text.message
+        );
+
+        let mut legacy = DatabaseSpec::from_db_config(
+            "legacy",
+            &DbConfig::on_disk(Profile::Transactional, "legacy.redb"),
+        );
+        legacy.profile = "ops_custom_profile".to_owned();
+        write_yaml_spec(&spec_path, &legacy)?;
+        let unresolved = explain(true)?;
+        assert_eq!(unresolved.exit_code, 0);
+        let report = json_message(&unresolved)?;
+        assert_eq!(report["resolution"], "unresolved");
+        assert!(has_issue(&report, "PROFILE_NOT_PROVISIONABLE"), "{report}");
+
+        let mut future = serde_json::to_value(&legacy)?;
+        future["version"] = json!(3);
+        std::fs::write(&spec_path, serde_norway::to_string(&future)?)?;
+        let unsupported = explain(false)?;
+        assert_eq!(unsupported.exit_code, 2);
+        assert!(unsupported.message.contains("UNSUPPORTED_VERSION"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_knobs_lists_the_registry_and_reserved_knobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let json = run(strings(&["profile", "knobs", "--json"]))?;
+        let report = json_message(&json)?;
+        let knobs = report.as_array().ok_or("profile knobs is not an array")?;
+
+        assert_eq!(knobs.len(), KNOB_REGISTRY.len() + RESERVED_KNOBS.len());
+        assert_eq!(
+            knobs.iter().filter(|knob| knob["reserved"] == true).count(),
+            RESERVED_KNOBS.len()
+        );
+        assert!(knobs.iter().any(|knob| knob["path"] == "cache.max_entries"));
+
+        let text = run(strings(&["profile", "knobs"]))?;
+        assert!(text.message.contains("history.mvcc_retention_millis"));
+        assert!(text.message.contains("reserved"));
+        Ok(())
+    }
+
+    fn studio_style_spec() -> DatabaseSpec {
+        let mut spec = DatabaseSpec::from_db_config(
+            "ops_custom_profile_example",
+            &DbConfig::on_disk(Profile::Transactional, "ops.redb"),
+        );
+        spec.profile = "ops_custom_profile".to_owned();
+        spec.overrides
+            .insert("profile.custom.base".to_owned(), "secure_app".to_owned());
+        spec.overrides.insert(
+            "profile.custom.description".to_owned(),
+            "Ops profile".to_owned(),
+        );
+        spec.operation_hints
+            .insert("studio.builder".to_owned(), "custom_profile".to_owned());
+        spec.operation_hints.insert(
+            "profile.custom.slug".to_owned(),
+            "ops_custom_profile".to_owned(),
+        );
+        spec
+    }
+
+    #[test]
+    fn config_upgrade_converts_studio_custom_profiles_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("studio.yaml");
+        write_yaml_spec(&input, &studio_style_spec())?;
+        let first_out = temp.path().join("v2.yaml");
+
+        let first = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&first_out),
+        ]))?;
+        assert_eq!(first.exit_code, 0, "{}", first.message);
+        assert!(first.message.contains("valid=true"), "{}", first.message);
+        let written = std::fs::read_to_string(&first_out)?;
+        let upgraded = serde_norway::from_str::<DatabaseSpec>(&written)?;
+        assert_eq!(upgraded.version, 2);
+        assert_eq!(upgraded.profile, "ops_custom_profile");
+        let custom = upgraded
+            .custom_profile
+            .as_ref()
+            .ok_or("missing custom_profile")?;
+        assert_eq!(custom.extends, "secure_app");
+        assert_eq!(custom.description.as_deref(), Some("Ops profile"));
+        assert!(upgraded.overrides.is_empty(), "{:?}", upgraded.overrides);
+        assert_eq!(
+            upgraded.operation_hints,
+            BTreeMap::from([("studio.builder".to_owned(), "custom_profile".to_owned())])
+        );
+        assert!(GuaranteeValidator::validate(&upgraded).valid);
+
+        let second_out = temp.path().join("v2-again.yaml");
+        let second = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&first_out),
+            "--out",
+            &path_arg(&second_out),
+        ]))?;
+        assert_eq!(second.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&second_out)?, written);
+
+        let stdout = run(strings(&["config", "upgrade", "--spec", &path_arg(&input)]))?;
+        assert_eq!(stdout.exit_code, 0);
+        assert_eq!(stdout.message, written.trim_end());
+
+        let json = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--json",
+        ]))?;
+        let report = json_message(&json)?;
+        assert_eq!(report["validation"]["valid"], true);
+        assert_eq!(report["spec"]["custom_profile"]["extends"], "secure_app");
+        assert!(
+            report["notes"]
+                .as_array()
+                .is_some_and(|notes| !notes.is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_refuses_to_overwrite_without_force() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let input = temp.path().join("spec.json");
+        write_spec(&input, &studio_style_spec())?;
+        let original = std::fs::read_to_string(&input)?;
+
+        let same = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&input),
+        ]));
+        assert!(
+            matches!(same, Err(CliError::Usage(ref message))
+                if message.contains("input spec") && message.contains("--force")),
+            "unexpected result: {same:?}"
+        );
+        let existing = temp.path().join("existing.json");
+        std::fs::write(&existing, "{}")?;
+        let other = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&existing),
+        ]));
+        assert!(
+            matches!(other, Err(CliError::Usage(ref message)) if message.contains("--force")),
+            "unexpected result: {other:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&input)?, original);
+        assert_eq!(std::fs::read_to_string(&existing)?, "{}");
+
+        let forced = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&input),
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 0, "{}", forced.message);
+        let upgraded = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&input)?)?;
+        assert_eq!(upgraded.version, 2);
+        assert!(upgraded.custom_profile.is_some());
+        assert!(!temp.path().join("spec.json.upgrade-tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_reports_unknown_profiles_without_a_base()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("unknown.yaml");
+        let mut spec = DatabaseSpec::from_db_config(
+            "unknown",
+            &DbConfig::on_disk(Profile::Balanced, "unknown.redb"),
+        );
+        spec.profile = "ops_custom_profile".to_owned();
+        write_yaml_spec(&input, &spec)?;
+
+        let outcome = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 2);
+        let report = json_message(&outcome)?;
+        assert_eq!(report["validation"]["valid"], false);
+        assert!(
+            has_issue(&report["validation"], "PROFILE_UNKNOWN"),
+            "{report}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_override_writes_a_v2_custom_profile() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+
+        let outcome = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "secure_app",
+            "--name",
+            "Orders",
+            "--override",
+            "cache.max_entries=8192",
+            "--out",
+            &path_arg(&spec_path),
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        let summary = json_message(&outcome)?;
+        assert_eq!(summary["valid"], true);
+        assert_eq!(summary["profile"], "secure_app_custom");
+        assert_eq!(summary["extends"], "secure_app");
+        assert_eq!(summary["version"], 2);
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        assert_eq!(spec.version, 2);
+        assert_eq!(spec.profile, "secure_app_custom");
+        let custom = spec
+            .custom_profile
+            .as_ref()
+            .ok_or("missing custom_profile")?;
+        assert_eq!(custom.extends, "secure_app");
+        assert_eq!(
+            serde_json::to_value(&custom.knobs)?,
+            json!({ "cache": { "max_entries": 8192 } })
+        );
+        assert!(GuaranteeValidator::validate(&spec).valid);
+
+        let game_path = temp.path().join("game.yaml");
+        let game = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "In-Memory",
+            "--name",
+            "Game",
+            "--override",
+            "floors.backup=true,query.timeout_ms=1000",
+            "--profile-name",
+            "game_fast",
+            "--out",
+            &path_arg(&game_path),
+        ]))?;
+        assert_eq!(game.exit_code, 0, "{}", game.message);
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&game_path)?)?;
+        assert_eq!(spec.profile, "game_fast");
+        assert_eq!(
+            spec.custom_profile
+                .as_ref()
+                .map(|custom| custom.extends.as_str()),
+            Some("in_memory")
+        );
+        assert_eq!(spec.deployment.mode, DeploymentMode::Embedded);
+        assert_eq!(spec.deployment.storage_path, None);
+        assert!(spec.guarantees.backup.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_profile_name_and_override_need_a_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+
+        let named = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "secure_app",
+            "--name",
+            "Orders",
+            "--profile-name",
+            "orders_custom",
+            "--out",
+            &path_arg(&spec_path),
+        ]));
+        assert!(
+            matches!(named, Err(CliError::Usage(ref message)) if message.contains("--override")),
+            "unexpected result: {named:?}"
+        );
+        assert!(!spec_path.exists());
+
+        let template = run(strings(&[
+            "init",
+            "--guided",
+            "--template",
+            "game-save",
+            "--name",
+            "Game",
+            "--override",
+            "cache.max_entries=1",
+        ]));
+        assert!(
+            matches!(template, Err(CliError::Usage(ref message)) if message.contains("not --template")),
+            "unexpected result: {template:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_warns_when_an_alias_names_a_non_canonical_variant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let init = |profile: &str| {
+            run(strings(&[
+                "init",
+                "--guided",
+                "--profile",
+                profile,
+                "--name",
+                "Orders",
+                "--out",
+                &path_arg(&spec_path),
+                "--force",
+            ]))
+        };
+
+        let alias = init("high_durability")?;
+        assert_eq!(alias.exit_code, 0);
+        let mut lines = alias.message.lines();
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("created config"))
+        );
+        assert!(
+            lines.next().is_some_and(|line| line
+                .starts_with("warning: profile high_durability is the high_durability variant")),
+            "{}",
+            alias.message
+        );
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        assert_eq!(spec.version, 1);
+        assert_eq!(spec.profile, "secure_app");
+
+        for canonical in ["secure_app", "transactional"] {
+            let outcome = init(canonical)?;
+            assert!(!outcome.message.contains("warning"), "{}", outcome.message);
+        }
         Ok(())
     }
 }

@@ -1751,9 +1751,19 @@ fn profile_name_candidates() -> impl Iterator<Item = &'static str> {
         .flat_map(|profile| std::iter::once(profile.slug).chain(profile.aliases.iter().copied()))
 }
 
+/// The built-in product slug or alias closest to `name` after normalisation, within edit
+/// distance 2; `None` when nothing is that close. Used for did-you-mean suggestions.
+#[must_use]
+pub fn suggest_profile_name(name: &str) -> Option<&'static str> {
+    suggest::closest(
+        &normalize_profile_name(name),
+        profile_name_candidates(),
+        SUGGESTION_DISTANCE,
+    )
+}
+
 fn profile_suggestion(name: &str) -> String {
-    let normalized = normalize_profile_name(name);
-    suggest::closest(&normalized, profile_name_candidates(), SUGGESTION_DISTANCE).map_or_else(
+    suggest_profile_name(name).map_or_else(
         || {
             format!(
                 "Use a built-in profile slug or alias: {}.",
@@ -1879,7 +1889,7 @@ mod tests {
         AutoOr, CommitMode, CustomProfileSpec, FloorOverrides, KnobSource, Limit,
         ProfileKnobOverrides, ProfileResolution, ResolvedProfile, ResolvedProfileKind,
         RoleSetDelta, StorageMedium, lookup_profile_name, profile_name_candidates,
-        profile_variants, resolve_named_profile, resolve_profile,
+        profile_variants, resolve_named_profile, resolve_profile, suggest_profile_name,
     };
     use crate::{
         config_spec::{
@@ -2180,6 +2190,17 @@ mod tests {
         };
         assert_eq!(issue.path, "custom_profile.extends");
         assert!(issue.suggestion.contains("high_durability"), "{issue:?}");
+    }
+
+    #[test]
+    fn suggest_profile_name_normalises_and_stays_within_distance_two() {
+        assert_eq!(
+            suggest_profile_name("high_durabilty"),
+            Some("high_durability")
+        );
+        assert_eq!(suggest_profile_name("Secure-Ap"), Some("secure_app"));
+        assert_eq!(suggest_profile_name(" vector "), Some("vector"));
+        assert_eq!(suggest_profile_name("nothing_like_it"), None);
     }
 
     #[test]
