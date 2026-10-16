@@ -20,12 +20,8 @@ use crate::{
     db::{Database, DbConfig},
     fileio, observability,
     query::REL_COLUMNAR_SEGMENTS_TABLE,
-    repl::{
-        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, propose_system,
-        propose_system_batch,
-    },
+    repl::{Op, ReadConsistency, ReplError, Replication, propose_system, propose_system_batch},
     storage::{Bytes, StorageError},
-    txn,
 };
 
 pub const CLOUD_SEGMENTS_TABLE: &str = "__cloud_segments";
@@ -911,98 +907,6 @@ fn write_lease_file(path: &Path, record: &CloudLeaseFile) -> Result<(), CloudErr
     Ok(())
 }
 
-pub struct QuotaReplication {
-    inner: Arc<dyn Replication>,
-    tenant: TenantRuntime,
-}
-
-impl QuotaReplication {
-    #[must_use]
-    pub fn new(inner: Arc<dyn Replication>, tenant: TenantRuntime) -> Self {
-        Self { inner, tenant }
-    }
-}
-
-impl Replication for QuotaReplication {
-    fn propose(&self, op: Op) -> Result<(), ReplError> {
-        self.propose_batch(vec![op])
-    }
-
-    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
-        let _write_permit = self.tenant.try_begin_write().map_err(repl_quota_error)?;
-        let reservation = self.tenant.reserve_ops(&ops).map_err(repl_quota_error)?;
-        if let Err(error) = self.inner.propose_batch(ops) {
-            self.tenant.release(&reservation);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn propose_authorized_batch(
-        &self,
-        ops: Vec<Op>,
-        authorization: txn::WriteAuthorization,
-    ) -> Result<(), ReplError> {
-        self.inner.propose_authorized_batch(ops, authorization)
-    }
-
-    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let _write_permit = self.tenant.try_begin_write().map_err(repl_quota_error)?;
-        let reservation = self
-            .tenant
-            .reserve_ops(&batch.ops)
-            .map_err(repl_quota_error)?;
-        if let Err(error) = self.inner.propose_conditional_batch(batch) {
-            self.tenant.release(&reservation);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn read(
-        &self,
-        table: &str,
-        key: &[u8],
-        consistency: ReadConsistency,
-    ) -> Result<Option<Bytes>, ReplError> {
-        let _query_permit = self.tenant.try_begin_query().map_err(repl_quota_error)?;
-        self.inner.read(table, key, consistency)
-    }
-
-    fn range(
-        &self,
-        table: &str,
-        start: &[u8],
-        end: &[u8],
-        consistency: ReadConsistency,
-    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
-        let _query_permit = self.tenant.try_begin_query().map_err(repl_quota_error)?;
-        self.inner.range(table, start, end, consistency)
-    }
-
-    fn scan_range_batches(
-        &self,
-        table: &str,
-        start: &[u8],
-        end: &[u8],
-        consistency: ReadConsistency,
-        batch_rows: usize,
-        cancelled: &dyn Fn() -> bool,
-        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
-    ) -> Result<(), ReplError> {
-        let _query_permit = self.tenant.try_begin_query().map_err(repl_quota_error)?;
-        self.inner.scan_range_batches(
-            table,
-            start,
-            end,
-            consistency,
-            batch_rows,
-            cancelled,
-            on_batch,
-        )
-    }
-}
-
 #[must_use]
 pub fn repl_quota_error(error: CloudError) -> ReplError {
     match error {
@@ -1785,12 +1689,12 @@ mod tests {
             resume_database_guarded, tier_columnar_segments, verify_backup_uri,
         },
         db::{
-            DbConfig, OperationalConfig, Profile, create_database, create_database_with_ops,
-            open_database,
+            DbConfig, DbError, OperationalConfig, Profile, create_database,
+            create_database_with_ops, open_database,
         },
         model::Value,
         query::{ColumnDef, ColumnType, REL_COLUMNAR_SEGMENTS_TABLE, TableSchema},
-        repl::{Op, ReadConsistency, Replication, propose_system},
+        repl::{Op, ReadConsistency, ReplError, Replication, propose_system},
     };
 
     #[test]
@@ -2036,6 +1940,46 @@ mod tests {
         let table = database.create_table("items", Some(schema), Vec::new())?;
         let result = table.insert(vec![Value::Int(1), Value::Str("x".repeat(4_096))]);
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_applies_to_transaction_commits() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tenant = TenantConfig::new("tenant-a", TenantQuota::storage_bytes(1_500));
+        let ops = OperationalConfig::new().with_tenant(tenant);
+        let mut database = create_database_with_ops(DbConfig::new(Profile::InMemory), ops)?;
+        let schema = TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("payload", ColumnType::Str, false),
+            ],
+            0,
+        );
+        database.create_table("items", Some(schema), Vec::new())?;
+        let large = vec![Value::Int(1), Value::Str("x".repeat(4_096))];
+
+        match database.transaction(|txn| txn.insert_row("items", large.clone())) {
+            Err(DbError::Repl(ReplError::QuotaExceeded { .. })) => {}
+            other => panic!("transaction commits must enforce the tenant quota, got {other:?}"),
+        }
+        assert_eq!(database.table("items")?.get(&Value::Int(1))?, None);
+
+        // The rejected commit released its write permit and reserved nothing.
+        database.transaction(|txn| {
+            txn.insert_row("items", vec![Value::Int(2), Value::Str("small".to_owned())])
+        })?;
+        assert!(database.table("items")?.get(&Value::Int(2))?.is_some());
+
+        let sql = format!(
+            "INSERT INTO items (id, payload) VALUES (3, '{}')",
+            "x".repeat(4_096)
+        );
+        match database.query(&sql).await {
+            Err(error) if error.to_string().contains("quota exceeded for tenant") => {}
+            other => panic!("SQL commits must enforce the tenant quota, got {other:?}"),
+        }
+        assert_eq!(database.table("items")?.get(&Value::Int(3))?, None);
         Ok(())
     }
 
