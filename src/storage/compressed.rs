@@ -192,6 +192,12 @@ pub fn encode_stored_value(
     Ok(encoded)
 }
 
+/// Reports whether `bytes` carry a compression frame. JSON never starts with the frame magic,
+/// so this is unambiguous for metadata values.
+pub(crate) fn is_framed(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC)
+}
+
 /// Decodes a value. Unframed legacy bytes are returned unchanged.
 /// # Errors
 /// Fails when the frame is corrupt or decompression fails.

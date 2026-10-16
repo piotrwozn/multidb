@@ -879,6 +879,19 @@ pub(crate) fn lookup_profile_name(
     variant_for_name(product, &key).map(|variant| (product, variant))
 }
 
+/// Finds the variant named exactly `variant` of the product slug named exactly `product`, as a
+/// persisted profile manifest records them. No normalisation and no alias lookup.
+pub(crate) fn product_variant(
+    product: &str,
+    variant: &str,
+) -> Option<(&'static ProfileSpec, &'static ProfileVariant)> {
+    let spec = built_in_profile(product).filter(|spec| spec.slug == product)?;
+    PROFILE_VARIANTS
+        .iter()
+        .find(|candidate| candidate.product == spec.slug && candidate.name == variant)
+        .map(|candidate| (spec, candidate))
+}
+
 /// Builds the preset knobs of one variant from the variant table and the product preset.
 pub(crate) fn preset_knobs(product: &ProfileSpec, variant: &ProfileVariant) -> ProfileKnobs {
     let columns = variant_columns(variant.storage_profile);

@@ -12,6 +12,7 @@ mod sim;
 mod traits;
 
 pub use any::{AnyEngine, AnyReadTxn, AnyWriteTxn, EngineKind};
+pub(crate) use compressed::is_framed;
 pub use compressed::{
     CompressedEngine, CompressedReadTxn, CompressedWriteTxn, decode_stored_value,
     encode_stored_value,
@@ -23,6 +24,7 @@ pub use encrypted::{
 };
 pub use error::StorageError;
 pub use memory::MemEngine;
+pub(crate) use redb::ExistingRedbOpen;
 pub use redb::RedbEngine;
 pub use sim::{Fault, FaultPlan, FaultPoint, ScheduledFault, SimReadTxn, SimStorage, SimWriteTxn};
 pub use traits::{RangeIter, ReadTransaction, StorageEngine, WriteTransaction};

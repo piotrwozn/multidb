@@ -82,7 +82,7 @@ use crate::security::{
 };
 use crate::storage::{
     AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, StorageEngine, StorageError,
-    WriteTransaction,
+    WriteTransaction, decode_stored_value, is_framed,
 };
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
 use crate::text::{FullTextIndex, FullTextIndexConfig, TextError};
@@ -98,8 +98,13 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod profile_binding;
 mod runtime;
 
+pub use profile_binding::{
+    MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
+    create_database_with_profile, inspect_database_metadata,
+};
 use runtime::wasm_runtime_for_database;
 
 const META_TABLE: &str = "__meta";
@@ -111,9 +116,20 @@ const KEY_PROFILE_NAME: &str = "profile";
 const KEY_REPLICATION: &[u8] = b"replication";
 const KEY_REPLICATION_NAME: &str = "replication";
 const KEY_LAYOUT: &[u8] = b"layout";
+const KEY_LAYOUT_NAME: &str = "layout";
+const KEY_PROFILE_MANIFEST: &[u8] = b"profile_manifest";
 const KEY_NEXT_COLLECTION_ID: &[u8] = b"next_collection_id";
 const KEY_NEXT_GRAPH_ID: &[u8] = b"next_graph_id";
+/// `schema_version` of every database whose values are not compression-framed.
 const SCHEMA_VERSION: u32 = 1;
+/// `schema_version` of a profile-manifest database with value framing. Older binaries refuse it.
+const SCHEMA_VERSION_FRAMED: u32 = 2;
+/// A legacy database (no profile manifest) whose values are compression-framed, read through an
+/// engine that does not frame values.
+const LEGACY_FRAMED_DATABASE: &str =
+    "legacy compression-framed database: open with OperationalConfig.performance.compression";
+/// Every encryption frame starts with this prefix (`MDBE1`, `MDBE2`, `MDBE3`).
+const ENCRYPTED_FRAME_PREFIX: &[u8] = b"MDBE";
 const AUTHZ_TABLE: &str = "__authz_policy";
 const KEY_AUTHZ_POLICY: &[u8] = b"policy";
 const KEY_PRINCIPAL_REGISTRY: &[u8] = b"principals";
@@ -368,6 +384,25 @@ pub enum ConfigError {
 
     #[error("metadata schema version mismatch: expected {expected}, found {found}")]
     SchemaVersionMismatch { expected: u32, found: u32 },
+
+    #[error(
+        "database metadata already exists; create_database_with_profile only initializes new databases"
+    )]
+    AlreadyInitialized,
+
+    #[error("storage format mismatch: {0}")]
+    StorageFormatMismatch(String),
+
+    #[error("unsupported profile manifest version {found}; this build reads version 1")]
+    UnsupportedProfileManifest { found: u32 },
+
+    #[error("invalid profile manifest: {0}")]
+    ProfileManifestInvalid(String),
+
+    #[error(
+        "database metadata key {key} is unreadable ({reason}); metadata is encrypted or corrupt; supply OperationalConfig.encryption"
+    )]
+    MetadataUnreadable { key: &'static str, reason: String },
 
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
@@ -3742,15 +3777,6 @@ impl Database {
         }
     }
 
-    fn new(
-        config: DbConfig,
-        engine: AnyEngine,
-        catalog: BTreeMap<String, CatalogEntry>,
-    ) -> Result<Self, ConfigError> {
-        let performance = PerformanceConfig::for_profile(config.profile);
-        Self::new_with_performance(config, engine, catalog, performance)
-    }
-
     fn new_with_performance(
         config: DbConfig,
         engine: AnyEngine,
@@ -5280,16 +5306,21 @@ fn db_hook_to_repl(error: HookError) -> ReplError {
 pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
 
-    match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+    let read = match read_metadata(&engine) {
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            read
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
+            MetadataRead::written(&config)
         }
         Err(error) => return Err(error),
-    }
+    };
 
+    let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new(config, engine, catalog)
+    Database::new_with_performance(config, engine, catalog, performance)
 }
 
 /// Opens an existing database and validates its metadata.
@@ -5297,10 +5328,11 @@ pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
 /// Fails when the config is invalid, storage cannot open, metadata is missing, or metadata conflicts.
 pub fn open_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new(config, engine, catalog)
+    Database::new_with_performance(config, engine, catalog, performance)
 }
 
 /// Creates a database with operational security, encryption, metrics, and resource settings.
@@ -5313,16 +5345,21 @@ pub fn create_database_with_ops(
     validate_operational(&config, &ops)?;
     let engine = engine_for_operational(&config, &ops)?;
 
-    match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+    let read = match read_metadata(&engine) {
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            read
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
+            MetadataRead::written(&config)
         }
         Err(error) => return Err(error),
-    }
+    };
 
+    let (engine, performance) =
+        finish_single_node_open(engine, ops.performance.as_ref(), &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let performance = effective_performance(&config, &ops);
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
     write_security_to_repl(database.replication_ref(), &ops.security)?;
@@ -5340,10 +5377,11 @@ pub fn open_database_with_ops(
 ) -> Result<Database, ConfigError> {
     validate_operational(&config, ops)?;
     let engine = engine_for_operational(&config, ops)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    let (engine, performance) =
+        finish_single_node_open(engine, ops.performance.as_ref(), &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let performance = effective_performance(&config, ops);
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
     let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
@@ -5363,7 +5401,10 @@ pub fn create_cluster_database(
     let engine = engine_for(&config)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5383,8 +5424,9 @@ pub fn open_cluster_database(
 ) -> Result<Database, ConfigError> {
     ensure_cluster_supported(&config, &cluster)?;
     let engine = engine_for(&config)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     Database::new_cp(config, engine, catalog, cluster)
 }
@@ -5402,7 +5444,10 @@ pub fn create_cluster_database_with_ops(
     let engine = engine_for_operational(&config, &ops)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5429,8 +5474,9 @@ pub fn open_cluster_database_with_ops(
     ensure_cluster_supported(&config, &cluster)?;
     validate_operational(&config, ops)?;
     let engine = engine_for_operational(&config, ops)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_cp(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
@@ -5451,7 +5497,10 @@ pub fn create_ap_database(
     let engine = engine_for(&config)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5471,8 +5520,9 @@ pub fn open_ap_database(
 ) -> Result<Database, ConfigError> {
     ensure_ap_supported(&config, &cluster)?;
     let engine = engine_for(&config)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     Database::new_ap(config, engine, catalog, cluster)
 }
@@ -5490,7 +5540,10 @@ pub fn create_ap_database_with_ops(
     let engine = engine_for_operational(&config, &ops)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5517,8 +5570,9 @@ pub fn open_ap_database_with_ops(
     ensure_ap_supported(&config, &cluster)?;
     validate_operational(&config, ops)?;
     let engine = engine_for_operational(&config, ops)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
@@ -5539,7 +5593,10 @@ pub fn create_sharded_database(
     let repl = Arc::new(build_sharded_replication(sharding, true)?);
 
     match read_metadata_from_repl(repl.as_ref()) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata_to_repl(repl.as_ref(), &config)?;
         }
@@ -5559,8 +5616,9 @@ pub fn open_sharded_database(
 ) -> Result<Database, ConfigError> {
     validate(&config)?;
     let repl = Arc::new(build_sharded_replication(sharding, false)?);
-    let metadata = read_metadata_from_repl(repl.as_ref())?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata_from_repl(repl.as_ref())?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog_from_repl(repl.as_ref())?;
     Database::new_sharded(config, repl, catalog)
 }
@@ -5810,10 +5868,86 @@ fn compressed_encrypted_redb_high_durability_for(
     }
 }
 
-fn effective_performance(config: &DbConfig, ops: &OperationalConfig) -> PerformanceConfig {
-    ops.performance
-        .clone()
-        .unwrap_or_else(|| PerformanceConfig::for_profile(config.profile))
+/// Applies what a single-node database records in `__meta` to the engine and the runtime
+/// performance: the storage format of its profile manifest (`docs/profiles.md`, "Persistence and
+/// format") and the manifest knobs, re-applied at every open.
+///
+/// Without a manifest the legacy behaviour is kept: `ops_performance`, else the storage
+/// profile's defaults. A legacy database whose values are compression-framed must be opened
+/// with an engine that frames values.
+fn finish_single_node_open(
+    engine: AnyEngine,
+    ops_performance: Option<&PerformanceConfig>,
+    config: &DbConfig,
+    read: &MetadataRead,
+) -> Result<(AnyEngine, PerformanceConfig), ConfigError> {
+    let Some(manifest) = &read.manifest else {
+        if read.values_framed {
+            return Err(ConfigError::StorageFormatMismatch(
+                LEGACY_FRAMED_DATABASE.to_owned(),
+            ));
+        }
+        let performance = ops_performance
+            .cloned()
+            .unwrap_or_else(|| PerformanceConfig::for_profile(config.profile));
+        return Ok((engine, performance));
+    };
+
+    let engine = if manifest.storage_format.value_framing {
+        if engine.is_value_framed() {
+            // Frames are self-describing: an ops algorithm or level that differs from the
+            // manifest still reads every value.
+            engine
+        } else {
+            let compression = ops_performance.map_or_else(
+                || manifest.storage_format.compression.clone(),
+                |performance| performance.compression.clone(),
+            );
+            engine.with_value_framing(compression)
+        }
+    } else if read.values_framed {
+        return Err(ConfigError::ProfileManifestInvalid(
+            "the manifest records no value framing, but __meta values are compression-framed"
+                .to_owned(),
+        ));
+    } else if engine.is_value_framed() {
+        return Err(ConfigError::StorageFormatMismatch(
+            "the database was created without value framing: enable compression through a \
+             provisioning format upgrade, not OperationalConfig.performance.compression"
+                .to_owned(),
+        ));
+    } else {
+        engine
+    };
+
+    let performance = match ops_performance {
+        Some(performance) => {
+            tracing::warn!(
+                profile = %manifest.profile,
+                digest = %manifest.digest,
+                "OperationalConfig.performance overrides the persisted profile manifest for this session"
+            );
+            performance.clone()
+        }
+        None => profile_binding::performance_for_manifest(manifest),
+    };
+    Ok((engine, performance))
+}
+
+/// CP, AP and sharded openers: profile manifests are single-node only in this build, and a
+/// database whose values are compression-framed needs an engine that frames values.
+fn refuse_profile_manifest(read: &MetadataRead) -> Result<(), ConfigError> {
+    if read.manifest.is_some() {
+        return Err(ConfigError::Unsupported(
+            "profile manifests are single-node only in this build".to_owned(),
+        ));
+    }
+    if read.values_framed {
+        return Err(ConfigError::StorageFormatMismatch(
+            LEGACY_FRAMED_DATABASE.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn query_permits_for(performance: &PerformanceConfig) -> Arc<Semaphore> {
@@ -6859,12 +6993,7 @@ fn build_shard_backend(
 ) -> Result<Arc<dyn Replication>, ConfigError> {
     match backend {
         ShardBackendConfig::Local(config) => {
-            let database = if create {
-                create_database(config.clone())?
-            } else {
-                open_database(config.clone())?
-            };
-            Ok(Arc::new(database))
+            Ok(Arc::new(open_local_shard(config.clone(), create)?))
         }
         ShardBackendConfig::Cp { config, cluster } => {
             let database = if create {
@@ -6883,6 +7012,28 @@ fn build_shard_backend(
             Ok(Arc::new(database))
         }
     }
+}
+
+/// Opens one local shard, initializing its metadata when `create` is set. A local shard is a
+/// plain single-node database, except that a profile manifest on any shard is refused before
+/// the shard database is built.
+fn open_local_shard(config: DbConfig, create: bool) -> Result<Database, ConfigError> {
+    let engine = engine_for(&config)?;
+
+    match read_metadata(&engine) {
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
+        Err(ConfigError::MissingMetadata { key }) if create && key == KEY_SCHEMA_VERSION_NAME => {
+            write_metadata(&engine, &config)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    let catalog = read_catalog(&engine)?;
+    let performance = PerformanceConfig::for_profile(config.profile);
+    Database::new_with_performance(config, engine, catalog, performance)
 }
 
 fn ensure_cluster_supported(
@@ -6941,6 +7092,33 @@ struct Metadata {
     layout: TableLayout,
 }
 
+/// `__meta` as the frame-tolerant reader decoded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetadataRead {
+    metadata: Metadata,
+    manifest: Option<PersistedProfileManifest>,
+    /// A `__meta` value still carried a compression frame after the engine read it: the database
+    /// frames values but the engine that read them does not. A framing engine strips every frame
+    /// itself, so this is only ever set when the engine does not frame values.
+    values_framed: bool,
+}
+
+impl MetadataRead {
+    /// The legacy metadata `write_metadata` just wrote for `config`.
+    fn written(config: &DbConfig) -> Self {
+        Self {
+            metadata: Metadata {
+                schema_version: SCHEMA_VERSION,
+                profile: config.profile,
+                replication: config.replication,
+                layout: layout_for(config.profile),
+            },
+            manifest: None,
+            values_framed: false,
+        }
+    }
+}
+
 #[derive(Serialize, serde::Deserialize)]
 struct StoredAuthzPolicy {
     roles: Vec<StoredRole>,
@@ -6968,32 +7146,121 @@ fn write_metadata<S: StorageEngine>(engine: &S, config: &DbConfig) -> Result<(),
     Ok(())
 }
 
-fn read_metadata<S: StorageEngine>(engine: &S) -> Result<Metadata, ConfigError> {
+fn read_metadata<S: StorageEngine>(engine: &S) -> Result<MetadataRead, ConfigError> {
     let txn = engine.begin_read()?;
-    let schema_version = read_json(&txn, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME)?;
+    decode_metadata(|key| Ok(txn.get(META_TABLE, key)?))
+}
 
-    if schema_version != SCHEMA_VERSION {
+/// The frame-tolerant `__meta` reader behind `read_metadata` and `read_metadata_from_repl`.
+///
+/// Every value passes through `decode_stored_value` before serde, so compression-framed
+/// metadata decodes and is reported as `values_framed`. `schema_version` 1 and 2 are accepted;
+/// the profile manifest is decoded and re-validated against the rest of `__meta`.
+fn decode_metadata(
+    get: impl Fn(&[u8]) -> Result<Option<Bytes>, ConfigError>,
+) -> Result<MetadataRead, ConfigError> {
+    let mut framed = false;
+    let schema_version: u32 = required_meta_value(
+        &get,
+        KEY_SCHEMA_VERSION,
+        KEY_SCHEMA_VERSION_NAME,
+        &mut framed,
+    )?;
+
+    if !(SCHEMA_VERSION..=SCHEMA_VERSION_FRAMED).contains(&schema_version) {
         return Err(ConfigError::SchemaVersionMismatch {
-            expected: SCHEMA_VERSION,
+            expected: SCHEMA_VERSION_FRAMED,
             found: schema_version,
         });
     }
 
-    let profile = read_json(&txn, KEY_PROFILE, KEY_PROFILE_NAME)?;
-    let replication = read_json(&txn, KEY_REPLICATION, KEY_REPLICATION_NAME)?;
-    let layout = match txn.get(META_TABLE, KEY_LAYOUT)? {
-        Some(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))?
-        }
+    let profile = required_meta_value(&get, KEY_PROFILE, KEY_PROFILE_NAME, &mut framed)?;
+    let replication =
+        required_meta_value(&get, KEY_REPLICATION, KEY_REPLICATION_NAME, &mut framed)?;
+    let layout = match get(KEY_LAYOUT)? {
+        Some(raw) => decode_meta_value(&raw, KEY_LAYOUT_NAME, &mut framed)?,
         None => layout_for(profile),
     };
+    let manifest = match get(KEY_PROFILE_MANIFEST)? {
+        Some(raw) => Some(profile_binding::decode_profile_manifest(
+            &decode_meta_bytes(&raw, &mut framed)?,
+        )?),
+        None => None,
+    };
 
-    Ok(Metadata {
+    let metadata = Metadata {
         schema_version,
         profile,
         replication,
         layout,
+    };
+    check_metadata_format(metadata, manifest.as_ref())?;
+    Ok(MetadataRead {
+        metadata,
+        manifest,
+        values_framed: framed,
     })
+}
+
+/// `schema_version` 2 exists only together with a value-framing profile manifest, and a
+/// manifest is re-validated against `__meta` on every read.
+fn check_metadata_format(
+    metadata: Metadata,
+    manifest: Option<&PersistedProfileManifest>,
+) -> Result<(), ConfigError> {
+    let value_framing = manifest.is_some_and(|manifest| manifest.storage_format.value_framing);
+    if metadata.schema_version == SCHEMA_VERSION_FRAMED && !value_framing {
+        return Err(ConfigError::ProfileManifestInvalid(
+            "schema_version 2 requires a profile manifest with storage_format.value_framing"
+                .to_owned(),
+        ));
+    }
+    if value_framing && metadata.schema_version != SCHEMA_VERSION_FRAMED {
+        return Err(ConfigError::ProfileManifestInvalid(format!(
+            "storage_format.value_framing requires schema_version 2, found {}",
+            metadata.schema_version
+        )));
+    }
+    if let Some(manifest) = manifest {
+        profile_binding::validate_manifest(manifest, metadata.profile)?;
+    }
+    Ok(())
+}
+
+fn required_meta_value<T: DeserializeOwned>(
+    get: &impl Fn(&[u8]) -> Result<Option<Bytes>, ConfigError>,
+    key: &[u8],
+    key_name: &'static str,
+    framed: &mut bool,
+) -> Result<T, ConfigError> {
+    let raw = get(key)?.ok_or(ConfigError::MissingMetadata { key: key_name })?;
+    decode_meta_value(&raw, key_name, framed)
+}
+
+/// Decodes one raw `__meta` value: strips a compression frame (recording it in `framed`), then
+/// parses the JSON. A frame that does not decode is storage corruption; JSON that does not parse
+/// is `MetadataUnreadable`.
+fn decode_meta_value<T: DeserializeOwned>(
+    raw: &[u8],
+    key: &'static str,
+    framed: &mut bool,
+) -> Result<T, ConfigError> {
+    let bytes = decode_meta_bytes(raw, framed)?;
+    serde_json::from_slice(&bytes).map_err(|error| ConfigError::MetadataUnreadable {
+        key,
+        reason: if bytes.starts_with(ENCRYPTED_FRAME_PREFIX) {
+            format!("the value carries an encryption frame (MDBE): {error}")
+        } else {
+            error.to_string()
+        },
+    })
+}
+
+fn decode_meta_bytes(raw: &[u8], framed: &mut bool) -> Result<Bytes, ConfigError> {
+    if is_framed(raw) {
+        *framed = true;
+    }
+    Ok(decode_stored_value(raw)?)
 }
 
 fn ensure_metadata_matches(config: &DbConfig, metadata: Metadata) -> Result<(), ConfigError> {
@@ -7051,31 +7318,8 @@ fn write_metadata_to_repl(repl: &dyn Replication, config: &DbConfig) -> Result<(
     Ok(())
 }
 
-fn read_metadata_from_repl(repl: &dyn Replication) -> Result<Metadata, ConfigError> {
-    let schema_version = read_json_from_repl(repl, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME)?;
-
-    if schema_version != SCHEMA_VERSION {
-        return Err(ConfigError::SchemaVersionMismatch {
-            expected: SCHEMA_VERSION,
-            found: schema_version,
-        });
-    }
-
-    let profile = read_json_from_repl(repl, KEY_PROFILE, KEY_PROFILE_NAME)?;
-    let replication = read_json_from_repl(repl, KEY_REPLICATION, KEY_REPLICATION_NAME)?;
-    let layout = match repl.read(META_TABLE, KEY_LAYOUT, ReadConsistency::Strong)? {
-        Some(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))?
-        }
-        None => layout_for(profile),
-    };
-
-    Ok(Metadata {
-        schema_version,
-        profile,
-        replication,
-        layout,
-    })
+fn read_metadata_from_repl(repl: &dyn Replication) -> Result<MetadataRead, ConfigError> {
+    decode_metadata(|key| Ok(repl.read(META_TABLE, key, ReadConsistency::Strong)?))
 }
 
 fn read_catalog_from_repl(
@@ -7229,18 +7473,6 @@ fn audit_hex_value(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn read_json_from_repl<T: DeserializeOwned>(
-    repl: &dyn Replication,
-    key: &[u8],
-    key_name: &'static str,
-) -> Result<T, ConfigError> {
-    let bytes = repl
-        .read(META_TABLE, key, ReadConsistency::Strong)?
-        .ok_or(ConfigError::MissingMetadata { key: key_name })?;
-
-    serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))
-}
-
 fn catalog_put_op(name: &str, entry: &CatalogEntry) -> Result<Op, DbError> {
     let value = serde_json::to_vec(entry).map_err(|error| DbError::Serde(error.to_string()))?;
     Ok(Op::Put {
@@ -7299,18 +7531,6 @@ fn write_json<T: serde::Serialize>(
     let bytes = serde_json::to_vec(value).map_err(|error| ConfigError::Serde(error.to_string()))?;
     txn.put(META_TABLE, key, &bytes)?;
     Ok(())
-}
-
-fn read_json<T: DeserializeOwned>(
-    txn: &impl ReadTransaction,
-    key: &[u8],
-    key_name: &'static str,
-) -> Result<T, ConfigError> {
-    let bytes = txn
-        .get(META_TABLE, key)?
-        .ok_or(ConfigError::MissingMetadata { key: key_name })?;
-
-    serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))
 }
 
 #[cfg(test)]

@@ -1,19 +1,28 @@
-use std::{collections::BTreeMap, io, sync::Arc, thread};
+use std::{collections::BTreeMap, io, path::Path, sync::Arc, thread};
+
+use serde_json::json;
 
 use super::{
-    ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_LAYOUT, META_TABLE,
-    OperationalConfig, Profile, ReplicationKind, SecurityConfig, ShardBackendConfig, ShardSpec,
-    ShardedDatabaseConfig, create_ap_database, create_cluster_database, create_database,
-    create_database_with_ops, create_sharded_database, engine_for, engine_for_operational,
-    force_wasm_runtime_init_failure, layout_for, open_ap_database, open_cluster_database,
-    open_database, open_database_with_ops, profile_validation_report, validate,
+    AUTHZ_TABLE, ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_LAYOUT,
+    KEY_PROFILE_MANIFEST, KEY_SCHEMA_VERSION, META_TABLE, Metadata, MetadataProbe, MetadataRead,
+    OperationalConfig, PersistedProfileManifest, ProbedMetadata, Profile, ReplicationKind,
+    RuntimeProfileBinding, SecurityConfig, ShardBackendConfig, ShardSpec, ShardedDatabaseConfig,
+    create_ap_database, create_cluster_database, create_database, create_database_with_ops,
+    create_database_with_profile, create_sharded_database, engine_for, engine_for_operational,
+    force_wasm_runtime_init_failure, inspect_database_metadata, layout_for, open_ap_database,
+    open_cluster_database, open_database, open_database_with_ops, open_sharded_database,
+    profile_validation_report, refuse_profile_manifest, validate,
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
     HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewSpec, ResumeToken,
 };
 use crate::cloud::ObjectStoreUri;
-use crate::config_spec::{ApplyStatus, ConsistencyMode, DatabaseSpec, MigrationPlanner};
+use crate::config_spec::{
+    ApplyStatus, ConsistencyMode, DatabaseSpec, DeploymentMode, MigrationPlanner, PolicyCompiler,
+    ProfileKnobOverrides, ResolvedProfileKind, resolve_named_profile,
+    spec_io::{SpecFormat, decode_spec_bytes},
+};
 use crate::continuous::{
     ContinuousQuerySpec, OutboxConnectorSpec, OutboxSink, TriggerEvent, TriggerSpec, TriggerTiming,
 };
@@ -43,7 +52,10 @@ use crate::security::{
     AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditOutcome, AuthzPolicy, Permission, Principal,
     PrincipalRegistry, Resource, Role,
 };
-use crate::storage::{EngineKind, RedbEngine, StorageEngine, StorageError, WriteTransaction};
+use crate::storage::{
+    EngineKind, ReadTransaction, RedbEngine, StorageEngine, StorageError, WriteTransaction,
+    decode_stored_value,
+};
 use crate::temporal::{TemporalPoint, TemporalRetention};
 use crate::text::FullTextIndexConfig;
 use crate::timeseries::{TimePoint, TimeSeriesConfig};
@@ -2951,4 +2963,794 @@ fn user_document(user_id: i64, city: Option<Value>) -> Value {
     doc.insert("user_id".to_owned(), Value::Int(user_id));
     doc.insert("profile".to_owned(), Value::Object(profile));
     Value::Object(doc)
+}
+
+#[test]
+fn profile_manifest_create_writes_unframed_metadata_once() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("balanced-profile.redb");
+    let binding = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&path))?;
+    assert!(!binding.manifest.storage_format.value_framing);
+
+    let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+    assert_eq!(database.profile(), Profile::Balanced);
+    assert_eq!(database.engine_kind(), EngineKind::Redb);
+    drop(database);
+
+    let schema_version = raw_value(&path, META_TABLE, KEY_SCHEMA_VERSION)?;
+    assert_eq!(schema_version.as_deref(), Some(b"1".as_slice()));
+    let manifest = raw_value(&path, META_TABLE, KEY_PROFILE_MANIFEST)?.ok_or("manifest missing")?;
+    assert!(manifest.starts_with(b"{"));
+    let stored: PersistedProfileManifest = serde_json::from_slice(&manifest)?;
+    assert_eq!(stored, binding.manifest);
+    assert_eq!(stored.manifest_version, 1);
+    assert_eq!(stored.written_by, env!("CARGO_PKG_VERSION"));
+
+    assert!(matches!(
+        create_database_with_profile(&binding, OperationalConfig::new()),
+        Err(ConfigError::AlreadyInitialized)
+    ));
+
+    let other = temp_dir.path().join("with-performance.redb");
+    let other_binding = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&other))?;
+    let ops = OperationalConfig::new()
+        .with_performance(PerformanceConfig::for_profile(Profile::Balanced));
+    assert!(matches!(
+        create_database_with_profile(&other_binding, ops),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(!other.exists());
+    Ok(())
+}
+
+#[test]
+fn profile_manifest_knobs_are_reapplied_by_every_single_node_opener()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("tuned.redb");
+    let binding = named_binding(
+        "balanced",
+        json!({
+            "cache": { "max_entries": 8192 },
+            "query": { "max_concurrent_queries": 3, "memory_limit_bytes": 134_217_728 },
+            "durability": { "group_commit_window_ms": 5 }
+        }),
+        ReplicationKind::Cp,
+        Some(&path),
+    )?;
+    assert_eq!(binding.manifest.kind, ResolvedProfileKind::Custom);
+    assert_eq!(binding.performance.cache.max_capacity, 8192);
+    assert_eq!(binding.performance.query.max_concurrent_queries, 3);
+    assert_eq!(binding.performance.io.group_commit_window_ms, 5);
+    assert_eq!(binding.performance.query.memory_limit_bytes, 134_217_728);
+    assert_ne!(
+        binding.performance,
+        PerformanceConfig::for_profile(Profile::Balanced)
+    );
+
+    let admin = Principal::new("root").with_role("admin");
+    let admin_role = Role::new("admin").grant(Resource::System, Permission::Admin);
+    let mut bootstrap = PrincipalRegistry::new();
+    bootstrap.insert("root", admin.clone());
+    let security = SecurityConfig {
+        authz_policy: AuthzPolicy::new([admin_role.clone()]),
+        principals: bootstrap,
+        ..SecurityConfig::default()
+    };
+    let policy = AuthzPolicy::new([
+        admin_role,
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+    ]);
+    let mut registry = PrincipalRegistry::new();
+    registry.insert("root", admin.clone());
+    registry.insert("alice", Principal::new("alice").with_role("reader"));
+
+    {
+        let mut database = create_database_with_profile(
+            &binding,
+            OperationalConfig::new().with_security(security),
+        )?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.query_permits.available_permits(), 3);
+        database.set_authz_policy_as(&admin, policy.clone())?;
+        database.set_principal_registry_as(&admin, registry.clone())?;
+    }
+    let authz_before = raw_rows(&path, AUTHZ_TABLE)?;
+    assert!(!authz_before.is_empty());
+
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    {
+        let database = create_database(config.clone())?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.query_permits.available_permits(), 3);
+    }
+    {
+        let database = open_database(config.clone())?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.query_permits.available_permits(), 3);
+    }
+    assert_eq!(raw_rows(&path, AUTHZ_TABLE)?, authz_before);
+
+    let database = open_database_with_ops(config, &OperationalConfig::new())?;
+    assert_eq!(database.performance_config(), &binding.performance);
+    assert_eq!(database.query_permits.available_permits(), 3);
+    assert_eq!(database.authz_policy(), &policy);
+    assert_eq!(database.principal_registry(), &registry);
+    drop(database);
+    assert_eq!(raw_rows(&path, AUTHZ_TABLE)?, authz_before);
+    Ok(())
+}
+
+#[test]
+fn profile_manifest_compression_frames_every_value() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("zstd.redb");
+    let binding = named_binding(
+        "balanced",
+        json!({ "compression": { "algorithm": "zstd" } }),
+        ReplicationKind::Cp,
+        Some(&path),
+    )?;
+    assert!(binding.manifest.storage_format.value_framing);
+    let value = b"framed value ".repeat(256);
+
+    {
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+        database.propose(Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: value.clone(),
+        })?;
+    }
+
+    let schema_version = raw_value(&path, META_TABLE, KEY_SCHEMA_VERSION)?.ok_or("no version")?;
+    assert!(schema_version.starts_with(b"MDBC1"));
+    assert_eq!(decode_stored_value(&schema_version)?, b"2");
+    let manifest = raw_value(&path, META_TABLE, KEY_PROFILE_MANIFEST)?.ok_or("no manifest")?;
+    assert!(manifest.starts_with(b"MDBC1"));
+    let data = raw_value(&path, "t", b"k")?.ok_or("data key missing")?;
+    assert!(data.starts_with(b"MDBC1"));
+    assert_eq!(data[5], 2, "values at or above min_bytes are zstd frames");
+    assert!(data.len() < value.len());
+
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    {
+        let database = open_database(config.clone())?;
+        assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(
+            database.read("t", b"k", ReadConsistency::Strong)?,
+            Some(value.clone())
+        );
+        assert_eq!(
+            database.performance_config().compression.algorithm,
+            CompressionAlgorithm::Zstd
+        );
+        assert_eq!(database.performance_config(), &binding.performance);
+    }
+
+    let mut lz4 = PerformanceConfig::for_profile(Profile::Balanced);
+    lz4.compression.algorithm = CompressionAlgorithm::Lz4;
+    let database = open_database_with_ops(config, &OperationalConfig::new().with_performance(lz4))?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    assert_eq!(
+        database.read("t", b"k", ReadConsistency::Strong)?,
+        Some(value)
+    );
+    assert_eq!(
+        database.performance_config().compression.algorithm,
+        CompressionAlgorithm::Lz4
+    );
+    Ok(())
+}
+
+#[test]
+fn profile_manifest_framing_without_compression_writes_raw_frames()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("raw-frames.redb");
+    let mut binding = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&path))?;
+    binding.manifest.storage_format.value_framing = true;
+
+    {
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+        database.propose(Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })?;
+    }
+
+    let data = raw_value(&path, "t", b"k")?.ok_or("data key missing")?;
+    assert!(data.starts_with(b"MDBC1"));
+    assert_eq!(data[5], 0, "algorithm none writes RAW frames");
+    let schema_version = raw_value(&path, META_TABLE, KEY_SCHEMA_VERSION)?.ok_or("no version")?;
+    assert_eq!(decode_stored_value(&schema_version)?, b"2");
+
+    let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    assert_eq!(
+        database.read("t", b"k", ReadConsistency::Strong)?,
+        Some(b"v".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_framed_database_needs_ops_compression() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("legacy-zstd.redb");
+    let config = DbConfig::on_disk(Profile::Transactional, &path);
+    let mut performance = PerformanceConfig::for_profile(Profile::Transactional);
+    performance.compression.algorithm = CompressionAlgorithm::Zstd;
+    performance.compression.min_bytes = 1;
+    let ops = OperationalConfig::new().with_performance(performance);
+
+    {
+        let database = create_database_with_ops(config.clone(), ops.clone())?;
+        database.propose(Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: b"legacy".to_vec(),
+        })?;
+    }
+
+    match open_database(config.clone()) {
+        Err(ConfigError::StorageFormatMismatch(message)) => {
+            assert!(message.contains("OperationalConfig.performance.compression"));
+        }
+        Err(error) => panic!("expected a storage format mismatch, got {error:?}"),
+        Ok(_) => panic!("a framed legacy database opened without compression"),
+    }
+    assert!(matches!(
+        open_cluster_database(config.clone(), cp_cluster_config()),
+        Err(ConfigError::StorageFormatMismatch(_))
+    ));
+
+    let database = open_database_with_ops(config, &ops)?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    assert_eq!(
+        database.read("t", b"k", ReadConsistency::Strong)?,
+        Some(b"legacy".to_vec())
+    );
+    assert!(matches!(
+        inspect_database_metadata(&path),
+        MetadataProbe::Locked
+    ));
+    drop(database);
+    match inspect_database_metadata(&path) {
+        MetadataProbe::Initialized(probed) => {
+            assert!(probed.values_framed);
+            assert_eq!(probed.schema_version, 1);
+            assert!(probed.manifest.is_none());
+        }
+        other => panic!("expected initialized metadata, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn unframed_profile_manifest_refuses_ops_compression() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("unframed.redb");
+    let binding = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&path))?;
+    drop(create_database_with_profile(
+        &binding,
+        OperationalConfig::new(),
+    )?);
+
+    let mut performance = PerformanceConfig::for_profile(Profile::Balanced);
+    performance.compression.algorithm = CompressionAlgorithm::Lz4;
+    match open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &path),
+        &OperationalConfig::new().with_performance(performance),
+    ) {
+        Err(ConfigError::StorageFormatMismatch(message)) => {
+            assert!(message.contains("provisioning format upgrade"));
+        }
+        Err(error) => panic!("expected a storage format mismatch, got {error:?}"),
+        Ok(_) => panic!("ops compression silently framed an unframed manifest database"),
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_reader_rejects_unknown_formats() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let newer = temp_dir.path().join("schema-3.redb");
+    drop(create_database(DbConfig::on_disk(
+        Profile::Balanced,
+        &newer,
+    ))?);
+    put_raw(&newer, META_TABLE, KEY_SCHEMA_VERSION, b"3")?;
+    assert!(matches!(
+        open_database(DbConfig::on_disk(Profile::Balanced, &newer)),
+        Err(ConfigError::SchemaVersionMismatch {
+            expected: 2,
+            found: 3
+        })
+    ));
+
+    let framed_without_manifest = temp_dir.path().join("schema-2.redb");
+    drop(create_database(DbConfig::on_disk(
+        Profile::Balanced,
+        &framed_without_manifest,
+    ))?);
+    put_raw(
+        &framed_without_manifest,
+        META_TABLE,
+        KEY_SCHEMA_VERSION,
+        b"2",
+    )?;
+    assert!(matches!(
+        open_database(DbConfig::on_disk(
+            Profile::Balanced,
+            &framed_without_manifest
+        )),
+        Err(ConfigError::ProfileManifestInvalid(_))
+    ));
+
+    let newer_manifest = manifest_database(temp_dir.path(), "manifest-2.redb")?;
+    edit_raw_manifest(&newer_manifest, |manifest| {
+        manifest["manifest_version"] = json!(2);
+    })?;
+    assert!(matches!(
+        open_database(DbConfig::on_disk(Profile::Balanced, &newer_manifest)),
+        Err(ConfigError::UnsupportedProfileManifest { found: 2 })
+    ));
+    Ok(())
+}
+
+#[test]
+fn metadata_reader_revalidates_profile_manifests() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let edits: [(&str, ManifestEdit); 4] = [
+        ("storage-profile.redb", |manifest| {
+            manifest["storage_profile"] = json!("Document");
+        }),
+        ("out-of-range.redb", |manifest| {
+            manifest["knobs"]["cache"]["max_entries"] = json!(2_000_000);
+        }),
+        ("derived-class.redb", |manifest| {
+            manifest["knobs"]["storage"]["layout"] = json!("columnar");
+        }),
+        ("unknown-field.redb", |manifest| {
+            manifest["knobs"]["cache"]["ttl_millis"] = json!(1);
+        }),
+    ];
+
+    for (name, edit) in edits {
+        let path = manifest_database(temp_dir.path(), name)?;
+        edit_raw_manifest(&path, edit)?;
+        match open_database(DbConfig::on_disk(Profile::Balanced, &path)) {
+            Err(ConfigError::ProfileManifestInvalid(_)) => {}
+            Err(error) => panic!("{name}: expected an invalid manifest, got {error:?}"),
+            Ok(_) => panic!("{name}: an edited manifest drove the runtime"),
+        }
+        assert!(matches!(
+            inspect_database_metadata(&path),
+            MetadataProbe::Unreadable { .. }
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_metadata_without_key_is_unreadable() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("encrypted.redb");
+    let key_path = temp_dir.path().join("key.bin");
+    std::fs::write(&key_path, [5_u8; 32])?;
+    drop(create_database_with_ops(
+        DbConfig::on_disk(Profile::Transactional, &path),
+        OperationalConfig::new().with_encryption(EncryptionConfig::file_key(&key_path)),
+    )?);
+
+    match open_database(DbConfig::on_disk(Profile::Transactional, &path)) {
+        Err(error @ ConfigError::MetadataUnreadable { key, .. }) => {
+            assert_eq!(key, "schema_version");
+            let message = error.to_string();
+            assert!(message.contains("MDBE"), "{message}");
+            assert!(message.contains("supply OperationalConfig.encryption"));
+        }
+        Err(error) => panic!("expected unreadable metadata, got {error:?}"),
+        Ok(_) => panic!("encrypted metadata opened without a key"),
+    }
+
+    match inspect_database_metadata(&path) {
+        MetadataProbe::Unreadable { reason } => {
+            assert!(
+                reason.contains("metadata is encrypted or corrupt"),
+                "{reason}"
+            );
+            assert!(reason.contains("supply OperationalConfig.encryption"));
+        }
+        other => panic!("expected unreadable metadata, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn refuse_profile_manifest_reports_single_node_only() -> Result<(), Box<dyn std::error::Error>> {
+    let binding = named_binding(
+        "balanced",
+        json!({}),
+        ReplicationKind::Cp,
+        Some(Path::new("unused.redb")),
+    )?;
+    let read = MetadataRead {
+        metadata: Metadata {
+            schema_version: 1,
+            profile: Profile::Balanced,
+            replication: ReplicationKind::Cp,
+            layout: TableLayout::Row,
+        },
+        manifest: Some(binding.manifest),
+        values_framed: false,
+    };
+
+    match refuse_profile_manifest(&read) {
+        Err(ConfigError::Unsupported(message)) => {
+            assert_eq!(
+                message,
+                "profile manifests are single-node only in this build"
+            );
+        }
+        other => panic!("expected the manifest to be refused, got {other:?}"),
+    }
+
+    let legacy = MetadataRead {
+        manifest: None,
+        ..read.clone()
+    };
+    assert!(refuse_profile_manifest(&legacy).is_ok());
+    let framed = MetadataRead {
+        values_framed: true,
+        ..legacy
+    };
+    assert!(matches!(
+        refuse_profile_manifest(&framed),
+        Err(ConfigError::StorageFormatMismatch(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn cluster_and_ap_openers_refuse_profile_manifests() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let cp_path = manifest_database(temp_dir.path(), "cp.redb")?;
+    assert!(matches!(
+        open_cluster_database(
+            DbConfig::on_disk(Profile::Balanced, &cp_path),
+            cp_cluster_config()
+        ),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        create_cluster_database(
+            DbConfig::on_disk(Profile::Balanced, &cp_path),
+            cp_cluster_config()
+        ),
+        Err(ConfigError::Unsupported(_))
+    ));
+
+    let ap_path = temp_dir.path().join("ap.redb");
+    let binding = named_binding("balanced", json!({}), ReplicationKind::Ap, Some(&ap_path))?;
+    drop(create_database_with_profile(
+        &binding,
+        OperationalConfig::new(),
+    )?);
+    let ap_config =
+        DbConfig::on_disk(Profile::Balanced, &ap_path).with_replication(ReplicationKind::Ap);
+    assert!(matches!(
+        open_ap_database(ap_config.clone(), ap_cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        create_ap_database(ap_config.clone(), ap_cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let reopened = open_database(ap_config)?;
+    assert_eq!(reopened.replication_kind(), ReplicationKind::Ap);
+    Ok(())
+}
+
+#[test]
+fn sharded_openers_refuse_profile_manifests_on_any_local_shard()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let manifest_shard = manifest_database(temp_dir.path(), "shard.redb")?;
+    let local_manifest =
+        || ShardBackendConfig::Local(DbConfig::on_disk(Profile::Balanced, &manifest_shard));
+    let local_memory = || ShardBackendConfig::Local(DbConfig::new(Profile::InMemory));
+
+    let global = ShardedDatabaseConfig::new(
+        PartitionStrategy::HashSlots { partitions: 16 },
+        1,
+        vec![
+            ShardSpec::new(1, local_manifest()),
+            ShardSpec::new(2, local_memory()),
+        ],
+    );
+    assert!(matches!(
+        open_sharded_database(DbConfig::new(Profile::InMemory), global),
+        Err(ConfigError::Unsupported(message)) if message.contains("single-node only")
+    ));
+
+    let non_global = ShardedDatabaseConfig::new(
+        PartitionStrategy::HashSlots { partitions: 16 },
+        1,
+        vec![
+            ShardSpec::new(1, local_memory()),
+            ShardSpec::new(2, local_manifest()),
+        ],
+    );
+    assert!(matches!(
+        create_sharded_database(DbConfig::new(Profile::InMemory), non_global),
+        Err(ConfigError::Unsupported(message)) if message.contains("single-node only")
+    ));
+    Ok(())
+}
+
+#[test]
+fn inspect_database_metadata_never_creates_files() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let missing = temp_dir.path().join("missing.redb");
+    assert_eq!(inspect_database_metadata(&missing), MetadataProbe::NotFound);
+    assert!(!missing.exists());
+
+    let empty = temp_dir.path().join("empty.redb");
+    std::fs::write(&empty, [])?;
+    assert_eq!(
+        inspect_database_metadata(&empty),
+        MetadataProbe::Uninitialized
+    );
+    assert_eq!(std::fs::metadata(&empty)?.len(), 0);
+
+    let raw = temp_dir.path().join("raw.redb");
+    drop(RedbEngine::open(&raw)?);
+    assert_eq!(
+        inspect_database_metadata(&raw),
+        MetadataProbe::Uninitialized
+    );
+
+    let legacy = temp_dir.path().join("legacy.redb");
+    let database = create_database(
+        DbConfig::on_disk(Profile::Analytical, &legacy).with_replication(ReplicationKind::Ap),
+    )?;
+    assert_eq!(inspect_database_metadata(&legacy), MetadataProbe::Locked);
+    drop(database);
+    assert_eq!(
+        inspect_database_metadata(&legacy),
+        MetadataProbe::Initialized(Box::new(ProbedMetadata {
+            schema_version: 1,
+            storage_profile: Profile::Analytical,
+            replication: ReplicationKind::Ap,
+            layout: TableLayout::Columnar,
+            manifest: None,
+            values_framed: false,
+        }))
+    );
+
+    let framed = temp_dir.path().join("framed.redb");
+    let binding = named_binding(
+        "high_durability",
+        json!({ "compression": { "algorithm": "lz4" } }),
+        ReplicationKind::Cp,
+        Some(&framed),
+    )?;
+    drop(create_database_with_profile(
+        &binding,
+        OperationalConfig::new(),
+    )?);
+    assert_eq!(
+        inspect_database_metadata(&framed),
+        MetadataProbe::Initialized(Box::new(ProbedMetadata {
+            schema_version: 2,
+            storage_profile: Profile::HighDurability,
+            replication: ReplicationKind::Cp,
+            layout: TableLayout::Row,
+            manifest: Some(binding.manifest.clone()),
+            values_framed: true,
+        }))
+    );
+    let probe = serde_json::to_value(inspect_database_metadata(&framed))?;
+    assert_eq!(probe["state"], "initialized");
+    assert_eq!(probe["manifest"]["variant"], "high_durability");
+    Ok(())
+}
+
+#[test]
+fn compiled_policy_binding_creates_a_manifest_database() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("orders.redb");
+
+    let binding = compiled.binding(&spec.deployment, Some(path.clone()))?;
+    assert_eq!(binding.db_config.path.as_deref(), Some(path.as_path()));
+    assert_eq!(binding.manifest.kind, ResolvedProfileKind::Custom);
+    assert_eq!(binding.manifest.profile, "orders_durable");
+    assert_eq!(binding.manifest.extends.as_deref(), Some("high_durability"));
+    let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+    assert_eq!(database.profile(), Profile::HighDurability);
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    assert_eq!(database.performance_config().cache.max_capacity, 8192);
+    drop(database);
+    let reopened = open_database(DbConfig::on_disk(Profile::HighDurability, &path))?;
+    assert_eq!(reopened.performance_config(), &binding.performance);
+
+    let mut cluster = spec.deployment.clone();
+    cluster.mode = DeploymentMode::Cluster;
+    assert!(matches!(
+        compiled.binding(&cluster, Some(path.clone())),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let mut replicated = compiled.clone();
+    replicated.topology.replica_count = 3;
+    assert!(matches!(
+        replicated.binding(&spec.deployment, Some(path.clone())),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let mut unresolved = compiled;
+    unresolved.resolved_profile = None;
+    assert!(matches!(
+        unresolved.binding(&spec.deployment, Some(path)),
+        Err(ConfigError::Unsupported(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn resolved_profile_bind_keeps_path_rules() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(matches!(
+        named_binding("balanced", json!({}), ReplicationKind::Cp, None),
+        Err(error) if matches!(
+            error.downcast_ref::<ConfigError>(),
+            Some(ConfigError::MissingPath { profile: Profile::Balanced })
+        )
+    ));
+    assert!(matches!(
+        named_binding("in_memory", json!({}), ReplicationKind::Cp, Some(Path::new("x.redb"))),
+        Err(error) if matches!(
+            error.downcast_ref::<ConfigError>(),
+            Some(ConfigError::VolatileWithPath { profile: Profile::InMemory })
+        )
+    ));
+
+    let memory = named_binding("in_memory", json!({}), ReplicationKind::Cp, None)?;
+    let database = create_database_with_profile(&memory, OperationalConfig::new())?;
+    assert_eq!(database.engine_kind(), EngineKind::Memory);
+    assert_eq!(database.performance_config(), &memory.performance);
+    Ok(())
+}
+
+#[test]
+fn tuning_rollback_returns_to_manifest_values() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("tuning.redb");
+    let binding = named_binding(
+        "balanced",
+        json!({ "cache": { "max_entries": 8192 } }),
+        ReplicationKind::Cp,
+        Some(&path),
+    )?;
+    drop(create_database_with_profile(
+        &binding,
+        OperationalConfig::new(),
+    )?);
+
+    let mut database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(database.performance_config().cache.max_capacity, 8192);
+    let mut policy = TuningPolicy {
+        enabled: true,
+        recommend_only: false,
+        ..TuningPolicy::default()
+    };
+    policy.envelopes.insert(
+        TunableParameter::CacheMaxCapacity,
+        ParameterEnvelope::new(64, 16_384, 64),
+    );
+    database.set_tuning_policy(&policy)?;
+
+    let entry = database.apply_tuning(TuningDecision::new(
+        TunableParameter::CacheMaxCapacity,
+        8192,
+        1_024,
+        "cache pressure",
+    ))?;
+    assert_eq!(database.performance_config().cache.max_capacity, 1_024);
+    database.rollback_tuning(&entry.id, "regression")?;
+    assert_eq!(database.performance_config().cache.max_capacity, 8192);
+    assert_ne!(
+        PerformanceConfig::for_profile(Profile::Balanced)
+            .cache
+            .max_capacity,
+        8192
+    );
+    Ok(())
+}
+
+type ManifestEdit = fn(&mut serde_json::Value);
+type RawRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn named_binding(
+    name: &str,
+    overrides: serde_json::Value,
+    replication: ReplicationKind,
+    path: Option<&Path>,
+) -> Result<RuntimeProfileBinding, Box<dyn std::error::Error>> {
+    let overrides: ProfileKnobOverrides = serde_json::from_value(overrides)?;
+    let resolution = resolve_named_profile(name, &overrides);
+    let resolved = resolution
+        .resolved()
+        .ok_or_else(|| format!("{name} did not resolve: {:?}", resolution.issues()))?;
+    Ok(resolved.bind(replication, path.map(Path::to_path_buf))?)
+}
+
+/// Creates an unframed `balanced` profile-manifest database and returns its path.
+fn manifest_database(
+    dir: &Path,
+    name: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let path = dir.join(name);
+    let binding = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&path))?;
+    drop(create_database_with_profile(
+        &binding,
+        OperationalConfig::new(),
+    )?);
+    Ok(path)
+}
+
+fn raw_value(
+    path: &Path,
+    table: &str,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let engine = RedbEngine::open(path)?;
+    let txn = engine.begin_read()?;
+    Ok(txn.get(table, key)?)
+}
+
+fn raw_rows(path: &Path, table: &str) -> Result<RawRows, Box<dyn std::error::Error>> {
+    let engine = RedbEngine::open(path)?;
+    let txn = engine.begin_read()?;
+    let rows = txn.range(table, &[], &[])?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn put_raw(
+    path: &Path,
+    table: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = RedbEngine::open(path)?;
+    let mut txn = engine.begin_write()?;
+    txn.put(table, key, value)?;
+    txn.commit()?;
+    Ok(())
+}
+
+fn edit_raw_manifest(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = raw_value(path, META_TABLE, KEY_PROFILE_MANIFEST)?.ok_or("manifest missing")?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&raw)?;
+    edit(&mut manifest);
+    put_raw(
+        path,
+        META_TABLE,
+        KEY_PROFILE_MANIFEST,
+        &serde_json::to_vec(&manifest)?,
+    )
 }

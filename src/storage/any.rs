@@ -317,6 +317,49 @@ impl AnyEngine {
         }
     }
 
+    /// Reports whether every value this engine writes carries a compression frame.
+    #[must_use]
+    pub const fn is_value_framed(&self) -> bool {
+        matches!(
+            self,
+            Self::CompressedMemory(_)
+                | Self::CompressedRedb(_)
+                | Self::CompressedEncryptedMemory(_)
+                | Self::CompressedEncryptedRedb(_)
+        )
+    }
+
+    /// Wraps this engine so every value it writes is compression-framed with `config`.
+    ///
+    /// The underlying handle is moved, never dropped and reopened. An already framed engine
+    /// keeps its inner engine and takes the new `config`; frames are self-describing, so values
+    /// written with another algorithm stay readable.
+    #[must_use]
+    pub fn with_value_framing(self, config: CompressionConfig) -> Self {
+        match self {
+            Self::Memory(engine) => Self::CompressedMemory(CompressedEngine::new(engine, config)),
+            Self::Redb(engine) => Self::CompressedRedb(CompressedEngine::new(engine, config)),
+            Self::EncryptedMemory(engine) => {
+                Self::CompressedEncryptedMemory(CompressedEngine::new(engine, config))
+            }
+            Self::EncryptedRedb(engine) => {
+                Self::CompressedEncryptedRedb(CompressedEngine::new(engine, config))
+            }
+            Self::CompressedMemory(engine) => {
+                Self::CompressedMemory(CompressedEngine::new(engine.into_inner(), config))
+            }
+            Self::CompressedRedb(engine) => {
+                Self::CompressedRedb(CompressedEngine::new(engine.into_inner(), config))
+            }
+            Self::CompressedEncryptedMemory(engine) => {
+                Self::CompressedEncryptedMemory(CompressedEngine::new(engine.into_inner(), config))
+            }
+            Self::CompressedEncryptedRedb(engine) => {
+                Self::CompressedEncryptedRedb(CompressedEngine::new(engine.into_inner(), config))
+            }
+        }
+    }
+
     /// Rotates the current data encryption key for encrypted engines.
     /// # Errors
     /// Fails when the engine is not encrypted or the provider cannot rotate.

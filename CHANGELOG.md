@@ -50,6 +50,19 @@ All notable public changes will be recorded here.
   generated from `KNOB_REGISTRY`. The version 1 schema is unchanged.
 - `examples/custom-profile/multidb.yaml`, a version 2 validation and explain
   example covered by `scripts/templates-smoke.ps1`.
+- Persisted profiles in `multidb::db`: `ResolvedProfile::bind` and
+  `CompiledPolicy::binding` produce a `RuntimeProfileBinding`, and
+  `create_database_with_profile` creates a new single-node database that
+  stores the resolved knobs in `__meta.profile_manifest`
+  (`PersistedProfileManifest`, `StorageFormat`). Every single-node opener,
+  and therefore `multidb serve`, re-validates the manifest and re-applies its
+  knobs at every open. Compression turns on value framing and
+  `schema_version` 2, which older binaries refuse. CP, AP and sharded openers
+  refuse manifests. `inspect_database_metadata` (`MetadataProbe`,
+  `ProbedMetadata`) reads a database's metadata without creating files. See
+  `docs/profiles.md`.
+- `AnyEngine::is_value_framed` and `AnyEngine::with_value_framing`, which
+  wraps an open engine in compression framing without reopening it.
 
 ### Changed
 
@@ -70,6 +83,12 @@ All notable public changes will be recorded here.
   `invalid_json` and CLI exit 1 before.
 - Specs over 1 MiB (`SPEC_TOO_LARGE`) or over the YAML alias expansion budget
   (`SPEC_TOO_COMPLEX`) are rejected before the typed decode.
+- Metadata reads tolerate compression frames. A legacy database created with
+  `OperationalConfig.performance.compression` and opened without it now fails
+  with `StorageFormatMismatch` (previously an opaque serde error), and
+  encrypted metadata opened without a key fails with `MetadataUnreadable`
+  ("supply OperationalConfig.encryption"). `SchemaVersionMismatch` now reports
+  `expected: 2`, the newest version this build reads.
 
 ### Breaking
 
@@ -77,6 +96,10 @@ All notable public changes will be recorded here.
   `None` keeps today's behaviour.
 - `ConfigSpecError::UnsupportedVersion` gains a `supported` range field.
 - `CompiledPolicy` struct literals must set the new `resolved_profile` field.
+- `ConfigError` gains `AlreadyInitialized`, `StorageFormatMismatch`,
+  `UnsupportedProfileManifest`, `ProfileManifestInvalid` and
+  `MetadataUnreadable`. `ConfigError` is not `non_exhaustive`, so exhaustive
+  matches outside the crate must handle them.
 
 ## 0.1.0-preview.1
 

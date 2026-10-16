@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, TableDefinition, TableError, TableHandle,
+    Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, TableDefinition,
+    TableError, TableHandle,
 };
 
 use crate::storage::{
@@ -14,6 +15,14 @@ type RedbReadOnlyTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
 pub struct RedbEngine {
     db: redb::Database,
     two_phase_commit: bool,
+}
+
+/// The outcome of opening a redb file that must already exist.
+pub(crate) enum ExistingRedbOpen {
+    Opened(RedbEngine),
+    /// Another handle holds the file lock.
+    Locked,
+    Failed(StorageError),
 }
 
 pub struct RedbReadTxn {
@@ -43,6 +52,23 @@ impl RedbEngine {
             db: Database::create(path).map_err(to_storage_err)?,
             two_phase_commit: true,
         })
+    }
+
+    /// Opens an existing redb file without ever creating one. redb may still run its own crash
+    /// repair on the file, exactly as a normal open would.
+    pub(crate) fn open_existing(
+        path: impl AsRef<Path>,
+        two_phase_commit: bool,
+    ) -> ExistingRedbOpen {
+        match Database::open(path) {
+            Ok(db) => ExistingRedbOpen::Opened(Self {
+                db,
+                two_phase_commit,
+            }),
+            Err(DatabaseError::DatabaseAlreadyOpen) => ExistingRedbOpen::Locked,
+            // `DatabaseError` is non_exhaustive: every other failure is reported as is.
+            Err(error) => ExistingRedbOpen::Failed(to_storage_err(error)),
+        }
     }
 }
 

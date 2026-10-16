@@ -11,10 +11,13 @@ API in `multidb::config_spec` (`resolve_profile`, `resolve_named_profile`,
 is a version 2 field. `multidb config validate`, `config explain`,
 `config plan` and the Control Plane `/config/validate` and `/config/plan`
 resolve the profile of every spec, report its issues and explain every knob.
+Only the Rust API builds a database from a resolved profile:
+`db::create_database_with_profile` persists the knobs in
+`__meta.profile_manifest`, and every single-node opener, `serve` included,
+re-applies them (see [Persistence and format](#persistence-and-format)).
 Nothing in the CLI, `serve` or the Control Plane creates a database from a
-spec: resolved knobs are reported there, not applied. Existing version 1
-specs keep their validation issues, serialization and plan ids; they only gain
-new Advice and Warnings.
+spec. Existing version 1 specs keep their validation issues, serialization and
+plan ids; they only gain new Advice and Warnings.
 
 ## Model
 
@@ -54,9 +57,9 @@ lowercase and map `-` to `_`, so `High-Durability` means `high_durability`.
 
 Values every preset shares:
 
-- compression `none`, `min_bytes` 256, `zstd_level` 3. Plain openers never
-  compress today, so a compressed preset would silently change the on-disk
-  format;
+- compression `none`, `min_bytes` 256, `zstd_level` 3. Compression is a
+  forward-only on-disk format change (value framing and `schema_version` 2),
+  so no preset turns it on;
 - query `max_concurrent_queries: auto` (four permits per available thread,
   today's value) and `target_partitions: auto` (the storage profile default);
   the other query limits are the runtime defaults: 1 MiB SQL, 32 statements,
@@ -345,3 +348,103 @@ the version 1 schema with `version: 2` and `custom_profile`. Its knob bounds,
 role enum and index enum are generated from `KNOB_REGISTRY` and the Rust
 enums; `auto` and `unlimited` are `oneOf` a constant or an integer range.
 `docs/schemas/database-spec-v1.schema.json` is unchanged.
+
+## Persistence and format
+
+`ResolvedProfile::bind(replication, path)` turns a resolved profile into a
+`db::RuntimeProfileBinding`: the `DbConfig` (storage class, replication and
+path), the `PerformanceConfig` the knobs produce and the
+`PersistedProfileManifest`. It keeps the `DbConfig` path rules: a volatile
+class takes no path, a durable class needs one. For a compiled spec,
+`CompiledPolicy::binding(&deployment, path)` does the same with the path
+argument or else `deployment.storage_path`, used only for a durable class; it
+refuses an unresolved profile, `deployment.mode: cluster` and any topology
+other than one replica and one shard with `Unsupported`.
+
+`db::create_database_with_profile(&binding, ops)` creates a new single-node
+database from a binding:
+
+- it never opens an existing database: a target that already holds metadata
+  is `AlreadyInitialized`;
+- the profile owns performance, so `OperationalConfig.performance` must be
+  unset (`Unsupported` otherwise); the other operational settings apply as in
+  `create_database_with_ops`, including writing `ops.security`;
+- `schema_version`, the storage profile, replication, layout and
+  `__meta.profile_manifest` are written in one write transaction.
+
+The manifest (`manifest_version: 1`) records the profile slug, its kind, the
+product profile, the variant, `extends`, the storage profile, every knob, the
+storage format (`value_framing` and the compression settings), the digest and
+the crate version that wrote it. It is re-validated on every read: its storage
+profile must equal `__meta.profile`, every knob must be within its registry
+bounds, the knobs must derive the recorded storage class under the recorded
+variant, and the storage format must agree with the compression knobs. A
+failure is `ProfileManifestInvalid`, and a newer `manifest_version` is
+`UnsupportedProfileManifest`, so a corrupt or hand-edited manifest never
+drives the runtime.
+
+Every single-node opener (`create_database`, `open_database`,
+`create_database_with_ops`, `open_database_with_ops`) re-applies the manifest:
+the runtime performance is rebuilt from the knobs at every open, so cache,
+query and group-commit knobs survive a restart and a tuning rollback returns
+to the manifest values. `multidb serve` and the CLI open databases through
+these openers, so they honour the manifest too; their `--profile` or
+`MULTIDB_PROFILE` must still name the database's storage class. An explicit
+`OperationalConfig.performance` wins for that session and logs one warning.
+No opener writes security because of a manifest. Databases without a manifest
+open exactly as before; plain `create_database` and `serve` never write one.
+
+### Value framing and `schema_version`
+
+- Compression other than `none` turns on value framing: every value,
+  `__meta` included, carries a compression frame (`MDBC1`), and the database
+  gets `schema_version` 2. Without compression it keeps `schema_version` 1 and
+  the unframed format. `schema_version` 2 without a value-framing manifest,
+  and a value-framing manifest without `schema_version` 2, are
+  `ProfileManifestInvalid`; anything above 2 is `SchemaVersionMismatch`.
+- A plain opener wraps the engine of a framed manifest database in place.
+  `OperationalConfig.performance.compression` may name another algorithm or
+  level; frames are self-describing, so every value stays readable.
+- Compression is forward-only. Older binaries fail closed on a framed
+  database: they report `SchemaVersionMismatch`, or, because `__meta` itself
+  is framed, fail to decode the metadata. Turning framing off is never
+  possible. A manifest database created without compression refuses
+  `OperationalConfig.performance.compression` with `StorageFormatMismatch`;
+  enabling compression later is a provisioning format upgrade, which this
+  build does not perform.
+- Metadata reads tolerate frames. A legacy database (no manifest) created with
+  `create_database_with_ops` and compression has framed values and must still
+  be opened with `OperationalConfig.performance.compression`; any opener
+  without it fails with `StorageFormatMismatch` (an opaque serde error
+  before).
+- Encrypted metadata read without a key is `MetadataUnreadable`, whose
+  message ends with "metadata is encrypted or corrupt; supply
+  OperationalConfig.encryption". A wrong key is still storage corruption.
+- Known limit: a legacy database created without compression and later opened
+  with `OperationalConfig.performance.compression` has unframed metadata but
+  framed data. `__meta` cannot reveal this, so such a database behaves as
+  before and must keep being opened with compression.
+
+### Single node only
+
+CP, AP and sharded openers refuse a profile manifest with
+`Unsupported("profile manifests are single-node only in this build")`. A
+sharded database refuses a manifest on every local shard, not only on the
+global one. These openers also refuse framed legacy metadata read without
+compression (`StorageFormatMismatch`).
+
+### Inspecting a database
+
+`db::inspect_database_metadata(path)` reads the metadata of a database file
+without creating anything:
+
+| result | meaning |
+| --- | --- |
+| `NotFound` | nothing exists at the path; nothing is opened or created |
+| `Uninitialized` | an empty file, or a redb file without database metadata |
+| `Locked` | another handle holds the database open |
+| `Unreadable { reason }` | the file or its metadata cannot be read, including encrypted metadata (with the hint above) and invalid manifests |
+| `Initialized` | `schema_version`, storage profile, replication, layout, the manifest (absent for legacy databases) and whether values are framed |
+
+It opens an existing file with redb, which may run redb's own crash repair
+exactly as a normal open would, and drops the handle before returning.

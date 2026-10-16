@@ -37,6 +37,7 @@ pub use profile::{
     StorageMedium, StorageOverrides, SystemVersioningKnob, TimeSeriesKnobs, TimeSeriesOverrides,
     profile_variants, resolve_named_profile, resolve_profile,
 };
+pub(crate) use profile::{check_knob_ranges, derive_storage_profile, product_variant};
 pub use schema::database_spec_v1_schema;
 pub use schema_v2::database_spec_v2_schema;
 
@@ -3298,6 +3299,15 @@ impl From<ReplicationKind> for ReplicationMode {
         match value {
             ReplicationKind::Cp => Self::Cp,
             ReplicationKind::Ap => Self::Ap,
+        }
+    }
+}
+
+impl From<ReplicationMode> for ReplicationKind {
+    fn from(value: ReplicationMode) -> Self {
+        match value {
+            ReplicationMode::Cp => Self::Cp,
+            ReplicationMode::Ap => Self::Ap,
         }
     }
 }
