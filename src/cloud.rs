@@ -17,12 +17,12 @@ use crate::{
         RestoreReport, RestoreTarget, VerifyReport, full_backup, incremental_backup,
         restore_backup, restore_backup_with_config, verify_backup, verify_backup_with_config,
     },
-    db::{Database, DbConfig},
+    db::{Database, DbConfig, ReplicationKind},
     fileio, observability,
     query::REL_COLUMNAR_SEGMENTS_TABLE,
     repl::{
-        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, propose_system,
-        propose_system_batch,
+        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition,
+        propose_system,
     },
     storage::{Bytes, StorageError},
     txn,
@@ -102,6 +102,10 @@ pub struct TieringReport {
     pub skipped_segments: usize,
     pub remote_bytes: u64,
     pub local_bytes: u64,
+    /// Segments left untouched because they changed between the tiering read and
+    /// the pointer install.
+    #[serde(default)]
+    pub conflicted_segments: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,9 +1089,16 @@ pub fn resolve_tiered_segment_payload(bytes: &[u8]) -> Result<Bytes, StorageErro
     Ok(loaded)
 }
 
-/// Tiers immutable columnar segments into the configured object store.
+/// Tiers columnar segments into the configured object store.
+///
+/// Each segment is uploaded to an immutable, content-addressed object and its
+/// pointer is installed only while the segment still holds the uploaded bytes.
+/// Segments rewritten or deleted concurrently are left untouched and counted in
+/// [`TieringReport::conflicted_segments`].
 /// # Errors
-/// Fails when storage, upload, checksum verification, or metadata writes fail.
+/// Fails when storage, upload, checksum verification, or metadata writes fail, and
+/// with [`CloudError::Unsupported`] when the replication backend cannot apply
+/// conditional writes (for example `eventual_ap`).
 pub fn tier_columnar_segments(
     database: &Database,
     object_store: &ObjectStoreConfig,
@@ -1095,6 +1106,12 @@ pub fn tier_columnar_segments(
 ) -> Result<TieringReport, CloudError> {
     if policy.pin_local {
         return Ok(TieringReport::default());
+    }
+    if database.replication_kind() == ReplicationKind::Ap {
+        return Err(CloudError::Unsupported(
+            "columnar tiering requires conditional writes, which eventual_ap replication does not support"
+                .to_owned(),
+        ));
     }
 
     let store = open_object_store(object_store)?;
@@ -1126,73 +1143,195 @@ pub fn tier_columnar_segments(
         }
 
         throttle(policy.io_budget_bytes_per_second, bytes, started);
-        let checksum = crc32fast::hash(&value);
-        let object_path = format!(
-            "segments/{}/{}.parquet",
-            REL_COLUMNAR_SEGMENTS_TABLE,
-            hex_key(&key)
-        );
-        let upload_token = Uuid::now_v7().to_string();
-        let uploading = SegmentMetadata {
-            table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
-            key: key.clone(),
-            location: SegmentLocation::Remote {
-                uri: object_store.uri.clone(),
-                path: object_path.clone(),
-            },
-            bytes,
-            checksum,
-            tiered_at: SystemTime::now(),
-            upload_token: upload_token.clone(),
-            state: TieringState::Uploading,
-        };
-        propose_system(
+        tier_segment(
             database,
-            Op::Put {
-                table: CLOUD_SEGMENTS_TABLE.to_owned(),
-                key: key.clone(),
-                value: encode_segment_metadata(&uploading)?,
-            },
+            store.as_ref(),
+            object_store,
+            &key,
+            &value,
+            &mut report,
         )?;
+    }
 
-        store.put(&object_path, &value)?;
+    Ok(report)
+}
+
+/// Uploads one local segment read as `value` and swaps it for a remote pointer.
+///
+/// The pointer is installed with a conditional write that requires the segment to
+/// still hold exactly `value`; when the segment changed in the meantime it is left
+/// as it is and the metadata is reconciled with its current value.
+fn tier_segment(
+    database: &Database,
+    store: &dyn CloudObjectStore,
+    object_store: &ObjectStoreConfig,
+    key: &[u8],
+    value: &[u8],
+    report: &mut TieringReport,
+) -> Result<(), CloudError> {
+    let bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    let checksum = crc32fast::hash(value);
+    let object_path = tiered_segment_object_path(key, value);
+    let upload_token = Uuid::now_v7().to_string();
+    let uploading = SegmentMetadata {
+        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+        key: key.to_vec(),
+        location: SegmentLocation::Remote {
+            uri: object_store.uri.clone(),
+            path: object_path.clone(),
+        },
+        bytes,
+        checksum,
+        tiered_at: SystemTime::now(),
+        upload_token,
+        state: TieringState::Uploading,
+    };
+    propose_system(
+        database,
+        Op::Put {
+            table: CLOUD_SEGMENTS_TABLE.to_owned(),
+            key: key.to_vec(),
+            value: encode_segment_metadata(&uploading)?,
+        },
+    )?;
+
+    // The path is content-addressed: an identical object left by an earlier run is
+    // reused instead of being rewritten.
+    let reusable = store.exists(&object_path)? && store.get(&object_path)? == value;
+    if !reusable {
+        store.put(&object_path, value)?;
         let verified = store.get(&object_path)?;
         if crc32fast::hash(&verified) != checksum {
             return Err(CloudError::Storage(StorageError::Corruption(format!(
                 "uploaded object checksum mismatch for {object_path}"
             ))));
         }
-
-        let pointer = TieredSegmentPointer {
-            uri: object_store.uri.clone(),
-            path: object_path.clone(),
-            bytes,
-            checksum,
-        };
-        let mut metadata = uploading;
-        metadata.state = TieringState::Remote;
-
-        propose_system_batch(
-            database,
-            vec![
-                Op::Put {
-                    table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
-                    key: key.clone(),
-                    value: encode_tiered_segment_pointer(&pointer)?,
-                },
-                Op::Put {
-                    table: CLOUD_SEGMENTS_TABLE.to_owned(),
-                    key,
-                    value: encode_segment_metadata(&metadata)?,
-                },
-            ],
-        )?;
-        observability::record_cloud_object("put", "ok", bytes);
-        report.uploaded_segments = report.uploaded_segments.saturating_add(1);
-        report.remote_bytes = report.remote_bytes.saturating_add(bytes);
     }
 
-    Ok(report)
+    let pointer = TieredSegmentPointer {
+        uri: object_store.uri.clone(),
+        path: object_path,
+        bytes,
+        checksum,
+    };
+    let pointer_bytes = encode_tiered_segment_pointer(&pointer)?;
+    let mut metadata = uploading;
+    if install_tiered_pointer(database, key, value, &pointer_bytes)? {
+        metadata.state = TieringState::Remote;
+        propose_system(
+            database,
+            Op::Put {
+                table: CLOUD_SEGMENTS_TABLE.to_owned(),
+                key: key.to_vec(),
+                value: encode_segment_metadata(&metadata)?,
+            },
+        )?;
+        if !reusable {
+            observability::record_cloud_object("put", "ok", bytes);
+        }
+        report.uploaded_segments = report.uploaded_segments.saturating_add(1);
+        report.remote_bytes = report.remote_bytes.saturating_add(bytes);
+    } else {
+        // The segment was rewritten or deleted after it was read. Never overwrite
+        // it; the uploaded object is immutable, unreferenced, and retained.
+        report.conflicted_segments = report.conflicted_segments.saturating_add(1);
+        reconcile_segment_metadata(database, key, &mut metadata)?;
+    }
+    Ok(())
+}
+
+/// Object path for a tiered segment.
+///
+/// The path is content-addressed by the segment key and the BLAKE3 hash of its
+/// bytes, so it is never rewritten with different bytes. Pointers, MVCC history,
+/// commit logs, and incremental backups may still reference earlier objects, which
+/// are retained. Legacy `<segment-key-hex>.parquet` pointers keep resolving because
+/// every pointer stores its own path.
+fn tiered_segment_object_path(key: &[u8], value: &[u8]) -> String {
+    format!(
+        "segments/{}/{}/{}.parquet",
+        REL_COLUMNAR_SEGMENTS_TABLE,
+        hex_key(key),
+        blake3::hash(value).to_hex()
+    )
+}
+
+/// Replaces the segment at `key` with `pointer` only while it still holds `expected`.
+///
+/// Returns `true` when the pointer is installed, including when the segment already
+/// holds exactly the same pointer (a concurrent run, or a crash before the metadata
+/// was finalized). Returns `false` when the segment holds anything else. Backends
+/// without conditional writes fail; there is no unconditional fallback.
+fn install_tiered_pointer(
+    database: &Database,
+    key: &[u8],
+    expected: &[u8],
+    pointer: &[u8],
+) -> Result<bool, CloudError> {
+    let batch = ConditionalBatch::new(
+        vec![WriteCondition::ValueEquals {
+            table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+            key: key.to_vec(),
+            expected: Some(expected.to_vec()),
+        }],
+        vec![Op::Put {
+            table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+            key: key.to_vec(),
+            value: pointer.to_vec(),
+        }],
+    );
+    match database.propose_maintenance_conditional_batch(batch) {
+        Ok(()) => Ok(true),
+        Err(ReplError::Conflict) => Ok(database
+            .read(REL_COLUMNAR_SEGMENTS_TABLE, key, ReadConsistency::Strong)?
+            .as_deref()
+            == Some(pointer)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Re-derives segment metadata from the current segment value and persists it.
+///
+/// The segment value (pointer or local bytes) is authoritative for reads;
+/// `__cloud_segments` only records tiering progress and can be stale after DML.
+fn reconcile_segment_metadata(
+    database: &Database,
+    metadata_key: &[u8],
+    metadata: &mut SegmentMetadata,
+) -> Result<TieringState, CloudError> {
+    match database.read(
+        REL_COLUMNAR_SEGMENTS_TABLE,
+        &metadata.key,
+        ReadConsistency::Strong,
+    )? {
+        None => metadata.state = TieringState::Failed,
+        Some(value) => {
+            if let Some(pointer) = decode_tiered_segment_pointer(&value)? {
+                metadata.state = TieringState::Remote;
+                metadata.location = SegmentLocation::Remote {
+                    uri: pointer.uri,
+                    path: pointer.path,
+                };
+                metadata.bytes = pointer.bytes;
+                metadata.checksum = pointer.checksum;
+            } else {
+                metadata.state = TieringState::Local;
+                metadata.location = SegmentLocation::Local {
+                    table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                    key: metadata.key.clone(),
+                };
+            }
+        }
+    }
+    propose_system(
+        database,
+        Op::Put {
+            table: CLOUD_SEGMENTS_TABLE.to_owned(),
+            key: metadata_key.to_vec(),
+            value: encode_segment_metadata(metadata)?,
+        },
+    )?;
+    Ok(metadata.state)
 }
 
 fn recover_tiering(
@@ -1264,53 +1403,38 @@ fn recover_remote_candidate(
     if store.exists(path)? {
         let bytes = store.get(path)?;
         if crc32fast::hash(&bytes) == metadata.checksum {
-            metadata.state = TieringState::Remote;
             let pointer = TieredSegmentPointer {
                 uri: uri.clone(),
                 path: path.clone(),
                 bytes: metadata.bytes,
                 checksum: metadata.checksum,
             };
-            propose_system_batch(
-                database,
-                vec![
-                    Op::Put {
-                        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
-                        key: metadata.key.clone(),
-                        value: encode_tiered_segment_pointer(&pointer)?,
-                    },
+            let pointer_bytes = encode_tiered_segment_pointer(&pointer)?;
+            // Finalize only while the segment still holds exactly the uploaded bytes
+            // (or already holds this pointer); a newer segment is never overwritten.
+            if install_tiered_pointer(database, &metadata.key, &bytes, &pointer_bytes)? {
+                metadata.state = TieringState::Remote;
+                propose_system(
+                    database,
                     Op::Put {
                         table: CLOUD_SEGMENTS_TABLE.to_owned(),
                         key: metadata_key.to_vec(),
                         value: encode_segment_metadata(metadata)?,
                     },
-                ],
-            )?;
-            report.recovered_segments = report.recovered_segments.saturating_add(1);
-            report.remote_bytes = report.remote_bytes.saturating_add(metadata.bytes);
-            return Ok(());
+                )?;
+                report.recovered_segments = report.recovered_segments.saturating_add(1);
+                report.remote_bytes = report.remote_bytes.saturating_add(metadata.bytes);
+                return Ok(());
+            }
         }
     }
 
-    if segment_has_local_payload(database, &metadata.key)? {
-        metadata.state = TieringState::Local;
-        metadata.location = SegmentLocation::Local {
-            table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
-            key: metadata.key.clone(),
-        };
-        report.recovered_segments = report.recovered_segments.saturating_add(1);
-    } else {
-        metadata.state = TieringState::Failed;
-        report.failed_segments = report.failed_segments.saturating_add(1);
+    match reconcile_segment_metadata(database, metadata_key, metadata)? {
+        TieringState::Failed => {
+            report.failed_segments = report.failed_segments.saturating_add(1);
+        }
+        _ => report.recovered_segments = report.recovered_segments.saturating_add(1),
     }
-    propose_system(
-        database,
-        Op::Put {
-            table: CLOUD_SEGMENTS_TABLE.to_owned(),
-            key: metadata_key.to_vec(),
-            value: encode_segment_metadata(metadata)?,
-        },
-    )?;
     Ok(())
 }
 
@@ -1766,31 +1890,39 @@ fn throttle(limit: Option<u64>, bytes: u64, started: Instant) {
 mod tests {
     use std::{
         collections::BTreeMap,
+        path::Path,
         time::{Duration, SystemTime},
     };
 
     use super::{
-        decode_tiered_segment_pointer, encode_tiered_segment_pointer, hex_key, retained_backup_ids,
-        write_object,
+        decode_tiered_segment_pointer, encode_tiered_segment_pointer, hex_key, read_object,
+        retained_backup_ids, tier_segment, tiered_segment_object_path, write_object,
     };
 
     use crate::{
-        backup::{BackupConfig, BackupKind, BackupManifest},
+        backup::{
+            BackupConfig, BackupKind, BackupManifest, RestoreTarget, full_backup, list_backups,
+            restore_backup, verify_backup,
+        },
         cloud::{
-            BackupGcPolicy, BackupUri, CLOUD_SEGMENTS_TABLE, CloudLease, CloudLeaseOptions,
-            ObjectStoreConfig, SegmentLocation, SegmentMetadata, TenantConfig, TenantQuota,
-            TenantRuntime, TieredSegmentPointer, TieringPolicy, TieringState,
-            encode_segment_metadata, full_backup_to_uri, gc_backup_uri, hibernate_database,
-            read_hibernation_marker, resolve_tiered_segment_payload, restore_backup_from_uri,
-            resume_database_guarded, tier_columnar_segments, verify_backup_uri,
+            BackupGcPolicy, BackupUri, CLOUD_SEGMENTS_TABLE, CloudError, CloudLease,
+            CloudLeaseOptions, ObjectStoreConfig, SegmentLocation, SegmentMetadata, TenantConfig,
+            TenantQuota, TenantRuntime, TieredSegmentPointer, TieringPolicy, TieringReport,
+            TieringState, decode_segment_metadata, encode_segment_metadata, full_backup_to_uri,
+            gc_backup_uri, hibernate_database, open_object_store, read_hibernation_marker,
+            resolve_tiered_segment_payload, restore_backup_from_uri, resume_database_guarded,
+            tier_columnar_segments, verify_backup_uri,
         },
         db::{
-            DbConfig, OperationalConfig, Profile, create_database, create_database_with_ops,
-            open_database,
+            Database, DbConfig, OperationalConfig, Profile, ReplicationKind, create_ap_database,
+            create_database, create_database_with_ops, open_database,
         },
+        keyenc,
         model::Value,
-        query::{ColumnDef, ColumnType, REL_COLUMNAR_SEGMENTS_TABLE, TableSchema},
-        repl::{Op, ReadConsistency, Replication, propose_system},
+        query::{ColumnDef, ColumnType, REL_COLUMNAR_SEGMENTS_TABLE, RelTable, TableSchema},
+        repl::{ApClusterConfig, Op, ReadConsistency, Replication, propose_system},
+        storage::Bytes,
+        txn,
     };
 
     #[test]
@@ -1808,10 +1940,15 @@ mod tests {
         let table = database.create_table("sales", Some(schema), Vec::new())?;
         table.insert(vec![Value::Int(1), Value::Int(10)])?;
         table.insert(vec![Value::Int(2), Value::Int(20)])?;
+        let (key, original) = only_segment(&database)?;
 
         let store = ObjectStoreConfig::local_dir(temp.path().join("objects"));
         let report = tier_columnar_segments(&database, &store, &TieringPolicy::default())?;
         assert_eq!(report.uploaded_segments, 1);
+        assert_eq!(
+            current_pointer(&database, &key)?.path,
+            tiered_segment_object_path(&key, &original)
+        );
 
         drop(table);
         drop(database);
@@ -1881,6 +2018,7 @@ mod tests {
             .read(REL_COLUMNAR_SEGMENTS_TABLE, &key, ReadConsistency::Strong)?
             .ok_or("missing recovered segment pointer")?;
         assert!(decode_tiered_segment_pointer(&pointer_bytes)?.is_some());
+        assert_eq!(database.table("sales")?.scan()?.len(), 1);
         Ok(())
     }
 
@@ -2187,6 +2325,491 @@ mod tests {
         let bytes = b"plain parquet bytes";
         assert_eq!(resolve_tiered_segment_payload(bytes)?, bytes);
         Ok(())
+    }
+
+    #[test]
+    fn tiering_skips_segment_rewritten_after_read() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("conflict.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        let (key, stale) = only_segment(&database)?;
+        table.insert(vec![Value::Int(2), Value::Int(20)])?;
+
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let store = open_object_store(&config)?;
+        let mut report = TieringReport::default();
+        tier_segment(
+            &database,
+            store.as_ref(),
+            &config,
+            &key,
+            &stale,
+            &mut report,
+        )?;
+        assert_eq!(report.conflicted_segments, 1);
+        assert_eq!(report.uploaded_segments, 0);
+        let current = segment_value(&database, &key)?.ok_or("missing columnar segment")?;
+        assert!(decode_tiered_segment_pointer(&current)?.is_none());
+        assert_ne!(current, stale);
+        assert_eq!(table.scan()?.len(), 2);
+        assert_eq!(
+            segment_metadata(&database, &key)?.state,
+            TieringState::Local
+        );
+
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        assert_eq!(table.scan()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn tiering_does_not_resurrect_deleted_segment() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("deleted.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        let (key, stale) = only_segment(&database)?;
+        table.delete(&Value::Int(1))?;
+
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let store = open_object_store(&config)?;
+        let mut report = TieringReport::default();
+        tier_segment(
+            &database,
+            store.as_ref(),
+            &config,
+            &key,
+            &stale,
+            &mut report,
+        )?;
+        assert_eq!(report.conflicted_segments, 1);
+        assert_eq!(report.uploaded_segments, 0);
+        assert!(segment_value(&database, &key)?.is_none());
+        assert!(table.scan()?.is_empty());
+        assert_eq!(
+            segment_metadata(&database, &key)?.state,
+            TieringState::Failed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tiering_conflict_keeps_concurrently_installed_pointer_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("race.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        let (key, stale) = only_segment(&database)?;
+        table.insert(vec![Value::Int(2), Value::Int(20)])?;
+
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let installed = segment_value(&database, &key)?.ok_or("missing columnar segment")?;
+        let pointer = decode_tiered_segment_pointer(&installed)?.ok_or("segment is not tiered")?;
+
+        let store = open_object_store(&config)?;
+        let mut report = TieringReport::default();
+        tier_segment(
+            &database,
+            store.as_ref(),
+            &config,
+            &key,
+            &stale,
+            &mut report,
+        )?;
+        assert_eq!(report.conflicted_segments, 1);
+        assert_eq!(report.uploaded_segments, 0);
+        assert_eq!(segment_value(&database, &key)?, Some(installed));
+        let metadata = segment_metadata(&database, &key)?;
+        assert_eq!(metadata.state, TieringState::Remote);
+        assert_eq!(
+            metadata.location,
+            SegmentLocation::Remote {
+                uri: pointer.uri,
+                path: pointer.path,
+            }
+        );
+        assert_eq!(table.scan()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn tiering_recovers_pointer_installed_before_metadata_finalize()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("finalize.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        table.insert(vec![Value::Int(2), Value::Int(20)])?;
+
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let (key, pointer_bytes) = only_segment(&database)?;
+        let mut metadata = segment_metadata(&database, &key)?;
+        assert_eq!(metadata.state, TieringState::Remote);
+
+        // Simulate a crash after the pointer install but before metadata finalize.
+        metadata.state = TieringState::Uploading;
+        propose_system(
+            &database,
+            Op::Put {
+                table: CLOUD_SEGMENTS_TABLE.to_owned(),
+                key: key.clone(),
+                value: encode_segment_metadata(&metadata)?,
+            },
+        )?;
+
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.recovered_segments, 1);
+        assert_eq!(report.uploaded_segments, 0);
+        assert_eq!(report.failed_segments, 0);
+        assert_eq!(segment_value(&database, &key)?, Some(pointer_bytes));
+        assert_eq!(
+            segment_metadata(&database, &key)?.state,
+            TieringState::Remote
+        );
+        assert_eq!(table.scan()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn tiering_recovery_does_not_overwrite_newer_segment() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("recovery-race.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        let (key, value) = only_segment(&database)?;
+
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let legacy_path = format!(
+            "segments/{}/{}.parquet",
+            REL_COLUMNAR_SEGMENTS_TABLE,
+            hex_key(&key)
+        );
+        write_object(&config.uri, &legacy_path, &value)?;
+        let metadata = SegmentMetadata {
+            table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+            key: key.clone(),
+            location: SegmentLocation::Remote {
+                uri: config.uri.clone(),
+                path: legacy_path.clone(),
+            },
+            bytes: u64::try_from(value.len())?,
+            checksum: crc32fast::hash(&value),
+            tiered_at: SystemTime::now(),
+            upload_token: "interrupted-upload".to_owned(),
+            state: TieringState::Uploading,
+        };
+        propose_system(
+            &database,
+            Op::Put {
+                table: CLOUD_SEGMENTS_TABLE.to_owned(),
+                key: key.clone(),
+                value: encode_segment_metadata(&metadata)?,
+            },
+        )?;
+        table.insert(vec![Value::Int(2), Value::Int(20)])?;
+
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.recovered_segments, 1);
+        assert_eq!(report.failed_segments, 0);
+        assert_eq!(report.uploaded_segments, 1);
+        assert_eq!(table.scan()?.len(), 2);
+        assert_ne!(current_pointer(&database, &key)?.path, legacy_path);
+        assert_eq!(read_object(&config.uri, &legacy_path)?, value);
+        Ok(())
+    }
+
+    #[test]
+    fn retiering_writes_new_object_and_old_pointer_stays_valid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("retier.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        table.insert(vec![Value::Int(2), Value::Int(20)])?;
+        let (key, first_value) = only_segment(&database)?;
+
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let first_pointer_bytes = segment_value(&database, &key)?.ok_or("missing segment")?;
+        let first_pointer =
+            decode_tiered_segment_pointer(&first_pointer_bytes)?.ok_or("segment is not tiered")?;
+        assert_eq!(
+            first_pointer.path,
+            tiered_segment_object_path(&key, &first_value)
+        );
+
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+
+        table.insert(vec![Value::Int(3), Value::Int(30)])?;
+        let (_, second_value) = only_segment(&database)?;
+        assert!(decode_tiered_segment_pointer(&second_value)?.is_none());
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let second_pointer = current_pointer(&database, &key)?;
+        assert_eq!(
+            second_pointer.path,
+            tiered_segment_object_path(&key, &second_value)
+        );
+        assert_ne!(first_pointer.path, second_pointer.path);
+        assert_eq!(
+            resolve_tiered_segment_payload(&first_pointer_bytes)?,
+            first_value
+        );
+        assert_eq!(table.scan()?.len(), 3);
+
+        // Re-tiering identical content reuses the existing object path.
+        table.delete(&Value::Int(3))?;
+        let (_, third_value) = only_segment(&database)?;
+        assert_eq!(third_value, first_value);
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        assert_eq!(current_pointer(&database, &key)?.path, first_pointer.path);
+        assert_eq!(
+            resolve_tiered_segment_payload(&first_pointer_bytes)?,
+            first_value
+        );
+
+        let restore_path = temp.path().join("retier-restore.redb");
+        restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Analytical, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        let restored = open_database(DbConfig::on_disk(Profile::Analytical, &restore_path))?;
+        assert_eq!(
+            restored.table("sales")?.scan()?,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_backup_inlines_tiered_segments_for_restore_without_object_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("inline.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        table.insert(vec![Value::Int(2), Value::Int(20)])?;
+
+        let objects = temp.path().join("objects");
+        let config = ObjectStoreConfig::local_dir(&objects);
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let (key, _) = only_segment(&database)?;
+        current_pointer(&database, &key)?;
+
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        std::fs::remove_dir_all(&objects)?;
+        verify_backup(&backup.path)?;
+
+        let restore_path = temp.path().join("inline-restore.redb");
+        restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Analytical, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        let restored = open_database(DbConfig::on_disk(Profile::Analytical, &restore_path))?;
+        assert_eq!(restored.table("sales")?.scan()?.len(), 2);
+        let segment = segment_value(&restored, &key)?.ok_or("missing restored segment")?;
+        assert!(decode_tiered_segment_pointer(&segment)?.is_none());
+        assert!(
+            restored
+                .begin_transaction()?
+                .get_row("sales", &Value::Int(1))?
+                .is_some()
+        );
+        let latest = latest_mvcc_value(
+            &restored,
+            &txn::version_key(REL_COLUMNAR_SEGMENTS_TABLE, &key)?,
+        )?
+        .ok_or("latest segment version is a delete")?;
+        assert!(decode_tiered_segment_pointer(&latest)?.is_none());
+        assert_eq!(latest, segment);
+        Ok(())
+    }
+
+    #[test]
+    fn full_backup_mvcc_inlining_is_limited_to_segment_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("blobs.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let (key, pointer_bytes) = only_segment(&database)?;
+        database.propose(Op::Put {
+            table: "blobs".to_owned(),
+            key: b"k".to_vec(),
+            value: pointer_bytes.clone(),
+        })?;
+
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        let restore_path = temp.path().join("blobs-restore.redb");
+        restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Analytical, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        let restored = open_database(DbConfig::on_disk(Profile::Analytical, &restore_path))?;
+        assert_eq!(
+            restored.read("blobs", b"k", ReadConsistency::Strong)?,
+            Some(pointer_bytes.clone())
+        );
+        assert_eq!(
+            latest_mvcc_value(&restored, &txn::version_key("blobs", b"k")?)?,
+            Some(pointer_bytes)
+        );
+        let segment = segment_value(&restored, &key)?.ok_or("missing restored segment")?;
+        assert!(decode_tiered_segment_pointer(&segment)?.is_none());
+        assert_eq!(
+            latest_mvcc_value(
+                &restored,
+                &txn::version_key(REL_COLUMNAR_SEGMENTS_TABLE, &key)?
+            )?,
+            Some(segment)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_backup_fails_closed_when_tiered_object_missing_or_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let (database, table) = sales_database(&temp.path().join("dangling.redb"))?;
+        table.insert(vec![Value::Int(1), Value::Int(10)])?;
+        let config = ObjectStoreConfig::local_dir(temp.path().join("objects"));
+        let report = tier_columnar_segments(&database, &config, &TieringPolicy::default())?;
+        assert_eq!(report.uploaded_segments, 1);
+        let (key, _) = only_segment(&database)?;
+        let pointer = current_pointer(&database, &key)?;
+        let store = open_object_store(&config)?;
+        let object = store.get(&pointer.path)?;
+        let backups = temp.path().join("backups");
+
+        store.delete(&pointer.path)?;
+        assert!(full_backup(&database, &backups, &BackupConfig::default()).is_err());
+        store.put(&pointer.path, b"corrupt segment")?;
+        assert!(full_backup(&database, &backups, &BackupConfig::default()).is_err());
+        assert!(list_backups(&backups)?.is_empty());
+
+        store.put(&pointer.path, &object)?;
+        full_backup(&database, &backups, &BackupConfig::default())?;
+        assert_eq!(list_backups(&backups)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tiering_rejects_eventual_ap_without_side_effects() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let ap = create_ap_database(
+            DbConfig::new(Profile::InMemory).with_replication(ReplicationKind::Ap),
+            ApClusterConfig::single_node_for_tests(1),
+        )?;
+        let objects = temp.path().join("objects");
+        let config = ObjectStoreConfig::local_dir(&objects);
+
+        assert!(matches!(
+            tier_columnar_segments(&ap, &config, &TieringPolicy::default()),
+            Err(CloudError::Unsupported(_))
+        ));
+        assert!(!objects.exists());
+        assert!(
+            ap.range(CLOUD_SEGMENTS_TABLE, &[], &[], ReadConsistency::Strong)?
+                .is_empty()
+        );
+
+        let pinned = TieringPolicy {
+            pin_local: true,
+            ..TieringPolicy::default()
+        };
+        assert_eq!(
+            tier_columnar_segments(&ap, &config, &pinned)?,
+            TieringReport::default()
+        );
+        Ok(())
+    }
+
+    fn sales_database(path: &Path) -> Result<(Database, RelTable), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::on_disk(Profile::Analytical, path))?;
+        let schema = TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("amount", ColumnType::Int, false),
+            ],
+            0,
+        );
+        let table = database.create_table("sales", Some(schema), Vec::new())?;
+        Ok((database, table))
+    }
+
+    fn only_segment(database: &Database) -> Result<(Bytes, Bytes), Box<dyn std::error::Error>> {
+        let mut segments = database.range(
+            REL_COLUMNAR_SEGMENTS_TABLE,
+            &[],
+            &[],
+            ReadConsistency::Strong,
+        )?;
+        assert_eq!(segments.len(), 1);
+        Ok(segments.pop().ok_or("missing columnar segment")?)
+    }
+
+    fn segment_value(
+        database: &Database,
+        key: &[u8],
+    ) -> Result<Option<Bytes>, Box<dyn std::error::Error>> {
+        Ok(database.read(REL_COLUMNAR_SEGMENTS_TABLE, key, ReadConsistency::Strong)?)
+    }
+
+    fn segment_metadata(
+        database: &Database,
+        key: &[u8],
+    ) -> Result<SegmentMetadata, Box<dyn std::error::Error>> {
+        let bytes = database
+            .read(CLOUD_SEGMENTS_TABLE, key, ReadConsistency::Strong)?
+            .ok_or("missing segment metadata")?;
+        Ok(decode_segment_metadata(&bytes)?)
+    }
+
+    fn current_pointer(
+        database: &Database,
+        key: &[u8],
+    ) -> Result<TieredSegmentPointer, Box<dyn std::error::Error>> {
+        let value = segment_value(database, key)?.ok_or("missing columnar segment")?;
+        Ok(decode_tiered_segment_pointer(&value)?.ok_or("segment is not tiered")?)
+    }
+
+    fn latest_mvcc_value(
+        database: &Database,
+        prefix: &[u8],
+    ) -> Result<Option<Bytes>, Box<dyn std::error::Error>> {
+        let end = keyenc::range_end(prefix);
+        let (_, record) = database
+            .range(txn::TXN_MVCC_TABLE, prefix, &end, ReadConsistency::Strong)?
+            .into_iter()
+            .rev()
+            .find(|(key, _)| key.len() == prefix.len() + 8)
+            .ok_or("missing mvcc version")?;
+        Ok(txn::decode_mvcc_record(&record)?.value)
     }
 
     fn fake_manifest(

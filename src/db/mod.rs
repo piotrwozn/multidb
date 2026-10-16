@@ -1054,6 +1054,18 @@ impl Database {
         self.repl.storage()
     }
 
+    /// Proposes a crate-internal conditional maintenance batch.
+    ///
+    /// This is the conditional counterpart of the system batch path: it runs no
+    /// user WASM triggers, CDC hooks, or tenant quota accounting. Conditions and
+    /// ops must still target public keyspaces.
+    pub(crate) fn propose_maintenance_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+    ) -> Result<(), ReplError> {
+        self.repl.propose_conditional_batch(batch)
+    }
+
     #[must_use]
     pub const fn performance_config(&self) -> &PerformanceConfig {
         &self.performance
