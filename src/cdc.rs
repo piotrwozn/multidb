@@ -603,12 +603,10 @@ pub fn poll_changefeed_page<R: Replication + ?Sized>(
     }
 
     let current = current_lsn(repl)?;
-    let mut records = commit_records_between(repl, from.lsn, current)?;
-    let limit = max.max(1);
-    let has_more = records.len() > limit;
-    if has_more {
-        records.truncate(limit);
-    }
+    let page = txn::history::commit_records_after(repl, from.lsn, current, max.max(1))?;
+    ensure_no_truncated_prefix(repl, &from, current, &page)?;
+    let has_more = page.has_more;
+    let records = page.records;
 
     let mut events = Vec::new();
     let mut last_lsn = from.lsn;
@@ -717,6 +715,9 @@ pub fn create_subscription_trusted(
 
 /// Acknowledges a subscription position.
 ///
+/// Re-acknowledging the token that is already stored returns the stored state
+/// without writing a commit.
+///
 /// # Errors
 /// Fails when the subscription is missing or metadata writes fail.
 pub fn ack_subscription(
@@ -726,6 +727,9 @@ pub fn ack_subscription(
 ) -> Result<SubscriptionState, SubscriptionError> {
     let mut state = read_subscription(repl, name)?
         .ok_or_else(|| SubscriptionError::MissingSubscription(name.to_owned()))?;
+    if state.last_ack == token {
+        return Ok(state);
+    }
     state.last_ack = token;
     state.updated_at = SystemTime::now();
     write_subscription(repl, &state)?;
@@ -827,6 +831,10 @@ async fn run_subscription_worker(
 
 /// Creates a materialized view and initializes it from the current source table.
 ///
+/// The view replays the changefeed from LSN 0. When history GC truncated the
+/// commit log, it instead starts from the current source rows and replays the
+/// changes after the LSN read before that scan.
+///
 /// # Errors
 /// Fails when the spec is unsupported, source table is missing, or metadata writes fail.
 pub fn create_materialized_view(
@@ -842,7 +850,14 @@ pub fn create_materialized_view(
         source_rows: BTreeMap::new(),
         groups: BTreeMap::new(),
     };
-    let token = ResumeToken::new(timeline_id(database)?, 0);
+    let mut token = ResumeToken::new(timeline_id(database)?, 0);
+    if earliest_lsn(database)? > 1 {
+        // LSN 0 can no longer be replayed. Take the token before the scan: replaying
+        // a change the scan already saw is idempotent, because the state keeps the
+        // latest row per source key.
+        token = current_resume_token(database)?;
+        seed_view_from_source_rows(database, spec, &mut state)?;
+    }
     let filter = ChangefeedFilter {
         target: ChangefeedTarget::Table(spec.source_table.clone()),
     };
@@ -1407,13 +1422,43 @@ fn read_timeline_record<R: Replication + ?Sized>(
 }
 
 fn earliest_lsn<R: Replication + ?Sized>(repl: &R) -> Result<Lsn, FeedError> {
-    let rows = repl.range(txn::COMMIT_LOG_TABLE, &[], &[], ReadConsistency::Strong)?;
-    let Some((key, _)) = rows.first() else {
-        return Ok(1);
-    };
-    txn::decode_txn_id(key).map_err(Into::into)
+    Ok(txn::history::earliest_commit_lsn(repl)?)
 }
 
+/// Re-checks the retained log floor when the page does not start right after
+/// `from`, so a truncation racing with this poll can never silently skip records.
+fn ensure_no_truncated_prefix<R: Replication + ?Sized>(
+    repl: &R,
+    from: &ResumeToken,
+    current: Lsn,
+    page: &txn::history::CommitRecordsPage,
+) -> Result<(), FeedError> {
+    if from.lsn >= current {
+        return Ok(());
+    }
+    let expected = from
+        .lsn
+        .checked_add(1)
+        .ok_or_else(|| FeedError::Serde("lsn overflow".to_owned()))?;
+    if page
+        .records
+        .first()
+        .is_some_and(|record| record.txn_id == expected)
+    {
+        return Ok(());
+    }
+    let earliest = earliest_lsn(repl)?;
+    if expected < earliest {
+        return Err(FeedError::TokenExpired {
+            requested: from.lsn,
+            earliest,
+        });
+    }
+    Ok(())
+}
+
+/// Reads every commit record in `(start, end]`, failing closed instead of
+/// skipping LSNs that history GC truncated or that are missing from the log.
 fn commit_records_between<R: Replication + ?Sized>(
     repl: &R,
     start: Lsn,
@@ -1425,17 +1470,41 @@ fn commit_records_between<R: Replication + ?Sized>(
     let first = start
         .checked_add(1)
         .ok_or_else(|| FeedError::Serde("lsn overflow".to_owned()))?;
+    ensure_commit_log_retained(repl, start)?;
     let start_key = txn::commit_log_key(first);
     let end_key = end.checked_add(1).map_or([0xFF; 8], txn::commit_log_key);
-    repl.range(
-        txn::COMMIT_LOG_TABLE,
-        &start_key,
-        &end_key,
-        ReadConsistency::Strong,
-    )?
-    .into_iter()
-    .map(|(_, value)| txn::decode_commit_log_record(&value).map_err(Into::into))
-    .collect()
+    let records = repl
+        .range(
+            txn::COMMIT_LOG_TABLE,
+            &start_key,
+            &end_key,
+            ReadConsistency::Strong,
+        )?
+        .into_iter()
+        .map(|(_, value)| txn::decode_commit_log_record(&value).map_err(FeedError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.iter().map(|record| record.txn_id).eq(first..=end) {
+        return Ok(records);
+    }
+    // A truncation that committed after the first check also leaves a gap.
+    ensure_commit_log_retained(repl, start)?;
+    Err(FeedError::Storage(StorageError::Corruption(format!(
+        "commit log is missing records in {first}..={end}"
+    ))))
+}
+
+fn ensure_commit_log_retained<R: Replication + ?Sized>(
+    repl: &R,
+    start: Lsn,
+) -> Result<(), FeedError> {
+    let earliest = earliest_lsn(repl)?;
+    if start.saturating_add(1) < earliest {
+        return Err(FeedError::TokenExpired {
+            requested: start,
+            earliest,
+        });
+    }
+    Ok(())
 }
 
 fn validate_view_spec(spec: &MaterializedViewSpec) -> Result<(), MaterializedViewError> {
@@ -1559,6 +1628,23 @@ fn apply_view_changefeed(
     }
 }
 
+/// Applies every stored row of the source table as an upsert, matching what a
+/// changefeed replay from LSN 0 leaves behind.
+fn seed_view_from_source_rows(
+    database: &crate::db::Database,
+    spec: &MaterializedViewSpec,
+    state: &mut MaterializedViewState,
+) -> Result<(), MaterializedViewError> {
+    let prefix = crate::temporal::table_prefix(&spec.source_table);
+    let end = crate::keyenc::range_end(&prefix);
+    for table in [REL_ROWS_TABLE, REL_COLUMNAR_SEGMENTS_TABLE] {
+        for (key, value) in database.range(table, &prefix, &end, ReadConsistency::Strong)? {
+            apply_view_upsert(spec, state, &key, &value)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_view_event(
     spec: &MaterializedViewSpec,
     state: &mut MaterializedViewState,
@@ -1572,6 +1658,15 @@ fn apply_view_event(
         }
         return Ok(());
     };
+    apply_view_upsert(spec, state, key, value_after)
+}
+
+fn apply_view_upsert(
+    spec: &MaterializedViewSpec,
+    state: &mut MaterializedViewState,
+    key: &[u8],
+    value_after: &[u8],
+) -> Result<(), MaterializedViewError> {
     let Some(row) = decode_row_bytes(value_after)? else {
         return Ok(());
     };
@@ -2119,5 +2214,317 @@ mod tests {
         )?;
         assert!(events.is_empty());
         Ok(())
+    }
+
+    mod bounded_history {
+        use std::{
+            collections::BTreeMap,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        use crate::{
+            cdc::{
+                ChangeOp, ChangefeedFilter, ChangefeedOptions, FeedError, HOOK_DELIVERIES_TABLE,
+                HookAction, HookError, HookSpec, HookTarget, ResumeToken, SubscriptionConfig,
+                commit_records_between, current_resume_token, deliver_after_commit_hooks,
+                poll_changefeed, poll_changefeed_page, register_hook,
+            },
+            db::{DbConfig, Profile, create_database},
+            repl::{Op, ReadConsistency, ReplError, Replication, SingleNode},
+            storage::{Bytes, MemEngine, StorageEngine, StorageError, WriteTransaction},
+            txn::{self, WriteAuthorization},
+        };
+
+        /// Counts commit-log rows read and can truncate LSNs 1..=5 right before
+        /// the first commit-log range read, simulating a concurrent history GC.
+        struct LogProbe {
+            inner: SingleNode<MemEngine>,
+            commit_log_rows: AtomicUsize,
+            truncate_on_first_range: AtomicBool,
+        }
+
+        impl LogProbe {
+            fn with_commits(count: u8, truncate_on_first_range: bool) -> Result<Self, ReplError> {
+                let inner = SingleNode::new(MemEngine::new());
+                for id in 0..count {
+                    inner.propose(Op::Put {
+                        table: "t".to_owned(),
+                        key: vec![id],
+                        value: vec![id],
+                    })?;
+                }
+                Ok(Self {
+                    inner,
+                    commit_log_rows: AtomicUsize::new(0),
+                    truncate_on_first_range: AtomicBool::new(truncate_on_first_range),
+                })
+            }
+
+            fn take_rows(&self) -> usize {
+                self.commit_log_rows.swap(0, Ordering::SeqCst)
+            }
+
+            fn truncate_prefix(&self, record_floor: bool) -> Result<(), ReplError> {
+                let mut write = self.inner.storage().begin_write()?;
+                for lsn in 1..=5 {
+                    write.delete(txn::COMMIT_LOG_TABLE, &txn::commit_log_key(lsn))?;
+                }
+                if record_floor {
+                    write.put(
+                        txn::TXN_META_TABLE,
+                        txn::history::COMMIT_LOG_FLOOR_KEY,
+                        &txn::encode_txn_id(6),
+                    )?;
+                }
+                write.commit()?;
+                Ok(())
+            }
+        }
+
+        impl Replication for LogProbe {
+            fn propose(&self, op: Op) -> Result<(), ReplError> {
+                self.inner.propose(op)
+            }
+
+            fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+                self.inner.propose_batch(ops)
+            }
+
+            fn propose_authorized_batch(
+                &self,
+                ops: Vec<Op>,
+                authorization: WriteAuthorization,
+            ) -> Result<(), ReplError> {
+                self.inner.propose_authorized_batch(ops, authorization)
+            }
+
+            fn read(
+                &self,
+                table: &str,
+                key: &[u8],
+                consistency: ReadConsistency,
+            ) -> Result<Option<Bytes>, ReplError> {
+                self.inner.read(table, key, consistency)
+            }
+
+            fn range(
+                &self,
+                table: &str,
+                start: &[u8],
+                end: &[u8],
+                consistency: ReadConsistency,
+            ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+                if table == txn::COMMIT_LOG_TABLE
+                    && self.truncate_on_first_range.swap(false, Ordering::SeqCst)
+                {
+                    self.truncate_prefix(true)?;
+                }
+                let rows = self.inner.range(table, start, end, consistency)?;
+                if table == txn::COMMIT_LOG_TABLE {
+                    self.commit_log_rows.fetch_add(rows.len(), Ordering::SeqCst);
+                }
+                Ok(rows)
+            }
+        }
+
+        fn system_options() -> ChangefeedOptions {
+            ChangefeedOptions {
+                include_system: true,
+            }
+        }
+
+        #[test]
+        fn changefeed_page_reads_bounded_records() -> Result<(), Box<dyn std::error::Error>> {
+            let repl = LogProbe::with_commits(40, false)?;
+            let catalog = BTreeMap::new();
+            let filter = ChangefeedFilter::default();
+            let options = system_options();
+
+            repl.take_rows();
+            let page = poll_changefeed_page(
+                &repl,
+                &catalog,
+                &ResumeToken::default(),
+                &filter,
+                &options,
+                5,
+            )?;
+            assert!(page.has_more);
+            assert_eq!(page.next.lsn, 5);
+            let commits = page
+                .events
+                .iter()
+                .filter(|event| matches!(event.op, ChangeOp::TxCommit))
+                .count();
+            assert_eq!(commits, 5);
+            assert!(repl.take_rows() <= 6);
+
+            let (all, last) = poll_changefeed(
+                &repl,
+                &catalog,
+                &ResumeToken::default(),
+                &filter,
+                &options,
+                1_000,
+            )?;
+            let mut paged = Vec::new();
+            let mut token = ResumeToken::default();
+            loop {
+                let page = poll_changefeed_page(&repl, &catalog, &token, &filter, &options, 5)?;
+                paged.extend(page.events);
+                token = page.next;
+                if !page.has_more {
+                    break;
+                }
+            }
+            assert_eq!(paged, all);
+            assert_eq!(token, last);
+            assert_eq!(last.lsn, 40);
+            Ok(())
+        }
+
+        #[test]
+        fn changefeed_poll_detects_truncated_prefix() -> Result<(), Box<dyn std::error::Error>> {
+            let catalog = BTreeMap::new();
+            let filter = ChangefeedFilter::default();
+            let options = system_options();
+
+            let truncated = LogProbe::with_commits(10, false)?;
+            truncated.truncate_prefix(false)?;
+            assert!(matches!(
+                poll_changefeed(
+                    &truncated,
+                    &catalog,
+                    &ResumeToken::default(),
+                    &filter,
+                    &options,
+                    100
+                ),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+            let (_, next) = poll_changefeed(
+                &truncated,
+                &catalog,
+                &ResumeToken::new("default", 5),
+                &filter,
+                &options,
+                100,
+            )?;
+            assert_eq!(next.lsn, 10);
+
+            // The truncation lands after the expiry check passed; the leading-gap
+            // recheck must still refuse to skip LSNs 1..=5.
+            let racing = LogProbe::with_commits(10, true)?;
+            assert!(matches!(
+                poll_changefeed(
+                    &racing,
+                    &catalog,
+                    &ResumeToken::default(),
+                    &filter,
+                    &options,
+                    100
+                ),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+            Ok(())
+        }
+
+        #[test]
+        fn hook_commit_reads_fail_closed_on_missing_records()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let lsns = |records: &[txn::CommitLogRecord]| {
+                records
+                    .iter()
+                    .map(|record| record.txn_id)
+                    .collect::<Vec<_>>()
+            };
+
+            let intact = LogProbe::with_commits(10, false)?;
+            assert_eq!(
+                lsns(&commit_records_between(&intact, 0, 10)?),
+                (1..=10).collect::<Vec<_>>()
+            );
+
+            let truncated = LogProbe::with_commits(10, false)?;
+            truncated.truncate_prefix(true)?;
+            assert!(matches!(
+                commit_records_between(&truncated, 0, 10),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+            assert_eq!(
+                lsns(&commit_records_between(&truncated, 5, 10)?),
+                (6..=10).collect::<Vec<_>>()
+            );
+
+            // The truncation lands after the floor check passed.
+            let racing = LogProbe::with_commits(10, true)?;
+            assert!(matches!(
+                commit_records_between(&racing, 0, 10),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+
+            // A hole above the floor is corruption, never a silently skipped record.
+            let holed = LogProbe::with_commits(10, false)?;
+            let mut write = holed.inner.storage().begin_write()?;
+            write.delete(txn::COMMIT_LOG_TABLE, &txn::commit_log_key(7))?;
+            write.commit()?;
+            assert!(matches!(
+                commit_records_between(&holed, 5, 10),
+                Err(FeedError::Storage(StorageError::Corruption(_)))
+            ));
+
+            // After-commit hook delivery surfaces the racing truncation and records nothing.
+            let hooked = LogProbe::with_commits(10, false)?;
+            register_hook(
+                &hooked,
+                &HookSpec::after(
+                    "audit",
+                    HookTarget::AnyUser,
+                    HookAction::RecordAfterCommit,
+                    1_000,
+                ),
+            )?;
+            hooked.truncate_on_first_range.store(true, Ordering::SeqCst);
+            let delivered = deliver_after_commit_hooks(&hooked, 0, 10);
+            assert!(
+                matches!(&delivered, Err(HookError::Serde(message)) if message.contains("expired")),
+                "{delivered:?}"
+            );
+            assert!(
+                hooked
+                    .range(HOOK_DELIVERIES_TABLE, &[], &[], ReadConsistency::Strong)?
+                    .is_empty()
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn ack_subscription_is_noop_for_unchanged_token() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let database = create_database(DbConfig::new(Profile::InMemory))?;
+            database.create_subscription(SubscriptionConfig::new("sub", ResumeToken::default()))?;
+            let token = ResumeToken::new("default", 1);
+            let first = database.ack_subscription("sub", token.clone())?;
+            let lsn = current_resume_token(&database)?.lsn;
+
+            let again = database.ack_subscription("sub", token)?;
+
+            assert_eq!(again, first);
+            assert_eq!(current_resume_token(&database)?.lsn, lsn);
+            assert_eq!(database.subscription_state("sub")?, first);
+            Ok(())
+        }
     }
 }

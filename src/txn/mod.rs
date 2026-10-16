@@ -7,6 +7,8 @@ use crate::phase30::{HLC_LOCAL_KEY, HLC_TABLE, HlcTimestamp};
 use crate::repl::{Op, WriteCondition};
 use crate::storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction};
 
+pub mod history;
+
 pub type TxnId = u64;
 pub type WriteKey = (String, Bytes);
 pub type WriteSet = BTreeMap<WriteKey, Option<Bytes>>;
@@ -558,6 +560,10 @@ pub fn decode_mvcc_record(bytes: &[u8]) -> Result<MvccRecord, StorageError> {
 }
 
 /// Removes obsolete MVCC versions while preserving the last version before the watermark.
+///
+/// This helper collects the whole MVCC table inside one write transaction and is
+/// kept for API compatibility only. Production history GC is the bounded,
+/// resumable `history::gc_history_batch`, driven by `Database::gc_history`.
 /// # Errors
 /// Fails when MVCC metadata is corrupt or storage rejects deletes.
 pub fn gc_mvcc_versions_in_txn(

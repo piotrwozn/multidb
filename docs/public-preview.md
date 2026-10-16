@@ -123,6 +123,9 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- History GC (`multidb maintenance gc`) is manual and offline; `multidb serve`
+  does not run it online or in the background yet. Commit-log truncation
+  requires a new full backup afterwards.
 
 ## Migration Guide
 

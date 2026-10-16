@@ -27,6 +27,7 @@ which claims are deliberately out of scope.
 | SDKs | Stable preview for API v1 client surface in repo packages | TypeScript, Python, Go and Rust package gates |
 | Metrics endpoint | Preview | Raw Prometheus text remains marked preview |
 | `config apply` | Audit/confirmation only | No physical data migration in v1 |
+| History GC (`multidb maintenance gc`, `Database::gc_history`) | Preview: manual and offline (CLI needs exclusive file access), local single-node only; no online/background GC in `serve` yet; MVCC pruned below min(current, AS OF pins, temporal `min_lsn`, current - `--history-retain-lsns` + 1), so without `--history-retain-lsns` plain tables lose `AS OF` history below the current LSN; commit log truncated only with explicit `--commit-log-retain-lsns`, never below durable consumer positions, and a new full backup is required afterwards (incremental backups fail with `CommitLogTruncated`); on encrypted engines one small `__enc_versions` row stays per pruned version and per truncated commit-log record | `txn::history`, `db::history`, cdc and CLI tests |
 
 ## Profiles And Domains
 

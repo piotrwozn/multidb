@@ -765,6 +765,47 @@ pub fn record_backup_verify(outcome: &str, latency: Duration) {
     }
 }
 
+pub fn record_history_gc(
+    outcome: &str,
+    latency: Duration,
+    batches: u64,
+    mvcc_versions_pruned: u64,
+    commit_log_records_pruned: u64,
+) {
+    let registry = global_registry();
+    if registry
+        .increment_counter("multidb_history_gc_runs_total", &[("outcome", outcome)], 1)
+        .is_err()
+    {
+        tracing::debug!("failed to record history gc run");
+    }
+    for (name, value) in [
+        ("multidb_history_gc_batches_total", batches),
+        (
+            "multidb_history_gc_mvcc_versions_pruned_total",
+            mvcc_versions_pruned,
+        ),
+        (
+            "multidb_history_gc_commit_log_records_pruned_total",
+            commit_log_records_pruned,
+        ),
+    ] {
+        if registry.increment_counter(name, &[], value).is_err() {
+            tracing::debug!("failed to record history gc counter");
+        }
+    }
+    if registry
+        .observe_histogram(
+            "multidb_history_gc_latency_seconds",
+            &[("outcome", outcome)],
+            duration_seconds(latency),
+        )
+        .is_err()
+    {
+        tracing::debug!("failed to record history gc latency");
+    }
+}
+
 pub fn record_cdc_events(count: usize) {
     if global_registry()
         .increment_counter(
@@ -1080,5 +1121,20 @@ mod tests {
         assert!(output.contains("multidb_backup_total"));
         assert!(output.contains("multidb_restore_total"));
         assert!(output.contains("multidb_backup_verify_total"));
+    }
+
+    #[test]
+    fn history_gc_recorder_emits_expected_metric_names() {
+        super::record_history_gc("ok", std::time::Duration::from_millis(5), 2, 7, 3);
+
+        let output = super::global_registry()
+            .render()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(output.contains("multidb_history_gc_runs_total{outcome=\"ok\"}"));
+        assert!(output.contains("multidb_history_gc_batches_total"));
+        assert!(output.contains("multidb_history_gc_mvcc_versions_pruned_total"));
+        assert!(output.contains("multidb_history_gc_commit_log_records_pruned_total"));
+        assert!(output.contains("multidb_history_gc_latency_seconds"));
     }
 }
