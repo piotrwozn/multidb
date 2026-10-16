@@ -686,12 +686,22 @@ async fn handle_connection(
         config.idle_timeout_ms,
     )
     .await?;
-    let response = handle_request(
-        request,
-        local_node,
-        endpoint.as_ref(),
-        raft_endpoint.as_deref(),
-    );
+    // Endpoints are synchronous and may block on work that runs on this same runtime (the CP
+    // Raft core), so they run on the blocking pool and never occupy the runtime's workers.
+    let response = tokio::task::spawn_blocking(move || {
+        handle_request(
+            request,
+            local_node,
+            endpoint.as_ref(),
+            raft_endpoint.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(ReplError::Transport(format!(
+            "internal transport handler failed: {error}"
+        )))
+    });
     let response = response.unwrap_or_else(|error| InternalResponse::Error(error.to_string()));
     write_frame(&mut stream, config.max_frame_bytes, &response).await?;
     stream.shutdown().await?;
