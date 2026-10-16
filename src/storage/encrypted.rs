@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
+    marker::PhantomData,
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -60,6 +61,11 @@ pub trait KeyProvider: Send + Sync + Clone + 'static {
     }
 
     /// Destroys one data encryption key version.
+    ///
+    /// Providers only enforce keyring invariants (for example, never destroying
+    /// the current or last live key). Whether stored values still reference the
+    /// key is checked by [`EncryptedEngine::destroy_dek`], which callers should
+    /// use instead of calling the provider directly.
     /// # Errors
     /// Fails for providers that do not support envelope keyrings.
     fn destroy_dek(&self, _key_id: u64) -> Result<(), StorageError> {
@@ -82,6 +88,24 @@ pub trait KekProvider: Send + Sync + Clone + 'static {
     /// Fails when the KEK cannot be loaded or is malformed.
     fn kek(&self) -> Result<ProtectedKey, StorageError>;
 }
+
+/// Object-safe view of a [`KekProvider`], so an envelope keyring can switch to
+/// a KEK provider of another type after [`EnvelopeKeyProvider::rotate_kek_with`].
+trait KekSource: Send + Sync {
+    fn load_kek(&self) -> Result<ProtectedKey, StorageError>;
+}
+
+impl<T> KekSource for T
+where
+    T: KekProvider,
+{
+    fn load_kek(&self) -> Result<ProtectedKey, StorageError> {
+        self.kek()
+    }
+}
+
+/// The KEK currently protecting a keyring, shared by every clone of the provider.
+type KekSlot = Arc<RwLock<Arc<dyn KekSource>>>;
 
 pub struct ProtectedKey {
     id: u64,
@@ -113,10 +137,15 @@ pub struct VaultKekProvider {
     timeout_ms: u64,
 }
 
+/// Envelope keyring of KEK-wrapped DEKs persisted as JSON.
+///
+/// Lock order is keyring, then KEK slot, then cache; the keyring lock is never
+/// taken while it is already held.
 #[derive(Clone)]
 pub struct EnvelopeKeyProvider<K> {
     keyring_path: Arc<PathBuf>,
-    kek_provider: K,
+    kek_provider: KekSlot,
+    kek_type: PhantomData<fn() -> K>,
     keyring: Arc<RwLock<EnvelopeKeyring>>,
     cache: Arc<Mutex<BTreeMap<u64, ProtectedKey>>>,
 }
@@ -139,6 +168,15 @@ pub struct KeyRotationPlan {
 pub struct CryptoShredReport {
     pub destroyed_key_id: u64,
     pub remaining_key_ids: Vec<u64>,
+}
+
+/// Summary of one [`EncryptedEngine::reencrypt_existing_values`] run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReencryptionReport {
+    pub current_key_id: u64,
+    pub scanned_values: u64,
+    pub reencrypted_values: u64,
+    pub batches: u64,
 }
 
 pub struct EncryptedEngine<S, K> {
@@ -342,40 +380,78 @@ impl<K> EnvelopeKeyProvider<K>
 where
     K: KekProvider,
 {
+    /// Opens an existing keyring and never creates one.
+    ///
+    /// Use this whenever encrypted data may already exist: a missing keyring
+    /// (path typo, unmounted volume) must not be replaced by a fresh keyring
+    /// whose DEK ids collide with the ids recorded in existing ciphertext.
+    /// # Errors
+    /// Fails when the keyring is missing, cannot be read, or its current DEK
+    /// cannot be authenticated with the KEK.
+    pub fn open(keyring_path: impl Into<PathBuf>, kek_provider: K) -> Result<Self, StorageError> {
+        let keyring_path = keyring_path.into();
+        if !keyring_path.try_exists()? {
+            return Err(StorageError::Corruption(format!(
+                "encryption keyring {} is missing; refusing to create a new keyring for a database that already contains data",
+                keyring_path.display()
+            )));
+        }
+        let keyring = read_keyring(&keyring_path)?;
+        Self::from_keyring(keyring_path, kek_provider, keyring)
+    }
+
     /// Opens an existing keyring or creates one with an initial DEK.
+    ///
+    /// A keyring is created whenever none exists at `keyring_path`, so callers
+    /// opening existing encrypted data should use [`Self::open`] instead.
     /// # Errors
     /// Fails when the keyring or KEK cannot be read, written, or authenticated.
     pub fn open_or_create(
         keyring_path: impl Into<PathBuf>,
         kek_provider: K,
     ) -> Result<Self, StorageError> {
-        let keyring_path = Arc::new(keyring_path.into());
-        let keyring = if keyring_path.exists() {
-            read_keyring(keyring_path.as_ref())?
-        } else {
-            let key = ProtectedKey::with_id(LEGACY_KEY_ID, random_key()?);
-            let wrapped = wrap_dek(&kek_provider.kek()?, &key)?;
-            let keyring = EnvelopeKeyring {
-                format_version: KEYRING_FORMAT_VERSION,
-                current_key_id: key.id(),
-                keys: vec![wrapped],
-            };
-            write_keyring(keyring_path.as_ref(), &keyring)?;
-            keyring
-        };
+        let keyring_path = keyring_path.into();
+        if keyring_path.try_exists()? {
+            return Self::open(keyring_path, kek_provider);
+        }
 
+        let key = ProtectedKey::with_id(LEGACY_KEY_ID, random_key()?);
+        let wrapped = wrap_dek(&kek_provider.kek()?, &key)?;
+        let keyring = EnvelopeKeyring {
+            format_version: KEYRING_FORMAT_VERSION,
+            current_key_id: key.id(),
+            keys: vec![wrapped],
+        };
+        write_keyring(&keyring_path, &keyring)?;
+        Self::from_keyring(keyring_path, kek_provider, keyring)
+    }
+
+    fn from_keyring(
+        keyring_path: PathBuf,
+        kek_provider: K,
+        keyring: EnvelopeKeyring,
+    ) -> Result<Self, StorageError> {
+        let kek_source: Arc<dyn KekSource> = Arc::new(kek_provider);
         let provider = Self {
-            keyring_path,
-            kek_provider,
+            keyring_path: Arc::new(keyring_path),
+            kek_provider: Arc::new(RwLock::new(kek_source)),
+            kek_type: PhantomData,
             keyring: Arc::new(RwLock::new(keyring)),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
         };
-        let current = provider.current_key()?;
-        provider.cache_key(current)?;
+        // Authenticates the current DEK with the KEK and warms the cache.
+        let _ = provider.current_key()?;
         Ok(provider)
     }
 
-    /// Rewraps every live DEK under a new KEK provider.
+    /// Rewraps every live DEK under a new KEK provider and switches this
+    /// provider, and every clone of it, to that KEK.
+    ///
+    /// The rewrapped keyring is built on a copy and persisted before the
+    /// in-memory keyring and KEK are swapped, so a failure leaves both
+    /// unchanged. Other provider instances opened on the same keyring file keep
+    /// the old KEK: rotate through the instance the database uses, or while the
+    /// database is closed.
     /// # Errors
     /// Fails when any key cannot be unwrapped, wrapped, or persisted.
     pub fn rotate_kek_with<N>(&self, new_kek_provider: &N) -> Result<(), StorageError>
@@ -386,13 +462,29 @@ where
             .keyring
             .write()
             .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
-        let old_kek = self.kek_provider.kek()?;
+        let mut kek_slot = self
+            .kek_provider
+            .write()
+            .map_err(|_| StorageError::Backend("KEK provider lock poisoned".to_owned()))?;
+        let old_kek = kek_slot.load_kek()?;
         let new_kek = new_kek_provider.kek()?;
-        for wrapped in keyring.keys.iter_mut().filter(|key| !key.deleted) {
+        let mut next = keyring.clone();
+        for wrapped in next.keys.iter_mut().filter(|key| !key.deleted) {
             let key = unwrap_dek(&old_kek, wrapped)?;
             *wrapped = wrap_dek(&new_kek, &key)?;
         }
-        write_keyring(self.keyring_path.as_ref(), &keyring)
+        write_keyring(self.keyring_path.as_ref(), &next)?;
+
+        let next_source: Arc<dyn KekSource> = Arc::new(new_kek_provider.clone());
+        *keyring = next;
+        *kek_slot = next_source;
+        Ok(())
+    }
+
+    fn kek_source(&self) -> Result<Arc<dyn KekSource>, StorageError> {
+        Ok(Arc::clone(&*self.kek_provider.read().map_err(|_| {
+            StorageError::Backend("KEK provider lock poisoned".to_owned())
+        })?))
     }
 
     fn cache_key(&self, key: ProtectedKey) -> Result<(), StorageError> {
@@ -428,19 +520,41 @@ where
             return Ok(key);
         }
 
-        let wrapped = self
+        let (wrapped, kek_source) = {
+            let keyring = self
+                .keyring
+                .read()
+                .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+            let wrapped = keyring
+                .keys
+                .iter()
+                .find(|key| key.key_id == key_id && !key.deleted)
+                .cloned()
+                .ok_or_else(|| {
+                    StorageError::Corruption(format!("unknown encryption key id {key_id}"))
+                })?;
+            (wrapped, self.kek_source()?)
+        };
+        // The KEK may be remote (Vault), so unwrap without holding the keyring lock.
+        let key = unwrap_dek(&kek_source.load_kek()?, &wrapped)?;
+
+        // `destroy_dek` evicts under the keyring write lock, so re-checking and
+        // caching under the read lock can never resurrect a destroyed key.
+        let keyring = self
             .keyring
             .read()
-            .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?
+            .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+        if !keyring
             .keys
             .iter()
-            .find(|key| key.key_id == key_id && !key.deleted)
-            .cloned()
-            .ok_or_else(|| {
-                StorageError::Corruption(format!("unknown encryption key id {key_id}"))
-            })?;
-        let key = unwrap_dek(&self.kek_provider.kek()?, &wrapped)?;
+            .any(|candidate| candidate.key_id == key_id && !candidate.deleted)
+        {
+            return Err(StorageError::Corruption(format!(
+                "encryption key id {key_id} has been destroyed"
+            )));
+        }
         self.cache_key(key.clone())?;
+        drop(keyring);
         Ok(key)
     }
 
@@ -458,12 +572,14 @@ where
             .checked_add(1)
             .ok_or_else(|| StorageError::Backend("encryption key id overflow".to_owned()))?;
         let key = ProtectedKey::with_id(next_id, random_key()?);
-        let wrapped = wrap_dek(&self.kek_provider.kek()?, &key)?;
-        keyring.current_key_id = next_id;
-        keyring.keys.push(wrapped);
-        write_keyring(self.keyring_path.as_ref(), &keyring)?;
-        drop(keyring);
+        let wrapped = wrap_dek(&self.kek_source()?.load_kek()?, &key)?;
+        let mut next = keyring.clone();
+        next.current_key_id = next_id;
+        next.keys.push(wrapped);
+        write_keyring(self.keyring_path.as_ref(), &next)?;
+        *keyring = next;
         self.cache_key(key)?;
+        drop(keyring);
         Ok(next_id)
     }
 
@@ -472,34 +588,46 @@ where
             .keyring
             .write()
             .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
-        let mut found = false;
-        for key in &mut keyring.keys {
-            if key.key_id == key_id {
-                key.deleted = true;
-                key.ciphertext.clear();
-                key.nonce.clear();
-                found = true;
-            }
-        }
-        if !found {
+        if !keyring.keys.iter().any(|key| key.key_id == key_id) {
             return Err(StorageError::Corruption(format!(
                 "unknown encryption key id {key_id}"
             )));
         }
-        if keyring.current_key_id == key_id {
-            keyring.current_key_id = keyring
-                .keys
-                .iter()
-                .filter(|key| !key.deleted)
-                .map(|key| key.key_id)
-                .max()
-                .unwrap_or(0);
+        if !keyring
+            .keys
+            .iter()
+            .any(|key| key.key_id == key_id && !key.deleted)
+        {
+            return Ok(());
         }
-        write_keyring(self.keyring_path.as_ref(), &keyring)?;
+        if keyring.current_key_id == key_id {
+            return Err(StorageError::Backend(format!(
+                "refusing to destroy current encryption key id {key_id}; rotate the DEK and re-encrypt existing values first"
+            )));
+        }
+        if !keyring
+            .keys
+            .iter()
+            .any(|key| key.key_id != key_id && !key.deleted)
+        {
+            return Err(StorageError::Backend(format!(
+                "refusing to destroy the last live encryption key id {key_id}"
+            )));
+        }
+
+        let mut next = keyring.clone();
+        for key in next.keys.iter_mut().filter(|key| key.key_id == key_id) {
+            key.deleted = true;
+            key.ciphertext.clear();
+            key.nonce.clear();
+        }
+        write_keyring(self.keyring_path.as_ref(), &next)?;
+        *keyring = next;
         self.cache
             .lock()
             .map_err(|_| StorageError::Backend("key cache lock poisoned".to_owned()))?
             .remove(&key_id);
+        drop(keyring);
         Ok(())
     }
 
@@ -523,6 +651,9 @@ impl ConfiguredKeyProvider {
     }
 
     /// Opens a local envelope keyring protected by a file-backed KEK.
+    ///
+    /// Creates a new keyring when none exists at `keyring_path`; use
+    /// [`Self::open_local_envelope`] when encrypted data may already exist.
     /// # Errors
     /// Fails when the keyring or KEK cannot be opened.
     pub fn local_envelope(
@@ -535,7 +666,25 @@ impl ConfiguredKeyProvider {
         )?))
     }
 
+    /// Opens an existing local envelope keyring protected by a file-backed KEK.
+    ///
+    /// Never creates a keyring, so a missing keyring for existing encrypted data
+    /// fails closed instead of minting colliding DEK ids.
+    /// # Errors
+    /// Fails when the keyring is missing or the keyring or KEK cannot be opened.
+    pub fn open_local_envelope(
+        keyring_path: impl Into<PathBuf>,
+        kek_path: impl Into<PathBuf>,
+    ) -> Result<Self, StorageError> {
+        Ok(Self::Envelope(EnvelopeKeyProvider::open(
+            keyring_path,
+            LocalFileKms::new(kek_path),
+        )?))
+    }
+
     /// Opens a local envelope keyring protected by a Vault KV v2 KEK.
+    ///
+    /// Creates a new keyring when none exists at `keyring_path`.
     /// # Errors
     /// Fails when the keyring or Vault KEK cannot be opened.
     pub fn vault_envelope(
@@ -615,36 +764,130 @@ impl<S, K> EncryptedEngine<S, K> {
 
 impl<S, K> EncryptedEngine<S, K>
 where
+    S: StorageEngine,
     K: KeyProvider,
 {
     /// Describes the next DEK rotation without mutating key material.
+    ///
+    /// `reencrypt_existing_values` is true while any stored value is still
+    /// encrypted under a key other than the current one.
     /// # Errors
-    /// Fails when the provider cannot expose current or live key ids.
+    /// Fails when the provider cannot expose current or live key ids, or the
+    /// stored values cannot be scanned.
     pub fn key_rotation_plan(&self) -> Result<KeyRotationPlan, StorageError> {
+        let current_key_id = self.key_provider.current_key()?.id();
+        let usage = self.encryption_key_usage()?;
         Ok(KeyRotationPlan {
-            current_key_id: self.key_provider.current_key()?.id(),
+            current_key_id,
             live_key_ids: self.key_provider.list_deks()?,
-            reencrypt_existing_values: false,
+            reencrypt_existing_values: usage.keys().any(|key_id| *key_id != current_key_id),
         })
     }
 
+    /// Counts stored values per DEK id.
+    ///
+    /// Only values written with key-version metadata are counted; legacy v1/v2
+    /// ciphertext and deleted rows are skipped. The scan reads every entry of
+    /// the encryption version table.
+    /// # Errors
+    /// Fails when storage cannot be read or a stored value header is malformed.
+    pub fn encryption_key_usage(&self) -> Result<BTreeMap<u64, u64>, StorageError> {
+        key_usage_in(&self.inner.begin_read()?)
+    }
+
     /// Rotates the current data encryption key when the provider supports it.
+    ///
+    /// Existing values keep their old key until
+    /// [`Self::reencrypt_existing_values`] rewrites them.
     /// # Errors
     /// Fails when the keyring cannot rotate or persist the new key.
     pub fn rotate_dek(&self) -> Result<u64, StorageError> {
         self.key_provider.rotate_dek()
     }
 
-    /// Destroys one data encryption key version.
+    /// Rewrites every stored value that is not encrypted under the current DEK.
+    ///
+    /// Values are decrypted with their recorded key and written back under the
+    /// current key in write transactions of at most `batch_size` values, each
+    /// committed on its own. The job is idempotent and safe to rerun after a
+    /// crash: a rerun only rewrites values that are still stale. Writers that
+    /// were in flight during the rotation can leave new stale values behind, so
+    /// run it until `reencrypted_values` is zero before destroying old keys.
+    /// Each batch holds the storage writer; async callers should run this on a
+    /// blocking thread.
     /// # Errors
-    /// Fails when the provider does not support crypto-shred or the id is unknown.
+    /// Fails when `batch_size` is zero, storage cannot be read or written, or a
+    /// stored value cannot be decrypted; the failing batch is rolled back.
+    pub fn reencrypt_existing_values(
+        &self,
+        batch_size: usize,
+    ) -> Result<ReencryptionReport, StorageError> {
+        if batch_size == 0 {
+            return Err(StorageError::Backend(
+                "re-encryption batch size must be greater than zero".to_owned(),
+            ));
+        }
+        let mut report = ReencryptionReport {
+            current_key_id: self.key_provider.current_key()?.id(),
+            ..ReencryptionReport::default()
+        };
+        let (scanned_values, stale) = self.stale_values(report.current_key_id)?;
+        report.scanned_values = scanned_values;
+        for batch in stale.chunks(batch_size) {
+            let (current_key_id, reencrypted) = self.reencrypt_batch(batch)?;
+            report.current_key_id = current_key_id;
+            report.reencrypted_values += reencrypted;
+            report.batches += 1;
+        }
+        Ok(report)
+    }
+
+    /// Destroys one data encryption key version.
+    ///
+    /// Refuses the current key, the last live key, and any key that still
+    /// protects stored values: rotate the DEK, run
+    /// [`Self::reencrypt_existing_values`], then destroy the old key. Backups
+    /// and other residual copies encrypted under a destroyed key become
+    /// permanently unreadable.
+    /// # Errors
+    /// Fails when the provider does not support crypto-shred, the id is unknown,
+    /// the key is current, last, or still in use, or storage cannot be scanned.
     pub fn destroy_dek(&self, key_id: u64) -> Result<(), StorageError> {
-        self.key_provider.destroy_dek(key_id)
+        if key_id == self.key_provider.current_key()?.id() {
+            return Err(StorageError::Backend(format!(
+                "refusing to destroy current encryption key id {key_id}; rotate the DEK and re-encrypt existing values first"
+            )));
+        }
+
+        // Holding the storage writer keeps new values from being written while
+        // references are counted. This relies on the writer-serialization branch
+        // of the `StorageEngine::begin_write` contract (redb, `MemEngine` and
+        // `SimStorage`); an optimistic backend would need a conflicting write.
+        let guard = self.inner.begin_write()?;
+        // A fresh snapshot sees the same state as the idle guard and avoids
+        // per-lookup table listing in backend write transactions.
+        let in_use = {
+            let read = self.inner.begin_read()?;
+            key_usage_in(&read)?.get(&key_id).copied().unwrap_or(0)
+        };
+        if in_use > 0 {
+            guard.rollback();
+            return Err(StorageError::Backend(format!(
+                "refusing to destroy encryption key id {key_id}: {in_use} stored values are still encrypted with it; run reencrypt_existing_values first"
+            )));
+        }
+        let result = self.key_provider.destroy_dek(key_id);
+        guard.rollback();
+        result
     }
 
     /// Destroys one DEK and reports the remaining live key ids.
+    ///
+    /// Crypto-shred only protects residual copies (old backups, freed pages,
+    /// replicas) once live values have been re-encrypted; it never erases live
+    /// data in place. See [`Self::destroy_dek`] for the refusal rules.
     /// # Errors
-    /// Fails when the provider does not support crypto-shred or the id is unknown.
+    /// Fails when [`Self::destroy_dek`] refuses or fails.
     pub fn crypto_shred(&self, key_id: u64) -> Result<CryptoShredReport, StorageError> {
         self.destroy_dek(key_id)?;
         Ok(CryptoShredReport {
@@ -658,6 +901,48 @@ where
     /// Fails when the provider cannot read its keyring.
     pub fn list_deks(&self) -> Result<Vec<u64>, StorageError> {
         self.key_provider.list_deks()
+    }
+
+    fn stale_values(
+        &self,
+        current_key_id: u64,
+    ) -> Result<(u64, Vec<(String, Bytes)>), StorageError> {
+        let read = self.inner.begin_read()?;
+        let mut scanned = 0_u64;
+        let mut stale = Vec::new();
+        visit_stored_key_ids(&read, |table, row_key, key_id| {
+            scanned += 1;
+            if key_id != current_key_id {
+                stale.push((table, row_key));
+            }
+        })?;
+        Ok((scanned, stale))
+    }
+
+    fn reencrypt_batch(&self, batch: &[(String, Bytes)]) -> Result<(u64, u64), StorageError> {
+        let mut write = self.begin_write()?;
+        let current_key_id = self.key_provider.current_key()?.id();
+        let mut reencrypted = 0_u64;
+        for (table, row_key) in batch {
+            let Some(stored) = write.inner.get(table, row_key)? else {
+                continue;
+            };
+            if stored_key_id(&stored)?.is_none_or(|key_id| key_id == current_key_id) {
+                continue;
+            }
+            let version = encryption_version_from(&write.inner, table, row_key)?;
+            let plaintext = Zeroizing::new(decrypt_value(
+                self.key_provider.as_ref(),
+                table,
+                row_key,
+                version,
+                &stored,
+            )?);
+            write.put(table, row_key, &plaintext)?;
+            reencrypted += 1;
+        }
+        write.commit()?;
+        Ok((current_key_id, reencrypted))
     }
 }
 
@@ -1011,6 +1296,61 @@ fn encryption_version_key(table: &str, row_key: &[u8]) -> Result<Bytes, StorageE
     Ok(key)
 }
 
+fn decode_encryption_version_key(bytes: &[u8]) -> Result<(String, Bytes), StorageError> {
+    let malformed = || StorageError::Corruption("encryption version key is malformed".to_owned());
+    let (table_len, rest) = bytes.split_at_checked(8).ok_or_else(malformed)?;
+    let table_len = usize::try_from(decode_u64(table_len, "encryption version table length")?)
+        .map_err(|_| malformed())?;
+    let (table, row_key) = rest.split_at_checked(table_len).ok_or_else(malformed)?;
+    let table = std::str::from_utf8(table).map_err(|_| malformed())?;
+    Ok((table.to_owned(), row_key.to_vec()))
+}
+
+/// Returns the DEK id recorded in a stored v3 value, or `None` for legacy v1/v2.
+fn stored_key_id(value: &[u8]) -> Result<Option<u64>, StorageError> {
+    match value.get(..MAGIC_V3.len()) {
+        Some(header) if header == MAGIC_V3 => {
+            let key_id_start = MAGIC_V3.len() + 1;
+            let key_id = value.get(key_id_start..key_id_start + 8).ok_or_else(|| {
+                StorageError::Corruption("encrypted v3 value has invalid header".to_owned())
+            })?;
+            decode_u64(key_id, "key id").map(Some)
+        }
+        Some(header) if header == MAGIC_V2 || header == MAGIC_V1 => Ok(None),
+        _ => Err(StorageError::Corruption(
+            "encrypted value has invalid header".to_owned(),
+        )),
+    }
+}
+
+/// Visits `(table, row_key, key_id)` for every live v3 value recorded in the
+/// encryption version table. `txn` must be a raw transaction below the
+/// encryption layer; deleted rows and legacy values are skipped.
+fn visit_stored_key_ids(
+    txn: &impl ReadTransaction,
+    mut visit: impl FnMut(String, Bytes, u64),
+) -> Result<(), StorageError> {
+    for entry in txn.range(ENCRYPTION_VERSIONS_TABLE, &[], &[])? {
+        let (version_key, _) = entry?;
+        let (table, row_key) = decode_encryption_version_key(&version_key)?;
+        let Some(stored) = txn.get(&table, &row_key)? else {
+            continue;
+        };
+        if let Some(key_id) = stored_key_id(&stored)? {
+            visit(table, row_key, key_id);
+        }
+    }
+    Ok(())
+}
+
+fn key_usage_in(txn: &impl ReadTransaction) -> Result<BTreeMap<u64, u64>, StorageError> {
+    let mut usage = BTreeMap::new();
+    visit_stored_key_ids(txn, |_, _, key_id| {
+        *usage.entry(key_id).or_insert(0_u64) += 1;
+    })?;
+    Ok(usage)
+}
+
 fn decode_u64(bytes: &[u8], name: &str) -> Result<u64, StorageError> {
     let bytes = bytes
         .try_into()
@@ -1295,9 +1635,16 @@ fn envelope_aad(key_id: u64) -> Bytes {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
+        time::Duration,
     };
 
     use tempfile::tempdir;
@@ -1307,7 +1654,39 @@ mod tests {
         KeyProvider, LocalFileKms, ProtectedKey, StaticKeyProvider, VaultKekProvider,
         encrypt_value_v1_for_tests,
     };
-    use crate::storage::{MemEngine, ReadTransaction, RedbEngine, StorageEngine, WriteTransaction};
+    use crate::performance::{CompressionAlgorithm, CompressionConfig};
+    use crate::storage::{
+        AnyEngine, MemEngine, ReadTransaction, RedbEngine, StorageEngine, StorageError,
+        WriteTransaction,
+    };
+
+    /// KEK provider whose next `kek()` call, once armed, signals `entered` and
+    /// blocks until `release` receives a message.
+    #[derive(Clone)]
+    struct GatedKek {
+        key: [u8; 32],
+        armed: Arc<AtomicBool>,
+        entered: Arc<Mutex<mpsc::Sender<()>>>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl KekProvider for GatedKek {
+        fn kek(&self) -> Result<ProtectedKey, StorageError> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.entered
+                    .lock()
+                    .map_err(|_| StorageError::Backend("gate sender poisoned".to_owned()))?
+                    .send(())
+                    .map_err(|error| StorageError::Backend(error.to_string()))?;
+                self.release
+                    .lock()
+                    .map_err(|_| StorageError::Backend("gate receiver poisoned".to_owned()))?
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|error| StorageError::Backend(error.to_string()))?;
+            }
+            Ok(ProtectedKey::new(self.key))
+        }
+    }
 
     #[test]
     fn encrypted_memory_round_trips_values() -> Result<(), Box<dyn std::error::Error>> {
@@ -1502,14 +1881,394 @@ mod tests {
         let mut second = engine.begin_write()?;
         second.put("t", b"new", b"new-value")?;
         second.commit()?;
+        assert!(engine.key_rotation_plan()?.reencrypt_existing_values);
+
+        assert!(matches!(
+            engine.crypto_shred(1),
+            Err(StorageError::Backend(message)) if message.contains("still encrypted")
+        ));
+        assert_eq!(engine.list_deks()?, vec![1, 2]);
+        assert_eq!(
+            engine.begin_read()?.get("t", b"old")?,
+            Some(b"old-value".to_vec())
+        );
+        assert!(matches!(
+            engine.crypto_shred(2),
+            Err(StorageError::Backend(message)) if message.contains("current")
+        ));
+
+        assert!(engine.reencrypt_existing_values(0).is_err());
+        let report = engine.reencrypt_existing_values(1)?;
+        assert_eq!(report.current_key_id, 2);
+        assert_eq!(report.reencrypted_values, 1);
+        assert_eq!(report.batches, 1);
+        assert_eq!(engine.reencrypt_existing_values(1)?.reencrypted_values, 0);
+        assert!(!engine.key_rotation_plan()?.reencrypt_existing_values);
+        assert_eq!(engine.encryption_key_usage()?, BTreeMap::from([(2, 2)]));
 
         let report = engine.crypto_shred(1)?;
         assert_eq!(report.destroyed_key_id, 1);
         assert_eq!(report.remaining_key_ids, vec![2]);
 
         let read = engine.begin_read()?;
-        assert!(read.get("t", b"old").is_err());
+        assert_eq!(read.get("t", b"old")?, Some(b"old-value".to_vec()));
         assert_eq!(read.get("t", b"new")?, Some(b"new-value".to_vec()));
+        assert_eq!(
+            read.range("t", b"", b"")?.collect::<Result<Vec<_>, _>>()?,
+            vec![
+                (b"new".to_vec(), b"new-value".to_vec()),
+                (b"old".to_vec(), b"old-value".to_vec()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_key_provider_refuses_destroying_current_or_last_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let kek_path = dir.path().join("kek.bin");
+        let keyring_path = dir.path().join("keyring.json");
+        std::fs::write(&kek_path, [3_u8; 32])?;
+        let provider =
+            EnvelopeKeyProvider::open_or_create(&keyring_path, LocalFileKms::new(&kek_path))?;
+
+        assert!(matches!(
+            provider.destroy_dek(1),
+            Err(StorageError::Backend(message)) if message.contains("current")
+        ));
+        assert_eq!(provider.list_deks()?, vec![1]);
+        assert_eq!(provider.current_key()?.id(), 1);
+
+        assert_eq!(provider.rotate_dek()?, 2);
+        assert!(matches!(
+            provider.destroy_dek(2),
+            Err(StorageError::Backend(message)) if message.contains("current")
+        ));
+        provider.destroy_dek(1)?;
+        provider.destroy_dek(1)?;
+        assert!(matches!(
+            provider.destroy_dek(99),
+            Err(StorageError::Corruption(_))
+        ));
+        assert_eq!(provider.list_deks()?, vec![2]);
+
+        let reopened =
+            EnvelopeKeyProvider::open_or_create(&keyring_path, LocalFileKms::new(&kek_path))?;
+        assert_eq!(reopened.current_key()?.id(), 2);
+        assert_eq!(reopened.list_deks()?, vec![2]);
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_key_provider_failed_persist_leaves_state_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let kek_path = dir.path().join("kek.bin");
+        let keyring_path = dir.path().join("keyring.json");
+        std::fs::write(&kek_path, [3_u8; 32])?;
+        let provider =
+            EnvelopeKeyProvider::open_or_create(&keyring_path, LocalFileKms::new(&kek_path))?;
+        assert_eq!(provider.rotate_dek()?, 2);
+
+        // A directory at the keyring path makes the atomic rename fail.
+        std::fs::remove_file(&keyring_path)?;
+        std::fs::create_dir(&keyring_path)?;
+
+        assert!(provider.rotate_dek().is_err());
+        assert_eq!(provider.list_deks()?, vec![1, 2]);
+        assert_eq!(provider.current_key()?.id(), 2);
+
+        assert!(provider.destroy_dek(1).is_err());
+        assert_eq!(provider.list_deks()?, vec![1, 2]);
+        assert_eq!(provider.key_by_id(1)?.id(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_key_provider_kek_rotation_applies_to_new_deks_and_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let kek_a = dir.path().join("kek-a.bin");
+        let kek_b = dir.path().join("kek-b.bin");
+        let kek_c = dir.path().join("kek-c.bin");
+        let keyring_path = dir.path().join("keyring.json");
+        std::fs::write(&kek_a, [3_u8; 32])?;
+        std::fs::write(&kek_b, [4_u8; 32])?;
+        std::fs::write(&kek_c, [5_u8; 32])?;
+
+        let provider =
+            EnvelopeKeyProvider::open_or_create(&keyring_path, LocalFileKms::new(&kek_a))?;
+        provider.rotate_kek_with(&LocalFileKms::new(&kek_b))?;
+        assert_eq!(provider.rotate_dek()?, 2);
+        provider.rotate_kek_with(&LocalFileKms::new(&kek_c))?;
+        assert_eq!(provider.rotate_dek()?, 3);
+        let originals = [
+            provider.key_by_id(1)?,
+            provider.key_by_id(2)?,
+            provider.key_by_id(3)?,
+        ];
+        drop(provider);
+
+        std::fs::remove_file(&kek_a)?;
+        std::fs::remove_file(&kek_b)?;
+        let reopened = EnvelopeKeyProvider::open(&keyring_path, LocalFileKms::new(&kek_c))?;
+        assert_eq!(reopened.current_key()?.id(), 3);
+        for original in originals {
+            assert_eq!(
+                reopened.key_by_id(original.id())?.as_slice(),
+                original.as_slice()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_key_provider_failed_kek_rewrap_leaves_keyring_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let old_kek = dir.path().join("old-kek.bin");
+        let new_kek = dir.path().join("new-kek.bin");
+        let keyring_path = dir.path().join("keyring.json");
+        std::fs::write(&old_kek, [3_u8; 32])?;
+        std::fs::write(&new_kek, [4_u8; 32])?;
+        {
+            let provider =
+                EnvelopeKeyProvider::open_or_create(&keyring_path, LocalFileKms::new(&old_kek))?;
+            assert_eq!(provider.rotate_dek()?, 2);
+            assert_eq!(provider.rotate_dek()?, 3);
+        }
+
+        let mut keyring: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&keyring_path)?)?;
+        let wrapped = keyring
+            .get_mut("keys")
+            .and_then(|keys| keys.get_mut(1))
+            .ok_or("missing wrapped key 2")?;
+        assert_eq!(
+            wrapped.get("key_id").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let byte = wrapped
+            .get_mut("ciphertext")
+            .and_then(|ciphertext| ciphertext.get_mut(0))
+            .ok_or("missing wrapped key ciphertext")?;
+        let tampered = byte.as_u64().ok_or("ciphertext byte is not a number")? ^ 1;
+        *byte = serde_json::Value::from(tampered);
+        std::fs::write(&keyring_path, serde_json::to_vec_pretty(&keyring)?)?;
+
+        let provider = EnvelopeKeyProvider::open(&keyring_path, LocalFileKms::new(&old_kek))?;
+        let before = std::fs::read(&keyring_path)?;
+        assert!(
+            provider
+                .rotate_kek_with(&LocalFileKms::new(&new_kek))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&keyring_path)?, before);
+
+        assert_eq!(provider.key_by_id(1)?.id(), 1);
+        assert_eq!(provider.rotate_dek()?, 4);
+        drop(provider);
+
+        let reopened = EnvelopeKeyProvider::open(&keyring_path, LocalFileKms::new(&old_kek))?;
+        assert_eq!(reopened.current_key()?.id(), 4);
+        assert_eq!(reopened.key_by_id(1)?.id(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_key_provider_does_not_recache_destroyed_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let keyring_path = dir.path().join("keyring.json");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let kek = GatedKek {
+            key: [6; 32],
+            armed: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Mutex::new(entered_tx)),
+            release: Arc::new(Mutex::new(release_rx)),
+        };
+        assert_eq!(
+            EnvelopeKeyProvider::open_or_create(&keyring_path, kek.clone())?.rotate_dek()?,
+            2
+        );
+
+        // A fresh provider caches only the current key, so key 1 must be unwrapped.
+        let provider = EnvelopeKeyProvider::open(&keyring_path, kek.clone())?;
+        kek.armed.store(true, Ordering::SeqCst);
+        let reader = {
+            let provider = provider.clone();
+            thread::spawn(move || provider.key_by_id(1).map(|_| ()))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(10))?;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let destroyer = {
+            let provider = provider.clone();
+            thread::spawn(move || {
+                let result = provider.destroy_dek(1);
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let _ = done_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(())?;
+
+        let _ = reader.join().map_err(|_| "key reader thread panicked")?;
+        destroyer
+            .join()
+            .map_err(|_| "key destroyer thread panicked")??;
+
+        assert!(provider.key_by_id(1).is_err());
+        assert_eq!(provider.list_deks()?, vec![2]);
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_key_provider_open_requires_existing_keyring()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let kek_path = dir.path().join("kek.bin");
+        std::fs::write(&kek_path, [3_u8; 32])?;
+        let missing_dir = dir.path().join("unmounted");
+        let keyring_path = missing_dir.join("keyring.json");
+
+        let opened = EnvelopeKeyProvider::open(&keyring_path, LocalFileKms::new(&kek_path));
+        assert!(matches!(
+            &opened,
+            Err(StorageError::Corruption(message)) if message.contains("keyring")
+        ));
+        assert!(!keyring_path.exists());
+        assert!(!missing_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reencrypt_existing_values_covers_all_tables_in_batches_and_survives_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("reencrypt.redb");
+        let kek_path = dir.path().join("kek.bin");
+        let keyring_path = dir.path().join("keyring.json");
+        std::fs::write(&kek_path, [3_u8; 32])?;
+        let rows: [(&str, &[u8], &[u8]); 5] = [
+            ("__meta", b"schema", b"meta-value"),
+            ("__txn_mvcc", b"mvcc-key", b"mvcc-value"),
+            ("__commit_log", &[0, 0, 0, 0, 0, 0, 0, 1], b"commit-record"),
+            ("users", b"u1", b"Ada"),
+            ("users", b"u3", b"Grace"),
+        ];
+        {
+            let engine = EncryptedEngine::new(
+                RedbEngine::open(&path)?,
+                ConfiguredKeyProvider::local_envelope(&keyring_path, &kek_path)?,
+            );
+            let mut write = engine.begin_write()?;
+            for (table, key, value) in rows {
+                write.put(table, key, value)?;
+            }
+            write.put("users", b"u2", b"deleted")?;
+            write.commit()?;
+            let mut write = engine.begin_write()?;
+            write.delete("users", b"u2")?;
+            write.commit()?;
+
+            assert_eq!(engine.rotate_dek()?, 2);
+            let report = engine.reencrypt_existing_values(2)?;
+            assert_eq!(report.current_key_id, 2);
+            assert_eq!(report.scanned_values, 5);
+            assert_eq!(report.reencrypted_values, 5);
+            assert!(report.batches >= 2);
+            assert_eq!(engine.encryption_key_usage()?, BTreeMap::from([(2, 5)]));
+            assert_eq!(engine.crypto_shred(1)?.remaining_key_ids, vec![2]);
+        }
+
+        let engine = EncryptedEngine::new(
+            RedbEngine::open(&path)?,
+            ConfiguredKeyProvider::local_envelope(&keyring_path, &kek_path)?,
+        );
+        let read = engine.begin_read()?;
+        for (table, key, value) in rows {
+            assert_eq!(read.get(table, key)?, Some(value.to_vec()));
+            let scanned = read
+                .range(table, b"", b"")?
+                .collect::<Result<Vec<_>, _>>()?;
+            assert!(scanned.contains(&(key.to_vec(), value.to_vec())));
+        }
+        assert_eq!(read.get("users", b"u2")?, None);
+        assert_eq!(read.range("users", b"", b"")?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn any_engine_compressed_envelope_reencrypts_and_requires_keyring()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("compressed.redb");
+        let kek_path = dir.path().join("kek.bin");
+        let keyring_path = dir.path().join("keyring.json");
+        std::fs::write(&kek_path, [3_u8; 32])?;
+        let compression = CompressionConfig {
+            algorithm: CompressionAlgorithm::Lz4,
+            min_bytes: 1,
+            zstd_level: 3,
+        };
+        let long_value = b"compressible-compressible-compressible-compressible".to_vec();
+        {
+            let engine = AnyEngine::compressed_encrypted_redb_envelope(
+                &path,
+                &keyring_path,
+                &kek_path,
+                compression.clone(),
+            )?;
+            let mut write = engine.begin_write()?;
+            write.put("t", b"a", &long_value)?;
+            write.put("t", b"b", b"short")?;
+            write.commit()?;
+            assert_eq!(engine.rotate_dek()?, 2);
+            assert!(engine.destroy_dek(1).is_err());
+            assert!(engine.reencrypt_existing_values(8)?.reencrypted_values > 0);
+            engine.destroy_dek(1)?;
+            assert_eq!(engine.list_deks()?, vec![2]);
+        }
+        {
+            let engine = AnyEngine::compressed_encrypted_redb_envelope(
+                &path,
+                &keyring_path,
+                &kek_path,
+                compression.clone(),
+            )?;
+            let read = engine.begin_read()?;
+            assert_eq!(read.get("t", b"a")?, Some(long_value.clone()));
+            assert_eq!(read.get("t", b"b")?, Some(b"short".to_vec()));
+        }
+
+        std::fs::rename(&keyring_path, dir.path().join("keyring.moved"))?;
+        let reopened = AnyEngine::compressed_encrypted_redb_envelope(
+            &path,
+            &keyring_path,
+            &kek_path,
+            compression,
+        );
+        assert!(matches!(
+            &reopened,
+            Err(StorageError::Corruption(message)) if message.contains("keyring")
+        ));
+        assert!(!keyring_path.exists());
+
+        let plain_path = dir.path().join("plain.redb");
+        {
+            let plain = AnyEngine::redb(&plain_path)?;
+            let mut write = plain.begin_write()?;
+            write.put("t", b"k", b"plaintext")?;
+            write.commit()?;
+        }
+        let plain_keyring = dir.path().join("plain-keyring.json");
+        assert!(
+            AnyEngine::encrypted_redb_envelope(&plain_path, &plain_keyring, &kek_path).is_err()
+        );
+        assert!(!plain_keyring.exists());
         Ok(())
     }
 
