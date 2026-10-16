@@ -89,6 +89,15 @@ All notable public changes will be recorded here.
   encrypted metadata opened without a key fails with `MetadataUnreadable`
   ("supply OperationalConfig.encryption"). `SchemaVersionMismatch` now reports
   `expected: 2`, the newest version this build reads.
+- Restore builds its target from the profile manifest in the backup: a
+  restored compressed manifest database is value-framed again, as its
+  manifest says, and `verify_backup` covers such backups. A restore
+  `DbConfig` whose storage profile disagrees with the backed-up manifest
+  fails with `BackupError::Config(ProfileMismatch)`, and a corrupt backed-up
+  manifest with `BackupError::Corruption`, before the target is created.
+  Restore now reads the full backup payload before it creates the target, so
+  a full payload that fails its checksum or decryption no longer leaves an
+  empty initialized target behind.
 
 ### Breaking
 

@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::{
     cloud::{CLOUD_HIBERNATION_TABLE, CLOUD_SEGMENTS_TABLE},
     db::{
-        ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode, Profile, create_database,
+        ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode,
+        PersistedProfileManifest, Profile, create_restore_target, decode_profile_manifest,
+        validate_manifest,
     },
     fileio,
     model::{DOCUMENT_TABLE, INDEX_TABLE},
@@ -49,6 +51,8 @@ const FULL_DATA_FILE: &str = "data/full.json.zst";
 const WAL_DATA_FILE: &str = "wal/incremental.json.zst";
 const BACKUP_META_TABLE: &str = "__backup_meta";
 const AUTHZ_TABLE: &str = "__authz_policy";
+const META_TABLE: &str = "__meta";
+const KEY_PROFILE_MANIFEST: &[u8] = b"profile_manifest";
 const KEY_TIMELINE_ID: &[u8] = b"timeline_id";
 const KEY_RECOVERY_LSN: &[u8] = b"recovery_lsn";
 const KEYSPACE_PRESENT_VALUE: &[u8] = b"1";
@@ -360,16 +364,16 @@ pub fn restore_backup_with_config(
 
     let backup_keys = restore_key_provider(restore_config)?;
     let target_lsn = resolve_target_lsn(&chain, &target, backup_keys.as_ref())?;
-    let database = create_database(config)?;
-    let storage = database.local_storage().ok_or_else(|| {
-        BackupError::Unsupported("restore target must have local storage".to_owned())
-    })?;
-    let mut write = storage.begin_write()?;
     let full_payload = read_backup_payload::<BackupDataPayload>(
         &chain[0].path,
         required_file(&chain[0].manifest, FULL_DATA_FILE)?,
         backup_keys.as_ref(),
     )?;
+    let database = restore_target_engine(config, &full_payload)?;
+    let storage = database.local_storage().ok_or_else(|| {
+        BackupError::Unsupported("restore target must have local storage".to_owned())
+    })?;
+    let mut write = storage.begin_write()?;
     apply_full_payload(&mut write, &full_payload)?;
 
     let mut applied = 0_usize;
@@ -942,6 +946,52 @@ fn ensure_restore_target_empty(config: &DbConfig) -> Result<(), BackupError> {
     ))
 }
 
+/// Creates the empty restore target from the profile manifest in the full backup payload, so
+/// a restored manifest database is framed the way its manifest says. A payload without a
+/// manifest gets the target `create_database` creates. Nothing is created when the manifest is
+/// corrupt or describes another storage profile than `config`.
+fn restore_target_engine(
+    config: DbConfig,
+    payload: &BackupDataPayload,
+) -> Result<Database, BackupError> {
+    let manifest = backed_up_profile_manifest(payload)?;
+    if let Some(found) = manifest
+        .as_ref()
+        .map(|manifest| manifest.storage_profile)
+        .filter(|found| *found != config.profile)
+    {
+        return Err(BackupError::Config(ConfigError::ProfileMismatch {
+            expected: config.profile,
+            found,
+        }));
+    }
+    Ok(create_restore_target(config, manifest.as_ref())?)
+}
+
+/// Decodes and re-validates `__meta.profile_manifest` from a full backup payload. Payload values
+/// are stored decoded, so the record is plain JSON; anything else is backup corruption.
+fn backed_up_profile_manifest(
+    payload: &BackupDataPayload,
+) -> Result<Option<PersistedProfileManifest>, BackupError> {
+    let Some(record) = payload
+        .records
+        .iter()
+        .find(|record| record.table == META_TABLE && record.key == KEY_PROFILE_MANIFEST)
+    else {
+        return Ok(None);
+    };
+    let corrupt = |error: ConfigError| {
+        BackupError::Corruption(format!("backed-up __meta.profile_manifest: {error}"))
+    };
+    let manifest = decode_profile_manifest(&record.value).map_err(|error| match error {
+        // A manifest written by a newer binary is not corruption; report it as an open would.
+        ConfigError::UnsupportedProfileManifest { .. } => BackupError::Config(error),
+        error => corrupt(error),
+    })?;
+    validate_manifest(&manifest, manifest.storage_profile).map_err(corrupt)?;
+    Ok(Some(manifest))
+}
+
 fn apply_full_payload(
     txn: &mut impl WriteTransaction,
     payload: &BackupDataPayload,
@@ -1027,18 +1077,61 @@ fn write_restore_metadata(
 mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
 
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        BackupConfig, RestoreConfig, RestoreTarget, full_backup, incremental_backup, list_backups,
-        restore_backup, restore_backup_with_config, verify_backup, verify_backup_with_config,
+        BackupConfig, BackupDataPayload, BackupDataRecord, BackupError, KEY_PROFILE_MANIFEST,
+        META_TABLE, RestoreConfig, RestoreTarget, full_backup, incremental_backup, list_backups,
+        restore_backup, restore_backup_with_config, restore_target_engine, verify_backup,
+        verify_backup_with_config,
     };
+    use crate::config_spec::{ProfileKnobOverrides, resolve_named_profile};
     use crate::db::{
-        DbConfig, EncryptionConfig, OperationalConfig, Profile, create_database,
-        create_database_with_ops, open_database,
+        ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
+        ReplicationKind, RuntimeProfileBinding, create_database, create_database_with_ops,
+        create_database_with_profile, inspect_database_metadata, open_database,
     };
+    use crate::performance::CompressionAlgorithm;
     use crate::repl::{Op, ReadConsistency, Replication};
+    use crate::storage::{EngineKind, ReadTransaction, RedbEngine, StorageEngine};
+
+    /// Binds the built-in profile `name` with knob `overrides` to a database at `path`.
+    fn profile_binding(
+        name: &str,
+        overrides: serde_json::Value,
+        path: &Path,
+    ) -> Result<RuntimeProfileBinding, Box<dyn std::error::Error>> {
+        let overrides: ProfileKnobOverrides = serde_json::from_value(overrides)?;
+        let resolution = resolve_named_profile(name, &overrides);
+        let resolved = resolution
+            .resolved()
+            .ok_or_else(|| format!("{name} did not resolve: {:?}", resolution.issues()))?;
+        Ok(resolved.bind(ReplicationKind::default(), Some(path.to_path_buf()))?)
+    }
+
+    /// Reads a stored value straight from the redb file, without decoding compression frames.
+    fn raw_value(
+        path: &Path,
+        table: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        let engine = RedbEngine::open(path)?;
+        let txn = engine.begin_read()?;
+        Ok(txn.get(table, key)?)
+    }
+
+    fn manifest_payload(value: Vec<u8>) -> BackupDataPayload {
+        BackupDataPayload {
+            records: vec![BackupDataRecord {
+                table: META_TABLE.to_owned(),
+                key: KEY_PROFILE_MANIFEST.to_vec(),
+                value,
+            }],
+        }
+    }
 
     #[test]
     fn full_backup_restore_round_trips_redb() -> Result<(), Box<dyn std::error::Error>> {
@@ -1218,6 +1311,237 @@ mod tests {
 
         assert_eq!(manifests.len(), 1);
         assert_eq!(manifests[0].backup_id, backup.manifest.backup_id);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_preserves_the_value_framing_of_a_profile_manifest_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let binding = profile_binding(
+            "high_durability",
+            json!({ "compression": { "algorithm": "zstd" } }),
+            &db_path,
+        )?;
+        assert!(binding.manifest.storage_format.value_framing);
+        let value = b"framed value ".repeat(256);
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        database.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"k".to_vec(),
+            value: value.clone(),
+        })?;
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        assert_eq!(backup.manifest.profile, Profile::HighDurability);
+
+        let restore_path = temp.path().join("restore.redb");
+        let report = restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::HighDurability, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        assert_eq!(report.restored_lsn, backup.manifest.end_lsn);
+
+        let data = raw_value(&restore_path, "user_data", b"k")?.ok_or("data key missing")?;
+        assert!(data.starts_with(b"MDBC1"));
+        assert_eq!(data[5], 2, "the restored value is a zstd frame");
+        let manifest = raw_value(&restore_path, META_TABLE, KEY_PROFILE_MANIFEST)?
+            .ok_or("manifest missing")?;
+        assert!(manifest.starts_with(b"MDBC1"));
+
+        let MetadataProbe::Initialized(probed) = inspect_database_metadata(&restore_path) else {
+            return Err("the restored database is not initialized".into());
+        };
+        assert_eq!(probed.schema_version, 2);
+        assert_eq!(probed.storage_profile, Profile::HighDurability);
+        assert_eq!(probed.manifest.as_ref(), Some(&binding.manifest));
+        assert!(probed.values_framed);
+
+        let restored = open_database(DbConfig::on_disk(Profile::HighDurability, &restore_path))?;
+        assert_eq!(restored.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(
+            restored.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(value)
+        );
+        assert_eq!(restored.performance_config(), &binding.performance);
+        assert_eq!(
+            restored.performance_config().compression.algorithm,
+            CompressionAlgorithm::Zstd
+        );
+
+        let verified = verify_backup(&backup.path)?;
+        assert_eq!(verified.restored_lsn, backup.manifest.end_lsn);
+        Ok(())
+    }
+
+    #[test]
+    fn restored_profile_manifest_chain_reopens_with_manifest_performance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let binding = profile_binding(
+            "balanced",
+            json!({
+                "compression": { "algorithm": "lz4" },
+                "cache": { "max_entries": 8192 },
+            }),
+            &db_path,
+        )?;
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        database.propose(Op::Put {
+            table: "items".to_owned(),
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        })?;
+        let root = temp.path().join("backups");
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        database.propose(Op::Put {
+            table: "items".to_owned(),
+            key: b"b".to_vec(),
+            value: b"2".to_vec(),
+        })?;
+        let incremental =
+            incremental_backup(&database, &root, &full.path, &BackupConfig::default())?;
+
+        let restore_path = temp.path().join("restore.redb");
+        let report = restore_backup(
+            &incremental.path,
+            DbConfig::on_disk(Profile::Balanced, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        assert!(report.applied_commits > 0);
+        let replayed = raw_value(&restore_path, "items", b"b")?.ok_or("replayed key missing")?;
+        assert!(
+            replayed.starts_with(b"MDBC1"),
+            "commit-log replay writes framed values"
+        );
+
+        let restored = open_database(DbConfig::on_disk(Profile::Balanced, &restore_path))?;
+        assert_eq!(restored.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(
+            restored.read("items", b"a", ReadConsistency::Strong)?,
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            restored.read("items", b"b", ReadConsistency::Strong)?,
+            Some(b"2".to_vec())
+        );
+        assert_eq!(restored.performance_config().cache.max_capacity, 8192);
+        assert_eq!(restored.performance_config(), &binding.performance);
+        verify_backup(&incremental.path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_a_profile_that_disagrees_with_the_backed_up_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let binding = profile_binding(
+            "high_durability",
+            json!({ "compression": { "algorithm": "zstd" } }),
+            &db_path,
+        )?;
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        database.propose(Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })?;
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+
+        let restore_path = temp.path().join("restore.redb");
+        let result = restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Balanced, &restore_path),
+            RestoreTarget::Latest,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(BackupError::Config(ConfigError::ProfileMismatch {
+                    expected: Profile::Balanced,
+                    found: Profile::HighDurability,
+                }))
+            ),
+            "unexpected result: {result:?}"
+        );
+        assert!(!restore_path.exists(), "nothing is created on a mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_target_fails_closed_on_a_corrupt_backed_up_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let target = temp.path().join("target.redb");
+        let config = DbConfig::on_disk(Profile::Balanced, &target);
+        let binding = profile_binding("balanced", json!({}), &target)?;
+        let manifest = serde_json::to_value(&binding.manifest)?;
+
+        let not_json = restore_target_engine(config.clone(), &manifest_payload(b"{".to_vec()));
+        assert!(
+            matches!(not_json, Err(BackupError::Corruption(_))),
+            "unexpected result: {:?}",
+            not_json.err()
+        );
+
+        let mut out_of_range = manifest.clone();
+        out_of_range["knobs"]["cache"]["max_entries"] = json!(2_000_000);
+        let out_of_range = restore_target_engine(
+            config.clone(),
+            &manifest_payload(serde_json::to_vec(&out_of_range)?),
+        );
+        let message = match out_of_range {
+            Err(BackupError::Corruption(message)) => message,
+            other => return Err(format!("unexpected result: {:?}", other.err()).into()),
+        };
+        assert!(message.contains("cache.max_entries"), "{message}");
+
+        let mut newer = manifest;
+        newer["manifest_version"] = json!(2);
+        let newer = restore_target_engine(
+            config.clone(),
+            &manifest_payload(serde_json::to_vec(&newer)?),
+        );
+        assert!(
+            matches!(
+                newer,
+                Err(BackupError::Config(
+                    ConfigError::UnsupportedProfileManifest { found: 2 }
+                ))
+            ),
+            "unexpected result: {:?}",
+            newer.err()
+        );
+        assert!(
+            !target.exists(),
+            "nothing is created for a corrupt manifest"
+        );
+
+        let legacy = restore_target_engine(
+            config,
+            &BackupDataPayload {
+                records: Vec::new(),
+            },
+        )?;
+        assert_eq!(legacy.engine_kind(), EngineKind::Redb);
+        drop(legacy);
+        let MetadataProbe::Initialized(probed) = inspect_database_metadata(&target) else {
+            return Err("the legacy restore target is not initialized".into());
+        };
+        assert_eq!(probed.schema_version, 1);
+        assert_eq!(probed.manifest, None);
+        assert!(!probed.values_framed);
         Ok(())
     }
 }

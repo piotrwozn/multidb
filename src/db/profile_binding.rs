@@ -1,5 +1,6 @@
 //! Runtime binding of resolved profiles: the `__meta.profile_manifest` record, the
-//! single-node creator that writes it and the read-only metadata probe.
+//! single-node creator that writes it, the restore target built from a backed-up manifest and
+//! the read-only metadata probe.
 
 use std::{
     io,
@@ -11,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use super::{
     ConfigError, Database, DbConfig, KEY_LAYOUT, KEY_PROFILE, KEY_PROFILE_MANIFEST,
     KEY_REPLICATION, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME, OperationalConfig, Profile,
-    ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED, engine_for_operational, layout_for,
-    read_catalog, read_metadata, validate, validate_operational, write_json,
-    write_security_to_repl,
+    ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED, engine_for, engine_for_operational,
+    layout_for, read_catalog, read_metadata, validate, validate_operational, write_json,
+    write_metadata, write_security_to_repl,
 };
 use crate::config_spec::{
     CompiledPolicy, CompressionKnob, DeploymentMode, DeploymentSpec, ProfileKnobs, ResolvedProfile,
@@ -238,6 +239,50 @@ pub fn create_database_with_profile(
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(ops.security);
     Ok(database)
+}
+
+/// Creates the empty target database of a restore, framed the way the backed-up profile
+/// manifest says.
+///
+/// With a manifest, the target gets the engine and metadata `create_database_with_profile`
+/// gives it: value framing with the manifest compression when the manifest records framing,
+/// and `schema_version`, the storage profile, replication, layout and the manifest in one write
+/// transaction. Without one, it is what `create_database` creates on an empty target. The
+/// restored `__meta` records overwrite this metadata afterwards.
+/// # Errors
+/// Fails with `ProfileManifestInvalid` when the manifest does not describe `config.profile`,
+/// with `AlreadyInitialized` when the target already holds database metadata, and as
+/// `engine_for` otherwise.
+pub(crate) fn create_restore_target(
+    config: DbConfig,
+    manifest: Option<&PersistedProfileManifest>,
+) -> Result<Database, ConfigError> {
+    if let Some(manifest) = manifest {
+        validate_manifest(manifest, config.profile)?;
+    }
+    let mut engine = engine_for(&config)?;
+    if let Some(storage_format) = manifest
+        .map(|manifest| &manifest.storage_format)
+        .filter(|storage_format| storage_format.value_framing)
+    {
+        engine = engine.with_value_framing(storage_format.compression.clone());
+    }
+
+    match read_metadata(&engine) {
+        Ok(_) => return Err(ConfigError::AlreadyInitialized),
+        Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {}
+        Err(error) => return Err(error),
+    }
+    let performance = if let Some(manifest) = manifest {
+        write_profile_metadata(&engine, &config, manifest)?;
+        performance_for_manifest(manifest)
+    } else {
+        write_metadata(&engine, &config)?;
+        PerformanceConfig::for_profile(config.profile)
+    };
+
+    let catalog = read_catalog(&engine)?;
+    Database::new_with_performance(config, engine, catalog, performance)
 }
 
 /// Reads the metadata of the database file at `path` without creating anything.

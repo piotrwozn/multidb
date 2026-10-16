@@ -105,6 +105,9 @@ pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
     create_database_with_profile, inspect_database_metadata,
 };
+pub(crate) use profile_binding::{
+    create_restore_target, decode_profile_manifest, validate_manifest,
+};
 use runtime::wasm_runtime_for_database;
 
 const META_TABLE: &str = "__meta";

@@ -425,6 +425,32 @@ open exactly as before; plain `create_database` and `serve` never write one.
   framed data. `__meta` cannot reveal this, so such a database behaves as
   before and must keep being opened with compression.
 
+### Backup and restore
+
+Backups read values through the database engine, so a backup of a framed
+manifest database holds decoded values, and its `BackupManifest.profile`
+stays the storage `Profile`. Restore looks for `__meta.profile_manifest` in
+the full backup payload before it creates anything:
+
+- With a manifest, the target is built the way `create_database_with_profile`
+  builds it: when the manifest records value framing, the engine frames values
+  with the manifest compression, so every restored value, `__meta` included,
+  is framed again and the restored database opens with its manifest
+  performance. The restored `__meta` records (`schema_version`, the manifest)
+  are copied verbatim, as before.
+- A restore `DbConfig` whose storage profile disagrees with the backed-up
+  manifest fails with `BackupError::Config(ProfileMismatch)`. A backed-up
+  manifest that does not decode or fails the read-time validation is
+  `BackupError::Corruption`, and one with a newer `manifest_version` is
+  `BackupError::Config(UnsupportedProfileManifest)`. In all three cases the
+  target is left absent or empty.
+- Without a manifest, restore behaves as before.
+
+`verify_backup` restores into a temporary database the same way, so it
+works for compressed manifest databases. A legacy database created with
+`OperationalConfig.performance.compression` has no manifest; it is restored
+unframed, as before.
+
 ### Single node only
 
 CP, AP and sharded openers refuse a profile manifest with
