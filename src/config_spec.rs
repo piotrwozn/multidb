@@ -14,8 +14,26 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::db::{DbConfig, Profile, ReplicationKind};
 
+mod knobs;
+mod profile;
 mod schema;
+mod suggest;
 
+pub use knobs::{
+    ChangePolicy, KNOB_REGISTRY, KnobAssignment, KnobAssignmentError, KnobDefinition,
+    KnobEnforcement, KnobTiming, KnobType, RESERVED_KNOBS, ReservedKnob, knob_definition,
+    parse_knob_assignment,
+};
+pub use profile::{
+    AutoOr, CacheKnobs, CacheOverrides, CommitMode, CompressionKnob, CompressionKnobs,
+    CompressionOverrides, ConsistencyKnobs, ConsistencyOverrides, CustomProfileSpec,
+    DurabilityKnobs, DurabilityOverrides, FloorOverrides, GuaranteeFloors, HistoryKnobs,
+    HistoryOverrides, KnobSource, LayoutKnob, Limit, LimitKnobs, LimitOverrides,
+    ProfileKnobOverrides, ProfileKnobs, ProfileResolution, ProfileVariant, QueryKnobs,
+    QueryOverrides, ResolvedProfile, ResolvedProfileKind, RoleSetDelta, StorageKnobs,
+    StorageMedium, StorageOverrides, SystemVersioningKnob, TimeSeriesKnobs, TimeSeriesOverrides,
+    profile_variants, resolve_named_profile, resolve_profile,
+};
 pub use schema::database_spec_v1_schema;
 
 pub const DATABASE_SPEC_VERSION: u32 = 1;
@@ -38,6 +56,10 @@ pub struct DatabaseSpec {
     pub extensions: Vec<ExtensionManifestRef>,
     pub overrides: BTreeMap<String, String>,
     pub operation_hints: BTreeMap<String, String>,
+    /// A user profile extending a built-in one. Spec version 2 only: a version 1 document that
+    /// sets it fails validation with `FIELD_REQUIRES_SPEC_V2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_profile: Option<CustomProfileSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -188,7 +210,7 @@ pub struct CollectionRoleSpec {
     pub indexes: Vec<CollectionIndexKind>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectionRole {
     DocumentEntity,
@@ -1117,6 +1139,7 @@ impl DatabaseSpec {
             extensions: Vec::new(),
             overrides: BTreeMap::new(),
             operation_hints: BTreeMap::new(),
+            custom_profile: None,
         }
     }
 
@@ -1236,6 +1259,7 @@ impl GuaranteeValidator {
                 issues,
             };
         }
+        issues.extend(spec_version_gate(spec));
 
         let mut status = spec.catalog_support_status_without_guarantees();
         let profile = built_in_profile(&spec.profile);
@@ -1538,6 +1562,22 @@ impl PolicyCompiler {
             collections,
         })
     }
+}
+
+/// Reports every field that needs a newer spec version than the document declares.
+fn spec_version_gate(spec: &DatabaseSpec) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if spec.version == DATABASE_SPEC_VERSION && spec.custom_profile.is_some() {
+        issues.push(validation_issue(
+            "FIELD_REQUIRES_SPEC_V2",
+            ValidationSeverity::Error,
+            "custom_profile",
+            "custom_profile is a DatabaseSpec version 2 field, but the document declares version 1",
+            "Set version: 2 to use custom_profile, or remove custom_profile.",
+            CertificationImpact::BlocksCertified,
+        ));
+    }
+    issues
 }
 
 #[allow(clippy::collapsible_match, clippy::manual_is_multiple_of)]
@@ -3400,6 +3440,13 @@ pub fn built_in_profile(slug_or_alias: &str) -> Option<&'static ProfileSpec> {
         .find(|profile| profile.slug == key || profile.aliases.contains(&key))
 }
 
+/// Like `built_in_profile`, but first trims, lowercases and maps `-` to `_`, so `Secure-App`
+/// finds `secure_app`. `built_in_profile` itself stays an exact match.
+#[must_use]
+pub fn built_in_profile_normalized(name: &str) -> Option<&'static ProfileSpec> {
+    built_in_profile(&profile::normalize_profile_name(name))
+}
+
 #[must_use]
 pub const fn collection_role_definitions() -> &'static [CollectionRoleDefinition] {
     COLLECTION_ROLE_DEFINITIONS
@@ -3704,9 +3751,10 @@ mod tests {
         ExtensionManifestValidator, ExtensionStability, GuaranteeValidator, MigrationPlanner,
         MigrationStepKind, PolicyCompiler, ReplicationMode, SupportStatus, TopologySpec,
         ValidationSeverity, WriteAck, built_in_extension_manifest, built_in_extension_manifests,
-        built_in_profile, built_in_profiles, collection_role_definition,
-        collection_role_definitions, compile_extension_catalog, consistency_domain_definition,
-        consistency_domain_definitions, database_spec_v1_schema, extension_capability_definitions,
+        built_in_profile, built_in_profile_normalized, built_in_profiles,
+        collection_role_definition, collection_role_definitions, compile_extension_catalog,
+        consistency_domain_definition, consistency_domain_definitions, database_spec_v1_schema,
+        extension_capability_definitions,
     };
     use crate::db::{DbConfig, Profile, ReplicationKind};
 
@@ -4627,5 +4675,123 @@ mod tests {
         assert!(unsupported.confirmation_matched);
         assert!(!unsupported.audit_recorded);
         assert!(!unsupported.data_mutated);
+    }
+
+    const V1_CORPUS: [(&str, &str, &str, &str); 5] = [
+        (
+            "game-save",
+            include_str!("../tests/fixtures/spec-v1/game-save.yaml"),
+            include_str!("../tests/fixtures/spec-v1/game-save.validation.json"),
+            include_str!("../tests/fixtures/spec-v1/game-save.reserialized.yaml"),
+        ),
+        (
+            "desktop-embedded",
+            include_str!("../tests/fixtures/spec-v1/desktop-embedded.yaml"),
+            include_str!("../tests/fixtures/spec-v1/desktop-embedded.validation.json"),
+            include_str!("../tests/fixtures/spec-v1/desktop-embedded.reserialized.yaml"),
+        ),
+        (
+            "ai-memory",
+            include_str!("../tests/fixtures/spec-v1/ai-memory.yaml"),
+            include_str!("../tests/fixtures/spec-v1/ai-memory.validation.json"),
+            include_str!("../tests/fixtures/spec-v1/ai-memory.reserialized.yaml"),
+        ),
+        (
+            "secure-saas",
+            include_str!("../tests/fixtures/spec-v1/secure-saas.yaml"),
+            include_str!("../tests/fixtures/spec-v1/secure-saas.validation.json"),
+            include_str!("../tests/fixtures/spec-v1/secure-saas.reserialized.yaml"),
+        ),
+        (
+            "analytics",
+            include_str!("../tests/fixtures/spec-v1/analytics.yaml"),
+            include_str!("../tests/fixtures/spec-v1/analytics.validation.json"),
+            include_str!("../tests/fixtures/spec-v1/analytics.reserialized.yaml"),
+        ),
+    ];
+
+    fn corpus_spec(slug: &str) -> Result<DatabaseSpec, Box<dyn std::error::Error>> {
+        let (_, yaml, _, _) = V1_CORPUS
+            .iter()
+            .find(|(name, ..)| *name == slug)
+            .ok_or("unknown corpus slug")?;
+        Ok(serde_norway::from_str::<DatabaseSpec>(yaml)?)
+    }
+
+    #[test]
+    fn v1_corpus_validates_and_serializes_exactly_as_frozen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (slug, yaml, validation, reserialized) in V1_CORPUS {
+            let decoded = serde_norway::from_str::<DatabaseSpec>(yaml)?;
+            let expected_validation = serde_json::from_str::<serde_json::Value>(validation)?;
+
+            assert_eq!(decoded.topology, TopologySpec::default(), "{slug}");
+            assert_eq!(decoded.custom_profile, None, "{slug}");
+            assert_eq!(
+                serde_json::to_value(GuaranteeValidator::validate(&decoded))?,
+                expected_validation,
+                "{slug}"
+            );
+            assert_eq!(serde_norway::to_string(&decoded)?, reserialized, "{slug}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v1_corpus_plan_id_is_frozen() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = MigrationPlanner::plan(&corpus_spec("game-save")?, &corpus_spec("secure-saas")?);
+
+        assert_eq!(plan.plan_id, "plan_cc80287c930fc6604ad0695a051f1e2c");
+        assert_eq!(plan.required_confirmation, plan.plan_id);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_profile_in_a_v1_document_requires_spec_v2() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut value = serde_json::to_value(DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        ))?;
+        assert!(value.get("custom_profile").is_none());
+        value["profile"] = json!("orders_durable");
+        value["custom_profile"] = json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        });
+
+        let decoded = serde_json::from_value::<DatabaseSpec>(value)?;
+        let report = GuaranteeValidator::validate(&decoded);
+
+        assert!(decoded.custom_profile.is_some());
+        assert!(!report.valid);
+        assert_eq!(report.status, SupportStatus::Invalid);
+        let gate = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "FIELD_REQUIRES_SPEC_V2")
+            .ok_or("missing FIELD_REQUIRES_SPEC_V2")?;
+        assert_eq!(gate.path, "custom_profile");
+        assert_eq!(gate.severity, ValidationSeverity::Error);
+        assert!(PolicyCompiler::compile(&decoded).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_profile_normalized_accepts_kebab_and_case_but_lookup_stays_exact() {
+        for name in ["secure-app", "Secure_App", " SECURE-APP "] {
+            assert!(built_in_profile(name).is_none(), "{name}");
+            assert_eq!(
+                built_in_profile_normalized(name).map(|profile| profile.slug),
+                Some("secure_app"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            built_in_profile_normalized("High-Durability").map(|profile| profile.slug),
+            Some("secure_app")
+        );
+        assert!(built_in_profile_normalized("unknown").is_none());
+        assert!(CollectionRole::DocumentEntity < CollectionRole::TimeSeries);
     }
 }

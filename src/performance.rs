@@ -8,7 +8,11 @@ use std::{
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 
-use crate::{db::Profile, storage::Bytes};
+use crate::{
+    config_spec::{AutoOr, ProfileKnobs},
+    db::Profile,
+    storage::Bytes,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerformanceConfig {
@@ -245,6 +249,40 @@ impl PerformanceConfig {
                 query,
             },
         }
+    }
+
+    /// Overlays resolved profile knobs onto this configuration. `auto` knobs keep the value
+    /// already present (the `for_profile` default); fields that are not knobs (`read_ahead`,
+    /// `scan_bypass_threshold_rows`, `benchmark`, `max_threads`) are left untouched.
+    #[must_use]
+    pub fn with_profile_knobs(mut self, knobs: &ProfileKnobs) -> Self {
+        self.io.group_commit_window_ms = u64::from(knobs.durability.group_commit_window_ms);
+        self.compression = CompressionConfig {
+            algorithm: knobs.compression.algorithm.into(),
+            min_bytes: saturating_usize(knobs.compression.min_bytes),
+            zstd_level: i32::from(knobs.compression.zstd_level),
+        };
+        self.cache.enabled = knobs.cache.enabled;
+        self.cache.max_capacity = u64::from(knobs.cache.max_entries);
+
+        let query = &knobs.query;
+        if let AutoOr::Value(permits) = query.max_concurrent_queries {
+            self.query.max_concurrent_queries = saturating_usize(permits);
+        }
+        if let AutoOr::Value(partitions) = query.target_partitions {
+            self.parallelism.target_partitions = usize::from(partitions);
+        }
+        self.query.queue_timeout_ms = u64::from(query.queue_timeout_ms);
+        self.query.timeout_ms = u64::from(query.timeout_ms);
+        self.query.memory_limit_bytes =
+            usize::try_from(query.memory_limit_bytes).unwrap_or(usize::MAX);
+        self.query.spill_limit_bytes = query.spill_limit_bytes;
+        self.query.batch_rows = saturating_usize(query.batch_rows);
+        self.query.max_sql_bytes = saturating_usize(query.max_sql_bytes);
+        self.query.max_statements = usize::from(query.max_statements);
+        self.query.max_values_rows = saturating_usize(query.max_values_rows);
+        self.query.parser_recursion_limit = usize::from(query.parser_recursion_limit);
+        self
     }
 
     #[must_use]
@@ -541,6 +579,10 @@ pub fn split_into_partitions<T>(items: Vec<T>, target_partitions: usize) -> Vec<
         .into_iter()
         .filter(|bucket| !bucket.is_empty())
         .collect()
+}
+
+fn saturating_usize(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn is_regressed(baseline: f64, candidate: f64, threshold_percent: u8) -> bool {

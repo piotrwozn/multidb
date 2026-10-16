@@ -1,0 +1,56 @@
+version: 1
+name: Arcade Save
+profile: game_local_balanced
+deployment:
+  mode: embedded
+  storage_path: null
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: false
+    pitr: false
+  encryption:
+    at_rest: false
+  audit:
+    enabled: true
+  sensitive_data: false
+  strict_cross_domain_transactions: false
+domains:
+- name: primary
+  mode: local_snapshot
+collections:
+- name: saves
+  role: document_entity
+  domain: primary
+  indexes:
+  - document
+- name: player_state
+  role: key_value
+  domain: primary
+  indexes:
+  - primary
+- name: session_events
+  role: event_log
+  domain: primary
+  indexes:
+  - primary
+- name: asset_cache
+  role: cache
+  domain: primary
+  indexes:
+  - primary
+extensions:
+- name: cdc
+  version: 1.0.0
+  stability: stable
+- name: document_index
+  version: 1.0.0
+  stability: stable
+overrides: {}
+operation_hints:
+  template.profile_reason: Uses the certified local snapshot profile so game state remains simple, fast and explicit about not claiming cross-node quorum semantics.
+  template.slug: game-save

@@ -1272,6 +1272,7 @@ fn guided_spec(profile: &ProfileSpec, name: &str) -> DatabaseSpec {
         extensions: Vec::new(),
         overrides: std::collections::BTreeMap::new(),
         operation_hints: std::collections::BTreeMap::new(),
+        custom_profile: None,
     }
 }
 
