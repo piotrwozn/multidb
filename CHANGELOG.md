@@ -24,9 +24,10 @@ All notable public changes will be recorded here.
   `built_in_profile_normalized` (trims, lowercases and maps `-` to `_`;
   `built_in_profile` stays an exact match).
 - `DatabaseSpec.custom_profile`, a spec version 2 field. A version 1 document
-  that sets it fails validation with `FIELD_REQUIRES_SPEC_V2`; documents
-  without it serialize, validate and plan exactly as before, pinned by the
-  frozen corpus in `tests/fixtures/spec-v1/`.
+  that sets it fails validation with `FIELD_REQUIRES_SPEC_V2`, and
+  `resolve_profile` returns that issue as `ProfileResolution::Invalid`;
+  documents without it serialize, validate and plan exactly as before, pinned
+  by the frozen corpus in `tests/fixtures/spec-v1/`.
 - `CollectionRole` derives `PartialOrd` and `Ord`.
 - `DatabaseSpec` version 2 (`DATABASE_SPEC_VERSION_V2`,
   `SUPPORTED_SPEC_VERSIONS = 1..=2`): a version 1 spec plus `custom_profile`
@@ -57,10 +58,16 @@ All notable public changes will be recorded here.
   (`PersistedProfileManifest`, `StorageFormat`). Every single-node opener,
   and therefore `multidb serve`, re-validates the manifest and re-applies its
   knobs at every open. Compression turns on value framing and
-  `schema_version` 2, which older binaries refuse. CP, AP and sharded openers
-  refuse manifests. `inspect_database_metadata` (`MetadataProbe`,
-  `ProbedMetadata`) reads a database's metadata without creating files. See
-  `docs/profiles.md`.
+  `schema_version` 2, which older binaries refuse. Without compression the
+  database keeps `schema_version` 1: an older binary opens it but ignores the
+  manifest, so a downgrade reverts every knob to the storage profile
+  defaults. A manifest is refused (`ProfileManifestInvalid`) unless its knobs
+  pass the resolver's range and conflict checks and leave the planned
+  `limits.*` knobs `unlimited`. `CompiledPolicy::binding` refuses a path for
+  a volatile storage class (`VolatileWithPath`), also for a version 1 spec,
+  where validation only warns. CP, AP and sharded openers refuse manifests.
+  `inspect_database_metadata` (`MetadataProbe`, `ProbedMetadata`) reads a
+  database's metadata without creating files. See `docs/profiles.md`.
 - `AnyEngine::is_value_framed` and `AnyEngine::with_value_framing`, which
   wraps an open engine in compression framing without reopening it.
 - CLI profile commands: `multidb profile show <profile> [--override
@@ -73,16 +80,18 @@ All notable public changes will be recorded here.
   `variants=`.
 - `multidb config upgrade --spec <in> [--out <file>] [--force] [--json]`
   converts a spec to version 2 and turns Studio's `profile.custom.*` keys into
-  `custom_profile`; it is idempotent and refuses to overwrite files without
-  `--force`.
+  `custom_profile`; it is idempotent, writes `--out` in the format of its
+  extension, refuses to overwrite files without `--force`, and exits 2
+  without writing when the result does not validate.
 - `multidb init --guided --profile <p> --override path=value...
   [--profile-name <slug>]` writes a version 2 spec with a `custom_profile`
   that extends `<p>`. Without `--override` guided init is unchanged.
 - `config_spec::suggest_profile_name`, the did-you-mean lookup over built-in
   profile slugs and aliases.
 - Control Plane `GET /profiles` adds `variants` (`name`, `storage_profile`,
-  `canonical`) and the canonical variant's preset `knobs` to every entry. The
-  fields are additive; the OpenAPI snapshot is unchanged.
+  `canonical`) and the canonical variant's resolved `knobs` (a full
+  `ProfileKnobs`, including `floors` and `compatible_roles`) to every entry.
+  The fields are additive and do not change the OpenAPI snapshot.
 - TypeScript SDK types: `DatabaseSpec.custom_profile` (`CustomProfileSpec`),
   `ProfileVariantSummary`, and optional `variants` and `knobs` on
   `ProfileSummary`. `DatabaseSpec.version` stays `number` (1 or 2).
@@ -95,23 +104,31 @@ All notable public changes will be recorded here.
   build" instead of "encrypted storage required", and `RuntimeLimits` is
   labelled advisory catalog guidance that this build does not enforce (its
   values are unchanged).
-- Version 1 specs gain Advice only: `PROFILE_NOT_PROVISIONABLE` after
-  `CUSTOM_PROFILE` for unknown profiles, and `OVERRIDE_IS_METADATA_ONLY` for
-  `overrides` keys in a knob namespace (including Studio's `profile.custom.*`
-  keys). Their existing issues, order, status and plan ids are unchanged.
+- Version 1 specs gain only Advice and Warnings, no new Errors:
+  `PROFILE_NOT_PROVISIONABLE` after `CUSTOM_PROFILE` for unknown profiles,
+  `OVERRIDE_IS_METADATA_ONLY` for `overrides` keys in a knob namespace
+  (including Studio's `profile.custom.*` keys), and the Warning
+  `PROFILE_DEPLOYMENT_MISMATCH` for a volatile profile such as `in_memory`
+  with a `deployment.storage_path`. Their existing issues, order, status and
+  plan ids are unchanged.
 - A missing, non-integer or unsupported spec `version` is a validation issue
   (`MISSING_VERSION`, `UNSUPPORTED_VERSION`): the CLI exits 2 and the Control
-  Plane answers 422 (`/config/validate` with the report, `/config/plan` with
-  error code `invalid_spec_version`). A body without `version` was HTTP 400
-  `invalid_json` and CLI exit 1 before.
+  Plane answers 422 (`/config/validate` with the report in a success
+  envelope, `/config/plan` with an error envelope whose code is
+  `invalid_spec_version`). A body without `version` was HTTP 400
+  `invalid_json` and CLI exit 1 before. The OpenAPI snapshot documents the
+  `/config/plan` 422 response as a success or an error envelope
+  (`JsonObjectOrErrorEnvelope`).
 - Specs over 1 MiB (`SPEC_TOO_LARGE`) or over the YAML alias expansion budget
   (`SPEC_TOO_COMPLEX`) are rejected before the typed decode.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
-  with `StorageFormatMismatch` (previously an opaque serde error), and
-  encrypted metadata opened without a key fails with `MetadataUnreadable`
-  ("supply OperationalConfig.encryption"). `SchemaVersionMismatch` now reports
-  `expected: 2`, the newest version this build reads.
+  with `StorageFormatMismatch` (previously an opaque serde error). Every
+  `__meta` value (`schema_version`, `profile`, `replication`, `layout`) that
+  does not parse as JSON is now `ConfigError::MetadataUnreadable` instead of
+  `ConfigError::Serde`; for encrypted metadata opened without a key its
+  message says "supply OperationalConfig.encryption". `SchemaVersionMismatch`
+  now reports `expected: 2`, the newest version this build reads.
 - Restore builds its target from the profile manifest in the backup: a
   restored compressed manifest database is value-framed again, as its
   manifest says, and `verify_backup` covers such backups. A restore

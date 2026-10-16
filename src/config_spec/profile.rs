@@ -11,8 +11,8 @@ use serde::{
 use super::{
     CertificationImpact, CollectionRole, ConsistencyMode, DATABASE_SPEC_VERSION_V2, DatabaseSpec,
     ProfileSpec, SupportStatus, ValidationIssue, ValidationSeverity, built_in_profile,
-    built_in_profiles, hex_prefix, knobs::KNOB_REGISTRY, suggest, update_hash_with_json,
-    validation_issue,
+    built_in_profiles, custom_profile_requires_spec_v2, hex_prefix, knobs::KNOB_REGISTRY, suggest,
+    update_hash_with_json, validation_issue,
 };
 use crate::{
     db::Profile,
@@ -788,6 +788,7 @@ pub const fn profile_variants() -> &'static [ProfileVariant] {
 ///
 /// Version 1 documents keep their lenient behaviour: unknown names are `Unresolved`, and
 /// new checks are Warnings or Advice. Version 2 documents get the same checks as Errors.
+/// A version 1 document that sets `custom_profile` is `Invalid` with `FIELD_REQUIRES_SPEC_V2`.
 #[must_use]
 pub fn resolve_profile(spec: &DatabaseSpec) -> ProfileResolution {
     let context = ResolveContext {
@@ -797,10 +798,7 @@ pub fn resolve_profile(spec: &DatabaseSpec) -> ProfileResolution {
 
     if let Some(custom) = &spec.custom_profile {
         if !context.strict {
-            return ProfileResolution::Unresolved {
-                reason: "custom_profile requires DatabaseSpec version 2".to_owned(),
-                issues: Vec::new(),
-            };
+            return ProfileResolution::Invalid(vec![custom_profile_requires_spec_v2()]);
         }
         return resolve_custom(&spec.profile, custom, &context);
     }
@@ -1030,8 +1028,40 @@ pub(crate) fn derive_storage_profile(
     }
 }
 
+/// The resolver's Error checks that need only the final knobs: registry bounds, conflicts and
+/// planned `limits.*` other than `unlimited`. Reading a persisted manifest re-runs them, so a
+/// hand-built or edited manifest cannot carry knobs the resolver would refuse.
+pub(crate) fn check_knob_values(knobs: &ProfileKnobs) -> Vec<ValidationIssue> {
+    let mut issues = check_knob_ranges(knobs);
+    check_knob_conflicts(knobs, &mut issues);
+    for (path, value) in [
+        ("limits.max_value_bytes", knobs.limits.max_value_bytes),
+        ("limits.max_batch_ops", knobs.limits.max_batch_ops),
+    ] {
+        if matches!(value, Limit::Value(_)) {
+            issues.push(limit_not_enforced(path));
+        }
+    }
+    issues
+}
+
+/// `PROFILE_KNOB_NOT_ENFORCED` for a planned `limits.*` knob set to a value.
+fn limit_not_enforced(path: &str) -> ValidationIssue {
+    validation_issue(
+        "PROFILE_KNOB_NOT_ENFORCED",
+        ValidationSeverity::Error,
+        format!("{KNOB_PATH_PREFIX}.{path}"),
+        format!(
+            "{path} is planned but not enforced: no user write path checks it until the single \
+             write pipeline (#11) lands"
+        ),
+        format!("Remove {path} or set it to unlimited."),
+        CertificationImpact::BlocksCertified,
+    )
+}
+
 /// Checks every numeric knob against its `KNOB_REGISTRY` bounds.
-pub(crate) fn check_knob_ranges(knobs: &ProfileKnobs) -> Vec<ValidationIssue> {
+fn check_knob_ranges(knobs: &ProfileKnobs) -> Vec<ValidationIssue> {
     let value = match serde_json::to_value(knobs) {
         Ok(value) => value,
         Err(error) => {
@@ -1375,17 +1405,7 @@ fn overlay_knobs(
         ] {
             take(target, value, path, provenance);
             if matches!(value, Some(Limit::Value(_))) {
-                issues.push(validation_issue(
-                    "PROFILE_KNOB_NOT_ENFORCED",
-                    ValidationSeverity::Error,
-                    format!("{KNOB_PATH_PREFIX}.{path}"),
-                    format!(
-                        "{path} is planned but not enforced: no user write path checks it until \
-                         the single write pipeline (#11) lands"
-                    ),
-                    format!("Remove {path} or set it to unlimited."),
-                    CertificationImpact::BlocksCertified,
-                ));
+                issues.push(limit_not_enforced(path));
             }
         }
     }
@@ -2675,13 +2695,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_profile_in_a_v1_document_is_left_to_the_version_gate() {
+    fn custom_profile_in_a_v1_document_is_invalid() {
         let resolution = resolve_profile(&spec(1, "orders_custom", Some(custom("balanced"))));
-        let ProfileResolution::Unresolved { issues, reason } = &resolution else {
-            panic!("v1 custom_profile should be unresolved: {resolution:?}");
-        };
-        assert!(issues.is_empty());
-        assert!(reason.contains("version 2"));
+        assert_invalid_with(&resolution, "FIELD_REQUIRES_SPEC_V2");
+        assert_eq!(resolution.issues().len(), 1);
+        assert_eq!(resolution.issues()[0].path, "custom_profile");
+        assert_eq!(resolution.issues()[0].severity, ValidationSeverity::Error);
     }
 
     #[test]

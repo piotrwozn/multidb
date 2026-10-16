@@ -326,8 +326,9 @@ fn run_config_apply(args: &[String]) -> Result<CliRun, CliError> {
     ))
 }
 
-/// `config upgrade`: converts a spec to version 2 (see `upgrade_spec`), writes it in the input's
-/// format to `--out` or stdout, and exits 2 when the upgraded spec does not validate.
+/// `config upgrade`: converts a spec to version 2 (see `upgrade_spec`) and validates it. A valid
+/// result goes to `--out`, in the format its extension names, or to stdout in the input's
+/// format. An invalid result exits 2 and is never written to `--out`.
 fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
@@ -342,14 +343,20 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
 
     let (upgraded, notes) = upgrade_spec(spec);
     let report = GuaranteeValidator::validate(&upgraded);
-    let format = match spec_io::spec_format_for_path(&spec_path) {
-        SpecFormat::Yaml => "yaml",
-        SpecFormat::Json => "json",
-    };
+    let format =
+        match spec_io::spec_format_for_path(out_path.as_deref().unwrap_or(spec_path.as_path())) {
+            SpecFormat::Yaml => "yaml",
+            SpecFormat::Json => "json",
+        };
     let content = serialize_spec(&upgraded, format)?;
-    if let Some(out_path) = &out_path {
-        write_file_replacing(out_path, &content)?;
-    }
+    // An invalid result is not written: with `--force` it could replace a valid input.
+    let written = match &out_path {
+        Some(out_path) if report.valid => {
+            write_file_replacing(out_path, &content)?;
+            true
+        }
+        _ => false,
+    };
 
     let message = if output == "json" {
         let mut summary = json!({
@@ -359,11 +366,17 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
         });
         if let Some(out_path) = &out_path {
             summary["path"] = json!(out_path.display().to_string());
+            summary["written"] = json!(written);
         }
         serde_json::to_string_pretty(&summary)?
     } else if let Some(out_path) = &out_path {
         let mut lines = vec![format!(
-            "upgraded config path={} version={} profile={} status={:?} valid={}",
+            "{} path={} version={} profile={} status={:?} valid={}",
+            if written {
+                "upgraded config"
+            } else {
+                "upgraded config not written (invalid)"
+            },
             out_path.display(),
             upgraded.version,
             upgraded.profile,
@@ -816,7 +829,8 @@ fn run_profile_show_db(path: &Path, output: &str) -> Result<CliRun, CliError> {
 }
 
 /// `profile explain --spec <file>`: the resolver result for a spec. Exit 2 when the profile is
-/// invalid; a version 1 spec whose profile cannot be resolved is reported, with exit 0.
+/// invalid, including a version 1 spec that sets `custom_profile`; a version 1 spec whose
+/// profile name is not built in is reported as unresolved, with exit 0.
 fn run_profile_explain(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
@@ -4305,6 +4319,21 @@ mod tests {
             text.message
         );
 
+        spec.version = 1;
+        write_yaml_spec(&spec_path, &spec)?;
+        let v1_custom = explain(true)?;
+        assert_eq!(v1_custom.exit_code, 2);
+        let report = json_message(&v1_custom)?;
+        assert_eq!(report["resolution"], "invalid");
+        assert!(has_issue(&report, "FIELD_REQUIRES_SPEC_V2"), "{report}");
+        let v1_custom_text = explain(false)?;
+        assert_eq!(v1_custom_text.exit_code, 2);
+        assert!(
+            v1_custom_text.message.contains("FIELD_REQUIRES_SPEC_V2"),
+            "{}",
+            v1_custom_text.message
+        );
+
         let mut legacy = DatabaseSpec::from_db_config(
             "legacy",
             &DbConfig::on_disk(Profile::Transactional, "legacy.redb"),
@@ -4517,6 +4546,82 @@ mod tests {
         assert!(
             has_issue(&report["validation"], "PROFILE_UNKNOWN"),
             "{report}"
+        );
+
+        // An invalid result never replaces a file, not even the input with --force.
+        let original = std::fs::read_to_string(&input)?;
+        let forced = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&input),
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 2);
+        assert!(
+            forced.message.contains("not written") && forced.message.contains("PROFILE_UNKNOWN"),
+            "{}",
+            forced.message
+        );
+        assert_eq!(std::fs::read_to_string(&input)?, original);
+        let out = temp.path().join("upgraded.yaml");
+        let json = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&out),
+            "--json",
+        ]))?;
+        assert_eq!(json.exit_code, 2);
+        assert_eq!(json_message(&json)?["written"], false);
+        assert!(!out.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_writes_the_format_of_the_out_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let input = temp.path().join("studio.yaml");
+        write_yaml_spec(&input, &studio_style_spec())?;
+        let json_out = temp.path().join("v2.json");
+
+        let upgraded = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&json_out),
+        ]))?;
+        assert_eq!(upgraded.exit_code, 0, "{}", upgraded.message);
+        let written = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&json_out)?)?;
+        assert_eq!(written.version, 2);
+        let validated = run(strings(&[
+            "config",
+            "validate",
+            "--spec",
+            &path_arg(&json_out),
+        ]))?;
+        assert_eq!(validated.exit_code, 0, "{}", validated.message);
+
+        let yaml_out = temp.path().join("v2-again.yml");
+        let again = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&json_out),
+            "--out",
+            &path_arg(&yaml_out),
+        ]))?;
+        assert_eq!(again.exit_code, 0, "{}", again.message);
+        assert_eq!(
+            serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&yaml_out)?)?,
+            written
         );
         Ok(())
     }

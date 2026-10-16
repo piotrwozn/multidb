@@ -86,7 +86,8 @@ multidb profile knobs
   created with, or "legacy database" for databases without one. It never
   creates a file.
 - `profile explain --spec <file>` resolves the profile of a spec; it exits 2
-  when the profile is invalid.
+  when the profile is invalid, including a version 1 spec that sets
+  `custom_profile` (`FIELD_REQUIRES_SPEC_V2`).
 - `init --guided --profile <profile> --override path=value [--profile-name <slug>]`
   writes a version 2 spec whose `custom_profile` extends `<profile>`. Without
   `--override`, guided init writes the same version 1 spec as before; an alias
@@ -95,8 +96,10 @@ multidb profile knobs
 - `config upgrade --spec <file> [--out <file>] [--force]` converts a spec to
   version 2 and turns the `profile.custom.*` keys of older Studio specs into
   a real `custom_profile` (the current Studio builder writes `custom_profile`
-  itself). It is idempotent, keeps the input format, does not keep YAML
-  comments and refuses to overwrite a file without `--force`.
+  itself). It is idempotent, writes `--out` in the format of its extension
+  (stdout keeps the input format), does not keep YAML comments, refuses to
+  overwrite a file without `--force`, and never writes a result that does not
+  validate (exit 2).
 - Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
   (as before), a product slug or alias in snake or kebab case, or `auto`,
   which reads the storage profile and replication of the existing database.

@@ -3204,8 +3204,17 @@ fn legacy_framed_database_needs_ops_compression() -> Result<(), Box<dyn std::err
         Err(error) => panic!("expected a storage format mismatch, got {error:?}"),
         Ok(_) => panic!("a framed legacy database opened without compression"),
     }
+    // refuse_profile_manifest_reports_single_node_only pins the framed refusal of the CP and AP
+    // openers directly; a CP constructor may refuse the cluster before it reads metadata.
     assert!(matches!(
         open_cluster_database(config.clone(), cp_cluster_config()),
+        Err(ConfigError::StorageFormatMismatch(_) | ConfigError::Unsupported(_))
+    ));
+    let ap_config = DbConfig::on_disk(Profile::Transactional, temp_dir.path().join("ap.redb"))
+        .with_replication(ReplicationKind::Ap);
+    drop(create_database_with_ops(ap_config.clone(), ops.clone())?);
+    assert!(matches!(
+        open_ap_database(ap_config, ap_cluster_config()),
         Err(ConfigError::StorageFormatMismatch(_))
     ));
 
@@ -3335,6 +3344,36 @@ fn metadata_reader_revalidates_profile_manifests() -> Result<(), Box<dyn std::er
             MetadataProbe::Unreadable { .. }
         ));
     }
+
+    // In-range values the resolver still refuses: a planned limit and two knob conflicts.
+    let refused: [(&str, ManifestEdit, &str); 3] = [
+        (
+            "planned-limit.redb",
+            |manifest| manifest["knobs"]["limits"]["max_value_bytes"] = json!(4_096),
+            "planned but not enforced",
+        ),
+        (
+            "cache-conflict.redb",
+            |manifest| manifest["knobs"]["cache"]["max_entries"] = json!(0),
+            "cache.max_entries is 0",
+        ),
+        (
+            "retention-conflict.redb",
+            |manifest| manifest["knobs"]["time_series"]["default_retention_millis"] = json!(1_000),
+            "shorter than",
+        ),
+    ];
+    for (name, edit, expected) in refused {
+        let path = manifest_database(temp_dir.path(), name)?;
+        edit_raw_manifest(&path, edit)?;
+        match open_database(DbConfig::on_disk(Profile::Balanced, &path)) {
+            Err(ConfigError::ProfileManifestInvalid(message)) => {
+                assert!(message.contains(expected), "{name}: {message}");
+            }
+            Err(error) => panic!("{name}: expected an invalid manifest, got {error:?}"),
+            Ok(_) => panic!("{name}: a refused knob drove the runtime"),
+        }
+    }
     Ok(())
 }
 
@@ -3367,6 +3406,80 @@ fn encrypted_metadata_without_key_is_unreadable() -> Result<(), Box<dyn std::err
                 "{reason}"
             );
             assert!(reason.contains("supply OperationalConfig.encryption"));
+        }
+        other => panic!("expected unreadable metadata, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn encrypted_compressed_profile_manifest_reopens_only_with_its_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("encrypted-zstd.redb");
+    let key_path = temp_dir.path().join("key.bin");
+    std::fs::write(&key_path, [7_u8; 32])?;
+    let encrypted = OperationalConfig::new().with_encryption(EncryptionConfig::file_key(&key_path));
+    let binding = named_binding(
+        "balanced",
+        json!({ "compression": { "algorithm": "zstd" }, "cache": { "max_entries": 8192 } }),
+        ReplicationKind::Cp,
+        Some(&path),
+    )?;
+    assert!(binding.manifest.storage_format.value_framing);
+    let value = b"encrypted framed value ".repeat(128);
+
+    {
+        let database = create_database_with_profile(&binding, encrypted.clone())?;
+        assert_eq!(database.engine_kind(), EngineKind::CompressedEncryptedRedb);
+        database.propose(Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: value.clone(),
+        })?;
+    }
+
+    // Values are compressed, then encrypted: on disk every value is an encryption frame.
+    for (table, key) in [
+        (META_TABLE, KEY_SCHEMA_VERSION),
+        (META_TABLE, KEY_PROFILE_MANIFEST),
+        ("t", b"k".as_slice()),
+    ] {
+        let raw = raw_value(&path, table, key)?.ok_or("value missing")?;
+        assert!(raw.starts_with(b"MDBE"), "{table} is not encrypted");
+    }
+
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    {
+        // No OperationalConfig.performance: the manifest supplies compression and the cache.
+        let database = open_database_with_ops(config.clone(), &encrypted)?;
+        assert_eq!(database.engine_kind(), EngineKind::CompressedEncryptedRedb);
+        assert_eq!(
+            database.read("t", b"k", ReadConsistency::Strong)?,
+            Some(value)
+        );
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.performance_config().cache.max_capacity, 8192);
+        assert_eq!(
+            database.performance_config().compression.algorithm,
+            CompressionAlgorithm::Zstd
+        );
+    }
+
+    match open_database(config) {
+        Err(ConfigError::MetadataUnreadable { key, reason }) => {
+            assert_eq!(key, "schema_version");
+            assert!(reason.contains("MDBE"), "{reason}");
+        }
+        Err(error) => panic!("expected unreadable metadata, got {error:?}"),
+        Ok(_) => panic!("an encrypted manifest database opened without a key"),
+    }
+    match inspect_database_metadata(&path) {
+        MetadataProbe::Unreadable { reason } => {
+            assert!(
+                reason.contains("supply OperationalConfig.encryption"),
+                "{reason}"
+            );
         }
         other => panic!("expected unreadable metadata, got {other:?}"),
     }
@@ -3606,6 +3719,47 @@ fn compiled_policy_binding_creates_a_manifest_database() -> Result<(), Box<dyn s
         unresolved.binding(&spec.deployment, Some(path)),
         Err(ConfigError::Unsupported(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn compiled_policy_binding_refuses_a_path_for_a_volatile_class()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Version 1 only warns about a volatile profile with a storage path, so it compiles.
+    let mut spec = decode_spec_bytes(
+        include_str!("../../tests/fixtures/spec-v1/game-save.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    spec.profile = "in_memory".to_owned();
+    spec.deployment.storage_path = Some("game.redb".to_owned());
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    assert_eq!(
+        compiled
+            .resolved_profile
+            .as_ref()
+            .map(|resolved| resolved.storage_profile),
+        Some(Profile::InMemory)
+    );
+    let volatile_with_path = |result: Result<RuntimeProfileBinding, ConfigError>| {
+        matches!(
+            result,
+            Err(ConfigError::VolatileWithPath {
+                profile: Profile::InMemory
+            })
+        )
+    };
+    assert!(volatile_with_path(compiled.binding(&spec.deployment, None)));
+
+    let mut without_path = spec.deployment.clone();
+    without_path.storage_path = None;
+    assert!(volatile_with_path(
+        compiled.binding(&without_path, Some("x.redb".into()))
+    ));
+
+    let memory = compiled.binding(&without_path, None)?;
+    assert_eq!(memory.db_config.path, None);
+    let database = create_database_with_profile(&memory, OperationalConfig::new())?;
+    assert_eq!(database.engine_kind(), EngineKind::Memory);
     Ok(())
 }
 

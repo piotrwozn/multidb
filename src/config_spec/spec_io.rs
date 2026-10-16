@@ -135,7 +135,9 @@ pub fn read_spec_file(path: &Path) -> Result<DatabaseSpec, SpecIoError> {
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_SPEC_BYTES {
-        let found = fs::metadata(path).map_or_else(|_| byte_count(&bytes), |meta| meta.len());
+        // Pipes, FIFOs and procfs files report length 0; the bytes read are a lower bound.
+        let read = byte_count(&bytes);
+        let found = fs::metadata(path).map_or(read, |meta| meta.len().max(read));
         return Err(SpecIoError::TooLarge {
             limit: MAX_SPEC_BYTES,
             found,

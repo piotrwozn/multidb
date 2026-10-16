@@ -18,7 +18,7 @@ use super::{
 };
 use crate::config_spec::{
     CompiledPolicy, CompressionKnob, DeploymentMode, DeploymentSpec, ProfileKnobs, ResolvedProfile,
-    ResolvedProfileKind, TopologySpec, check_knob_ranges, derive_storage_profile, product_variant,
+    ResolvedProfileKind, TopologySpec, check_knob_values, derive_storage_profile, product_variant,
 };
 use crate::performance::{CompressionConfig, PerformanceConfig};
 use crate::query::TableLayout;
@@ -142,12 +142,13 @@ impl ResolvedProfile {
 
 impl CompiledPolicy {
     /// Binds the resolved profile of this policy to a single-node database at
-    /// `path_override`, or else at `deployment.storage_path`. The path is used only for a
-    /// durable storage class.
+    /// `path_override`, or else at `deployment.storage_path`.
     /// # Errors
     /// Fails with `Unsupported` when the profile did not resolve, for cluster deployments and
     /// for any topology other than one replica and one shard; otherwise as
-    /// [`ResolvedProfile::bind`].
+    /// [`ResolvedProfile::bind`]. In particular a volatile storage class with either path is
+    /// `VolatileWithPath`, although a version 1 spec only warns about it
+    /// (`PROFILE_DEPLOYMENT_MISMATCH`): binding never drops a path the caller gave.
     pub fn binding(
         &self,
         deployment: &DeploymentSpec,
@@ -174,11 +175,7 @@ impl CompiledPolicy {
             )));
         }
 
-        let path = if resolved.storage_profile.is_on_disk() {
-            path_override.or_else(|| deployment.storage_path.as_deref().map(PathBuf::from))
-        } else {
-            None
-        };
+        let path = path_override.or_else(|| deployment.storage_path.as_deref().map(PathBuf::from));
         resolved.bind(self.replication_kind.into(), path)
     }
 }
@@ -376,7 +373,8 @@ pub(crate) fn decode_profile_manifest(
 }
 
 /// Re-validates a manifest before it drives the runtime: it must describe the storage profile
-/// recorded in `__meta`, every knob must be in range, the knobs must derive that storage class
+/// recorded in `__meta`, the knobs must pass the resolver's value checks (registry bounds, knob
+/// conflicts, planned `limits.*` left `unlimited`), the knobs must derive that storage class
 /// under the recorded variant, and the storage format must agree with the compression knobs.
 pub(crate) fn validate_manifest(
     manifest: &PersistedProfileManifest,
@@ -392,7 +390,7 @@ pub(crate) fn validate_manifest(
             manifest.storage_profile
         ));
     }
-    if let Some(issue) = check_knob_ranges(&manifest.knobs).first() {
+    if let Some(issue) = check_knob_values(&manifest.knobs).first() {
         return invalid(format!("{}: {}", issue.path, issue.message));
     }
     let Some((product, variant)) = product_variant(&manifest.product_profile, &manifest.variant)

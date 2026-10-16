@@ -3671,6 +3671,78 @@ mod tests {
         Ok(())
     }
 
+    /// Every 422 body that `/config/validate` and `/config/plan` send has an envelope shape the
+    /// `OpenAPI` snapshot documents for that status.
+    #[tokio::test]
+    async fn phase52_config_unprocessable_bodies_match_openapi()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let openapi: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        let current = DatabaseSpec::from_db_config(
+            "current",
+            &DbConfig::on_disk(Profile::Balanced, "current.redb"),
+        );
+        let mut invalid = current.clone();
+        invalid.guarantees.write_ack = crate::config_spec::WriteAck::Local;
+        let mut version_3 = serde_json::to_value(&current)?;
+        version_3["version"] = serde_json::json!(3);
+
+        let cases = [
+            ("/config/validate", serde_json::to_value(&invalid)?, true),
+            ("/config/validate", version_3.clone(), true),
+            (
+                "/config/plan",
+                serde_json::json!({ "current": current, "desired": invalid }),
+                true,
+            ),
+            (
+                "/config/plan",
+                serde_json::json!({ "current": current, "desired": version_3 }),
+                false,
+            ),
+        ];
+        for (path, request, ok) in cases {
+            let response = super::router(test_state()?)
+                .oneshot(authed_request(Method::POST, path, Some(&request))?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], ok, "{path}: {body}");
+            assert!(
+                openapi_documents_envelope(&openapi, path, "422", ok)?,
+                "OpenAPI {path} 422 does not document an ok={ok} envelope"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the documented `status` response of `POST path` admits an envelope with this
+    /// `ok` value: its schema, or one of its `oneOf` alternatives, fixes `ok` to it.
+    fn openapi_documents_envelope(
+        openapi: &Value,
+        path: &str,
+        status: &str,
+        ok: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let operation = resolve_openapi_operation(openapi, &openapi["paths"][path]["post"])?;
+        let response = resolve_openapi_operation(openapi, &operation["responses"][status])?;
+        let schema = &response["content"]["application/json"]["schema"];
+        let alternatives = match schema.get("oneOf").and_then(Value::as_array) {
+            Some(alternatives) => alternatives.iter().collect::<Vec<_>>(),
+            None => vec![schema],
+        };
+        for alternative in alternatives {
+            let resolved = resolve_openapi_operation(openapi, alternative)?;
+            if resolved["properties"]["ok"]["const"] == ok {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[tokio::test]
     async fn phase52_openapi_is_public_and_available_with_api_prefix()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -754,6 +754,120 @@ mod tests {
         }
     }
 
+    /// The knob reference table of docs/profiles.md agrees with `KNOB_REGISTRY`: one row per
+    /// registry path, in registry order, with the registry's bounds, timing, enforcement and
+    /// after-creation policy. A cell may add prose after the registry value (`, ...`, `: ...`,
+    /// ` (...)`); the runtime sink column is prose and is not compared.
+    #[test]
+    fn profiles_doc_knob_table_matches_the_registry() -> Result<(), Box<dyn std::error::Error>> {
+        let doc = include_str!("../../docs/profiles.md");
+        let rows = doc
+            .lines()
+            .filter_map(|line| {
+                let cells = line
+                    .trim()
+                    .strip_prefix('|')?
+                    .strip_suffix('|')?
+                    .replace("\\|", "\u{0}")
+                    .split('|')
+                    .map(|cell| cell.trim().replace('\u{0}', "|"))
+                    .collect::<Vec<_>>();
+                let path = cells
+                    .first()?
+                    .strip_prefix('`')?
+                    .strip_suffix('`')?
+                    .to_owned();
+                (cells.len() == 6 && knob_definition(&path).is_some()).then_some((path, cells))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            KNOB_REGISTRY
+                .iter()
+                .map(|definition| definition.path)
+                .collect::<Vec<_>>(),
+            "docs/profiles.md knob rows differ from KNOB_REGISTRY"
+        );
+
+        for (path, cells) in &rows {
+            let definition = knob_definition(path).ok_or("unknown path")?;
+            let enforcement = match definition.enforcement {
+                KnobEnforcement::Enforced => "enforced".to_owned(),
+                KnobEnforcement::Planned { tracking } => format!("planned ({tracking})"),
+                KnobEnforcement::Declarative => "declarative".to_owned(),
+            };
+            let expected = [
+                (
+                    "type and bounds",
+                    definition.value_type.describe(),
+                    expand_units(&cells[1])?,
+                ),
+                ("timing", snake_label(definition.timing)?, cells[2].clone()),
+                ("enforcement", enforcement, cells[4].clone()),
+                (
+                    "after creation",
+                    snake_label(definition.after_creation)?,
+                    cells[5].clone(),
+                ),
+            ];
+            for (column, registry, documented) in expected {
+                let agrees = documented == registry
+                    || documented
+                        .strip_prefix(registry.as_str())
+                        .is_some_and(|rest| rest.starts_with([',', ':', ' ', ';']));
+                assert!(
+                    agrees,
+                    "docs/profiles.md {path} {column}: documented {documented:?}, registry \
+                     {registry:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The serde name of a registry enum, with `_` read as a space as the docs spell it.
+    fn snake_label(value: impl serde::Serialize) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(serde_json::to_value(value)?
+            .as_str()
+            .ok_or("not a unit variant")?
+            .replace('_', " "))
+    }
+
+    /// Rewrites `64 MiB` style sizes in a docs cell to the byte counts the registry uses.
+    fn expand_units(cell: &str) -> Result<String, Box<dyn std::error::Error>> {
+        const UNITS: [(&str, u64); 4] = [
+            (" KiB", 1 << 10),
+            (" MiB", 1 << 20),
+            (" GiB", 1 << 30),
+            (" TiB", 1 << 40),
+        ];
+        let mut expanded = String::new();
+        let mut rest = cell;
+        while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+            expanded.push_str(&rest[..start]);
+            rest = &rest[start..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let (digits, after) = rest.split_at(end);
+            if let Some((unit, factor)) = UNITS.iter().find(|(unit, _)| after.starts_with(unit)) {
+                let bytes = digits
+                    .parse::<u64>()?
+                    .checked_mul(*factor)
+                    .ok_or("size overflows u64")?;
+                expanded.push_str(&bytes.to_string());
+                rest = &after[unit.len()..];
+            } else {
+                expanded.push_str(digits);
+                rest = after;
+            }
+        }
+        expanded.push_str(rest);
+        Ok(expanded)
+    }
+
     #[test]
     fn knob_assignments_parse_and_apply() -> Result<(), Box<dyn std::error::Error>> {
         let mut knobs = ProfileKnobOverrides::default();

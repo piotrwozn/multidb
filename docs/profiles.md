@@ -145,7 +145,7 @@ profile.
 | `floors.backup` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR`, or `PRODUCTION_BACKUP_DISABLED` for production_cp (`guarantees.backup.enabled`) | enforced | not applicable |
 | `floors.pitr` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.backup.pitr`) | enforced | not applicable |
 | `floors.encryption_at_rest` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.encryption.at_rest`) | enforced | not applicable |
-| `compatible_roles` | role set, changed with `add` / `remove` | validation | `ROLE_OUTSIDE_PROFILE_CERTIFICATION` | enforced | not applicable |
+| `compatible_roles` | a set of collection roles, changed with `add` / `remove` | validation | `ROLE_OUTSIDE_PROFILE_CERTIFICATION` | enforced | not applicable |
 
 `auto` keeps the storage profile default; `null` retention keeps data forever.
 `IoConfig.read_ahead`, `CacheConfig.scan_bypass_threshold_rows` and the
@@ -240,8 +240,9 @@ deployment: { mode: single_node, storage_path: orders.redb }
 ```
 
 It validates as `valid=true status=Custom`, with storage class
-HighDurability. Provenance marks compression, cache, query and history as
-`override` and the other leaves as `variant` or `preset`.
+HighDurability. Provenance marks compression, cache, query, history,
+`floors.audit`, `floors.backup` and `compatible_roles` as `override` and the
+other leaves as `variant` or `preset`.
 
 - **`profile`** is the custom slug. It must match `^[a-z][a-z0-9_]{2,63}$` and
   must not equal a built-in slug or alias after normalisation.
@@ -322,9 +323,10 @@ and the Control Plane read every spec through `multidb::config_spec::spec_io`:
 Size, complexity and version problems are validation issues: the CLI exits 2
 (with `--json`, the report is printed as JSON) and the Control Plane answers
 422. `/config/validate` returns the report as `data`; `/config/plan` cannot
-build a plan from such a spec and answers with the error code
-`invalid_spec_version`. Syntax errors and decode errors keep exit code 1 and
-HTTP 400 `invalid_json`.
+build a plan from such a spec and answers with an error envelope whose code is
+`invalid_spec_version`, so the OpenAPI snapshot documents its 422 response as
+a success or an error envelope (`JsonObjectOrErrorEnvelope`). Syntax errors
+and decode errors keep exit code 1 and HTTP 400 `invalid_json`.
 
 ### Compiled policy, explain and plans
 
@@ -365,9 +367,11 @@ path), the `PerformanceConfig` the knobs produce and the
 `PersistedProfileManifest`. It keeps the `DbConfig` path rules: a volatile
 class takes no path, a durable class needs one. For a compiled spec,
 `CompiledPolicy::binding(&deployment, path)` does the same with the path
-argument or else `deployment.storage_path`, used only for a durable class; it
-refuses an unresolved profile, `deployment.mode: cluster` and any topology
-other than one replica and one shard with `Unsupported`.
+argument or else `deployment.storage_path`, under the same rules: a volatile
+class with either path is `VolatileWithPath`, even for a version 1 spec, where
+validation only warns (`PROFILE_DEPLOYMENT_MISMATCH`). It refuses an
+unresolved profile, `deployment.mode: cluster` and any topology other than one
+replica and one shard with `Unsupported`.
 
 `db::create_database_with_profile(&binding, ops)` creates a new single-node
 database from a binding:
@@ -385,11 +389,12 @@ product profile, the variant, `extends`, the storage profile, every knob, the
 storage format (`value_framing` and the compression settings), the digest and
 the crate version that wrote it. It is re-validated on every read: its storage
 profile must equal `__meta.profile`, every knob must be within its registry
-bounds, the knobs must derive the recorded storage class under the recorded
-variant, and the storage format must agree with the compression knobs. A
-failure is `ProfileManifestInvalid`, and a newer `manifest_version` is
-`UnsupportedProfileManifest`, so a corrupt or hand-edited manifest never
-drives the runtime.
+bounds, the knobs must pass the resolver's conflict checks and leave the
+planned `limits.*` knobs `unlimited`, the knobs must derive the recorded
+storage class under the recorded variant, and the storage format must agree
+with the compression knobs. A failure is `ProfileManifestInvalid`, and a
+newer `manifest_version` is `UnsupportedProfileManifest`, so a corrupt or
+hand-edited manifest never drives the runtime.
 
 Every single-node opener (`create_database`, `open_database`,
 `create_database_with_ops`, `open_database_with_ops`) re-applies the manifest:
@@ -421,6 +426,12 @@ open exactly as before; plain `create_database` and `serve` never write one.
   `OperationalConfig.performance.compression` with `StorageFormatMismatch`;
   enabling compression later is a provisioning format upgrade, which this
   build does not perform.
+- Downgrades of a manifest database without compression do not fail closed:
+  it keeps `schema_version` 1, so an older binary opens it, ignores
+  `__meta.profile_manifest` and runs with the storage profile defaults
+  (`PerformanceConfig::for_profile`). Every knob, including query timeouts,
+  `max_sql_bytes`, `max_concurrent_queries` and the cache size, reverts until
+  a binary that reads manifests opens the database again.
 - Metadata reads tolerate frames. A legacy database (no manifest) created with
   `create_database_with_ops` and compression has framed values and must still
   be opened with `OperationalConfig.performance.compression`; any opener
@@ -493,7 +504,7 @@ exactly as a normal open would, and drops the handle before returning.
 | `profile list [--json]` | the six product profiles; JSON adds `variants` (`name`, `storage_profile`, `canonical`) and the canonical variant's `knobs`, text adds `variants=` | 0 |
 | `profile show <profile> [--override path=value]... [--json]` | the resolved profile: a header naming the product, variant, status and storage profile, the digest, and one row per knob with its value, source (`preset`, `variant`, `override`), timing, enforcement and sink | 0, or 2 when the profile is invalid |
 | `profile show --db <path> [--json]` | the profile manifest of the database, or `legacy database: storage profile X, no manifest`; JSON prints the `inspect_database_metadata` result | 0, or 1 when nothing, an uninitialized file, a locked or an unreadable database is found |
-| `profile explain --spec <file> [--json]` | `resolve_profile` for a spec read through `spec_io`; JSON has `resolution` (`resolved`, `unresolved`, `invalid`), `profile`, `rows` and `issues` | 0 for resolved and version 1 unresolved profiles, 2 when invalid or when the spec cannot be read (`SPEC_TOO_LARGE`, `UNSUPPORTED_VERSION`, ...) |
+| `profile explain --spec <file> [--json]` | `resolve_profile` for a spec read through `spec_io`; JSON has `resolution` (`resolved`, `unresolved`, `invalid`), `profile`, `rows` and `issues` | 0 for resolved and version 1 unresolved profiles, 2 when invalid (including `FIELD_REQUIRES_SPEC_V2` for a version 1 spec that sets `custom_profile`) or when the spec cannot be read (`SPEC_TOO_LARGE`, `UNSUPPORTED_VERSION`, ...) |
 | `profile knobs [--json]` | every `KNOB_REGISTRY` entry, then the reserved knobs marked `reserved` | 0 |
 
 `--override path=value` may be repeated or hold a comma-separated list. It
@@ -529,14 +540,17 @@ converts a spec to version 2:
   those keys are removed; every other key, `studio.builder` included, stays;
 - it is deterministic and idempotent: upgrading the output again gives the
   same bytes;
-- the output keeps the input's format and goes to stdout without `--out`
-  (notes and an invalid validation report go to stderr then); `--json` prints
-  `{spec, notes, validation}`;
+- `--out` gets the format its extension names (`.yaml`/`.yml` is YAML,
+  anything else JSON); without `--out` the output keeps the input's format
+  and goes to stdout (notes and an invalid validation report go to stderr
+  then); `--json` prints `{spec, notes, validation}`, plus `path` and
+  `written` with `--out`;
 - it refuses to overwrite an existing file, the input included, without
   `--force`, and replaces files by writing a sibling file and renaming it;
 - the result is validated: exit 2 when it is invalid, for example
   `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
-  `profile.custom.base`.
+  `profile.custom.base`, and an invalid result is never written to `--out`,
+  so `--force` cannot replace a valid input with it.
 
 It re-serializes the spec, so YAML comments and formatting are not kept and
 defaulted fields such as `topology` are written out. Knob-like `overrides`
@@ -567,9 +581,13 @@ exact profile.
 
 `GET /profiles` lists the six product profiles. Each entry carries
 `variants` (`name`, `storage_profile`, `canonical`; exactly one variant is
-canonical) and `knobs`, the preset knobs of the canonical variant, in the
-same JSON form as `custom_profile.knobs`. `/config/validate` and
-`/config/plan` accept version 1 and version 2 specs (see
+canonical) and `knobs`, the fully resolved `ProfileKnobs` of the canonical
+variant. Its knob sections use the same leaf names and value forms as
+`custom_profile.knobs`, but it also holds `floors` and `compatible_roles` (the
+full role set), which a spec sets through `custom_profile.floors` and
+`custom_profile.compatible_roles.add`/`remove`, not inside
+`custom_profile.knobs`. `/config/validate` and `/config/plan` accept version
+1 and version 2 specs (see
 [Reading specs](#reading-specs-size-version-and-yaml-limits)). No Control
 Plane endpoint creates a database from a spec in this build.
 

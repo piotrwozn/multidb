@@ -37,7 +37,7 @@ pub use profile::{
     StorageMedium, StorageOverrides, SystemVersioningKnob, TimeSeriesKnobs, TimeSeriesOverrides,
     profile_variants, resolve_named_profile, resolve_profile, suggest_profile_name,
 };
-pub(crate) use profile::{check_knob_ranges, derive_storage_profile, product_variant};
+pub(crate) use profile::{check_knob_values, derive_storage_profile, product_variant};
 pub use schema::database_spec_v1_schema;
 pub use schema_v2::database_spec_v2_schema;
 
@@ -1276,323 +1276,328 @@ impl DatabaseSpec {
 impl GuaranteeValidator {
     #[must_use]
     pub fn validate(spec: &DatabaseSpec) -> ValidationReport {
-        validate_spec(spec).0
+        Self::validate_with_resolution(spec).0
     }
-}
 
-/// Validates `spec` and also returns the profile resolution the report was built from, so the
-/// compiler and explainer resolve the profile once. The resolution is `None` only when the
-/// structure is invalid.
-fn validate_spec(spec: &DatabaseSpec) -> (ValidationReport, Option<ProfileResolution>) {
-    let mut issues = Vec::new();
+    /// Validates `spec` and also returns the profile resolution the report was built from, so the
+    /// compiler and explainer resolve the profile once. The resolution is `None` only when the
+    /// structure is invalid.
+    fn validate_with_resolution(
+        spec: &DatabaseSpec,
+    ) -> (ValidationReport, Option<ProfileResolution>) {
+        let mut issues = Vec::new();
 
-    if let Err(error) = spec.validate_structure() {
-        issues.push(validation_issue(
-            "STRUCTURE_INVALID",
-            ValidationSeverity::Error,
-            "$",
-            format!("DatabaseSpec structure is invalid: {error}"),
-            "Fix the structural DatabaseSpec error before checking product guarantees.",
-            CertificationImpact::BlocksCertified,
-        ));
-        return (
-            ValidationReport {
-                valid: false,
-                status: SupportStatus::Invalid,
-                issues,
-            },
-            None,
-        );
-    }
-    issues.extend(spec_version_gate(spec));
-
-    let strict = spec.version >= DATABASE_SPEC_VERSION_V2;
-    let resolution = resolve_profile(spec);
-    let mut status = spec.catalog_support_status_without_guarantees();
-    let profile = built_in_profile(&spec.profile);
-    // Version 1 keeps every existing issue where it was: the resolver's new Warnings and
-    // Advice go last, except PROFILE_NOT_PROVISIONABLE, which explains CUSTOM_PROFILE.
-    let mut trailing_issues = Vec::new();
-    if strict {
-        issues.extend(resolution.issues().iter().cloned());
-    } else {
-        if profile.is_none() {
+        if let Err(error) = spec.validate_structure() {
             issues.push(validation_issue(
-                "CUSTOM_PROFILE",
-                ValidationSeverity::Warning,
-                "profile",
-                format!(
-                    "profile {} is not part of the built-in support catalog",
-                    spec.profile
-                ),
-                "Use a built-in profile or treat this configuration as Custom.",
-                CertificationImpact::DowngradesToCustom,
+                "STRUCTURE_INVALID",
+                ValidationSeverity::Error,
+                "$",
+                format!("DatabaseSpec structure is invalid: {error}"),
+                "Fix the structural DatabaseSpec error before checking product guarantees.",
+                CertificationImpact::BlocksCertified,
             ));
+            return (
+                ValidationReport {
+                    valid: false,
+                    status: SupportStatus::Invalid,
+                    issues,
+                },
+                None,
+            );
         }
-        for issue in resolution.issues() {
-            if issue.code == "PROFILE_NOT_PROVISIONABLE" {
-                issues.push(issue.clone());
-            } else {
-                trailing_issues.push(issue.clone());
+        issues.extend(spec_version_gate(spec));
+
+        let strict = spec.version >= DATABASE_SPEC_VERSION_V2;
+        let resolution = resolve_profile(spec);
+        let mut status = spec.catalog_support_status_without_guarantees();
+        let profile = built_in_profile(&spec.profile);
+        // Version 1 keeps every existing issue where it was: the resolver's new Warnings and
+        // Advice go last, except PROFILE_NOT_PROVISIONABLE, which explains CUSTOM_PROFILE.
+        let mut trailing_issues = Vec::new();
+        if strict {
+            issues.extend(resolution.issues().iter().cloned());
+        } else {
+            if profile.is_none() {
+                issues.push(validation_issue(
+                    "CUSTOM_PROFILE",
+                    ValidationSeverity::Warning,
+                    "profile",
+                    format!(
+                        "profile {} is not part of the built-in support catalog",
+                        spec.profile
+                    ),
+                    "Use a built-in profile or treat this configuration as Custom.",
+                    CertificationImpact::DowngradesToCustom,
+                ));
+            }
+            for issue in resolution.issues() {
+                match issue.code.as_str() {
+                    // Already reported by the version gate.
+                    "FIELD_REQUIRES_SPEC_V2" => {}
+                    "PROFILE_NOT_PROVISIONABLE" => issues.push(issue.clone()),
+                    _ => trailing_issues.push(issue.clone()),
+                }
             }
         }
-    }
 
-    validate_topology(spec, &mut issues);
+        validate_topology(spec, &mut issues);
 
-    let certified_roles = match resolution.resolved() {
-        Some(resolved) => Some((
-            if resolved.kind == ResolvedProfileKind::Custom {
-                resolved.slug.clone()
-            } else {
-                resolved.product_profile.clone()
-            },
-            resolved.kind == ResolvedProfileKind::Custom,
-            resolved.knobs.compatible_roles.clone(),
-        )),
-        None => profile.map(|profile| {
-            (
-                profile.slug.to_owned(),
-                false,
-                profile.compatible_roles.iter().copied().collect(),
-            )
-        }),
-    };
-    if let Some((slug, custom, roles)) = certified_roles {
-        for (index, collection) in spec.collections.iter().enumerate() {
-            if !roles.contains(&collection.role) {
+        let certified_roles = match resolution.resolved() {
+            Some(resolved) => Some((
+                if resolved.kind == ResolvedProfileKind::Custom {
+                    resolved.slug.clone()
+                } else {
+                    resolved.product_profile.clone()
+                },
+                resolved.kind == ResolvedProfileKind::Custom,
+                resolved.knobs.compatible_roles.clone(),
+            )),
+            None => profile.map(|profile| {
+                (
+                    profile.slug.to_owned(),
+                    false,
+                    profile.compatible_roles.iter().copied().collect(),
+                )
+            }),
+        };
+        if let Some((slug, custom, roles)) = certified_roles {
+            for (index, collection) in spec.collections.iter().enumerate() {
+                if !roles.contains(&collection.role) {
+                    issues.push(validation_issue(
+                        "ROLE_OUTSIDE_PROFILE_CERTIFICATION",
+                        ValidationSeverity::Warning,
+                        format!("collections[{index}].role"),
+                        format!(
+                            "collection {} uses role {:?}, which is outside profile {slug} certification",
+                            collection.name, collection.role
+                        ),
+                        if custom {
+                            "Add the role to custom_profile.compatible_roles.add, or move the collection to a compatible profile."
+                        } else {
+                            "Move the collection to a compatible profile or accept Custom support status."
+                        },
+                        CertificationImpact::DowngradesToCustom,
+                    ));
+                }
+            }
+        }
+
+        let explicit_extensions = spec
+            .extensions
+            .iter()
+            .map(|extension| extension.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for (index, extension) in spec.extensions.iter().enumerate() {
+            if extension.stability == ExtensionStability::Experimental {
+                status = status.weakest(SupportStatus::Experimental);
                 issues.push(validation_issue(
-                    "ROLE_OUTSIDE_PROFILE_CERTIFICATION",
+                    "EXPERIMENTAL_EXTENSION",
                     ValidationSeverity::Warning,
-                    format!("collections[{index}].role"),
+                    format!("extensions[{index}].stability"),
+                    format!("extension {} is marked experimental", extension.name),
+                    "Use a stable extension for certified configurations, or accept Experimental support status.",
+                    CertificationImpact::DowngradesToExperimental,
+                ));
+            }
+
+            if let Some(manifest) = built_in_extension_manifest(&extension.name) {
+                status = status.weakest(manifest.status);
+                let manifest_report = ExtensionManifestValidator::validate(manifest);
+                if manifest_report.has_errors() {
+                    issues.push(validation_issue(
+                        "BUILTIN_EXTENSION_MANIFEST_INVALID",
+                        ValidationSeverity::Error,
+                        format!("extensions[{index}]"),
+                        format!(
+                            "built-in extension manifest {} failed validation",
+                            extension.name
+                        ),
+                        "Fix the built-in extension manifest before using this catalog.",
+                        CertificationImpact::BlocksCertified,
+                    ));
+                }
+            } else {
+                status = status.weakest(SupportStatus::Custom);
+                issues.push(validation_issue(
+                    "CUSTOM_EXTENSION",
+                    ValidationSeverity::Warning,
+                    format!("extensions[{index}].name"),
                     format!(
-                        "collection {} uses role {:?}, which is outside profile {slug} certification",
-                        collection.name, collection.role
+                        "extension {} is not part of the built-in extension manifest catalog",
+                        extension.name
                     ),
-                    if custom {
-                        "Add the role to custom_profile.compatible_roles.add, or move the collection to a compatible profile."
-                    } else {
-                        "Move the collection to a compatible profile or accept Custom support status."
-                    },
+                    "Provide an extension manifest and treat the configuration as Custom.",
                     CertificationImpact::DowngradesToCustom,
                 ));
             }
         }
-    }
 
-    let explicit_extensions = spec
-        .extensions
-        .iter()
-        .map(|extension| extension.name.as_str())
-        .collect::<BTreeSet<_>>();
-    for (index, extension) in spec.extensions.iter().enumerate() {
-        if extension.stability == ExtensionStability::Experimental {
-            status = status.weakest(SupportStatus::Experimental);
-            issues.push(validation_issue(
-                "EXPERIMENTAL_EXTENSION",
-                ValidationSeverity::Warning,
-                format!("extensions[{index}].stability"),
-                format!("extension {} is marked experimental", extension.name),
-                "Use a stable extension for certified configurations, or accept Experimental support status.",
-                CertificationImpact::DowngradesToExperimental,
-            ));
+        let mut required_extensions = BTreeSet::new();
+        for collection in &spec.collections {
+            for extension in role_required_extensions(collection.role) {
+                required_extensions.insert((*extension).to_owned());
+            }
+            for extension in index_required_extensions(&collection.indexes) {
+                required_extensions.insert(extension);
+            }
         }
-
-        if let Some(manifest) = built_in_extension_manifest(&extension.name) {
-            status = status.weakest(manifest.status);
-            let manifest_report = ExtensionManifestValidator::validate(manifest);
-            if manifest_report.has_errors() {
+        for extension in required_extensions {
+            if built_in_extension_manifest(&extension).is_some()
+                && !explicit_extensions.contains(extension.as_str())
+            {
                 issues.push(validation_issue(
-                    "BUILTIN_EXTENSION_MANIFEST_INVALID",
-                    ValidationSeverity::Error,
-                    format!("extensions[{index}]"),
-                    format!(
-                        "built-in extension manifest {} failed validation",
-                        extension.name
-                    ),
-                    "Fix the built-in extension manifest before using this catalog.",
-                    CertificationImpact::BlocksCertified,
+                    "IMPLICIT_EXTENSION_REQUIRED",
+                    ValidationSeverity::Advice,
+                    "$.collections",
+                    format!("collection roles or indexes require extension {extension}"),
+                    "The policy compiler will include this built-in extension in the runtime requirements.",
+                    CertificationImpact::None,
                 ));
             }
-        } else {
-            status = status.weakest(SupportStatus::Custom);
+        }
+
+        let has_strong_cp = spec.defaults.replication == ReplicationMode::Cp
+            || spec
+                .domains
+                .iter()
+                .any(|domain| domain.mode == ConsistencyMode::StrongCp);
+        if has_strong_cp && spec.guarantees.write_ack == WriteAck::Local {
             issues.push(validation_issue(
-                "CUSTOM_EXTENSION",
-                ValidationSeverity::Warning,
-                format!("extensions[{index}].name"),
-                format!(
-                    "extension {} is not part of the built-in extension manifest catalog",
-                    extension.name
-                ),
-                "Provide an extension manifest and treat the configuration as Custom.",
-                CertificationImpact::DowngradesToCustom,
+                "CP_LOCAL_ACK",
+                ValidationSeverity::Error,
+                "guarantees.write_ack",
+                "strong CP cannot be certified with local write acknowledgement",
+                "Use write_ack=quorum or write_ack=all for strong CP guarantees.",
+                CertificationImpact::BlocksCertified,
             ));
         }
-    }
 
-    let mut required_extensions = BTreeSet::new();
-    for collection in &spec.collections {
-        for extension in role_required_extensions(collection.role) {
-            required_extensions.insert((*extension).to_owned());
+        let has_eventual_ap = spec.defaults.replication == ReplicationMode::Ap
+            || spec
+                .domains
+                .iter()
+                .any(|domain| domain.mode == ConsistencyMode::EventualAp);
+        if has_eventual_ap && spec.guarantees.conflict_resolution == ConflictResolution::None {
+            issues.push(validation_issue(
+                "AP_MISSING_CONFLICT_POLICY",
+                ValidationSeverity::Error,
+                "guarantees.conflict_resolution",
+                "AP/eventual consistency requires an explicit conflict resolution policy",
+                "Set conflict_resolution to vector_clock, last_write_wins, crdt, or custom.",
+                CertificationImpact::BlocksCertified,
+            ));
         }
-        for extension in index_required_extensions(&collection.indexes) {
-            required_extensions.insert(extension);
+
+        match resolution.resolved() {
+            Some(resolved) => check_profile_floors(spec, resolved, &mut issues),
+            None => {
+                if profile.is_some_and(|profile| profile.slug == "production_cp")
+                    && !spec.guarantees.backup.enabled
+                {
+                    issues.push(production_backup_disabled());
+                }
+            }
         }
-    }
-    for extension in required_extensions {
-        if built_in_extension_manifest(&extension).is_some()
-            && !explicit_extensions.contains(extension.as_str())
+
+        if spec.guarantees.sensitive_data && !spec.guarantees.encryption.at_rest {
+            issues.push(validation_issue(
+                "SENSITIVE_WITHOUT_ENCRYPTION",
+                ValidationSeverity::Error,
+                "guarantees.encryption.at_rest",
+                "sensitive data requires encryption at rest",
+                "Enable encryption.at_rest or mark the data as non-sensitive.",
+                CertificationImpact::BlocksCertified,
+            ));
+        }
+
+        for (index, collection) in spec.collections.iter().enumerate() {
+            match collection.role {
+                CollectionRole::VectorMemory
+                    if !collection.indexes.contains(&CollectionIndexKind::Vector) =>
+                {
+                    issues.push(validation_issue(
+                        "VECTOR_INDEX_REQUIRED",
+                        ValidationSeverity::Error,
+                        format!("collections[{index}].indexes"),
+                        format!(
+                            "vector_memory collection {} requires a vector index",
+                            collection.name
+                        ),
+                        "Add vector to the collection indexes.",
+                        CertificationImpact::BlocksCertified,
+                    ));
+                }
+                CollectionRole::Graph
+                    if !collection.indexes.contains(&CollectionIndexKind::Graph) =>
+                {
+                    issues.push(validation_issue(
+                        "GRAPH_INDEX_REQUIRED",
+                        ValidationSeverity::Error,
+                        format!("collections[{index}].indexes"),
+                        format!(
+                            "graph collection {} requires a graph index",
+                            collection.name
+                        ),
+                        "Add graph to the collection indexes.",
+                        CertificationImpact::BlocksCertified,
+                    ));
+                }
+                CollectionRole::Audit if !spec.guarantees.audit.enabled => {
+                    issues.push(validation_issue(
+                        "AUDIT_DISABLED",
+                        ValidationSeverity::Error,
+                        "guarantees.audit.enabled",
+                        format!(
+                            "audit collection {} requires audit to be enabled",
+                            collection.name
+                        ),
+                        "Enable audit guarantees or change the collection role.",
+                        CertificationImpact::BlocksCertified,
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        if spec.guarantees.strict_cross_domain_transactions
+            && spec
+                .domains
+                .iter()
+                .any(|domain| domain.mode == ConsistencyMode::StrongCp)
+            && spec
+                .domains
+                .iter()
+                .any(|domain| domain.mode == ConsistencyMode::EventualAp)
         {
             issues.push(validation_issue(
-                "IMPLICIT_EXTENSION_REQUIRED",
-                ValidationSeverity::Advice,
-                "$.collections",
-                format!("collection roles or indexes require extension {extension}"),
-                "The policy compiler will include this built-in extension in the runtime requirements.",
-                CertificationImpact::None,
+                "STRICT_CP_AP_CROSS_DOMAIN_TXN",
+                ValidationSeverity::Error,
+                "guarantees.strict_cross_domain_transactions",
+                "strict cross-domain transactions cannot span CP and AP consistency domains",
+                "Use one consistency mode for strict transactions or disable strict cross-domain transactions.",
+                CertificationImpact::BlocksCertified,
             ));
         }
-    }
 
-    let has_strong_cp = spec.defaults.replication == ReplicationMode::Cp
-        || spec
-            .domains
+        issues.extend(trailing_issues);
+        check_override_keys(spec, strict, &mut issues);
+
+        let valid = !issues
             .iter()
-            .any(|domain| domain.mode == ConsistencyMode::StrongCp);
-    if has_strong_cp && spec.guarantees.write_ack == WriteAck::Local {
-        issues.push(validation_issue(
-            "CP_LOCAL_ACK",
-            ValidationSeverity::Error,
-            "guarantees.write_ack",
-            "strong CP cannot be certified with local write acknowledgement",
-            "Use write_ack=quorum or write_ack=all for strong CP guarantees.",
-            CertificationImpact::BlocksCertified,
-        ));
-    }
-
-    let has_eventual_ap = spec.defaults.replication == ReplicationMode::Ap
-        || spec
-            .domains
-            .iter()
-            .any(|domain| domain.mode == ConsistencyMode::EventualAp);
-    if has_eventual_ap && spec.guarantees.conflict_resolution == ConflictResolution::None {
-        issues.push(validation_issue(
-            "AP_MISSING_CONFLICT_POLICY",
-            ValidationSeverity::Error,
-            "guarantees.conflict_resolution",
-            "AP/eventual consistency requires an explicit conflict resolution policy",
-            "Set conflict_resolution to vector_clock, last_write_wins, crdt, or custom.",
-            CertificationImpact::BlocksCertified,
-        ));
-    }
-
-    match resolution.resolved() {
-        Some(resolved) => check_profile_floors(spec, resolved, &mut issues),
-        None => {
-            if profile.is_some_and(|profile| profile.slug == "production_cp")
-                && !spec.guarantees.backup.enabled
-            {
-                issues.push(production_backup_disabled());
-            }
+            .any(|issue| issue.severity == ValidationSeverity::Error);
+        if !valid {
+            status = SupportStatus::Invalid;
         }
+
+        (
+            ValidationReport {
+                valid,
+                status,
+                issues,
+            },
+            Some(resolution),
+        )
     }
-
-    if spec.guarantees.sensitive_data && !spec.guarantees.encryption.at_rest {
-        issues.push(validation_issue(
-            "SENSITIVE_WITHOUT_ENCRYPTION",
-            ValidationSeverity::Error,
-            "guarantees.encryption.at_rest",
-            "sensitive data requires encryption at rest",
-            "Enable encryption.at_rest or mark the data as non-sensitive.",
-            CertificationImpact::BlocksCertified,
-        ));
-    }
-
-    for (index, collection) in spec.collections.iter().enumerate() {
-        match collection.role {
-            CollectionRole::VectorMemory
-                if !collection.indexes.contains(&CollectionIndexKind::Vector) =>
-            {
-                issues.push(validation_issue(
-                    "VECTOR_INDEX_REQUIRED",
-                    ValidationSeverity::Error,
-                    format!("collections[{index}].indexes"),
-                    format!(
-                        "vector_memory collection {} requires a vector index",
-                        collection.name
-                    ),
-                    "Add vector to the collection indexes.",
-                    CertificationImpact::BlocksCertified,
-                ));
-            }
-            CollectionRole::Graph if !collection.indexes.contains(&CollectionIndexKind::Graph) => {
-                issues.push(validation_issue(
-                    "GRAPH_INDEX_REQUIRED",
-                    ValidationSeverity::Error,
-                    format!("collections[{index}].indexes"),
-                    format!(
-                        "graph collection {} requires a graph index",
-                        collection.name
-                    ),
-                    "Add graph to the collection indexes.",
-                    CertificationImpact::BlocksCertified,
-                ));
-            }
-            CollectionRole::Audit if !spec.guarantees.audit.enabled => {
-                issues.push(validation_issue(
-                    "AUDIT_DISABLED",
-                    ValidationSeverity::Error,
-                    "guarantees.audit.enabled",
-                    format!(
-                        "audit collection {} requires audit to be enabled",
-                        collection.name
-                    ),
-                    "Enable audit guarantees or change the collection role.",
-                    CertificationImpact::BlocksCertified,
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    if spec.guarantees.strict_cross_domain_transactions
-        && spec
-            .domains
-            .iter()
-            .any(|domain| domain.mode == ConsistencyMode::StrongCp)
-        && spec
-            .domains
-            .iter()
-            .any(|domain| domain.mode == ConsistencyMode::EventualAp)
-    {
-        issues.push(validation_issue(
-            "STRICT_CP_AP_CROSS_DOMAIN_TXN",
-            ValidationSeverity::Error,
-            "guarantees.strict_cross_domain_transactions",
-            "strict cross-domain transactions cannot span CP and AP consistency domains",
-            "Use one consistency mode for strict transactions or disable strict cross-domain transactions.",
-            CertificationImpact::BlocksCertified,
-        ));
-    }
-
-    issues.extend(trailing_issues);
-    check_override_keys(spec, strict, &mut issues);
-
-    let valid = !issues
-        .iter()
-        .any(|issue| issue.severity == ValidationSeverity::Error);
-    if !valid {
-        status = SupportStatus::Invalid;
-    }
-
-    (
-        ValidationReport {
-            valid,
-            status,
-            issues,
-        },
-        Some(resolution),
-    )
 }
 
 fn production_backup_disabled() -> ValidationIssue {
@@ -1774,7 +1779,7 @@ fn knob_spec_path(path: &str) -> String {
 
 impl PolicyCompiler {
     pub fn compile(spec: &DatabaseSpec) -> Result<CompiledPolicy, ValidationReport> {
-        let (report, resolution) = validate_spec(spec);
+        let (report, resolution) = GuaranteeValidator::validate_with_resolution(spec);
         if report.has_errors() {
             return Err(report);
         }
@@ -1840,16 +1845,22 @@ impl PolicyCompiler {
 fn spec_version_gate(spec: &DatabaseSpec) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
     if spec.version == DATABASE_SPEC_VERSION && spec.custom_profile.is_some() {
-        issues.push(validation_issue(
-            "FIELD_REQUIRES_SPEC_V2",
-            ValidationSeverity::Error,
-            "custom_profile",
-            "custom_profile is a DatabaseSpec version 2 field, but the document declares version 1",
-            "Set version: 2 to use custom_profile, or remove custom_profile.",
-            CertificationImpact::BlocksCertified,
-        ));
+        issues.push(custom_profile_requires_spec_v2());
     }
     issues
+}
+
+/// `FIELD_REQUIRES_SPEC_V2` for a version 1 document that sets `custom_profile`. The version
+/// gate reports it, and `resolve_profile` returns it as the reason the profile is invalid.
+fn custom_profile_requires_spec_v2() -> ValidationIssue {
+    validation_issue(
+        "FIELD_REQUIRES_SPEC_V2",
+        ValidationSeverity::Error,
+        "custom_profile",
+        "custom_profile is a DatabaseSpec version 2 field, but the document declares version 1",
+        "Set version: 2 to use custom_profile, or remove custom_profile.",
+        CertificationImpact::BlocksCertified,
+    )
 }
 
 #[allow(clippy::collapsible_match, clippy::manual_is_multiple_of)]
@@ -1920,7 +1931,7 @@ fn validate_topology(spec: &DatabaseSpec, issues: &mut Vec<ValidationIssue>) {
 impl ConfigExplainer {
     #[must_use]
     pub fn explain(spec: &DatabaseSpec) -> ExplainConfigReport {
-        let (validation, resolution) = validate_spec(spec);
+        let (validation, resolution) = GuaranteeValidator::validate_with_resolution(spec);
         let compiled_policy = (!validation.has_errors())
             .then(|| PolicyCompiler::compile_valid(spec, resolution.as_ref()));
         let mut decisions = Vec::new();
@@ -5307,6 +5318,16 @@ mod tests {
             .ok_or("missing FIELD_REQUIRES_SPEC_V2")?;
         assert_eq!(gate.path, "custom_profile");
         assert_eq!(gate.severity, ValidationSeverity::Error);
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.code == "FIELD_REQUIRES_SPEC_V2")
+                .count(),
+            1,
+            "{:?}",
+            report.issues
+        );
         assert!(PolicyCompiler::compile(&decoded).is_err());
         Ok(())
     }
