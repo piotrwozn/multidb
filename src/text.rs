@@ -634,7 +634,11 @@ mod tests {
         docs.delete(rust)?;
         let state = index.refresh_full()?;
         assert_eq!(state.indexed_documents, 1);
-        assert!(index.search("rust database", 5)?.is_empty());
+        assert!(
+            index.search("rust database", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("rust database", 5)?
+        );
         Ok(())
     }
 

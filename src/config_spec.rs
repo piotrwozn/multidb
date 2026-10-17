@@ -3989,8 +3989,14 @@ mod tests {
         let mut profile_names = BTreeSet::new();
         for profile in built_in_profiles() {
             assert!(profile_names.insert(profile.slug));
-            assert!(!profile.description.trim().is_empty());
-            assert!(!profile.compatible_roles.is_empty());
+            assert!(
+                !profile.description.trim().is_empty(),
+                "expected a non-empty value"
+            );
+            assert!(
+                !profile.compatible_roles.is_empty(),
+                "expected a non-empty value"
+            );
             assert!(consistency_domain_definition(profile.default_domain).is_some());
 
             for alias in profile.aliases {
@@ -4003,15 +4009,21 @@ mod tests {
         }
 
         for role in collection_role_definitions() {
-            assert!(!role.description.trim().is_empty());
-            assert!(!role.required_capabilities.is_empty());
-            assert!(!role.constraints.is_empty());
+            assert!(
+                !role.description.trim().is_empty(),
+                "expected a non-empty value"
+            );
+            assert!(
+                !role.required_capabilities.is_empty(),
+                "expected a non-empty value"
+            );
+            assert!(!role.constraints.is_empty(), "expected a non-empty value");
             assert_eq!(collection_role_definition(role.role), Some(role));
         }
 
         for domain in consistency_domain_definitions() {
-            assert!(!domain.guarantees.is_empty());
-            assert!(!domain.limits.is_empty());
+            assert!(!domain.guarantees.is_empty(), "expected a non-empty value");
+            assert!(!domain.limits.is_empty(), "expected a non-empty value");
             assert_eq!(consistency_domain_definition(domain.mode), Some(domain));
         }
 
@@ -4316,8 +4328,11 @@ mod tests {
             .iter()
             .filter(|issue| issue.severity == ValidationSeverity::Error)
         {
-            assert!(!issue.path.trim().is_empty());
-            assert!(!issue.suggestion.trim().is_empty());
+            assert!(!issue.path.trim().is_empty(), "expected a non-empty value");
+            assert!(
+                !issue.suggestion.trim().is_empty(),
+                "expected a non-empty value"
+            );
         }
     }
 

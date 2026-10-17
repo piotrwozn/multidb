@@ -636,7 +636,9 @@ mod tests {
         assert!(
             index
                 .within_radius(GeoPoint::new(-179.9, 0.0)?, 50_000.0)?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            index.within_radius(GeoPoint::new(-179.9, 0.0)?, 50_000.0)?
         );
         Ok(())
     }

@@ -342,7 +342,11 @@ mod tests {
         let path = graph.shortest_path(&a, &c, "knows", TraversalOptions::default())?;
         assert_eq!(path.map(|path| path.len()), Some(3));
         graph.delete_edge(&a, "knows", &GraphNodeId::from_str_id("b"))?;
-        assert!(graph.neighbors(&a, "knows")?.is_empty());
+        assert!(
+            graph.neighbors(&a, "knows")?.is_empty(),
+            "expected an empty value, got {:?}",
+            graph.neighbors(&a, "knows")?
+        );
         Ok(())
     }
 }
