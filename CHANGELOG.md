@@ -68,9 +68,28 @@ All notable public changes will be recorded here.
   settings that miss `floors.encryption_at_rest` (no
   `OperationalConfig.encryption`) or `floors.audit`, and
   `Database::set_audit_enabled_as` refuses to disable audit on a database
-  whose manifest sets `floors.audit`. Restore does not check floors: a
-  restored `floors.encryption_at_rest` database is not encrypted (see
-  `docs/profiles.md`). `CompiledPolicy::binding` refuses a path for a volatile
+  whose manifest sets `floors.audit`. Restore refuses
+  (`BackupError::ProfileFloorsNotMet`, naming the floors) a backup whose
+  restored database would not meet `floors.encryption_at_rest` (a restore
+  target is never encrypted) or `floors.audit` (audit off in the restored
+  state), before it creates anything, unless
+  `RestoreConfig.allow_unmet_profile_floors` (builder
+  `with_unmet_profile_floors_allowed`) or `multidb restore
+  --allow-unmet-floors` opts in; hibernation resume has no opt-in, and the
+  error message names the opt-ins and says so. `verify_backup` sets
+  the opt-in for its own drill, because its temporary, unencrypted target is
+  removed after the drill (a failed removal is only logged). `floors.encryption_at_rest` covers the database
+  file and is never checked on backup: backup files are encrypted by backup
+  encryption (`BackupConfig.encryption`, by default the encryption config of
+  the database backed up), so a backup of an encrypted database is
+  encrypted and a backup of a database below the floor is not, unless
+  `BackupConfig.encryption` is set (see `docs/profiles.md`). Every
+  single-node opener logs a `tracing::warn!` naming each manifest floor the
+  opened database does not meet; it reaches embedders that install a tracing
+  subscriber, while the `multidb` binary, `serve` included, installs none, so
+  CLI users see unmet floors through `profile show --db` and `restore
+  --allow-unmet-floors`.
+  `CompiledPolicy::binding` refuses a path for a volatile
   storage class (`VolatileWithPath`), also for a version 1 spec, where
   validation only warns. CP, AP and sharded openers refuse manifests.
   `inspect_database_metadata` (`MetadataProbe`, `ProbedMetadata`) reads a
@@ -79,8 +98,9 @@ All notable public changes will be recorded here.
   `NeedsRecovery`, and `recover_database_file` runs redb's crash recovery on
   it without touching the metadata. `ProbedMetadata.unmet_floors` lists
   `floors.encryption_at_rest` when the manifest sets it, because the probe
-  read the metadata without a key, and `profile show --db` prints it as a
-  warning. The persistent format registry
+  read the metadata without a key, and `floors.audit` when the manifest sets
+  it and the stored audit flag is off; `profile show --db` and `restore
+  --allow-unmet-floors` print them as warnings. The persistent format registry
   (`FormatRegistry::phase_24_default`) lists database metadata
   `schema_version` 2 and the profile manifest. See `docs/profiles.md`.
 - `AnyEngine::is_value_framed` and `AnyEngine::with_value_framing`, which
@@ -96,8 +116,10 @@ All notable public changes will be recorded here.
   `variants` and the canonical variant's `knobs`; the text output adds
   `variants=`.
 - `multidb config upgrade --spec <in> [--out <file>] [--force] [--json]`
-  converts a spec to version 2 and turns Studio's `profile.custom.*` keys into
-  `custom_profile`; it is idempotent, writes `--out` in the format of its
+  converts a spec to version 2 and turns Studio's `profile.custom.base` (with
+  `profile.custom.description`) into `custom_profile`; the validation
+  suggestion for a `profile.custom.*` key it leaves in place says what to
+  move by hand. It is idempotent, writes `--out` in the format of its
   extension, refuses to overwrite files without `--force`, writes through a
   new, randomly named sibling file that it renames into place (a planted
   symlink cannot redirect the write), and exits 2 without writing when the
@@ -157,9 +179,18 @@ All notable public changes will be recorded here.
   `DbConfig` whose storage profile disagrees with the backed-up manifest
   fails with `BackupError::Config(ProfileMismatch)`, and a corrupt backed-up
   manifest with `BackupError::Corruption`, before the target is created.
-  Restore now reads the full backup payload before it creates the target, so
-  a full payload that fails its checksum or decryption no longer leaves an
-  empty initialized target behind.
+  Restore now reads and checks every backup payload, full and incremental,
+  before it creates the target, so a payload that fails its checksum or
+  decryption no longer leaves an empty initialized target behind. It reads
+  each incremental payload twice (three times for a time target), one at a
+  time (a check pass that also
+  decides the profile floors, then the apply pass), so it still holds at
+  most one incremental payload in memory, beside the full payload.
+  `restore_backup_from_uri` restores with the default `RestoreConfig`, so it
+  refuses unmet profile floors too, and `restore_backup_from_uri_with_config`
+  takes the opt-in. Hibernation resume (`cloud::resume_database`,
+  `resume_database_guarded`) takes no `RestoreConfig`, so it refuses them
+  with no opt-in, before it creates the target or consumes the marker.
 - Every CLI `--profile` flag and `MULTIDB_PROFILE` also accept product slugs
   (their canonical variant), aliases in snake or kebab case, and `auto`,
   which reads the storage profile of the existing database read-only
@@ -193,6 +224,11 @@ All notable public changes will be recorded here.
   `UnsupportedProfileManifest`, `ProfileManifestInvalid`,
   `ProfileFloorNotMet` and `MetadataUnreadable`. `ConfigError` is not
   `non_exhaustive`, so exhaustive matches outside the crate must handle them.
+- `RestoreConfig` gains the public field `allow_unmet_profile_floors`, so
+  struct literals must set it (`false` keeps the refusal) or use
+  `..RestoreConfig::default()`; `RestoreConfig::default()` and the builders
+  are unchanged. `BackupError` gains `ProfileFloorsNotMet { floors }` and is
+  not `non_exhaustive` either.
 
 ## 0.1.0-preview.1
 

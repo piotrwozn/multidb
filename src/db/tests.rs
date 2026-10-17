@@ -3,15 +3,16 @@ use std::{collections::BTreeMap, io, path::Path, sync::Arc, thread};
 use serde_json::json;
 
 use super::{
-    AUTHZ_TABLE, ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_LAYOUT,
-    KEY_PROFILE_MANIFEST, KEY_SCHEMA_VERSION, META_TABLE, Metadata, MetadataProbe, MetadataRead,
-    OperationalConfig, PersistedProfileManifest, ProbedMetadata, Profile, ReplicationKind,
-    RuntimeProfileBinding, SecurityConfig, ShardBackendConfig, ShardSpec, ShardedDatabaseConfig,
-    create_ap_database, create_cluster_database, create_database, create_database_with_ops,
-    create_database_with_profile, create_sharded_database, engine_for, engine_for_operational,
-    force_wasm_runtime_init_failure, inspect_database_metadata, layout_for, open_ap_database,
-    open_cluster_database, open_database, open_database_with_ops, open_sharded_database,
-    profile_validation_report, recover_database_file, refuse_profile_manifest, validate,
+    AUTHZ_TABLE, ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_AUDIT_ENABLED,
+    KEY_LAYOUT, KEY_PROFILE_MANIFEST, KEY_SCHEMA_VERSION, META_TABLE, Metadata, MetadataProbe,
+    MetadataRead, OperationalConfig, PersistedProfileManifest, ProbedMetadata, Profile,
+    ReplicationKind, RuntimeProfileBinding, SecurityConfig, ShardBackendConfig, ShardSpec,
+    ShardedDatabaseConfig, create_ap_database, create_cluster_database, create_database,
+    create_database_with_ops, create_database_with_profile, create_sharded_database, engine_for,
+    engine_for_operational, force_wasm_runtime_init_failure, inspect_database_metadata, layout_for,
+    open_ap_database, open_cluster_database, open_database, open_database_with_ops,
+    open_sharded_database, profile_validation_report, recover_database_file,
+    refuse_profile_manifest, validate,
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
@@ -3683,7 +3684,10 @@ fn inspect_database_metadata_never_creates_files() -> Result<(), Box<dyn std::er
 
 /// The probe opens files read-only: it never writes a file, and a file that needs crash
 /// recovery is `NeedsRecovery` instead of being repaired. `recover_database_file` recovers it
-/// without touching the database metadata, and leaves a cleanly closed file alone.
+/// without touching the database metadata, and leaves a cleanly closed file alone. Unix only:
+/// the crash is simulated by copying the file while the database holds it open, and Windows
+/// refuses to read a file that redb has locked.
+#[cfg(unix)]
 #[test]
 fn inspect_database_metadata_never_writes_or_repairs() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -3953,6 +3957,117 @@ fn audit_floor_keeps_audit_enabled_after_creation() -> Result<(), Box<dyn std::e
     database.set_authz_policy(admin_policy());
     database.set_audit_enabled_as(&admin, false)?;
     assert!(!database.audit_enabled());
+    Ok(())
+}
+
+/// Runs `run` with a subscriber that records what `tracing` logs on this thread, without ANSI
+/// colours.
+fn capture_logs<T>(run: impl FnOnce() -> T) -> Result<(T, String), Box<dyn std::error::Error>> {
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("the log buffer is poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, run);
+    let logs = captured
+        .0
+        .lock()
+        .map_err(|_| "the log buffer is poisoned")?
+        .clone();
+    Ok((value, String::from_utf8(logs)?))
+}
+
+/// Every single-node opener warns about each manifest floor the opened database does not meet,
+/// as the probe lists it: an unencrypted restore target that was allowed to miss
+/// `floors.encryption_at_rest`, and audit switched off below `floors.audit`. A database that
+/// meets its floors opens without a warning.
+#[test]
+fn single_node_openers_warn_about_unmet_profile_floors() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let encrypted = temp_dir.path().join("encrypted.redb");
+    let key_path = temp_dir.path().join("key.bin");
+    std::fs::write(&key_path, [4_u8; 32])?;
+    let ops = OperationalConfig::new().with_encryption(EncryptionConfig::file_key(&key_path));
+    let binding = encryption_floor_binding(&encrypted)?;
+    let config = |path: &Path| DbConfig::on_disk(binding.db_config.profile, path);
+    drop(create_database_with_profile(&binding, ops.clone())?);
+    let (opened, logs) = capture_logs(|| open_database_with_ops(config(&encrypted), &ops))?;
+    drop(opened?);
+    assert!(!logs.contains("floors."), "{logs}");
+
+    let restored = temp_dir.path().join("restored.redb");
+    drop(super::create_restore_target(
+        config(&restored),
+        Some(&binding.manifest),
+    )?);
+    for (name, open) in [
+        (
+            "open_database",
+            open_database as fn(DbConfig) -> Result<Database, ConfigError>,
+        ),
+        ("create_database", create_database),
+    ] {
+        let (opened, logs) = capture_logs(|| open(config(&restored)))?;
+        drop(opened?);
+        assert!(
+            logs.contains("WARN") && logs.contains("floors.encryption_at_rest"),
+            "{name}: {logs}"
+        );
+        // The restore target holds no security state, so audit is on.
+        assert!(!logs.contains("floors.audit"), "{name}: {logs}");
+    }
+
+    // An older binary that ignores the manifest could switch audit off.
+    let audited = temp_dir.path().join("audited.redb");
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let binding = compiled.binding(&spec.deployment, Some(audited.clone()))?;
+    let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+    propose_system(
+        &database,
+        Op::Put {
+            table: AUTHZ_TABLE.to_owned(),
+            key: KEY_AUDIT_ENABLED.to_vec(),
+            value: b"false".to_vec(),
+        },
+    )?;
+    drop(database);
+    match inspect_database_metadata(&audited) {
+        MetadataProbe::Initialized(probed) => {
+            assert_eq!(probed.unmet_floors, vec!["floors.audit"]);
+        }
+        other => return Err(format!("expected an initialized database, got {other:?}").into()),
+    }
+    let audited_config = DbConfig::on_disk(binding.db_config.profile, &audited);
+    let (opened, logs) =
+        capture_logs(|| open_database_with_ops(audited_config, &OperationalConfig::new()))?;
+    assert!(!opened?.audit_enabled());
+    assert!(
+        logs.contains("WARN") && logs.contains("floors.audit"),
+        "{logs}"
+    );
+    assert!(!logs.contains("floors.encryption_at_rest"), "{logs}");
     Ok(())
 }
 

@@ -84,9 +84,13 @@ multidb profile knobs
   view; a misspelled knob gets a did-you-mean suggestion.
 - `profile show --db <path>` prints the profile manifest a database was
   created with, or "legacy database" for databases without one. It opens the
-  file read-only and never creates or writes a file. It warns when the file
-  visibly misses a manifest floor: a restored `floors.encryption_at_rest`
-  database is not encrypted.
+  file read-only and never creates or writes a file. It warns about each
+  manifest floor the file visibly misses: `floors.encryption_at_rest`, because
+  it read the metadata without a key, so the file is not encrypted, and
+  `floors.audit` when the stored audit flag is off. `restore` refuses a backup
+  whose restored database would miss such a floor (a restore target is never
+  encrypted) and creates nothing, unless `--allow-unmet-floors` is given; it
+  then prints the same warnings.
 - `profile explain --spec <file>` resolves the profile of a spec; it exits 2
   when the profile is invalid, including a version 1 spec that sets
   `custom_profile` (`FIELD_REQUIRES_SPEC_V2`).
@@ -96,9 +100,15 @@ multidb profile knobs
   of a non-canonical variant (for example `high_durability`) gets a warning,
   because a version 1 spec records the product slug.
 - `config upgrade --spec <file> [--out <file>] [--force]` converts a spec to
-  version 2 and turns the `profile.custom.*` keys of older Studio specs into
-  a real `custom_profile` (the current Studio builder writes `custom_profile`
-  itself). It is idempotent, writes `--out` in the format of its extension
+  version 2. When `custom_profile` is unset, it turns the
+  `profile.custom.base` override of older Studio specs, with
+  `profile.custom.description`, into a real `custom_profile`, and writes the
+  `profile.custom.slug` operation hint to the spec's `profile` field (the
+  current Studio builder writes
+  `custom_profile` itself). Any other `profile.custom.*` key, these keys
+  without a base, and these keys beside an existing `custom_profile` stay in
+  place; the upgrade notes and the validation suggestions say what to move by
+  hand. It is idempotent, writes `--out` in the format of its extension
   (stdout keeps the input format), does not keep YAML comments, refuses to
   overwrite a file without `--force`, and never writes a result that does not
   validate (exit 2).

@@ -53,7 +53,8 @@ pub enum KnobTiming {
     Provisioning,
     /// A default for generated specs (guided init, templates).
     GenerationDefault,
-    /// Checked by spec validation only.
+    /// Checked by spec validation. The sink of `floors.audit` and `floors.encryption_at_rest`
+    /// also names the runtime checks of a database created with the profile.
     Validation,
 }
 
@@ -418,10 +419,15 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         path: "floors.audit",
         value_type: KnobType::Bool,
         timing: KnobTiming::Validation,
-        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR (guarantees.audit.enabled)",
+        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR (guarantees.audit.enabled); at \
+               runtime, db::create_database_with_profile refuses audit off \
+               (ProfileFloorNotMet), Database::set_audit_enabled_as keeps audit on, and restore \
+               refuses a backup with audit off unless RestoreConfig.allow_unmet_profile_floors \
+               (multidb restore --allow-unmet-floors)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::NotApplicable,
-        description: "Requires guarantees.audit.enabled; may only be raised.",
+        description: "Requires guarantees.audit.enabled, and keeps audit on in a database \
+                      created with the profile; may only be raised.",
     },
     KnobDefinition {
         path: "floors.backup",
@@ -446,10 +452,17 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         path: "floors.encryption_at_rest",
         value_type: KnobType::Bool,
         timing: KnobTiming::Validation,
-        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR (guarantees.encryption.at_rest)",
+        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR \
+               (guarantees.encryption.at_rest); at runtime, db::create_database_with_profile \
+               refuses a database without OperationalConfig.encryption (ProfileFloorNotMet), and \
+               restore, whose target is never encrypted, refuses unless \
+               RestoreConfig.allow_unmet_profile_floors (multidb restore --allow-unmet-floors)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::NotApplicable,
-        description: "Requires guarantees.encryption.at_rest; may only be raised.",
+        description: "Requires guarantees.encryption.at_rest, and an encryption config for a \
+                      database created with the profile; covers the database file and is never \
+                      checked on backup, whose files backup encryption encrypts (by default the \
+                      database's own encryption config); may only be raised.",
     },
     KnobDefinition {
         path: "compatible_roles",
@@ -732,6 +745,19 @@ mod tests {
             if matches!(section, "history" | "time_series") {
                 assert_eq!(definition.timing, KnobTiming::Provisioning);
                 assert_eq!(definition.enforcement, KnobEnforcement::Declarative);
+            }
+            // The runtime checks these floors at creation and on restore, not only validation.
+            if matches!(
+                definition.path,
+                "floors.audit" | "floors.encryption_at_rest"
+            ) {
+                for check in [
+                    "GUARANTEE_BELOW_PROFILE_FLOOR",
+                    "db::create_database_with_profile",
+                    "RestoreConfig.allow_unmet_profile_floors",
+                ] {
+                    assert!(definition.sink.contains(check), "{}", definition.path);
+                }
             }
         }
         for reserved in RESERVED_KNOBS {

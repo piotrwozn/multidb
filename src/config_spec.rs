@@ -1691,7 +1691,7 @@ fn check_override_keys(spec: &DatabaseSpec, strict: bool, issues: &mut Vec<Valid
         {
             continue;
         }
-        let suggestion = override_suggestion(key, strict, spec.custom_profile.is_some());
+        let suggestion = override_suggestion(key, strict, spec);
         if strict {
             issues.push(validation_issue(
                 "OVERRIDE_SHADOWS_TYPED_KNOB",
@@ -1749,22 +1749,15 @@ fn override_knob(key: &str) -> Option<&'static str> {
         })
 }
 
+/// Studio's version 1 custom-profile keys that `multidb config upgrade` converts.
+const PROFILE_CUSTOM_BASE: &str = "profile.custom.base";
+const PROFILE_CUSTOM_DESCRIPTION: &str = "profile.custom.description";
+
 /// The fix for a knob-like `overrides` key. A version 1 document (`v2` false) also needs to move
 /// to version 2; a version 2 document only needs to move the value into `custom_profile`.
-/// `config upgrade` converts the `profile.custom.*` convention only while `custom_profile` is
-/// unset, so with `custom_profile` set those keys are moved by hand.
-fn override_suggestion(key: &str, v2: bool, custom_profile_set: bool) -> String {
+fn override_suggestion(key: &str, v2: bool, spec: &DatabaseSpec) -> String {
     if key.starts_with("profile.custom.") {
-        return if custom_profile_set {
-            "custom_profile is already set, so multidb config upgrade leaves this key in place: \
-             move its value into custom_profile by hand (profile.custom.base is \
-             custom_profile.extends, profile.custom.description is custom_profile.description) \
-             and remove this overrides key."
-        } else {
-            "Run multidb config upgrade to turn the profile.custom.* convention into a \
-             version 2 custom_profile."
-        }
-        .to_owned();
+        return profile_custom_suggestion(key, v2, spec);
     }
     match (override_knob(key), v2) {
         (Some(path), false) => format!(
@@ -1782,6 +1775,40 @@ fn override_suggestion(key: &str, v2: bool, custom_profile_set: bool) -> String 
                          outside the knob namespaces."
             .to_owned(),
     }
+}
+
+/// The fix for an `overrides["profile.custom.*"]` key. `config upgrade` turns
+/// `profile.custom.base` (with `profile.custom.description`, if present) into a
+/// `custom_profile`, but only while `custom_profile` is unset, and it never converts any other
+/// `profile.custom.*` key; everything it leaves in place is moved by hand.
+fn profile_custom_suggestion(key: &str, v2: bool, spec: &DatabaseSpec) -> String {
+    let needs_v2 = if v2 { "" } else { " in a version 2 spec" };
+    if key != PROFILE_CUSTOM_BASE && key != PROFILE_CUSTOM_DESCRIPTION {
+        return format!(
+            "multidb config upgrade converts only {PROFILE_CUSTOM_BASE} and \
+             {PROFILE_CUSTOM_DESCRIPTION}, so it leaves this key in place: set what it means in \
+             custom_profile (extends, description, knobs, floors or compatible_roles){needs_v2} \
+             by hand and remove this overrides key."
+        );
+    }
+    if spec.custom_profile.is_some() {
+        return "custom_profile is already set, so multidb config upgrade leaves this key in \
+                place: move its value into custom_profile by hand (profile.custom.base is \
+                custom_profile.extends, profile.custom.description is \
+                custom_profile.description) and remove this overrides key."
+            .to_owned();
+    }
+    if spec.overrides.contains_key(PROFILE_CUSTOM_BASE) {
+        return "Run multidb config upgrade to turn the profile.custom.* convention into a \
+                version 2 custom_profile."
+            .to_owned();
+    }
+    format!(
+        "There is no overrides[{PROFILE_CUSTOM_BASE}], so multidb config upgrade leaves this key \
+         in place: add custom_profile {{ extends: <the profile it builds on>, description: \
+         <this value> }}{needs_v2} by hand and remove this overrides key, or just remove the \
+         key."
+    )
 }
 
 /// Where a registry knob lives in a spec document.
@@ -5709,6 +5736,76 @@ mod tests {
             !issue.suggestion.contains("Run multidb config upgrade"),
             "{issue:?}"
         );
+        Ok(())
+    }
+
+    /// `config upgrade` converts the `profile.custom.*` convention only from
+    /// `profile.custom.base`, and converts no other `profile.custom.*` key, so the suggestion
+    /// points at it only when a base is present and otherwise says what to move by hand.
+    #[test]
+    fn profile_custom_overrides_that_config_upgrade_leaves_are_moved_by_hand()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let suggestion =
+            |spec: &DatabaseSpec, key: &str| -> Result<String, Box<dyn std::error::Error>> {
+                let path = format!("overrides.{key}");
+                Ok(GuaranteeValidator::validate(spec)
+                    .issues
+                    .into_iter()
+                    .find(|issue| issue.path == path)
+                    .ok_or_else(|| format!("{path} is not flagged"))?
+                    .suggestion)
+            };
+
+        let mut without_base = catalog_spec("secure_app", ConsistencyMode::StrongCp);
+        without_base
+            .overrides
+            .insert("profile.custom.description".to_owned(), "Orders".to_owned());
+        without_base
+            .overrides
+            .insert("profile.custom.slug".to_owned(), "orders".to_owned());
+        let description = suggestion(&without_base, "profile.custom.description")?;
+        assert!(
+            description.starts_with("There is no overrides[profile.custom.base]")
+                && description.contains(
+                    "add custom_profile { extends: <the profile it builds on>, description: \
+                     <this value> } in a version 2 spec by hand"
+                ),
+            "{description}"
+        );
+        let other = suggestion(&without_base, "profile.custom.slug")?;
+        assert!(
+            other.starts_with(
+                "multidb config upgrade converts only profile.custom.base and \
+                 profile.custom.description"
+            ),
+            "{other}"
+        );
+
+        // With a base, config upgrade converts the base and the description, but still not
+        // the other key.
+        let mut with_base = without_base.clone();
+        with_base
+            .overrides
+            .insert("profile.custom.base".to_owned(), "secure_app".to_owned());
+        for key in ["profile.custom.base", "profile.custom.description"] {
+            let converted = suggestion(&with_base, key)?;
+            assert!(
+                converted.starts_with("Run multidb config upgrade"),
+                "{key}: {converted}"
+            );
+        }
+        assert_eq!(suggestion(&with_base, "profile.custom.slug")?, other);
+
+        // A version 2 document only needs the value moved.
+        let mut v2 = without_base;
+        v2.version = DATABASE_SPEC_VERSION_V2;
+        let description = suggestion(&v2, "profile.custom.description")?;
+        assert!(
+            description.contains("description: <this value> } by hand"),
+            "{description}"
+        );
+        let v2_other = suggestion(&v2, "profile.custom.slug")?;
+        assert!(!v2_other.contains("version 2 spec"), "{v2_other}");
         Ok(())
     }
 

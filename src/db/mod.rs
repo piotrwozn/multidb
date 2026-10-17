@@ -102,7 +102,8 @@ mod profile_binding;
 mod runtime;
 
 pub(crate) use profile_binding::{
-    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, validate_manifest,
+    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, unmet_profile_floors,
+    validate_manifest,
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
@@ -5355,7 +5356,9 @@ pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
 
     let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_with_performance(config, engine, catalog, performance)
+    let database = Database::new_with_performance(config, engine, catalog, performance)?;
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
+    Ok(database)
 }
 
 /// Opens an existing database and validates its metadata.
@@ -5367,7 +5370,9 @@ pub fn open_database(config: DbConfig) -> Result<Database, ConfigError> {
     ensure_metadata_matches(&config, read.metadata)?;
     let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_with_performance(config, engine, catalog, performance)
+    let database = Database::new_with_performance(config, engine, catalog, performance)?;
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
+    Ok(database)
 }
 
 /// Creates a database with operational security, encryption, metrics, and resource settings.
@@ -5400,6 +5405,7 @@ pub fn create_database_with_ops(
     write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(ops.security);
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
@@ -5422,6 +5428,7 @@ pub fn open_database_with_ops(
     let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
