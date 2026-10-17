@@ -1562,7 +1562,9 @@ mod tests {
         assert!(
             WorkloadProfiler::report(&repl, WorkloadWindow::All)?
                 .entries
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            WorkloadProfiler::report(&repl, WorkloadWindow::All)?.entries
         );
         let buffered = buffer.report(&repl, WorkloadWindow::All)?;
         assert_eq!(buffered.entries.len(), 1);
