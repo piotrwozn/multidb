@@ -193,7 +193,8 @@ fn columnar_table_round_trips_through_parquet() -> Result<(), Box<dyn std::error
                 &end,
                 ReadConsistency::Strong
             )?
-            .is_empty()
+            .is_empty(),
+        "expected a non-empty value"
     );
 
     Ok(())
