@@ -699,11 +699,19 @@ fn relational_index_is_maintained() -> Result<(), Box<dyn std::error::Error>> {
         Value::Int(38),
         Value::Bool(true),
     ])?;
-    assert!(table.query_eq(2, &Value::Int(37))?.rows.is_empty());
+    assert!(
+        table.query_eq(2, &Value::Int(37))?.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        table.query_eq(2, &Value::Int(37))?.rows
+    );
     assert_eq!(table.query_eq(2, &Value::Int(38))?.rows.len(), 1);
 
     table.delete(&Value::Int(1))?;
-    assert!(table.query_eq(2, &Value::Int(38))?.rows.is_empty());
+    assert!(
+        table.query_eq(2, &Value::Int(38))?.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        table.query_eq(2, &Value::Int(38))?.rows
+    );
 
     let row_key = make_row_key("users", &Value::Int(2))?;
     assert!(
@@ -713,7 +721,8 @@ fn relational_index_is_maintained() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         !repl
             .range(REL_INDEX_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
-            .is_empty()
+            .is_empty(),
+        "expected a non-empty value"
     );
 
     Ok(())
