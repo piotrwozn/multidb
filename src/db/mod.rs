@@ -7265,7 +7265,7 @@ fn parse_audit_key_file(bytes: &[u8]) -> Result<[u8; 32], String> {
     }
 
     let mut key = [0; 32];
-    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = audit_hex_value(chunk[0])?;
         let low = audit_hex_value(chunk[1])?;
         key[index] = (high << 4) | low;
