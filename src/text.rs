@@ -860,12 +860,20 @@ mod tests {
         })?;
         assert_eq!(postings_for(&database, c)?, 0);
         assert!(!has_doc_entry(&database, c)?);
-        assert!(index.search("delta", 5)?.is_empty());
+        assert!(
+            index.search("delta", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("delta", 5)?
+        );
 
         database.transaction(|txn| txn.delete_document("posts", a))?;
         assert_eq!(postings_for(&database, a)?, 0);
         assert!(!has_doc_entry(&database, a)?);
-        assert!(index.search("gamma", 5)?.is_empty());
+        assert!(
+            index.search("gamma", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("gamma", 5)?
+        );
         Ok(())
     }
 
@@ -933,7 +941,11 @@ mod tests {
             }],
         )?;
         let index = database.full_text_index("posts_text")?;
-        assert!(index.search("ghost", 5)?.is_empty());
+        assert!(
+            index.search("ghost", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("ghost", 5)?
+        );
         assert_eq!(hit_ids(&index.search("rust", 5)?), BTreeSet::from([id]));
         Ok(())
     }

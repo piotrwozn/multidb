@@ -1970,8 +1970,16 @@ async fn full_text_and_geo_indexes_follow_document_writes_without_refresh()
             rust_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
             vec![r]
         );
-        assert!(text.search("tokio", 10)?.is_empty());
-        assert!(text.search("go", 10)?.is_empty());
+        assert!(
+            text.search("tokio", 10)?.is_empty(),
+            "expected an empty value, got {:?}",
+            text.search("tokio", 10)?
+        );
+        assert!(
+            text.search("go", 10)?.is_empty(),
+            "expected an empty value, got {:?}",
+            text.search("go", 10)?
+        );
         let geo = database.geo_index("places_geo")?;
         let near_warsaw = geo.within_radius(GeoPoint::new(21.0122, 52.2297)?, 1_000.0)?;
         assert_eq!(
@@ -1980,7 +1988,9 @@ async fn full_text_and_geo_indexes_follow_document_writes_without_refresh()
         );
         assert!(
             geo.within_radius(GeoPoint::new(-0.1276, 51.5072)?, 1_000.0)?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            geo.within_radius(GeoPoint::new(-0.1276, 51.5072)?, 1_000.0)?
         );
         (p, r)
     };
