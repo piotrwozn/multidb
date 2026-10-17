@@ -941,7 +941,11 @@ mod tests {
             ts.insert_point_with_clock("cpu", point(NOW - 10_001, 1.0), &clock),
             Err(TimeSeriesError::InvalidPoint(_))
         ));
-        assert!(ts.range("cpu", NOW - 20_000, NOW + 1)?.is_empty());
+        assert!(
+            ts.range("cpu", NOW - 20_000, NOW + 1)?.is_empty(),
+            "expected an empty value, got {:?}",
+            ts.range("cpu", NOW - 20_000, NOW + 1)?
+        );
         assert!(ts.latest("cpu")?.is_none());
 
         ts.insert_point_with_clock("cpu", point(NOW - 10_000, 2.0), &clock)?;
@@ -1118,7 +1122,11 @@ mod tests {
         ts.insert_point_with_clock("cpu", point(NOW, 2.0), &clock)?;
 
         assert_eq!(ts.range("cpu", i64::MIN, i64::MAX)?.len(), 2);
-        assert!(ts.range("cpu", i64::MIN, i64::MIN + 1)?.is_empty());
+        assert!(
+            ts.range("cpu", i64::MIN, i64::MIN + 1)?.is_empty(),
+            "expected an empty value, got {:?}",
+            ts.range("cpu", i64::MIN, i64::MIN + 1)?
+        );
         assert_eq!(ts.codec_stats("cpu", i64::MIN, i64::MAX)?.raw_bytes, 32);
         Ok(())
     }
