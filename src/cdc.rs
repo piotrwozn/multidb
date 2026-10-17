@@ -1911,7 +1911,7 @@ mod tests {
 
         let (again, again_token) =
             database.poll_changefeed(&token, &filter, &ChangefeedOptions::default(), 100)?;
-        assert!(again.is_empty());
+        assert!(again.is_empty(), "expected an empty value, got {again:?}");
         assert_eq!(again_token, token);
         Ok(())
     }
@@ -2118,7 +2118,7 @@ mod tests {
             },
             100,
         )?;
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "expected an empty value, got {events:?}");
         Ok(())
     }
 }

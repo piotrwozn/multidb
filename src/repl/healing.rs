@@ -946,7 +946,8 @@ mod tests {
             !read
                 .range(HEALING_EVENTS_TABLE, &[], &[0xFF])?
                 .collect::<Result<Vec<_>, _>>()?
-                .is_empty()
+                .is_empty(),
+            "expected a non-empty value"
         );
 
         Ok(())
