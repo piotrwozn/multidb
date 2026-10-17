@@ -499,7 +499,7 @@ impl GroupCommitCoordinator {
                     state.leader_active = false;
                     break;
                 }
-                state.pending.drain(..).collect::<Vec<_>>()
+                std::mem::take(&mut state.pending)
             };
 
             let started = Instant::now();
