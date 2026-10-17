@@ -76,7 +76,6 @@ pub const REL_INDEX_TABLE: &str = "rel_indexes";
 pub const REL_SCHEMA_TABLE: &str = "__schema__";
 
 const EMPTY_INDEX_VALUE: &[u8] = b"";
-const COLUMNAR_SEGMENT_ID: u64 = 0;
 const COLUMNAR_SEGMENT_ROWS: usize = 1_024;
 
 pub type Row = Vec<Value>;
@@ -1214,8 +1213,8 @@ impl RelTable {
         Ok(primary_key_value(self.schema.as_ref(), row)?.clone())
     }
 
-    pub(crate) fn columnar_segment_key(&self) -> Bytes {
-        columnar_segment_key(&self.name, COLUMNAR_SEGMENT_ID)
+    pub(crate) fn columnar_segment_bounds(&self) -> (Bytes, Bytes) {
+        columnar_segment_range_bounds(&self.name)
     }
 
     pub(crate) fn decode_columnar_rows(
@@ -1392,6 +1391,21 @@ impl RelTable {
     }
 
     fn columnar_replace_ops_from_rows(&self, rows: Vec<Row>) -> Result<Vec<Op>, QueryError> {
+        let (start, end) = columnar_segment_range_bounds(&self.name);
+        let segments = self.repl.range(
+            REL_COLUMNAR_SEGMENTS_TABLE,
+            &start,
+            &end,
+            ReadConsistency::Strong,
+        )?;
+        self.columnar_rewrite_ops(&segments, rows)
+    }
+
+    pub(crate) fn columnar_rewrite_ops(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: Vec<Row>,
+    ) -> Result<Vec<Op>, QueryError> {
         for row in &rows {
             validate_row(self.schema.as_ref(), row)?;
         }
@@ -1406,16 +1420,8 @@ impl RelTable {
             .map(|(_, row)| row)
             .collect::<Vec<_>>();
 
-        let (start, end) = columnar_segment_range_bounds(&self.name);
-        let mut ops = self
-            .repl
-            .range(
-                REL_COLUMNAR_SEGMENTS_TABLE,
-                &start,
-                &end,
-                ReadConsistency::Strong,
-            )?
-            .into_iter()
+        let mut ops = segments
+            .iter()
             .flat_map(|(key, _)| {
                 [
                     Op::Delete {
@@ -1424,7 +1430,7 @@ impl RelTable {
                     },
                     Op::Delete {
                         table: REL_COLUMNAR_SEGMENT_META_TABLE.to_owned(),
-                        key,
+                        key: key.clone(),
                     },
                 ]
             })

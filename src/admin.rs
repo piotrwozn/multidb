@@ -4557,6 +4557,105 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn columnar_table_row_crud_keeps_rows_beyond_first_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::query::{ColumnDef, ColumnType, TableSchema};
+
+        let dir = tempdir()?;
+        let mut database = create_database(DbConfig::on_disk(
+            Profile::Analytical,
+            dir.path().join("columnar-crud.redb"),
+        ))?;
+        database.set_authz_policy(AuthzPolicy::new([Role::new("admin")
+            .grant(Resource::System, Permission::Admin)
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Database, Permission::Write)
+            .grant(Resource::Database, Permission::Admin)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin")),
+        );
+        let table = database.create_table(
+            "events",
+            Some(TableSchema::new(
+                vec![
+                    ColumnDef::new("id", ColumnType::Int, false),
+                    ColumnDef::new("name", ColumnType::Str, false),
+                ],
+                0,
+            )),
+            Vec::new(),
+        )?;
+        let rows = (0..2_500)
+            .map(|id| {
+                vec![
+                    crate::model::Value::Int(id),
+                    crate::model::Value::Str(format!("event-{id}")),
+                ]
+            })
+            .collect();
+        crate::repl::Replication::propose_batch(&database, table.columnar_replace_ops(rows)?)?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+
+        for (method, body) in [
+            (
+                Method::POST,
+                serde_json::json!({ "row": [2_500, "event-2500"] }),
+            ),
+            (
+                Method::PUT,
+                serde_json::json!({ "row": [1_500, "updated"] }),
+            ),
+            (
+                Method::DELETE,
+                serde_json::json!({ "primary_key": 2_400, "confirm": "events" }),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    method,
+                    "/data/tables/events/rows",
+                    Some(&body),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let updated = app
+            .clone()
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/tables/events/rows?offset=1500&limit=1",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(updated.status(), StatusCode::OK);
+        let body = json_body(updated).await?;
+        assert_eq!(
+            body["data"]["rows"][0],
+            serde_json::json!([1_500, "updated"])
+        );
+
+        let tail = app
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/tables/events/rows?offset=2499&limit=10",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(tail.status(), StatusCode::OK);
+        let body = json_body(tail).await?;
+        assert_eq!(body["data"]["returned"], serde_json::json!(1));
+        assert_eq!(
+            body["data"]["rows"][0],
+            serde_json::json!([2_500, "event-2500"])
+        );
+        assert_eq!(body["data"]["has_more"], serde_json::json!(false));
+        Ok(())
+    }
+
     fn test_state() -> Result<AdminState, Box<dyn std::error::Error>> {
         Ok(AdminState::from_database(admin_database()?).with_admin_token("secret"))
     }
