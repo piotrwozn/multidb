@@ -185,7 +185,7 @@ test("operator can inspect Studio data, validate config and build a dry run", as
 
   await page.getByRole("button", { name: /data explorer/i }).click();
   await page.getByRole("button", { name: /load page/i }).click();
-  await expect(page.getByText("Ada")).toBeVisible();
+  await expect(page.getByRole("cell", { name: "Ada" })).toBeVisible();
   await expect(page.getByRole("button", { name: /delete row/i })).toBeDisabled();
   await page.getByLabel("Confirm table name").fill("users");
   await page.getByRole("button", { name: /delete row/i }).click();
