@@ -726,8 +726,14 @@ mod tests {
                 "duplicate {}",
                 definition.path
             );
-            assert!(!definition.sink.trim().is_empty());
-            assert!(!definition.description.trim().is_empty());
+            assert!(
+                !definition.sink.trim().is_empty(),
+                "expected a non-empty value"
+            );
+            assert!(
+                !definition.description.trim().is_empty(),
+                "expected a non-empty value"
+            );
             let section = definition
                 .path
                 .split_once('.')
@@ -762,7 +768,10 @@ mod tests {
         }
         for reserved in RESERVED_KNOBS {
             assert!(knob_definition(reserved.path).is_none());
-            assert!(!reserved.reason.trim().is_empty());
+            assert!(
+                !reserved.reason.trim().is_empty(),
+                "expected a non-empty value"
+            );
         }
     }
 

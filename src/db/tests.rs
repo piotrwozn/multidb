@@ -3062,7 +3062,7 @@ fn profile_manifest_knobs_are_reapplied_by_every_single_node_opener()
         database.set_principal_registry_as(&admin, registry.clone())?;
     }
     let authz_before = raw_rows(&path, AUTHZ_TABLE)?;
-    assert!(!authz_before.is_empty());
+    assert!(!authz_before.is_empty(), "expected a non-empty value");
 
     let config = DbConfig::on_disk(Profile::Balanced, &path);
     {

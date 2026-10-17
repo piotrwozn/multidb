@@ -2579,7 +2579,11 @@ mod tests {
 
         let mut no_path = spec(2, "in_memory", None);
         no_path.deployment.storage_path = None;
-        assert!(resolve_profile(&no_path).issues().is_empty());
+        assert!(
+            resolve_profile(&no_path).issues().is_empty(),
+            "expected an empty value, got {:?}",
+            resolve_profile(&no_path).issues()
+        );
     }
 
     #[test]

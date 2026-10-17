@@ -5989,7 +5989,7 @@ mod tests {
         );
         for definition in super::KNOB_REGISTRY {
             let knob = decision(&format!("$.profile.knobs.{}", definition.path))?;
-            assert!(!knob.outcome.is_empty());
+            assert!(!knob.outcome.is_empty(), "expected a non-empty value");
             match definition.enforcement {
                 super::KnobEnforcement::Planned { .. } => {
                     assert!(knob.outcome.starts_with("planned:"), "{knob:?}");
