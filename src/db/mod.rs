@@ -1060,6 +1060,37 @@ impl Database {
         &self.performance
     }
 
+    /// Sets the query governor: at most `max_concurrent_queries` statements run
+    /// at once, and a statement that finds no free slot waits up to
+    /// `queue_timeout_ms` before it fails with [`QueryError::Busy`]
+    /// (SQLSTATE 53200).
+    ///
+    /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// # Errors
+    /// Fails when either limit is zero or `max_concurrent_queries` is more than
+    /// the governor can count.
+    pub fn set_query_governor(
+        &mut self,
+        max_concurrent_queries: usize,
+        queue_timeout_ms: u64,
+    ) -> Result<(), ConfigError> {
+        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Unsupported(format!(
+                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if queue_timeout_ms == 0 {
+            return Err(ConfigError::Unsupported(
+                "query governor queue timeout must be at least 1 ms".to_owned(),
+            ));
+        }
+        self.performance.query.max_concurrent_queries = max_concurrent_queries;
+        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        self.query_permits = query_permits_for(&self.performance);
+        Ok(())
+    }
+
     #[must_use]
     pub const fn encryption_config(&self) -> Option<&EncryptionConfig> {
         self.encryption.as_ref()
@@ -1227,18 +1258,24 @@ impl Database {
         self.principals = registry;
     }
 
+    /// Reports whether the bootstrap admin role and principal are already in
+    /// place exactly as `ensure_bootstrap_admin_principal` writes them, so that
+    /// callers can skip it and the exclusive access it needs.
+    #[must_use]
+    pub(crate) fn has_bootstrap_admin_principal(&self) -> bool {
+        let (role, principal) = bootstrap_admin_identity();
+        self.authz.roles().get(role.name()) == Some(&role)
+            && self.principals.principals().get(principal.name()) == Some(&principal)
+    }
+
     /// Ensures the bootstrap admin identity can use password-backed sessions.
     /// # Errors
     /// Fails when the updated security metadata cannot be persisted.
     pub fn ensure_bootstrap_admin_principal(&mut self) -> Result<(), DbError> {
-        let admin_role = Role::new("admin")
-            .grant(Resource::System, Permission::Admin)
-            .grant(Resource::Database, Permission::Read)
-            .grant(Resource::Database, Permission::Write)
-            .grant(Resource::Database, Permission::Admin);
-        self.authz = self.authz.clone().allow(admin_role);
+        let (role, principal) = bootstrap_admin_identity();
+        self.authz = self.authz.clone().allow(role);
         self.principals
-            .insert("admin", Principal::new("admin").with_role("admin"));
+            .insert(principal.name().to_owned(), principal);
         self.persist_security_state()
     }
 
@@ -3921,7 +3958,7 @@ impl Database {
         )
         .await
         .map_err(|_| {
-            QueryError::ResourceLimit(format!(
+            QueryError::Busy(format!(
                 "query queue exceeded {} ms",
                 self.performance.query.queue_timeout_ms
             ))
@@ -5875,6 +5912,22 @@ fn query_permits_for(performance: &PerformanceConfig) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(
         performance.query.max_concurrent_queries.max(1),
     ))
+}
+
+/// The bootstrap `admin` role and the `admin` principal that holds it.
+///
+/// Password-backed Control Plane sessions and the insecure local admin act as
+/// this principal. `Database::ensure_bootstrap_admin_principal` installs this
+/// definition and `Database::has_bootstrap_admin_principal` compares against
+/// it, so a grant change here applies to both.
+pub(crate) fn bootstrap_admin_identity() -> (Role, Principal) {
+    let role = Role::new("admin")
+        .grant(Resource::System, Permission::Admin)
+        .grant(Resource::Database, Permission::Read)
+        .grant(Resource::Database, Permission::Write)
+        .grant(Resource::Database, Permission::Admin);
+    let principal = Principal::new("admin").with_role(role.name());
+    (role, principal)
 }
 
 #[cfg(test)]

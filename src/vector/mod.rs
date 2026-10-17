@@ -383,11 +383,19 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
     /// # Errors
     /// Fails when storage reads or vector decoding fails.
     pub fn rebuild_index(&self) -> Result<(), VectorError> {
+        let mut state = self.state.write().map_err(|_| VectorError::LockPoisoned)?;
+        self.rebuild_locked(&mut state)
+    }
+
+    /// Reads the durable vector rows and installs the rebuilt index.
+    ///
+    /// The persisted read and the install happen under one write guard of the
+    /// shared index, so a concurrent `insert_vector` is either part of the read
+    /// or applied after the install, and is never dropped from the in-memory index.
+    fn rebuild_locked(&self, state: &mut VectorIndexState) -> Result<(), VectorError> {
         let items = self.read_persisted_vectors()?;
         let mut rebuilt = VectorIndexState::new(self.config.metric, self.config.hnsw, items.len());
         rebuilt.rebuild(items)?;
-
-        let mut state = self.state.write().map_err(|_| VectorError::LockPoisoned)?;
         *state = rebuilt;
         state.loaded = true;
         Ok(())
@@ -402,7 +410,11 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         {
             return Ok(());
         }
-        self.rebuild_index()
+        let mut state = self.state.write().map_err(|_| VectorError::LockPoisoned)?;
+        if state.loaded {
+            return Ok(());
+        }
+        self.rebuild_locked(&mut state)
     }
 
     fn read_persisted_vectors(&self) -> Result<Vec<(DocumentId, Vec<f32>)>, VectorError> {
@@ -420,16 +432,15 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
     }
 
     fn insert_in_memory(&self, id: DocumentId, vector: Vec<f32>) -> Result<(), VectorError> {
-        let needs_rebuild = self
-            .state
-            .read()
-            .map_err(|_| VectorError::LockPoisoned)?
-            .needs_resize_after_insert();
-        if needs_rebuild {
-            return self.rebuild_index();
-        }
-
         let mut state = self.state.write().map_err(|_| VectorError::LockPoisoned)?;
+        if state.vectors.contains_key(&id) {
+            // A rebuild that read storage after this vector committed already indexed it.
+            return Ok(());
+        }
+        if state.needs_resize_after_insert() {
+            // The vector is already durable, so the rebuild picks it up.
+            return self.rebuild_locked(&mut state);
+        }
         state.insert(id, vector)
     }
 

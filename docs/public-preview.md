@@ -129,6 +129,17 @@ Consistency status:
   background task. Samples buffered since the last flush are lost on crash or
   when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
   AP and sharded databases do not flush on drop.
+- `multidb serve` runs statements concurrently, but catalog changes and
+  security updates take an exclusive database lock, so a long statement or
+  `/catalog` scan delays them and the requests queued behind them. The query
+  governor defaults to 4 x CPUs concurrent statements and a 100 ms queue;
+  `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` change
+  it for `multidb serve` but not for `multidb admin serve`. `/catalog` row
+  counts still read every row. Under steady commit traffic, filtered columnar
+  scans often skip zone-map pruning and decode every segment. Each columnar
+  `INSERT` rewrites the whole table, so
+  concurrent inserts into one columnar table retry and effectively run one at
+  a time.
 
 ## Migration Guide
 

@@ -1342,7 +1342,8 @@ fn read_subscription(
         .map_err(|error| SubscriptionError::Serde(error.to_string()))
 }
 
-fn current_lsn<R: Replication + ?Sized>(repl: &R) -> Result<Lsn, ReplError> {
+/// Reads the id of the last committed transaction; every commit advances it.
+pub(crate) fn current_lsn<R: Replication + ?Sized>(repl: &R) -> Result<Lsn, ReplError> {
     let Some(bytes) = repl.read(
         txn::TXN_META_TABLE,
         txn::CURRENT_TXN_ID_KEY,

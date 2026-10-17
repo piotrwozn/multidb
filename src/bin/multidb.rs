@@ -107,7 +107,21 @@ struct ServeConfig {
     pg_password: String,
     pg_tls: ServePgTls,
     studio_dir: PathBuf,
+    query_governor: ServeQueryGovernor,
 }
+
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`; an
+/// unset value keeps the profile default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ServeQueryGovernor {
+    max_concurrent_queries: Option<usize>,
+    queue_timeout_ms: Option<u64>,
+}
+
+/// Upper bound for `MULTIDB_MAX_CONCURRENT_QUERIES`.
+const MAX_SERVE_CONCURRENT_QUERIES: usize = 4_096;
+/// Upper bound for `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`.
+const MAX_SERVE_QUERY_QUEUE_TIMEOUT_MS: u64 = 60_000;
 
 impl CliRun {
     fn success(message: impl Into<String>) -> Self {
@@ -891,8 +905,10 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let database = create_database(DbConfig::on_disk(config.profile, &config.db_path))?;
-    let database = Arc::new(tokio::sync::Mutex::new(database));
+    let mut database = create_database(DbConfig::on_disk(config.profile, &config.db_path))?;
+    apply_query_governor(&mut database, config.query_governor)?;
+    let max_concurrent_queries = database.performance_config().query.max_concurrent_queries;
+    let database = Arc::new(tokio::sync::RwLock::new(database));
 
     let mut admin_state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
         .with_admin_session_ttl_seconds(config.admin_session_ttl_seconds)
@@ -915,7 +931,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         4096,
         ScramCredential::from_password(&config.pg_password, 4096)?,
     );
-    let pg_config = NetworkConfig::new(tls, pg_auth);
+    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries);
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -925,7 +941,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
                 .await
                 .map_err(CliError::Runtime)?;
         }
-        if !admin_state.is_admin_auth_configured() {
+        if !admin_state.is_admin_auth_configured().await {
             return Err(CliError::Usage(
                 "multidb serve requires MULTIDB_ADMIN_PASSWORD(_FILE), \
                  MULTIDB_ADMIN_TOKEN(_FILE), or an existing stored admin credential"
@@ -1008,7 +1024,7 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     "pass --insecure-local-admin only for loopback development binds".to_owned(),
                 ));
             }
-            let database = Arc::new(tokio::sync::Mutex::new(database));
+            let database = Arc::new(tokio::sync::RwLock::new(database));
             let mut state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
                 .with_admin_session_ttl_seconds(admin_session_ttl_seconds)
                 .with_admin_login_rate_limit(admin_login_rate_limit);
@@ -1029,7 +1045,7 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                             std::io::Error::other(format!("admin password: {error}"))
                         })?;
                 }
-                if !state.is_admin_auth_configured() {
+                if !state.is_admin_auth_configured().await {
                     return Err(std::io::Error::other(
                         "admin serve requires --admin-password, \
                          MULTIDB_ADMIN_PASSWORD(_FILE), --admin-token, \
@@ -1483,6 +1499,14 @@ fn flatten_serve_task(
     }
 }
 
+/// Runs at most as many `PostgreSQL` wire statements as the query governor admits,
+/// so a burst waits for a free statement slot instead of failing the governor queue timeout.
+fn serve_pg_config(tls: TlsMode, auth: AuthConfig, max_concurrent_queries: usize) -> NetworkConfig {
+    let config = NetworkConfig::new(tls, auth);
+    let max_blocking_tasks = config.max_blocking_tasks.min(max_concurrent_queries.max(1));
+    config.with_max_blocking_tasks(max_blocking_tasks)
+}
+
 fn serve_config_from_env() -> Result<ServeConfig, CliError> {
     serve_config_from_sources(|name| env::var(name).ok())
 }
@@ -1530,6 +1554,18 @@ where
         "/usr/share/multidb/studio",
     ));
     let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
+    let query_governor = ServeQueryGovernor {
+        max_concurrent_queries: bounded_positive_from_sources(
+            &get_env,
+            "MULTIDB_MAX_CONCURRENT_QUERIES",
+            MAX_SERVE_CONCURRENT_QUERIES,
+        )?,
+        queue_timeout_ms: bounded_positive_from_sources(
+            &get_env,
+            "MULTIDB_QUERY_QUEUE_TIMEOUT_MS",
+            MAX_SERVE_QUERY_QUEUE_TIMEOUT_MS,
+        )?,
+    };
 
     Ok(ServeConfig {
         admin_bind,
@@ -1545,7 +1581,48 @@ where
         pg_password,
         pg_tls,
         studio_dir,
+        query_governor,
     })
+}
+
+/// Reads an optional integer from 1 to `max`; any other set value fails startup.
+fn bounded_positive_from_sources<F, T>(
+    get_env: &F,
+    name: &str,
+    max: T,
+) -> Result<Option<T>, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+    T: Copy + PartialOrd + From<u8> + std::str::FromStr + std::fmt::Display,
+{
+    let Some(value) = get_env(name).filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match value.trim().parse::<T>() {
+        Ok(parsed) if parsed >= T::from(1) && parsed <= max => Ok(Some(parsed)),
+        _ => Err(CliError::Usage(format!(
+            "invalid {name} {value}; expected an integer from 1 to {max}"
+        ))),
+    }
+}
+
+/// Applies the `multidb serve` query governor overrides before the database is shared.
+fn apply_query_governor(
+    database: &mut multidb::db::Database,
+    governor: ServeQueryGovernor,
+) -> Result<(), CliError> {
+    if governor == ServeQueryGovernor::default() {
+        return Ok(());
+    }
+    let defaults = &database.performance_config().query;
+    let max_concurrent_queries = governor
+        .max_concurrent_queries
+        .unwrap_or(defaults.max_concurrent_queries);
+    let queue_timeout_ms = governor
+        .queue_timeout_ms
+        .unwrap_or(defaults.queue_timeout_ms);
+    database.set_query_governor(max_concurrent_queries, queue_timeout_ms)?;
+    Ok(())
 }
 
 fn env_or_default<F>(get_env: &F, name: &str, default: &str) -> String
@@ -1869,13 +1946,17 @@ fn usage() -> CliError {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{CliError, ServePgTls, run, serve_config_from_sources};
+    use super::{
+        CliError, ServePgTls, ServeQueryGovernor, apply_query_governor, run,
+        serve_config_from_sources, serve_pg_config,
+    };
     use multidb::{
         config_spec::{
             CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, MigrationPlanner,
             WriteAck,
         },
         db::{DbConfig, Profile, create_database},
+        network::{AuthConfig, NetworkConfig, ScramCredential, TlsMode},
         tuning::WorkloadSample,
     };
     use std::collections::BTreeMap;
@@ -2001,6 +2082,133 @@ mod tests {
         assert_eq!(config.admin_login_rate_limit.max_failures, 1);
         assert_eq!(config.admin_login_rate_limit.window_seconds, 2);
         assert_eq!(config.admin_login_rate_limit.lockout_seconds, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_config_caps_statements_at_the_query_governor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let default_tasks =
+            NetworkConfig::new(TlsMode::DisabledForTests, auth.clone()).max_blocking_tasks;
+
+        let small = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 4);
+        assert_eq!(small.max_blocking_tasks, 4);
+        let zero = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 0);
+        assert_eq!(zero.max_blocking_tasks, 1);
+        let large = serve_pg_config(TlsMode::DisabledForTests, auth, default_tasks + 64);
+        assert_eq!(large.max_blocking_tasks, default_tasks);
+        Ok(())
+    }
+
+    fn local_dev_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+        ]);
+        env.extend(env_map(extra));
+        env
+    }
+
+    #[test]
+    fn serve_config_parses_query_governor_limits() -> Result<(), Box<dyn std::error::Error>> {
+        let env = local_dev_env(&[]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(config.query_governor, ServeQueryGovernor::default());
+
+        let env = local_dev_env(&[
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "8"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", " 2500 "),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(
+            config.query_governor,
+            ServeQueryGovernor {
+                max_concurrent_queries: Some(8),
+                queue_timeout_ms: Some(2_500),
+            }
+        );
+
+        let env = local_dev_env(&[
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "4096"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "60000"),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(config.query_governor.max_concurrent_queries, Some(4_096));
+        assert_eq!(config.query_governor.queue_timeout_ms, Some(60_000));
+        Ok(())
+    }
+
+    #[test]
+    fn serve_config_rejects_invalid_query_governor_limits() {
+        for (name, value) in [
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "0"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "-1"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "4097"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "many"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "0"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "60001"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "1.5"),
+        ] {
+            let env = local_dev_env(&[(name, value)]);
+            let error = serve_config_from_sources(|name| env.get(name).cloned());
+            assert!(
+                matches!(error, Err(CliError::Usage(ref message)) if message.contains(name)),
+                "{name}={value}: unexpected result {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_governor_overrides_apply_to_database_and_pg_wire_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let defaults = database.performance_config().query.clone();
+
+        apply_query_governor(&mut database, ServeQueryGovernor::default())?;
+        assert_eq!(database.performance_config().query, defaults);
+
+        apply_query_governor(
+            &mut database,
+            ServeQueryGovernor {
+                max_concurrent_queries: None,
+                queue_timeout_ms: Some(250),
+            },
+        )?;
+        let query = &database.performance_config().query;
+        assert_eq!(
+            query.max_concurrent_queries,
+            defaults.max_concurrent_queries
+        );
+        assert_eq!(query.queue_timeout_ms, 250);
+
+        apply_query_governor(
+            &mut database,
+            ServeQueryGovernor {
+                max_concurrent_queries: Some(3),
+                queue_timeout_ms: None,
+            },
+        )?;
+        let query = &database.performance_config().query;
+        assert_eq!(query.max_concurrent_queries, 3);
+        assert_eq!(query.queue_timeout_ms, 250);
+
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let pg_config = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth,
+            database.performance_config().query.max_concurrent_queries,
+        );
+        assert_eq!(pg_config.max_blocking_tasks, 3);
         Ok(())
     }
 
