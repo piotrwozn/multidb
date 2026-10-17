@@ -349,7 +349,7 @@
           "additionalProperties": false,
           "properties": {
             "default_domain": {
-              "description": "Consistency domain that generated specs start from.",
+              "description": "Consistency domain of the spec that init --guided --override writes. Guided init without --override and templates use the product's domain.",
               "enum": [
                 "local_snapshot",
                 "strong_cp",

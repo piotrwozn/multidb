@@ -3986,6 +3986,32 @@ mod tests {
         Ok(())
     }
 
+    /// A spec body over the 1 MiB router body limit never reaches `spec_io`: it is HTTP 400
+    /// `invalid_json`, not a `SPEC_TOO_LARGE` report (docs/profiles.md, "Reading specs").
+    #[tokio::test]
+    async fn oversized_spec_bodies_are_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let padding = "x".repeat(super::MAX_CONTROL_PLANE_BODY_BYTES);
+        for uri in ["/config/validate", "/config/plan"] {
+            let body = serde_json::to_vec(&serde_json::json!({ "version": 1, "pad": padding }))?;
+            let response = super::router(test_state()?)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .header("x-multidb-principal", "root")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "invalid_json", "{uri}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn catalog_endpoints_return_enveloped_json() -> Result<(), Box<dyn std::error::Error>> {
         for path in [

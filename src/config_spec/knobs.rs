@@ -408,10 +408,11 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         path: "consistency.default_domain",
         value_type: KnobType::Enum(&["local_snapshot", "strong_cp", "eventual_ap"]),
         timing: KnobTiming::GenerationDefault,
-        sink: "guided init, templates and domain advice",
+        sink: "multidb init --guided --override (domain mode and replication of the spec it writes)",
         enforcement: KnobEnforcement::Declarative,
         after_creation: ChangePolicy::NotApplicable,
-        description: "Consistency domain that generated specs start from.",
+        description: "Consistency domain of the spec that init --guided --override writes. \
+                      Guided init without --override and templates use the product's domain.",
     },
     KnobDefinition {
         path: "floors.audit",

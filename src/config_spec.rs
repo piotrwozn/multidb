@@ -37,7 +37,9 @@ pub use profile::{
     StorageMedium, StorageOverrides, SystemVersioningKnob, TimeSeriesKnobs, TimeSeriesOverrides,
     profile_variants, resolve_named_profile, resolve_profile, suggest_profile_name,
 };
-pub(crate) use profile::{check_knob_values, derive_storage_profile, product_variant};
+pub(crate) use profile::{
+    check_knob_values, derive_storage_profile, product_variant, profile_digest,
+};
 pub use schema::database_spec_v1_schema;
 pub use schema_v2::database_spec_v2_schema;
 
@@ -1689,7 +1691,7 @@ fn check_override_keys(spec: &DatabaseSpec, strict: bool, issues: &mut Vec<Valid
         {
             continue;
         }
-        let suggestion = override_suggestion(key);
+        let suggestion = override_suggestion(key, strict, spec.custom_profile.is_some());
         if strict {
             issues.push(validation_issue(
                 "OVERRIDE_SHADOWS_TYPED_KNOB",
@@ -1747,25 +1749,39 @@ fn override_knob(key: &str) -> Option<&'static str> {
         })
 }
 
-fn override_suggestion(key: &str) -> String {
+/// The fix for a knob-like `overrides` key. A version 1 document (`v2` false) also needs to move
+/// to version 2; a version 2 document only needs to move the value into `custom_profile`.
+/// `config upgrade` converts the `profile.custom.*` convention only while `custom_profile` is
+/// unset, so with `custom_profile` set those keys are moved by hand.
+fn override_suggestion(key: &str, v2: bool, custom_profile_set: bool) -> String {
     if key.starts_with("profile.custom.") {
-        return "Run multidb config upgrade to turn the profile.custom.* convention into a \
-                version 2 custom_profile."
-            .to_owned();
+        return if custom_profile_set {
+            "custom_profile is already set, so multidb config upgrade leaves this key in place: \
+             move its value into custom_profile by hand (profile.custom.base is \
+             custom_profile.extends, profile.custom.description is custom_profile.description) \
+             and remove this overrides key."
+        } else {
+            "Run multidb config upgrade to turn the profile.custom.* convention into a \
+             version 2 custom_profile."
+        }
+        .to_owned();
     }
-    override_knob(key).map_or_else(
-        || {
-            "Set typed profile knobs in custom_profile.knobs of a version 2 spec, or keep \
-             this key outside the knob namespaces."
-                .to_owned()
-        },
-        |path| {
-            format!(
-                "Did you mean {}? Typed knobs need a version 2 spec with custom_profile.",
-                knob_spec_path(path)
-            )
-        },
-    )
+    match (override_knob(key), v2) {
+        (Some(path), false) => format!(
+            "Did you mean {}? Typed knobs need a version 2 spec with custom_profile.",
+            knob_spec_path(path)
+        ),
+        (Some(path), true) => format!(
+            "Did you mean {}? Move the value there and remove this overrides key.",
+            knob_spec_path(path)
+        ),
+        (None, false) => "Set typed profile knobs in custom_profile.knobs of a version 2 spec, \
+                          or keep this key outside the knob namespaces."
+            .to_owned(),
+        (None, true) => "Set typed profile knobs in custom_profile.knobs, or keep this key \
+                         outside the knob namespaces."
+            .to_owned(),
+    }
 }
 
 /// Where a registry knob lives in a spec document.
@@ -1949,7 +1965,7 @@ impl ConfigExplainer {
             },
             impact_none(),
         );
-        explain_catalog_decisions(spec, &mut decisions);
+        explain_catalog_decisions(spec, resolution.as_ref(), &mut decisions);
         explain_guarantee_decisions(spec, &mut decisions);
         explain_domain_decisions(spec, &mut decisions);
         explain_collection_decisions(spec, &mut decisions);
@@ -2131,13 +2147,32 @@ impl MigrationPlanner {
     }
 }
 
-fn explain_catalog_decisions(spec: &DatabaseSpec, decisions: &mut Vec<ExplainDecision>) {
+fn explain_catalog_decisions(
+    spec: &DatabaseSpec,
+    resolution: Option<&ProfileResolution>,
+    decisions: &mut Vec<ExplainDecision>,
+) {
     let profile = built_in_profile(&spec.profile);
+    // Per-knob `$.profile.knobs.<path>` decisions exist only for a resolved profile.
+    let resolved = resolution.and_then(ProfileResolution::resolved).is_some();
     let custom_reason = spec.custom_profile.as_ref().map(|custom| {
-        format!(
-            "The profile is a custom profile extending {}; its knobs are under $.profile.knobs.",
-            custom.extends
-        )
+        let extends = &custom.extends;
+        if resolved {
+            format!(
+                "The profile is a custom profile extending {extends}; its knobs are under \
+                 $.profile.knobs."
+            )
+        } else if spec.version < DATABASE_SPEC_VERSION_V2 {
+            format!(
+                "The profile is a custom profile extending {extends}, but custom_profile needs a \
+                 version 2 spec (FIELD_REQUIRES_SPEC_V2), so no knobs were resolved."
+            )
+        } else {
+            format!(
+                "The profile is a custom profile extending {extends}, but it did not resolve, so \
+                 no knobs were resolved; see the validation issues."
+            )
+        }
     });
     push_decision(
         decisions,
@@ -5629,6 +5664,52 @@ mod tests {
                 .all(|issue| issue.severity == ValidationSeverity::Error)
         );
         assert!(!issue_codes(&strict).contains("OVERRIDE_IS_METADATA_ONLY"));
+        // The document already is version 2: the suggestion only moves the value.
+        let shadow = |path: &str| shadows.iter().find(|issue| issue.path == path).copied();
+        assert!(shadow("overrides.query.timeout_ms").is_some_and(|issue| {
+            issue.suggestion
+                == "Did you mean custom_profile.knobs.query.timeout_ms? Move the value there and \
+                    remove this overrides key."
+        }));
+        assert!(
+            shadows
+                .iter()
+                .all(|issue| !issue.suggestion.contains("version 2 spec")),
+            "{shadows:?}"
+        );
+        // Without custom_profile, config upgrade still converts the convention.
+        assert!(
+            shadow("overrides.profile.custom.base")
+                .is_some_and(|issue| issue.suggestion.contains("multidb config upgrade"))
+        );
+    }
+
+    /// With `custom_profile` set, `config upgrade` leaves the `profile.custom.*` keys in place, so
+    /// the suggestion asks to move them by hand instead of pointing at the upgrade.
+    #[test]
+    fn profile_custom_overrides_beside_a_custom_profile_are_moved_by_hand()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = v2_custom_spec("high_durability", json!({}))?;
+        spec.overrides
+            .insert("profile.custom.base".to_owned(), "secure_app".to_owned());
+        let report = GuaranteeValidator::validate(&spec);
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.path == "overrides.profile.custom.base")
+            .ok_or("overrides.profile.custom.base is not flagged")?;
+        assert_eq!(issue.code, "OVERRIDE_SHADOWS_TYPED_KNOB");
+        assert!(
+            issue
+                .suggestion
+                .contains("move its value into custom_profile by hand"),
+            "{issue:?}"
+        );
+        assert!(
+            !issue.suggestion.contains("Run multidb config upgrade"),
+            "{issue:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -5717,6 +5798,48 @@ mod tests {
             ),
             (1_048_576, 1_024, 8)
         );
+        Ok(())
+    }
+
+    /// `$.profile` points at `$.profile.knobs.<path>` decisions only when the profile resolved
+    /// and so emitted them.
+    #[test]
+    fn explain_profile_decision_names_knobs_only_when_they_resolved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let profile_reason = |spec: &DatabaseSpec| {
+            let report = ConfigExplainer::explain(spec);
+            let knob_decisions = report
+                .decisions
+                .iter()
+                .filter(|decision| decision.path.starts_with("$.profile.knobs."))
+                .count();
+            report
+                .decisions
+                .iter()
+                .find(|decision| decision.path == "$.profile")
+                .map(|decision| (decision.reason.clone(), knob_decisions))
+                .ok_or("missing $.profile decision")
+        };
+
+        let resolved = v2_custom_spec("high_durability", json!({}))?;
+        let (reason, knobs) = profile_reason(&resolved)?;
+        assert!(
+            reason.ends_with("its knobs are under $.profile.knobs."),
+            "{reason}"
+        );
+        assert_eq!(knobs, super::KNOB_REGISTRY.len());
+
+        let mut v1 = resolved.clone();
+        v1.version = super::DATABASE_SPEC_VERSION;
+        let (reason, knobs) = profile_reason(&v1)?;
+        assert!(reason.contains("FIELD_REQUIRES_SPEC_V2"), "{reason}");
+        assert!(!reason.contains("$.profile.knobs"), "{reason}");
+        assert_eq!(knobs, 0);
+
+        let invalid = v2_custom_spec("no_such_profile", json!({}))?;
+        let (reason, knobs) = profile_reason(&invalid)?;
+        assert!(reason.contains("did not resolve"), "{reason}");
+        assert_eq!(knobs, 0);
         Ok(())
     }
 

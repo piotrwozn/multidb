@@ -26,8 +26,11 @@ pub const MAX_SPEC_BYTES: usize = 1_048_576;
 /// Most YAML nodes the peek visits, counting every alias expansion. An alias-free document has
 /// at most about one node per source byte, so only alias expansion can reach this.
 pub const MAX_SPEC_NODES: usize = 2 * MAX_SPEC_BYTES;
-/// Most scalar bytes the peek visits, counting every alias expansion. Decoded scalars are never
-/// longer than their source, so only alias expansion can reach this.
+/// Most scalar bytes the peek visits, counting every alias expansion. A decoded scalar is at
+/// most 1.5 times its source: the YAML escapes `\L` and `\P` decode two source bytes to the
+/// three UTF-8 bytes of U+2028 and U+2029, and every other escape decodes to no more bytes than
+/// it takes. An alias-free document of [`MAX_SPEC_BYTES`] therefore stays below this budget, so
+/// only alias expansion can reach it.
 pub const MAX_SPEC_EXPANDED_BYTES: usize = 2 * MAX_SPEC_BYTES;
 
 /// Spec document encodings.
@@ -510,6 +513,28 @@ mod tests {
         std::fs::write(&exact, vec![b' '; MAX_SPEC_BYTES])?;
         let error = read_spec_file(&exact).err().ok_or("blank JSON must fail")?;
         assert!(matches!(error, SpecIoError::Json(_)), "{error:?}");
+        Ok(())
+    }
+
+    /// Invalid UTF-8 stays the I/O error `std::fs::read_to_string` gave before `spec_io`, with
+    /// no validation report, so the CLI keeps exit code 1.
+    #[test]
+    fn invalid_utf8_files_are_io_errors_without_a_report() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        for name in ["latin1.yaml", "latin1.json"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"version: 1\nname: caf\xe9\n")?;
+            let error = read_spec_file(&path)
+                .err()
+                .ok_or("invalid UTF-8 must fail")?;
+            assert!(
+                matches!(&error, SpecIoError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData),
+                "{name}: {error:?}"
+            );
+            assert_eq!(error.to_string(), "stream did not contain valid UTF-8");
+            assert!(error.validation_report().is_none(), "{name}");
+        }
         Ok(())
     }
 

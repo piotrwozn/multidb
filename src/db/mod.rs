@@ -101,12 +101,12 @@ use crate::vector::{
 mod profile_binding;
 mod runtime;
 
+pub(crate) use profile_binding::{
+    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, validate_manifest,
+};
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
-    create_database_with_profile, inspect_database_metadata,
-};
-pub(crate) use profile_binding::{
-    create_restore_target, decode_profile_manifest, validate_manifest,
+    create_database_with_profile, inspect_database_metadata, recover_database_file,
 };
 use runtime::wasm_runtime_for_database;
 
@@ -124,9 +124,9 @@ const KEY_PROFILE_MANIFEST: &[u8] = b"profile_manifest";
 const KEY_NEXT_COLLECTION_ID: &[u8] = b"next_collection_id";
 const KEY_NEXT_GRAPH_ID: &[u8] = b"next_graph_id";
 /// `schema_version` of every database whose values are not compression-framed.
-const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// `schema_version` of a profile-manifest database with value framing. Older binaries refuse it.
-const SCHEMA_VERSION_FRAMED: u32 = 2;
+pub(crate) const SCHEMA_VERSION_FRAMED: u32 = 2;
 /// A legacy database (no profile manifest) whose values are compression-framed, read through an
 /// engine that does not frame values.
 const LEGACY_FRAMED_DATABASE: &str =
@@ -401,6 +401,9 @@ pub enum ConfigError {
 
     #[error("invalid profile manifest: {0}")]
     ProfileManifestInvalid(String),
+
+    #[error("profile floor {floor} is not met: {reason}")]
+    ProfileFloorNotMet { floor: &'static str, reason: String },
 
     #[error(
         "database metadata key {key} is unreadable ({reason}); metadata is encrypted or corrupt; supply OperationalConfig.encryption"
@@ -1397,9 +1400,12 @@ impl Database {
 
     /// Enables or disables audit recording after checking system admin permission.
     ///
-    /// Disabling audit writes an audit event before the flag is persisted.
+    /// Disabling audit writes an audit event before the flag is persisted. A database whose
+    /// profile manifest sets `floors.audit` keeps audit on: disabling it is refused and audited
+    /// as failed.
     /// # Errors
-    /// Fails when authorization, audit, or metadata persistence fails.
+    /// Fails when authorization, audit, or metadata persistence fails, and with
+    /// `Config(ProfileFloorNotMet)` when disabling audit would break the `floors.audit` floor.
     pub fn set_audit_enabled_as(
         &mut self,
         principal: &Principal,
@@ -1412,6 +1418,32 @@ impl Database {
             "set_audit_enabled",
         )?;
         if !enabled {
+            // Only single-node openers accept a profile manifest: CP, AP and sharded openers
+            // refuse one (`refuse_profile_manifest`), and an AP database keeps `__meta` outside
+            // the tables its replication reads, so `__meta` is read for a single node only.
+            let audit_floor = match &self.repl {
+                DatabaseRepl::SingleNode(repl) => read_metadata_from_repl(repl.as_ref())?
+                    .manifest
+                    .is_some_and(|manifest| manifest.knobs.floors.audit),
+                DatabaseRepl::CpRaft(_) | DatabaseRepl::ApDynamo(_) | DatabaseRepl::Sharded(_) => {
+                    false
+                }
+            };
+            if audit_floor {
+                self.record_audit(&AuditEvent::new(
+                    Some(principal),
+                    "set_audit_enabled",
+                    Resource::System,
+                    AuditOutcome::Failed,
+                    Some("enabled: false; refused by profile floor floors.audit"),
+                ))?;
+                return Err(DbError::Config(ConfigError::ProfileFloorNotMet {
+                    floor: "floors.audit",
+                    reason: "the profile manifest of this database requires audit, so it cannot \
+                             be disabled"
+                        .to_owned(),
+                }));
+            }
             self.record_audit(&AuditEvent::new(
                 Some(principal),
                 "set_audit_enabled",

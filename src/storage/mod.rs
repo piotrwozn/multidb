@@ -24,7 +24,7 @@ pub use encrypted::{
 };
 pub use error::StorageError;
 pub use memory::MemEngine;
-pub(crate) use redb::ExistingRedbOpen;
 pub use redb::RedbEngine;
+pub(crate) use redb::{ExistingRedbOpen, RedbReadOnly};
 pub use sim::{Fault, FaultPlan, FaultPoint, ScheduledFault, SimReadTxn, SimStorage, SimWriteTxn};
 pub use traits::{RangeIter, ReadTransaction, StorageEngine, WriteTransaction};

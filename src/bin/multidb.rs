@@ -34,7 +34,7 @@ use multidb::{
     },
     db::{
         DbConfig, DbError, MetadataProbe, PersistedProfileManifest, Profile, create_database,
-        inspect_database_metadata, open_database,
+        inspect_database_metadata, open_database, recover_database_file,
     },
     migration::{
         ExportFormat, ImportOptions, MigrationError, export_table_csv, export_table_jsonl,
@@ -120,7 +120,7 @@ struct ServeConfig {
 }
 
 /// What a `--profile` flag or `MULTIDB_PROFILE` selects: a storage profile, or `auto`, which
-/// reads the storage profile and replication of an existing database.
+/// reads the storage profile of an existing single-node CP database (see `cli_db_config`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProfileSelection {
     Fixed(Profile),
@@ -387,11 +387,17 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
         lines.extend(report.issues.iter().map(format_issue));
         lines.join("\n")
     } else {
-        // stdout carries only the spec, so it can be redirected into a file.
+        // stdout carries only the spec, so it can be redirected into a file. The warnings and
+        // advice of a valid result (PROFILE_NOT_PROVISIONABLE among them) go to stderr, as
+        // they go to the `--out` summary.
         for note in &notes {
             eprintln!("note: {note}");
         }
-        if !report.valid {
+        if report.valid {
+            for issue in &report.issues {
+                eprintln!("{}", format_issue(issue));
+            }
+        } else {
             eprintln!("{}", format_validation_report(&report));
         }
         content.trim_end_matches('\n').to_owned()
@@ -498,8 +504,9 @@ fn ensure_upgrade_target(input: &Path, out: &Path, force: bool) -> Result<(), Cl
     Ok(())
 }
 
-/// Writes `content` next to `path` and renames it into place, so a failed write never leaves a
-/// half-written file where the old one was (`config upgrade --force` may replace its input).
+/// Writes `content` to a new, randomly named file next to `path` and renames it into place, so
+/// a failed write never leaves a half-written file where the old one was (`config upgrade
+/// --force` may replace its input). See `write_through_temp_file`.
 fn write_file_replacing(path: &Path, content: &str) -> Result<(), CliError> {
     let Some(file_name) = path.file_name() else {
         return Err(CliError::Usage(format!(
@@ -507,13 +514,44 @@ fn write_file_replacing(path: &Path, content: &str) -> Result<(), CliError> {
             path.display()
         )));
     };
-    let mut temp_name = file_name.to_os_string();
-    temp_name.push(".upgrade-tmp");
-    let temp_path = path.with_file_name(temp_name);
-    std::fs::write(&temp_path, content.as_bytes())?;
-    if let Err(error) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error.into());
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{}.upgrade-tmp", uuid::Uuid::now_v7()));
+    Ok(write_through_temp_file(
+        path,
+        &path.with_file_name(temp_name),
+        content,
+    )?)
+}
+
+/// Writes `content` to `temp_path`, syncs it and renames it to `path`, then syncs the parent
+/// directory (best effort) so the rename survives a crash. `temp_path` is created with
+/// `create_new`, which never follows or reuses an existing path, so a symlink planted there
+/// fails the write with `AlreadyExists` instead of redirecting it; the rename replaces `path`
+/// itself, never the target of a symlink at `path`. The temporary file is removed on failure
+/// only when this call created it.
+fn write_through_temp_file(path: &Path, temp_path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written.and_then(|()| std::fs::rename(temp_path, path)) {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(error);
+    }
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     }
     Ok(())
 }
@@ -786,10 +824,17 @@ fn run_profile_list(args: &[String]) -> Result<CliRun, CliError> {
 }
 
 /// `profile show <name> [--override path=value]...` resolves a built-in slug or alias as a
-/// what-if; `profile show --db <path>` reports the profile persisted in a database.
+/// what-if; `profile show --db <path>` reports the profile persisted in a database. The name
+/// may stand anywhere among the flags.
 fn run_profile_show(args: &[String]) -> Result<CliRun, CliError> {
     let output = output_format(args)?;
-    let name = args.first().filter(|value| !value.starts_with("--"));
+    let names = positional_args(args, &["--db", "--output", "--override"]);
+    if let [first, second, ..] = names.as_slice() {
+        return Err(CliError::Usage(format!(
+            "profile show takes one profile name, found {first} and {second}"
+        )));
+    }
+    let name = names.first().copied();
     match (name, optional_value(args, "--db")) {
         (Some(_), Some(_)) => Err(CliError::Usage(
             "use either a profile name or --db with profile show, not both".to_owned(),
@@ -1430,12 +1475,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     }
 
     let config = serve_config_from_env()?;
-    if let Some(parent) = config.db_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let database = create_database(cli_db_config(config.profile, config.db_path.clone())?)?;
+    let database = serve_database(&config)?;
     let database = Arc::new(tokio::sync::Mutex::new(database));
 
     let mut admin_state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
@@ -1501,6 +1541,19 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     })?;
 
     Ok("serve stopped".to_owned())
+}
+
+/// Creates or opens the single-node CP database `serve` runs on. With `MULTIDB_PROFILE=auto`
+/// the database must already exist (see `cli_db_config`).
+fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliError> {
+    // Resolved first, so `auto` on a missing path fails before any directory is created.
+    let db_config = cli_db_config(config.profile, config.db_path.clone())?;
+    if let Some(parent) = config.db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(create_database(db_config)?)
 }
 
 fn run_admin(args: &[String]) -> Result<String, CliError> {
@@ -1653,13 +1706,22 @@ fn format_metadata_probe(path: &Path, probe: &MetadataProbe) -> Result<String, C
                 metadata.layout,
                 metadata.values_framed
             );
-            match &metadata.manifest {
+            let mut lines = vec![match &metadata.manifest {
                 Some(manifest) => format_manifest(manifest, &details)?,
                 None => format!(
                     "legacy database: storage profile {:?}, no manifest\n{details}",
                     metadata.storage_profile
                 ),
-            }
+            }];
+            // The probe reports only floors.encryption_at_rest as visibly unmet.
+            lines.extend(metadata.unmet_floors.iter().map(|floor| {
+                format!(
+                    "warning: {floor} is not met: the metadata is readable without a key, so \
+                     this file is not encrypted at rest (a restore target never is; see \
+                     docs/profiles.md, \"Backup and restore\")"
+                )
+            }));
+            lines.join("\n")
         }
         MetadataProbe::NotFound => format!("no database at {}", path.display()),
         MetadataProbe::Uninitialized => {
@@ -1667,6 +1729,11 @@ fn format_metadata_probe(path: &Path, probe: &MetadataProbe) -> Result<String, C
         }
         MetadataProbe::Locked => format!(
             "{} is locked: another handle holds the database open",
+            path.display()
+        ),
+        MetadataProbe::NeedsRecovery => format!(
+            "{} was not closed cleanly and needs crash recovery; profile show never writes the \
+             file, so open it once (any command with --profile auto or its profile) and retry",
             path.display()
         ),
         MetadataProbe::Unreadable { reason } => {
@@ -1857,7 +1924,7 @@ fn enforcement_label(enforcement: KnobEnforcement) -> String {
 
 const fn change_policy_label(policy: ChangePolicy) -> &'static str {
     match policy {
-        ChangePolicy::Unsupported => "fixed",
+        ChangePolicy::Unsupported => "unsupported",
         ChangePolicy::Retune => "retune",
         ChangePolicy::FormatUpgrade => "format upgrade",
         ChangePolicy::Provisioning => "provisioning",
@@ -2669,6 +2736,20 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|value| value == flag)
 }
 
+/// The arguments that are neither a `--flag` nor the value after one of `value_flags`, in order.
+fn positional_args<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a str> {
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if value_flags.contains(&arg.as_str()) {
+            iter.next();
+        } else if !arg.starts_with("--") {
+            positional.push(arg.as_str());
+        }
+    }
+    positional
+}
+
 /// Every value of a repeatable flag, in order. Each occurrence may also hold a comma-separated
 /// list, so `--override a=1 --override b=2` and `--override a=1,b=2` are the same.
 fn values(args: &[String], flag: &str) -> Vec<String> {
@@ -2761,14 +2842,34 @@ fn storage_profile_name(value: &str) -> Option<Profile> {
     }
 }
 
-/// The `DbConfig` of the database at `path`. `auto` reads the storage profile and replication
-/// of the existing database without creating anything, and is an error for anything else.
+/// The `DbConfig` of the database at `path`. The CLI and `serve` open single-node CP databases
+/// only, so the replication is always CP. `auto` reads only the storage profile of the existing
+/// database, without creating anything: a database whose metadata records another replication
+/// fails with `ReplicationMismatch`, exactly as it does with a named profile. `auto` is an error
+/// for anything but an initialized database. A file that was not closed cleanly (`serve` has no
+/// graceful shutdown, so every stop by a signal leaves one) first gets redb's crash recovery,
+/// which every opener runs anyway, also for a file that then fails the replication check; `auto`
+/// writes nothing else, and nothing at all to a cleanly closed file.
 fn cli_db_config(selection: ProfileSelection, path: PathBuf) -> Result<DbConfig, CliError> {
     let ProfileSelection::Fixed(profile) = selection else {
-        return match inspect_database_metadata(&path) {
+        let probe = match inspect_database_metadata(&path) {
+            MetadataProbe::NeedsRecovery => {
+                recover_database_file(&path)?;
+                inspect_database_metadata(&path)
+            }
+            probe => probe,
+        };
+        return match probe {
             MetadataProbe::Initialized(metadata) => {
-                Ok(DbConfig::on_disk(metadata.storage_profile, path)
-                    .with_replication(metadata.replication))
+                let config = DbConfig::on_disk(metadata.storage_profile, path);
+                if metadata.replication != config.replication {
+                    return Err(multidb::db::ConfigError::ReplicationMismatch {
+                        expected: config.replication,
+                        found: metadata.replication,
+                    }
+                    .into());
+                }
+                Ok(config)
             }
             MetadataProbe::NotFound => Err(CliError::Usage(format!(
                 "profile auto reads the profile of an existing database, but nothing exists at \
@@ -2782,6 +2883,11 @@ fn cli_db_config(selection: ProfileSelection, path: PathBuf) -> Result<DbConfig,
             MetadataProbe::Locked => Err(CliError::Usage(format!(
                 "profile auto cannot inspect {}: another process holds the database open; stop \
                  it or name the profile",
+                path.display()
+            ))),
+            MetadataProbe::NeedsRecovery => Err(CliError::Usage(format!(
+                "profile auto cannot read the metadata of {}: it still needs crash recovery \
+                 after recovering it; name the profile",
                 path.display()
             ))),
             MetadataProbe::Unreadable { reason } => Err(CliError::Usage(format!(
@@ -2885,9 +2991,11 @@ fn usage() -> CliError {
 mod tests {
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use super::write_through_temp_file;
     use super::{
-        CliError, ProfileSelection, ServePgTls, cli_db_config, parse_profile_selection, run,
-        serve_config_from_sources, values,
+        CliError, ProfileSelection, ServePgTls, cli_db_config, format_metadata_probe,
+        parse_profile_selection, run, serve_config_from_sources, serve_database, values,
     };
     use multidb::{
         config_spec::{
@@ -2896,8 +3004,9 @@ mod tests {
             WriteAck, resolve_named_profile,
         },
         db::{
-            DbConfig, OperationalConfig, Profile, ReplicationKind, create_database,
-            create_database_with_profile,
+            ConfigError, DbConfig, MetadataProbe, OperationalConfig, Profile, ReplicationKind,
+            create_database, create_database_with_profile, inspect_database_metadata,
+            open_database,
         },
         tuning::WorkloadSample,
     };
@@ -3914,13 +4023,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let db_path = temp.path().join("vectors.redb");
-        let ap_config =
-            DbConfig::on_disk(Profile::Vector, &db_path).with_replication(ReplicationKind::Ap);
-        drop(create_database(ap_config.clone())?);
+        let config = DbConfig::on_disk(Profile::Vector, &db_path);
+        drop(create_database(config.clone())?);
 
         assert_eq!(
             cli_db_config(ProfileSelection::Auto, db_path.clone())?,
-            ap_config
+            config
         );
         let advice = run(strings(&[
             "advice",
@@ -3952,6 +4060,212 @@ mod tests {
             "unexpected result: {admin:?}"
         );
         assert!(!missing.exists());
+
+        // `serve` resolves `auto` before it creates the parent directories of the path.
+        let nested = temp.path().join("volume");
+        let nested_db = nested.join("data").join("missing.redb");
+        let env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+            ("MULTIDB_PROFILE", "auto"),
+            ("MULTIDB_DB_PATH", &path_arg(&nested_db)),
+        ]);
+        let serve = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let database = serve_database(&serve);
+        assert!(
+            matches!(database, Err(CliError::Usage(ref message)) if message.contains("nothing exists")),
+            "unexpected result: {:?}",
+            database.err()
+        );
+        assert!(!nested.exists());
+        Ok(())
+    }
+
+    /// The CLI and `serve` open single-node CP files only. `auto` reads the storage profile but
+    /// never adopts AP replication: an AP file fails exactly as it does with a named profile.
+    #[test]
+    fn profile_auto_refuses_ap_databases_like_a_named_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn is_ap_mismatch<T>(result: &Result<T, CliError>) -> bool {
+            matches!(
+                result,
+                Err(CliError::Config(ConfigError::ReplicationMismatch {
+                    expected: ReplicationKind::Cp,
+                    found: ReplicationKind::Ap,
+                }))
+            )
+        }
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("ap.redb");
+        let ap_config =
+            DbConfig::on_disk(Profile::Document, &db_path).with_replication(ReplicationKind::Ap);
+        drop(create_database(ap_config.clone())?);
+        let before = std::fs::read(&db_path)?;
+
+        let config = cli_db_config(ProfileSelection::Auto, db_path.clone());
+        assert!(is_ap_mismatch(&config), "unexpected result: {config:?}");
+        let csv = temp.path().join("rows.csv");
+        std::fs::write(&csv, "id,name\n1,a\n")?;
+        let csv_arg = path_arg(&csv);
+        let db_arg = path_arg(&db_path);
+        // `auto` fails before anything opens the file; a named profile fails in the opener.
+        for profile in ["auto", "document"] {
+            for mut args in [
+                vec!["admin", "status"],
+                vec!["advice", "list"],
+                vec!["migrate", "value-codec"],
+                vec!["import", "csv", "--file", &csv_arg, "--table", "t"],
+            ] {
+                args.extend(["--db", &db_arg, "--profile", profile]);
+                let outcome = run(strings(&args));
+                assert!(
+                    is_ap_mismatch(&outcome),
+                    "{args:?}: unexpected result: {outcome:?}"
+                );
+            }
+
+            let env = env_map(&[
+                ("MULTIDB_RUNTIME_MODE", "local-dev"),
+                ("MULTIDB_PG_TLS_MODE", "disabled"),
+                ("MULTIDB_PG_PASSWORD", "pg-secret"),
+                ("MULTIDB_PROFILE", profile),
+                ("MULTIDB_DB_PATH", &db_arg),
+            ]);
+            let serve = serve_config_from_sources(|name| env.get(name).cloned())?;
+            let database = serve_database(&serve);
+            assert!(
+                is_ap_mismatch(&database),
+                "serve {profile}: unexpected result: {:?}",
+                database.err()
+            );
+            if profile == "auto" {
+                assert_eq!(
+                    std::fs::read(&db_path)?,
+                    before,
+                    "auto wrote to the AP file"
+                );
+            }
+        }
+
+        let reopened = open_database(ap_config)?;
+        assert_eq!(reopened.replication_kind(), ReplicationKind::Ap);
+        Ok(())
+    }
+
+    /// `serve` stops only when it is killed, so the file it leaves behind needs crash recovery.
+    /// `profile show --db` still never writes it, while `--profile auto` and
+    /// `MULTIDB_PROFILE=auto` recover it, as every opener would, before reading its profile.
+    #[test]
+    fn profile_auto_recovers_a_database_that_was_not_closed_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let live = temp.path().join("live.redb");
+        let overrides = serde_json::from_value(json!({ "cache": { "max_entries": 8192 } }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with a cache override must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(live.clone()))?;
+        let database = create_database_with_profile(&binding, OperationalConfig::default())?;
+        // A copy taken while the database is open is what a killed process leaves behind.
+        let shown_path = temp.path().join("shown.redb");
+        let cli_path = temp.path().join("cli.redb");
+        let serve_path = temp.path().join("serve.redb");
+        for path in [&shown_path, &cli_path, &serve_path] {
+            std::fs::copy(&live, path)?;
+        }
+        drop(database);
+
+        let before = std::fs::read(&shown_path)?;
+        let shown = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&shown_path),
+        ]))?;
+        assert_eq!(shown.exit_code, 1);
+        assert!(
+            shown.message.contains("needs crash recovery"),
+            "{}",
+            shown.message
+        );
+        let shown = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&shown_path),
+            "--json",
+        ]))?;
+        assert_eq!(shown.exit_code, 1);
+        assert_eq!(json_message(&shown)?["state"], "needs_recovery");
+        assert_eq!(
+            std::fs::read(&shown_path)?,
+            before,
+            "profile show wrote the file"
+        );
+
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, shown_path.clone())?,
+            DbConfig::on_disk(Profile::HighDurability, &shown_path)
+        );
+        let shown = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&shown_path),
+        ]))?;
+        assert_eq!(shown.exit_code, 0, "{}", shown.message);
+
+        let status = run(strings(&[
+            "admin",
+            "status",
+            "--db",
+            &path_arg(&cli_path),
+            "--profile",
+            "auto",
+        ]))?;
+        assert_eq!(status.exit_code, 0, "{}", status.message);
+
+        let serve_arg = path_arg(&serve_path);
+        let env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+            ("MULTIDB_PROFILE", "auto"),
+            ("MULTIDB_DB_PATH", &serve_arg),
+        ]);
+        let serve = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let database = serve_database(&serve)?;
+        assert_eq!(database.profile(), Profile::HighDurability);
+        drop(database);
+
+        // Recovery runs before the replication check, so a crashed AP file is recovered and
+        // then refused; it keeps its replication.
+        let ap_live = temp.path().join("ap-live.redb");
+        let ap_crashed = temp.path().join("ap-crashed.redb");
+        let database = create_database(
+            DbConfig::on_disk(Profile::Document, &ap_live).with_replication(ReplicationKind::Ap),
+        )?;
+        std::fs::copy(&ap_live, &ap_crashed)?;
+        drop(database);
+        let config = cli_db_config(ProfileSelection::Auto, ap_crashed.clone());
+        assert!(
+            matches!(
+                config,
+                Err(CliError::Config(ConfigError::ReplicationMismatch {
+                    expected: ReplicationKind::Cp,
+                    found: ReplicationKind::Ap,
+                }))
+            ),
+            "unexpected result: {config:?}"
+        );
+        let reopened = open_database(
+            DbConfig::on_disk(Profile::Document, &ap_crashed).with_replication(ReplicationKind::Ap),
+        )?;
+        assert_eq!(reopened.replication_kind(), ReplicationKind::Ap);
         Ok(())
     }
 
@@ -4194,6 +4508,65 @@ mod tests {
     }
 
     #[test]
+    fn profile_show_finds_the_name_anywhere_among_the_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = json_message(&run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "cache.max_entries=8192",
+            "--json",
+        ]))?)?;
+        for args in [
+            vec![
+                "--json",
+                "--override",
+                "cache.max_entries=8192",
+                "high_durability",
+            ],
+            vec![
+                "--override",
+                "cache.max_entries=8192",
+                "high_durability",
+                "--output",
+                "json",
+            ],
+        ] {
+            let mut full = vec!["profile", "show"];
+            full.extend(args);
+            let outcome = run(strings(&full))?;
+            assert_eq!(outcome.exit_code, 0, "{full:?}: {}", outcome.message);
+            assert_eq!(json_message(&outcome)?, first, "{full:?}");
+        }
+
+        let two = run(strings(&[
+            "profile",
+            "show",
+            "secure_app",
+            "--json",
+            "balanced",
+        ]));
+        assert!(
+            matches!(two, Err(CliError::Usage(ref message))
+                if message.contains("one profile name") && message.contains("balanced")),
+            "unexpected result: {two:?}"
+        );
+        let both = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            "x.redb",
+            "secure_app",
+        ]));
+        assert!(
+            matches!(both, Err(CliError::Usage(ref message)) if message.contains("not both")),
+            "unexpected result: {both:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn profile_show_db_prints_the_manifest_or_legacy() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let manifest_path = temp.path().join("orders.redb");
@@ -4235,6 +4608,20 @@ mod tests {
             text.message
         );
         assert!(text.message.contains("HighDurability"), "{}", text.message);
+        assert_eq!(report["unmet_floors"], json!([]));
+        assert!(!text.message.contains("warning:"), "{}", text.message);
+        // A floor the probe sees unmet (a restore target of a floors.encryption_at_rest
+        // database, covered in the db tests) is printed as a warning.
+        let MetadataProbe::Initialized(mut probed) = inspect_database_metadata(&manifest_path)
+        else {
+            return Err("the manifest database is not initialized".into());
+        };
+        probed.unmet_floors = vec!["floors.encryption_at_rest"];
+        let warned = format_metadata_probe(&manifest_path, &MetadataProbe::Initialized(probed))?;
+        assert!(
+            warned.contains("\nwarning: floors.encryption_at_rest is not met"),
+            "{warned}"
+        );
         assert_eq!(
             cli_db_config(ProfileSelection::Auto, manifest_path.clone())?,
             DbConfig::on_disk(Profile::HighDurability, &manifest_path)
@@ -4368,10 +4755,39 @@ mod tests {
             RESERVED_KNOBS.len()
         );
         assert!(knobs.iter().any(|knob| knob["path"] == "cache.max_entries"));
+        let medium = knobs
+            .iter()
+            .find(|knob| knob["path"] == "storage.medium")
+            .ok_or("missing storage.medium")?;
+        assert_eq!(medium["after_creation"], "unsupported");
 
         let text = run(strings(&["profile", "knobs"]))?;
         assert!(text.message.contains("history.mvcc_retention_millis"));
         assert!(text.message.contains("reserved"));
+        // The text output names ChangePolicy::Unsupported as the docs and --json do, in the
+        // after-creation column (aligned to its header; cells are padded by characters).
+        let header = text.message.lines().next().ok_or("missing header row")?;
+        let column = header
+            .find("after creation")
+            .ok_or("missing after creation column")?;
+        let after_creation =
+            |line: &str| -> String { line.chars().skip(column).collect::<String>() };
+        let medium_row = text
+            .message
+            .lines()
+            .find(|line| line.starts_with("storage.medium "))
+            .ok_or("missing storage.medium row")?;
+        assert!(
+            after_creation(medium_row).starts_with("unsupported "),
+            "{medium_row}"
+        );
+        assert!(
+            text.message
+                .lines()
+                .all(|line| !after_creation(line).starts_with("fixed ")),
+            "{}",
+            text.message
+        );
         Ok(())
     }
 
@@ -4516,7 +4932,124 @@ mod tests {
         let upgraded = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&input)?)?;
         assert_eq!(upgraded.version, 2);
         assert!(upgraded.custom_profile.is_some());
-        assert!(!temp.path().join("spec.json.upgrade-tmp").exists());
+        assert_eq!(upgrade_temp_files(temp.path())?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// The names of `config upgrade` temporary files left in `dir`.
+    fn upgrade_temp_files(dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".upgrade-tmp") {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// A symlink planted at the temporary name, or at `--out` itself, never redirects the
+    /// write: the temporary file is created exclusively (a planted link fails it with
+    /// `AlreadyExists`), and the rename replaces the link at `--out`, not its target.
+    #[cfg(unix)]
+    #[test]
+    fn config_upgrade_out_never_writes_through_a_planted_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("spec.json");
+        write_spec(&input, &studio_style_spec())?;
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, "keep")?;
+        let out = temp.path().join("upgraded.json");
+        // A symlink planted at the exact temporary name fails the write instead of redirecting
+        // it, and is left in place.
+        let planted = temp.path().join(".upgraded.json.planted.upgrade-tmp");
+        std::os::unix::fs::symlink(&victim, &planted)?;
+        let refused = write_through_temp_file(&out, &planted, "{}");
+        assert!(
+            matches!(&refused, Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "unexpected result: {refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+        assert!(!out.exists());
+
+        let outcome = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&out),
+        ]))?;
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+        assert!(
+            std::fs::symlink_metadata(&planted)?
+                .file_type()
+                .is_symlink()
+        );
+        let upgraded = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&out)?)?;
+        assert_eq!(upgraded.version, 2);
+
+        let linked_out = temp.path().join("linked.json");
+        std::os::unix::fs::symlink(&victim, &linked_out)?;
+        let forced = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&linked_out),
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 0, "{}", forced.message);
+        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+        assert!(
+            !std::fs::symlink_metadata(&linked_out)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            upgrade_temp_files(temp.path())?,
+            vec![".upgraded.json.planted.upgrade-tmp".to_owned()]
+        );
+        Ok(())
+    }
+
+    /// A spec that is not UTF-8 is an I/O error (exit 1) for every spec reader, as before
+    /// `spec_io`, not a validation report (exit 2).
+    #[test]
+    fn spec_files_that_are_not_utf8_keep_exit_code_1() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec = temp.path().join("latin1.yaml");
+        std::fs::write(&spec, b"version: 1\nname: caf\xe9\n")?;
+        let spec_arg = path_arg(&spec);
+        for args in [
+            vec!["config", "validate", "--spec", &spec_arg],
+            vec!["config", "explain", "--spec", &spec_arg, "--json"],
+            vec!["config", "upgrade", "--spec", &spec_arg],
+            vec!["profile", "explain", "--spec", &spec_arg],
+            vec![
+                "config",
+                "plan",
+                "--current",
+                &spec_arg,
+                "--desired",
+                &spec_arg,
+            ],
+        ] {
+            let outcome = run(strings(&args));
+            match outcome {
+                Err(CliError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{args:?}");
+                    assert_eq!(
+                        CliError::Io(error).to_string(),
+                        "io: stream did not contain valid UTF-8"
+                    );
+                }
+                other => panic!("{args:?}: expected an I/O error, got {other:?}"),
+            }
+        }
         Ok(())
     }
 

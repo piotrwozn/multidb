@@ -62,12 +62,27 @@ All notable public changes will be recorded here.
   database keeps `schema_version` 1: an older binary opens it but ignores the
   manifest, so a downgrade reverts every knob to the storage profile
   defaults. A manifest is refused (`ProfileManifestInvalid`) unless its knobs
-  pass the resolver's range and conflict checks and leave the planned
-  `limits.*` knobs `unlimited`. `CompiledPolicy::binding` refuses a path for
-  a volatile storage class (`VolatileWithPath`), also for a version 1 spec,
-  where validation only warns. CP, AP and sharded openers refuse manifests.
+  pass the resolver's range and conflict checks, leave the planned
+  `limits.*` knobs `unlimited` and match the recorded digest.
+  `create_database_with_profile` refuses (`ProfileFloorNotMet`) operational
+  settings that miss `floors.encryption_at_rest` (no
+  `OperationalConfig.encryption`) or `floors.audit`, and
+  `Database::set_audit_enabled_as` refuses to disable audit on a database
+  whose manifest sets `floors.audit`. Restore does not check floors: a
+  restored `floors.encryption_at_rest` database is not encrypted (see
+  `docs/profiles.md`). `CompiledPolicy::binding` refuses a path for a volatile
+  storage class (`VolatileWithPath`), also for a version 1 spec, where
+  validation only warns. CP, AP and sharded openers refuse manifests.
   `inspect_database_metadata` (`MetadataProbe`, `ProbedMetadata`) reads a
-  database's metadata without creating files. See `docs/profiles.md`.
+  database's metadata through a read-only redb open, so it never creates,
+  writes or repairs files; a file that was not closed cleanly is
+  `NeedsRecovery`, and `recover_database_file` runs redb's crash recovery on
+  it without touching the metadata. `ProbedMetadata.unmet_floors` lists
+  `floors.encryption_at_rest` when the manifest sets it, because the probe
+  read the metadata without a key, and `profile show --db` prints it as a
+  warning. The persistent format registry
+  (`FormatRegistry::phase_24_default`) lists database metadata
+  `schema_version` 2 and the profile manifest. See `docs/profiles.md`.
 - `AnyEngine::is_value_framed` and `AnyEngine::with_value_framing`, which
   wraps an open engine in compression framing without reopening it.
 - CLI profile commands: `multidb profile show <profile> [--override
@@ -75,14 +90,18 @@ All notable public changes will be recorded here.
   plus what-if overrides with did-you-mean suggestions), `profile show --db
   <path>` (the persisted profile manifest, or "legacy database"), `profile
   explain --spec <file>` (exit 2 when the profile is invalid) and `profile
-  knobs` (the knob registry and reserved knobs). `profile list --json` adds
+  knobs` (the knob registry and reserved knobs; a knob that cannot change
+  after creation reads `unsupported`, in text as in JSON). The profile name of
+  `profile show` may stand anywhere among its flags. `profile list --json` adds
   `variants` and the canonical variant's `knobs`; the text output adds
   `variants=`.
 - `multidb config upgrade --spec <in> [--out <file>] [--force] [--json]`
   converts a spec to version 2 and turns Studio's `profile.custom.*` keys into
   `custom_profile`; it is idempotent, writes `--out` in the format of its
-  extension, refuses to overwrite files without `--force`, and exits 2
-  without writing when the result does not validate.
+  extension, refuses to overwrite files without `--force`, writes through a
+  new, randomly named sibling file that it renames into place (a planted
+  symlink cannot redirect the write), and exits 2 without writing when the
+  result does not validate.
 - `multidb init --guided --profile <p> --override path=value...
   [--profile-name <slug>]` writes a version 2 spec with a `custom_profile`
   that extends `<p>`. Without `--override` guided init is unchanged.
@@ -119,8 +138,11 @@ All notable public changes will be recorded here.
   `invalid_json` and CLI exit 1 before. The OpenAPI snapshot documents the
   `/config/plan` 422 response as a success or an error envelope
   (`JsonObjectOrErrorEnvelope`).
-- Specs over 1 MiB (`SPEC_TOO_LARGE`) or over the YAML alias expansion budget
-  (`SPEC_TOO_COMPLEX`) are rejected before the typed decode.
+- Spec files over 1 MiB (`SPEC_TOO_LARGE`) or over the YAML alias expansion
+  budget (`SPEC_TOO_COMPLEX`) are rejected before the typed decode (CLI exit
+  2). Control Plane request bodies over 1 MiB stay HTTP 400 `invalid_json`
+  from the router's body limit, and JSON bodies cannot reach
+  `SPEC_TOO_COMPLEX`.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
   with `StorageFormatMismatch` (previously an opaque serde error). Every
@@ -140,8 +162,12 @@ All notable public changes will be recorded here.
   empty initialized target behind.
 - Every CLI `--profile` flag and `MULTIDB_PROFILE` also accept product slugs
   (their canonical variant), aliases in snake or kebab case, and `auto`,
-  which reads the storage profile and replication of the existing database
-  (`restore` refuses `auto`). Every value accepted before keeps its meaning.
+  which reads the storage profile of the existing database read-only
+  (`restore` refuses `auto`). A file that was not closed cleanly, such as the
+  one a stopped `serve` leaves, first gets redb's crash recovery, as with any
+  opener. The CLI and `serve` still open single-node CP databases only: with
+  `auto`, an AP database fails with `ReplicationMismatch`, as with a named
+  profile. Every value accepted before keeps its meaning.
   Guided init accepts profile names in any case.
 - Guided init with an alias of a non-canonical variant (for example
   `high_durability` or `time-series`) prints a warning that the version 1
@@ -164,9 +190,9 @@ All notable public changes will be recorded here.
 - `ConfigSpecError::UnsupportedVersion` gains a `supported` range field.
 - `CompiledPolicy` struct literals must set the new `resolved_profile` field.
 - `ConfigError` gains `AlreadyInitialized`, `StorageFormatMismatch`,
-  `UnsupportedProfileManifest`, `ProfileManifestInvalid` and
-  `MetadataUnreadable`. `ConfigError` is not `non_exhaustive`, so exhaustive
-  matches outside the crate must handle them.
+  `UnsupportedProfileManifest`, `ProfileManifestInvalid`,
+  `ProfileFloorNotMet` and `MetadataUnreadable`. `ConfigError` is not
+  `non_exhaustive`, so exhaustive matches outside the crate must handle them.
 
 ## 0.1.0-preview.1
 

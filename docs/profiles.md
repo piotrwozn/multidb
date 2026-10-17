@@ -140,7 +140,7 @@ profile.
 | `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | declarative: recorded only until provisioning exists | provisioning |
 | `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
 | `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
-| `consistency.default_domain` | local_snapshot \| strong_cp \| eventual_ap | generation default | guided init, templates and domain advice | declarative | not applicable |
+| `consistency.default_domain` | local_snapshot \| strong_cp \| eventual_ap | generation default | `multidb init --guided --override` (domain mode and replication of the spec it writes); guided init without `--override` and templates use the product's domain | declarative | not applicable |
 | `floors.audit` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.audit.enabled`) | enforced | not applicable |
 | `floors.backup` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR`, or `PRODUCTION_BACKUP_DISABLED` for production_cp (`guarantees.backup.enabled`) | enforced | not applicable |
 | `floors.pitr` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.backup.pitr`) | enforced | not applicable |
@@ -320,13 +320,22 @@ and the Control Plane read every spec through `multidb::config_spec::spec_io`:
 - the typed decode then reads the original text, so syntax and unknown-field
   errors keep their line and column.
 
-Size, complexity and version problems are validation issues: the CLI exits 2
-(with `--json`, the report is printed as JSON) and the Control Plane answers
-422. `/config/validate` returns the report as `data`; `/config/plan` cannot
-build a plan from such a spec and answers with an error envelope whose code is
-`invalid_spec_version`, so the OpenAPI snapshot documents its 422 response as
-a success or an error envelope (`JsonObjectOrErrorEnvelope`). Syntax errors
-and decode errors keep exit code 1 and HTTP 400 `invalid_json`.
+The CLI reports size, complexity and version problems as validation issues
+and exits 2 (with `--json`, the report is printed as JSON). The Control
+Plane answers each case differently:
+
+- a request body over 1 MiB is refused by the router's body limit
+  (`DefaultBodyLimit`) before the spec is read, as HTTP 400 `invalid_json`,
+  so `SPEC_TOO_LARGE` is a CLI result only;
+- a JSON body has no anchors or aliases, so it never hits `SPEC_TOO_COMPLEX`;
+- a missing or unsupported version is HTTP 422. `/config/validate` returns
+  the report as `data`; `/config/plan` cannot build a plan from such a spec
+  and answers with an error envelope whose code is `invalid_spec_version`,
+  so the OpenAPI snapshot documents its 422 response as a success or an
+  error envelope (`JsonObjectOrErrorEnvelope`).
+
+Syntax errors and decode errors keep exit code 1 and HTTP 400
+`invalid_json`.
 
 ### Compiled policy, explain and plans
 
@@ -391,10 +400,23 @@ the crate version that wrote it. It is re-validated on every read: its storage
 profile must equal `__meta.profile`, every knob must be within its registry
 bounds, the knobs must pass the resolver's conflict checks and leave the
 planned `limits.*` knobs `unlimited`, the knobs must derive the recorded
-storage class under the recorded variant, and the storage format must agree
-with the compression knobs. A failure is `ProfileManifestInvalid`, and a
-newer `manifest_version` is `UnsupportedProfileManifest`, so a corrupt or
-hand-edited manifest never drives the runtime.
+storage class under the recorded variant, the storage format must agree
+with the compression knobs, and the recorded digest must equal the digest of
+the decoded knobs, so an in-range edit is refused too. A failure is
+`ProfileManifestInvalid`, and a newer `manifest_version` is
+`UnsupportedProfileManifest`, so a corrupt or hand-edited manifest never
+drives the runtime.
+
+`create_database_with_profile` also refuses (`ProfileFloorNotMet`, before
+anything is created) operational settings that miss a floor the runtime can
+check: `floors.encryption_at_rest` needs `OperationalConfig.encryption`, and
+`floors.audit` needs `OperationalConfig.security.audit_enabled`. After
+creation, `Database::set_audit_enabled_as(_, false)` on a database whose
+manifest sets `floors.audit` is refused with `ProfileFloorNotMet` and audited
+as failed, so audit stays on. Backup and PITR are operator-managed (`multidb
+backup`, no scheduler), so `floors.backup` and `floors.pitr` are checked only
+by validation, against the spec guarantees. Restore does not check floors
+(see [Backup and restore](#backup-and-restore)).
 
 Every single-node opener (`create_database`, `open_database`,
 `create_database_with_ops`, `open_database_with_ops`) re-applies the manifest:
@@ -407,6 +429,24 @@ it from the database (see [CLI](#cli)). An explicit
 `OperationalConfig.performance` wins for that session and logs one warning.
 No opener writes security because of a manifest. Databases without a manifest
 open exactly as before; plain `create_database` and `serve` never write one.
+
+### Evolving the manifest
+
+`ProfileKnobs`, its sections, `StorageFormat` and `PersistedProfileManifest`
+are decoded with `deny_unknown_fields`, and the digest is recomputed from the
+decoded knobs on every read, so every database created with a profile
+depends on their exact shape. A new knob leaf must get a serde default equal
+to the preset value older manifests ran with, and must not be serialized at
+that value, so older manifests keep decoding with an unchanged digest; an
+older binary then refuses only manifests that set the new leaf to another
+value. Removing or renaming a leaf, or changing its value form, requires a
+`manifest_version` bump with a migration that reads the older version. The
+digest hashes the serialized JSON bytes, so reordering fields or changing a
+serde attribute (a rename or representation) of the knobs or of the storage
+`Profile` also changes every stored digest, even when the decoded values stay
+the same, and needs the same bump. A golden manifest written by the first
+build with manifests is pinned by a test, so a change that breaks older
+manifests fails CI.
 
 ### Value framing and `schema_version`
 
@@ -452,12 +492,20 @@ manifest database holds decoded values, and its `BackupManifest.profile`
 stays the storage `Profile`. Restore looks for `__meta.profile_manifest` in
 the full backup payload before it creates anything:
 
-- With a manifest, the target is built the way `create_database_with_profile`
-  builds it: when the manifest records value framing, the engine frames values
-  with the manifest compression, so every restored value, `__meta` included,
-  is framed again and the restored database opens with its manifest
-  performance. The restored `__meta` records (`schema_version`, the manifest)
-  are copied verbatim, as before.
+- With a manifest, the target gets the storage format and metadata
+  `create_database_with_profile` writes: when the manifest records value
+  framing, the engine frames values with the manifest compression, so every
+  restored value, `__meta` included, is framed again and the restored
+  database opens with its manifest performance. The restored `__meta` records
+  (`schema_version`, the manifest) are copied verbatim, as before.
+- Restore does not check the manifest floors. Like every restore target in
+  this build, the target is not encrypted at rest, so a restored database
+  whose manifest sets `floors.encryption_at_rest` stores plaintext although
+  its manifest still records the floor. `inspect_database_metadata` lists
+  the floor in `unmet_floors` (it read `__meta` without a key), and
+  `profile show --db` prints it as a warning. Restore such a database only
+  where that is acceptable; an encrypted restore target is not available
+  yet.
 - A restore `DbConfig` whose storage profile disagrees with the backed-up
   manifest fails with `BackupError::Config(ProfileMismatch)`. A backed-up
   manifest that does not decode or fails the read-time validation is
@@ -488,12 +536,23 @@ without creating anything:
 | --- | --- |
 | `NotFound` | nothing exists at the path; nothing is opened or created |
 | `Uninitialized` | an empty file, or a redb file without database metadata |
-| `Locked` | another handle holds the database open |
-| `Unreadable { reason }` | the file or its metadata cannot be read, including encrypted metadata (with the hint above) and invalid manifests |
-| `Initialized` | `schema_version`, storage profile, replication, layout, the manifest (absent for legacy databases) and whether values are framed |
+| `Locked` | another handle holds the database open for writing |
+| `NeedsRecovery` | the file was not closed cleanly (a crash, or a killed `serve`) and needs redb's crash recovery before its metadata can be read |
+| `Unreadable { reason }` | the path is not a regular file (a directory, for example), or the file or its metadata cannot be read, including encrypted metadata (with the hint above) and invalid manifests |
+| `Initialized` | `schema_version`, storage profile, replication, layout, the manifest (absent for legacy databases), whether values are framed, and `unmet_floors`: `floors.encryption_at_rest` when the manifest sets it, because an encrypted file's metadata is never readable without a key |
 
-It opens an existing file with redb, which may run redb's own crash repair
-exactly as a normal open would, and drops the handle before returning.
+It opens an existing file read-only (`redb::ReadOnlyDatabase`: no write
+access, a shared lock) and drops the handle before returning, so it never
+writes the file. redb recovers a file that was not closed cleanly only on a
+read-write open, so such a file is `NeedsRecovery` until an opener has
+recovered it. `db::recover_database_file(path)` runs just that recovery: it
+opens the existing file read-write without creating it, which restores the
+last committed state as every opener does first, and closes it, without
+reading or writing any database metadata; a cleanly closed file is left
+untouched, and a path that is not a regular file is refused before it is
+opened. `profile show --db` never recovers a file and reports it as
+needing recovery; `--profile auto` and `MULTIDB_PROFILE=auto` recover it
+first (see [CLI](#cli)).
 
 ## CLI
 
@@ -503,7 +562,7 @@ exactly as a normal open would, and drops the handle before returning.
 | --- | --- | --- |
 | `profile list [--json]` | the six product profiles; JSON adds `variants` (`name`, `storage_profile`, `canonical`) and the canonical variant's `knobs`, text adds `variants=` | 0 |
 | `profile show <profile> [--override path=value]... [--json]` | the resolved profile: a header naming the product, variant, status and storage profile, the digest, and one row per knob with its value, source (`preset`, `variant`, `override`), timing, enforcement and sink | 0, or 2 when the profile is invalid |
-| `profile show --db <path> [--json]` | the profile manifest of the database, or `legacy database: storage profile X, no manifest`; JSON prints the `inspect_database_metadata` result | 0, or 1 when nothing, an uninitialized file, a locked or an unreadable database is found |
+| `profile show --db <path> [--json]` | the profile manifest of the database, or `legacy database: storage profile X, no manifest`, and a warning per unmet floor; JSON prints the `inspect_database_metadata` result; it never writes the file | 0, or 1 when nothing, an uninitialized file, or a locked, unrecovered or unreadable database is found |
 | `profile explain --spec <file> [--json]` | `resolve_profile` for a spec read through `spec_io`; JSON has `resolution` (`resolved`, `unresolved`, `invalid`), `profile`, `rows` and `issues` | 0 for resolved and version 1 unresolved profiles, 2 when invalid (including `FIELD_REQUIRES_SPEC_V2` for a version 1 spec that sets `custom_profile`) or when the spec cannot be read (`SPEC_TOO_LARGE`, `UNSUPPORTED_VERSION`, ...) |
 | `profile knobs [--json]` | every `KNOB_REGISTRY` entry, then the reserved knobs marked `reserved` | 0 |
 
@@ -542,11 +601,15 @@ converts a spec to version 2:
   same bytes;
 - `--out` gets the format its extension names (`.yaml`/`.yml` is YAML,
   anything else JSON); without `--out` the output keeps the input's format
-  and goes to stdout (notes and an invalid validation report go to stderr
-  then); `--json` prints `{spec, notes, validation}`, plus `path` and
+  and goes to stdout (notes, the warnings and advice of a valid result, for
+  example `PROFILE_NOT_PROVISIONABLE`, and an invalid validation report go to
+  stderr then); `--json` prints `{spec, notes, validation}`, plus `path` and
   `written` with `--out`;
 - it refuses to overwrite an existing file, the input included, without
-  `--force`, and replaces files by writing a sibling file and renaming it;
+  `--force`, and replaces files by writing a new, randomly named sibling
+  file and renaming it into place: the sibling is created exclusively, so a
+  planted symlink cannot redirect the write, and the rename replaces a
+  symlink at `--out` instead of writing through it;
 - the result is validated: exit 2 when it is invalid, for example
   `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
   `profile.custom.base`, and an invalid result is never written to `--out`,
@@ -566,11 +629,18 @@ Every `--profile` flag (`backup`, `restore`, `advice`, `cdc`, `view`,
   which keep their meaning;
 - a product slug, which selects its canonical variant's storage profile, or
   an alias, which selects its variant's, in snake or kebab case;
-- `auto`, which reads the storage profile and replication of the existing
-  database with `inspect_database_metadata`. It is a usage error when nothing
-  exists at the path, the file holds no database metadata, the database is
-  locked by another process or its metadata cannot be read. `restore` refuses
-  `auto`, because its target must be absent or empty.
+- `auto`, which reads the storage profile of the existing database with
+  `inspect_database_metadata`, without writing a cleanly closed file. A file
+  that needs crash recovery (`serve` has no graceful shutdown, so every stop
+  by a signal leaves one) first gets `recover_database_file`, the recovery
+  every opener runs anyway; this also happens for a file that then fails the
+  replication check. The CLI and `serve` open single-node CP databases only,
+  so `auto` never adopts another replication: a database whose metadata
+  records AP replication fails with `ReplicationMismatch`, exactly as it does
+  with a named profile. It is a usage error when nothing exists at the path,
+  the file holds no database metadata, the database is locked by another
+  process or its metadata cannot be read. `restore` refuses `auto`, because
+  its target must be absent or empty.
 
 `multidb serve` defaults to `MULTIDB_PROFILE=transactional`, so it fails with
 `ProfileMismatch` on a database of another storage class, such as a manifest

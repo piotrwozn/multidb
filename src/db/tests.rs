@@ -11,7 +11,7 @@ use super::{
     create_database_with_profile, create_sharded_database, engine_for, engine_for_operational,
     force_wasm_runtime_init_failure, inspect_database_metadata, layout_for, open_ap_database,
     open_cluster_database, open_database, open_database_with_ops, open_sharded_database,
-    profile_validation_report, refuse_profile_manifest, validate,
+    profile_validation_report, recover_database_file, refuse_profile_manifest, validate,
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
@@ -3647,6 +3647,7 @@ fn inspect_database_metadata_never_creates_files() -> Result<(), Box<dyn std::er
             layout: TableLayout::Columnar,
             manifest: None,
             values_framed: false,
+            unmet_floors: Vec::new(),
         }))
     );
 
@@ -3670,11 +3671,372 @@ fn inspect_database_metadata_never_creates_files() -> Result<(), Box<dyn std::er
             layout: TableLayout::Row,
             manifest: Some(binding.manifest.clone()),
             values_framed: true,
+            unmet_floors: Vec::new(),
         }))
     );
     let probe = serde_json::to_value(inspect_database_metadata(&framed))?;
     assert_eq!(probe["state"], "initialized");
     assert_eq!(probe["manifest"]["variant"], "high_durability");
+    assert_eq!(probe["unmet_floors"], json!([]));
+    Ok(())
+}
+
+/// The probe opens files read-only: it never writes a file, and a file that needs crash
+/// recovery is `NeedsRecovery` instead of being repaired. `recover_database_file` recovers it
+/// without touching the database metadata, and leaves a cleanly closed file alone.
+#[test]
+fn inspect_database_metadata_never_writes_or_repairs() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("live.redb");
+    let crashed = temp_dir.path().join("crashed.redb");
+    let reopened = temp_dir.path().join("reopened.redb");
+    let ap_config =
+        DbConfig::on_disk(Profile::Document, &path).with_replication(ReplicationKind::Ap);
+    let mut database = create_database(ap_config)?;
+    database.create_table("users", Some(account_schema()), Vec::new())?;
+    database.table("users")?.insert(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(37),
+    ])?;
+    // A copy taken while the database is open is what a crash leaves behind.
+    std::fs::copy(&path, &crashed)?;
+    std::fs::copy(&path, &reopened)?;
+    drop(database);
+
+    let clean = std::fs::read(&path)?;
+    assert!(matches!(
+        inspect_database_metadata(&path),
+        MetadataProbe::Initialized(_)
+    ));
+    recover_database_file(&path)?;
+    assert_eq!(std::fs::read(&path)?, clean);
+
+    let before = std::fs::read(&crashed)?;
+    assert_eq!(
+        inspect_database_metadata(&crashed),
+        MetadataProbe::NeedsRecovery
+    );
+    assert_eq!(
+        serde_json::to_value(inspect_database_metadata(&crashed))?["state"],
+        "needs_recovery"
+    );
+    assert_eq!(std::fs::read(&crashed)?, before);
+
+    // Recovery keeps every committed record; then the probe reads it.
+    recover_database_file(&crashed)?;
+    match inspect_database_metadata(&crashed) {
+        MetadataProbe::Initialized(probed) => {
+            assert_eq!(probed.storage_profile, Profile::Document);
+            assert_eq!(probed.replication, ReplicationKind::Ap);
+        }
+        other => panic!("expected a recovered database, got {other:?}"),
+    }
+    let recovered = open_database(
+        DbConfig::on_disk(Profile::Document, &crashed).with_replication(ReplicationKind::Ap),
+    )?;
+    assert!(recovered.table("users")?.get(&Value::Int(1))?.is_some());
+    drop(recovered);
+
+    // A normal opener recovers it too.
+    drop(open_database(
+        DbConfig::on_disk(Profile::Document, &reopened).with_replication(ReplicationKind::Ap),
+    )?);
+    assert!(matches!(
+        inspect_database_metadata(&reopened),
+        MetadataProbe::Initialized(_)
+    ));
+
+    let missing = temp_dir.path().join("missing.redb");
+    assert!(matches!(
+        recover_database_file(&missing),
+        Err(ConfigError::Storage(_))
+    ));
+    assert!(!missing.exists());
+    Ok(())
+}
+
+/// The probe and the recovery refuse a path that is not a regular file before opening it, so a
+/// FIFO never blocks them.
+#[test]
+fn metadata_probe_and_recovery_refuse_a_directory() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let directory = temp_dir.path().join("not-a-database");
+    std::fs::create_dir(&directory)?;
+
+    match inspect_database_metadata(&directory) {
+        MetadataProbe::Unreadable { reason } => {
+            assert!(reason.contains("not a regular file"), "{reason}");
+        }
+        other => panic!("expected an unreadable directory, got {other:?}"),
+    }
+    match recover_database_file(&directory) {
+        Err(ConfigError::Storage(error)) => {
+            assert!(error.to_string().contains("not a regular file"), "{error}");
+        }
+        other => panic!("expected the recovery to refuse a directory, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_dir(&directory)?.count(), 0);
+    Ok(())
+}
+
+/// An in-range, conflict-free hand edit passes every value check, so only the digest notices
+/// it. The edited manifest must never drive the runtime or be reported as the original.
+#[test]
+fn metadata_reader_refuses_manifests_whose_digest_does_not_match()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let edits: [(&str, ManifestEdit); 3] = [
+        ("cache.redb", |manifest| {
+            let current = manifest["knobs"]["cache"]["max_entries"].as_u64();
+            manifest["knobs"]["cache"]["max_entries"] =
+                json!(if current == Some(4_096) { 8_192 } else { 4_096 });
+        }),
+        ("timeout.redb", |manifest| {
+            manifest["knobs"]["query"]["timeout_ms"] = json!(1_234);
+        }),
+        ("digest.redb", |manifest| {
+            manifest["digest"] = json!("prof_00000000000000000000000000000000");
+        }),
+    ];
+
+    for (name, edit) in edits {
+        let path = manifest_database(temp_dir.path(), name)?;
+        edit_raw_manifest(&path, edit)?;
+        match open_database(DbConfig::on_disk(Profile::Balanced, &path)) {
+            Err(ConfigError::ProfileManifestInvalid(message)) => {
+                assert!(message.contains("digest"), "{name}: {message}");
+            }
+            Err(error) => panic!("{name}: expected an invalid manifest, got {error:?}"),
+            Ok(_) => panic!("{name}: an edited manifest drove the runtime"),
+        }
+        match inspect_database_metadata(&path) {
+            MetadataProbe::Unreadable { reason } => {
+                assert!(reason.contains("digest"), "{name}: {reason}");
+            }
+            other => panic!("{name}: expected an unreadable manifest, got {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// The example spec with `floors.encryption_at_rest` raised, and the guarantee that meets it.
+fn encryption_floor_binding(
+    path: &Path,
+) -> Result<RuntimeProfileBinding, Box<dyn std::error::Error>> {
+    let mut spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    spec.custom_profile
+        .as_mut()
+        .ok_or("the example sets custom_profile")?
+        .floors
+        .encryption_at_rest = Some(true);
+    spec.guarantees.encryption.at_rest = true;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    Ok(compiled.binding(&spec.deployment, Some(path.to_path_buf()))?)
+}
+
+/// A manifest never claims a floor its database does not meet: creation refuses operational
+/// settings that miss a floor the runtime can check, before anything is created.
+#[test]
+fn profile_floors_the_runtime_can_check_must_be_met_at_creation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let unencrypted = temp_dir.path().join("unencrypted.redb");
+    let binding = encryption_floor_binding(&unencrypted)?;
+    assert!(binding.manifest.knobs.floors.encryption_at_rest);
+    match create_database_with_profile(&binding, OperationalConfig::new()) {
+        Err(ConfigError::ProfileFloorNotMet { floor, reason }) => {
+            assert_eq!(floor, "floors.encryption_at_rest");
+            assert!(reason.contains("OperationalConfig.encryption"), "{reason}");
+        }
+        Err(error) => panic!("expected an unmet floor, got {error:?}"),
+        Ok(_) => panic!("an unencrypted database claimed encryption at rest"),
+    }
+    assert!(!unencrypted.exists());
+
+    let encrypted = temp_dir.path().join("encrypted.redb");
+    let key_path = temp_dir.path().join("key.bin");
+    std::fs::write(&key_path, [9_u8; 32])?;
+    let ops = OperationalConfig::new().with_encryption(EncryptionConfig::file_key(&key_path));
+    let binding = encryption_floor_binding(&encrypted)?;
+    let database = create_database_with_profile(&binding, ops.clone())?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedEncryptedRedb);
+    drop(database);
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::HighDurability, &encrypted), &ops)?;
+    assert_eq!(reopened.performance_config(), &binding.performance);
+    drop(reopened);
+
+    // The probe reads `__meta` without a key: the encrypted file stays unreadable, and an
+    // unencrypted restore target whose manifest claims the floor reports it as unmet.
+    assert!(matches!(
+        inspect_database_metadata(&encrypted),
+        MetadataProbe::Unreadable { .. }
+    ));
+    let restored = temp_dir.path().join("restored.redb");
+    drop(super::create_restore_target(
+        DbConfig::on_disk(Profile::HighDurability, &restored),
+        Some(&binding.manifest),
+    )?);
+    match inspect_database_metadata(&restored) {
+        MetadataProbe::Initialized(probed) => {
+            assert_eq!(probed.manifest.as_ref(), Some(&binding.manifest));
+            assert_eq!(probed.unmet_floors, vec!["floors.encryption_at_rest"]);
+        }
+        other => panic!("expected the restore target to be readable, got {other:?}"),
+    }
+
+    // The example raises floors.audit; audit cannot be switched off for it either.
+    let audited = temp_dir.path().join("audited.redb");
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let binding = compiled.binding(&spec.deployment, Some(audited.clone()))?;
+    assert!(binding.manifest.knobs.floors.audit);
+    let security = SecurityConfig {
+        audit_enabled: false,
+        ..SecurityConfig::default()
+    };
+    assert!(matches!(
+        create_database_with_profile(&binding, OperationalConfig::new().with_security(security)),
+        Err(ConfigError::ProfileFloorNotMet {
+            floor: "floors.audit",
+            ..
+        })
+    ));
+    assert!(!audited.exists());
+    Ok(())
+}
+
+/// `floors.audit` holds after creation too: `set_audit_enabled_as` refuses to disable audit on
+/// such a database and audits the refusal, while a manifest without the floor still allows it.
+#[test]
+fn audit_floor_keeps_audit_enabled_after_creation() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let admin = Principal::new("root").with_role("admin");
+    let admin_policy =
+        || AuthzPolicy::new([Role::new("admin").grant(Resource::System, Permission::Admin)]);
+
+    let audited = temp_dir.path().join("audited.redb");
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let binding = compiled.binding(&spec.deployment, Some(audited.clone()))?;
+    assert!(binding.manifest.knobs.floors.audit);
+    let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+    database.set_authz_policy(admin_policy());
+    match database.set_audit_enabled_as(&admin, false) {
+        Err(DbError::Config(ConfigError::ProfileFloorNotMet { floor, .. })) => {
+            assert_eq!(floor, "floors.audit");
+        }
+        other => panic!("expected the audit floor to refuse, got {other:?}"),
+    }
+    assert!(database.audit_enabled());
+    assert!(database.audit_events()?.iter().any(|event| {
+        event.action == "set_audit_enabled" && event.outcome == AuditOutcome::Failed
+    }));
+    drop(database);
+    let reopened = open_database(DbConfig::on_disk(binding.db_config.profile, &audited))?;
+    assert!(reopened.audit_enabled());
+    drop(reopened);
+
+    let unaudited = manifest_database(temp_dir.path(), "balanced.redb")?;
+    let mut database = open_database(DbConfig::on_disk(Profile::Balanced, &unaudited))?;
+    database.set_authz_policy(admin_policy());
+    database.set_audit_enabled_as(&admin, false)?;
+    assert!(!database.audit_enabled());
+    Ok(())
+}
+
+/// Only single-node databases can carry a profile manifest, so the `floors.audit` check never
+/// reads `__meta` of a CP, AP or sharded database: an AP opener keeps `__meta` outside the
+/// tables `ApDynamo::read` serves, and disabling audit there must keep working.
+#[test]
+fn audit_can_be_disabled_on_databases_without_a_manifest_opener()
+-> Result<(), Box<dyn std::error::Error>> {
+    fn disable_audit(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("admin").grant(Resource::System, Permission::Admin)
+        ]));
+        database.set_audit_enabled_as(&Principal::new("root").with_role("admin"), false)?;
+        assert!(!database.audit_enabled());
+        Ok(())
+    }
+
+    disable_audit(&mut create_ap_database(
+        DbConfig::new(Profile::InMemory).with_replication(ReplicationKind::Ap),
+        ap_cluster_config(),
+    )?)?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("ap.redb"))
+        .with_replication(ReplicationKind::Ap);
+    disable_audit(&mut create_ap_database(
+        config.clone(),
+        ap_cluster_config(),
+    )?)?;
+    disable_audit(&mut open_ap_database(config, ap_cluster_config())?)?;
+    disable_audit(&mut create_cluster_database(
+        DbConfig::new(Profile::InMemory),
+        cp_cluster_config(),
+    )?)?;
+    disable_audit(&mut create_sharded_database(
+        DbConfig::new(Profile::InMemory),
+        sharded_config(),
+    )?)?;
+    Ok(())
+}
+
+/// A `__meta.profile_manifest` exactly as the first build with profile manifests wrote it
+/// (crate 0.1.0, `manifest_version` 1): `high_durability` with a larger cache and zstd. Never
+/// edit it. If a change stops it from decoding or validating, every database created by that
+/// build stops opening: give new knob leaves a serde default that leaves this manifest and its
+/// digest unchanged, and bump `manifest_version` with a migration for anything else (see
+/// `ProfileKnobs` and docs/profiles.md, "Evolving the manifest").
+const GOLDEN_MANIFEST_V1: &str = concat!(
+    r#"{"manifest_version":1,"profile":"high_durability_custom","kind":"custom","#,
+    r#""product_profile":"secure_app","variant":"high_durability","extends":"high_durability","#,
+    r#""storage_profile":"HighDurability","knobs":{"storage":{"medium":"durable","#,
+    r#""layout":"row"},"durability":{"commit":"two_phase","group_commit_window_ms":0},"#,
+    r#""compression":{"algorithm":"zstd","min_bytes":256,"zstd_level":3},"#,
+    r#""cache":{"enabled":true,"max_entries":8192},"query":{"max_concurrent_queries":"auto","#,
+    r#""queue_timeout_ms":100,"timeout_ms":30000,"memory_limit_bytes":805306368,"#,
+    r#""spill_limit_bytes":2147483648,"target_partitions":"auto","batch_rows":1024,"#,
+    r#""max_sql_bytes":1048576,"max_statements":32,"max_values_rows":10000,"#,
+    r#""parser_recursion_limit":128},"limits":{"max_value_bytes":"unlimited","#,
+    r#""max_batch_ops":"unlimited"},"history":{"system_versioning":"off","keep_history":true},"#,
+    r#""time_series":{"default_chunk_millis":3600000,"default_retention_millis":null},"#,
+    r#""consistency":{"default_domain":"strong_cp"},"floors":{"audit":false,"backup":false,"#,
+    r#""pitr":false,"encryption_at_rest":false},"compatible_roles":["document_entity","#,
+    r#""key_value","event_log","audit"]},"storage_format":{"value_framing":true,"#,
+    r#""compression":{"algorithm":"Zstd","min_bytes":256,"zstd_level":3}},"#,
+    r#""digest":"prof_1a834651abbcb9023c91f831a368591e","written_by":"0.1.0"}"#,
+);
+
+#[test]
+fn profile_manifest_v1_golden_still_decodes_and_validates() -> Result<(), Box<dyn std::error::Error>>
+{
+    let manifest = super::decode_profile_manifest(GOLDEN_MANIFEST_V1.as_bytes())?;
+    super::validate_manifest(&manifest, Profile::HighDurability)?;
+    assert_eq!(manifest.manifest_version, 1);
+    assert_eq!(manifest.profile, "high_durability_custom");
+    assert_eq!(manifest.kind, ResolvedProfileKind::Custom);
+    assert_eq!(manifest.variant, "high_durability");
+    assert_eq!(manifest.written_by, "0.1.0");
+    assert!(manifest.storage_format.value_framing);
+    assert_eq!(
+        manifest.storage_format.compression.algorithm,
+        CompressionAlgorithm::Zstd
+    );
+    let performance = super::profile_binding::performance_for_manifest(&manifest);
+    assert_eq!(performance.cache.max_capacity, 8192);
     Ok(())
 }
 

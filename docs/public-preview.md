@@ -83,8 +83,10 @@ multidb profile knobs
   `--override path=value` (repeatable, or comma-separated) gives a what-if
   view; a misspelled knob gets a did-you-mean suggestion.
 - `profile show --db <path>` prints the profile manifest a database was
-  created with, or "legacy database" for databases without one. It never
-  creates a file.
+  created with, or "legacy database" for databases without one. It opens the
+  file read-only and never creates or writes a file. It warns when the file
+  visibly misses a manifest floor: a restored `floors.encryption_at_rest`
+  database is not encrypted.
 - `profile explain --spec <file>` resolves the profile of a spec; it exits 2
   when the profile is invalid, including a version 1 spec that sets
   `custom_profile` (`FIELD_REQUIRES_SPEC_V2`).
@@ -102,8 +104,14 @@ multidb profile knobs
   validate (exit 2).
 - Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
   (as before), a product slug or alias in snake or kebab case, or `auto`,
-  which reads the storage profile and replication of the existing database.
-  `restore` does not accept `auto`, because its target must be empty.
+  which reads the storage profile of the existing database without writing
+  it. A database that was not closed cleanly (`serve` has no graceful
+  shutdown, so this follows every stop by a signal) first gets redb's crash
+  recovery, as with a named profile; `profile show --db` never writes and
+  reports it as needing recovery. The CLI and `serve` open single-node CP
+  databases only, so an AP database fails with `ReplicationMismatch` with
+  `auto` as with a named profile. `restore` does not accept `auto`, because
+  its target must be empty.
 
 Only the Rust API (`db::create_database_with_profile`) creates databases from
 profile knobs in this build; the CLI writes and inspects specs and opens

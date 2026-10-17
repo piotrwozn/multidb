@@ -88,6 +88,29 @@ pub enum Limit<T> {
 }
 
 /// Fully resolved profile knobs: every leaf is concrete.
+///
+/// # Evolving the persisted form
+///
+/// These knobs, every section struct below and `db::PersistedProfileManifest` are persisted in
+/// `__meta.profile_manifest`, decoded with `deny_unknown_fields`, and every read recomputes the
+/// manifest digest from the knobs as serialized here. Databases written by older builds must
+/// keep opening, so:
+///
+/// - a new leaf needs a `#[serde(default)]` equal to the value every preset had before the leaf
+///   existed (what older manifests ran with), and must not be serialized at that value
+///   (`skip_serializing_if`); otherwise older manifests fail to decode or their digest no longer
+///   matches. An older binary refuses a manifest that sets the leaf to another value, which is
+///   the intended fail-closed outcome;
+/// - removing or renaming a leaf, or changing its value form, needs a `manifest_version` bump and
+///   a migration that reads the older version;
+/// - the digest hashes the serialized JSON bytes (`profile_digest`), so reordering fields or
+///   changing a serde attribute (rename, representation) here, in a section struct or on
+///   `Profile` changes every stored digest even when the decoded values stay the same; it needs
+///   the same version bump, with the older digest recomputed the way that version serialized;
+/// - `profile_manifest_v1_golden_still_decodes_and_validates` in `src/db/tests.rs` pins a
+///   manifest written by the first build with manifests and must keep passing unchanged.
+///
+/// See docs/profiles.md, "Evolving the manifest".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileKnobs {
@@ -104,6 +127,7 @@ pub struct ProfileKnobs {
     pub compatible_roles: BTreeSet<CollectionRole>,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageKnobs {
@@ -111,6 +135,7 @@ pub struct StorageKnobs {
     pub layout: LayoutKnob,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurabilityKnobs {
@@ -118,6 +143,7 @@ pub struct DurabilityKnobs {
     pub group_commit_window_ms: u16,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompressionKnobs {
@@ -126,6 +152,7 @@ pub struct CompressionKnobs {
     pub zstd_level: u8,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheKnobs {
@@ -133,6 +160,7 @@ pub struct CacheKnobs {
     pub max_entries: u32,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryKnobs {
@@ -149,6 +177,7 @@ pub struct QueryKnobs {
     pub parser_recursion_limit: u16,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitKnobs {
@@ -156,6 +185,7 @@ pub struct LimitKnobs {
     pub max_batch_ops: Limit<u32>,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryKnobs {
@@ -163,6 +193,7 @@ pub struct HistoryKnobs {
     pub keep_history: bool,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimeSeriesKnobs {
@@ -170,6 +201,7 @@ pub struct TimeSeriesKnobs {
     pub default_retention_millis: Option<i64>,
 }
 
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsistencyKnobs {
@@ -177,6 +209,7 @@ pub struct ConsistencyKnobs {
 }
 
 /// Guarantees a profile requires. A custom profile may raise them, never lower them.
+/// Persisted in profile manifests: evolve it only as [`ProfileKnobs`] describes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1878,7 +1911,9 @@ fn describe_roles(roles: impl Iterator<Item = CollectionRole>) -> String {
         .join(", ")
 }
 
-fn profile_digest(knobs: &ProfileKnobs, storage_profile: Profile) -> String {
+/// The `prof_` digest of resolved knobs and their storage class. `PersistedProfileManifest`
+/// stores it, and every manifest read recomputes it from the decoded knobs.
+pub(crate) fn profile_digest(knobs: &ProfileKnobs, storage_profile: Profile) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"multidb-profile-v1");
     update_hash_with_json(&mut hasher, knobs);
