@@ -2385,7 +2385,11 @@ mod tests {
         assert_eq!(report.conflicted_segments, 1);
         assert_eq!(report.uploaded_segments, 0);
         assert!(segment_value(&database, &key)?.is_none());
-        assert!(table.scan()?.is_empty());
+        assert!(
+            table.scan()?.is_empty(),
+            "expected an empty value, got {:?}",
+            table.scan()?
+        );
         assert_eq!(
             segment_metadata(&database, &key)?.state,
             TieringState::Failed
@@ -2709,7 +2713,11 @@ mod tests {
         assert!(full_backup(&database, &backups, &BackupConfig::default()).is_err());
         store.put(&pointer.path, b"corrupt segment")?;
         assert!(full_backup(&database, &backups, &BackupConfig::default()).is_err());
-        assert!(list_backups(&backups)?.is_empty());
+        assert!(
+            list_backups(&backups)?.is_empty(),
+            "expected an empty value, got {:?}",
+            list_backups(&backups)?
+        );
 
         store.put(&pointer.path, &object)?;
         full_backup(&database, &backups, &BackupConfig::default())?;
@@ -2735,7 +2743,9 @@ mod tests {
         assert!(!objects.exists());
         assert!(
             ap.range(CLOUD_SEGMENTS_TABLE, &[], &[], ReadConsistency::Strong)?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            ap.range(CLOUD_SEGMENTS_TABLE, &[], &[], ReadConsistency::Strong)?
         );
 
         let pinned = TieringPolicy {
