@@ -27,6 +27,7 @@ which claims are deliberately out of scope.
 | SDKs | Stable preview for API v1 client surface in repo packages | TypeScript, Python, Go and Rust package gates |
 | Metrics endpoint | Preview | Raw Prometheus text remains marked preview |
 | `config apply` | Audit/confirmation only | No physical data migration in v1 |
+| Spec provisioning (`multidb::provision`, spec v2) | Preview; Rust API only in this build: plan, drift, export and apply for embedded and single-node CP databases; objects are created or adopted, never dropped or altered; no profile or storage-class switch; encryption at rest needs a `LocalEnvelope` config on the Rust API | plan, apply, failure-injection, RBAC, format upgrade and backup/restore provisioning tests |
 | Composable profiles (`custom_profile`, spec v2) | Preview; single-node profile manifests through the Rust API only; compression is forward-only and needs `schema_version` 2; the encryption and audit floors are enforced at creation (audit also afterwards) but not on restore, whose target is unencrypted (`profile show --db` warns about it); CLI `profile show/explain/knobs`, `config upgrade`, `init --override` and `--profile auto`; `GET /profiles` variants and knobs; Studio custom-profile builder (validate and dry-run only) | resolver, schema v2 snapshot, v1 compatibility corpus, profile manifest open/refusal and backup/restore tests, CLI profile command tests, Control Plane `/profiles` and Studio builder tests |
 
 ## Profiles And Domains

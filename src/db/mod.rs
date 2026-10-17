@@ -1422,6 +1422,17 @@ impl Database {
             Permission::Admin,
             "set_audit_enabled",
         )?;
+        self.change_audit_enabled(principal, enabled)
+    }
+
+    /// The body of [`Database::set_audit_enabled_as`] after authorization, shared with
+    /// provisioning's local operators: the `floors.audit` refusal, the disable event before the
+    /// flag and the enable event after it.
+    fn change_audit_enabled(
+        &mut self,
+        principal: &Principal,
+        enabled: bool,
+    ) -> Result<(), DbError> {
         if !enabled {
             // Only single-node openers accept a profile manifest: CP, AP and sharded openers
             // refuse one (`refuse_profile_manifest`), and an AP database keeps `__meta` outside

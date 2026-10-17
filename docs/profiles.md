@@ -15,11 +15,14 @@ Only the Rust API builds a database from a resolved profile:
 `db::create_database_with_profile` persists the knobs in
 `__meta.profile_manifest`, and every single-node opener, `serve` included,
 re-applies them (see [Persistence and format](#persistence-and-format)).
-Nothing in the CLI, `serve` or the Control Plane creates a database from a
-spec. The CLI inspects profiles and specs (`multidb profile show`, `profile
-explain`, `profile knobs`), writes version 2 specs (`init --override`,
-`config upgrade`) and reads a database's own profile with `--profile auto`
-(see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and
+Spec provisioning (`provision::provision_new_database` and
+`provision::apply_provision`, see [provisioning.md](provisioning.md)) creates
+databases this way and writes the manifest of an adopted, retuned or
+format-upgraded database. Nothing in the CLI, `serve` or the Control Plane
+creates a database from a spec yet. The CLI inspects profiles and specs
+(`multidb profile show`, `profile explain`, `profile knobs`), writes version 2
+specs (`init --override`, `config upgrade`) and reads a database's own profile
+with `--profile auto` (see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and
 the Studio custom-profile builder writes version 2 `custom_profile` specs for
 validation and dry-run plans (see
 [Control Plane and Studio](#control-plane-and-studio)). Existing version 1
@@ -136,10 +139,10 @@ profile.
 | `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits | enforced | retune |
 | `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (#11 single write pipeline): only `unlimited` is accepted | provisioning |
 | `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (#11 single write pipeline): only `unlimited` is accepted | provisioning |
-| `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | declarative: recorded only until provisioning exists | provisioning |
-| `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | declarative: recorded only until provisioning exists | provisioning |
-| `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
-| `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
+| `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | enforced: applied by provisioning to the objects it creates | provisioning |
+| `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | enforced: applied by provisioning to the objects it creates | provisioning |
+| `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
+| `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
 | `consistency.default_domain` | local_snapshot \| strong_cp \| eventual_ap | generation default | `multidb init --guided --override` (domain mode and replication of the spec it writes); guided init without `--override` and templates use the product's domain | declarative | not applicable |
 | `floors.audit` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.audit.enabled`) | enforced | not applicable |
 | `floors.backup` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR`, or `PRODUCTION_BACKUP_DISABLED` for production_cp (`guarantees.backup.enabled`) | enforced | not applicable |
@@ -361,9 +364,11 @@ Syntax errors and decode errors keep exit code 1 and HTTP 400
   spec cannot set: MVCC and commit-log retention, cache TTL and eviction,
   backup schedules, runtime write acknowledgement and conflict knobs, and a
   per-collection consistency domain. Every-open knobs are applied only to
-  databases created with `db::create_database_with_profile`; explain says so,
-  and that the CLI, `serve` and the Control Plane do not create databases
-  from specs in this build.
+  databases created with `db::create_database_with_profile` or by
+  provisioning, and explain says so; the `history.*` and `time_series.*`
+  knobs are applied by provisioning to the tables and series it creates, and
+  the compression outcome names the provisioning format upgrade
+  (`allow_format_upgrade`).
 - `config plan` reports a `custom_profile` change as an unsupported
   `change_profile` step at `$.custom_profile`, and a change of `version` alone
   as one supported no-op step at `$.version`. Version 1 pairs plan exactly as
@@ -474,8 +479,9 @@ manifests fails CI.
   is framed, fail to decode the metadata. Turning framing off is never
   possible. A manifest database created without compression refuses
   `OperationalConfig.performance.compression` with `StorageFormatMismatch`;
-  enabling compression later is a provisioning format upgrade, which this
-  build does not perform.
+  enabling compression later is the provisioning format upgrade
+  (`allow_format_upgrade`, see [provisioning.md](provisioning.md)), which
+  takes effect at the next open.
 - Downgrades of a manifest database without compression do not fail closed:
   it keeps `schema_version` 1, so an older binary opens it, ignores
   `__meta.profile_manifest` and runs with the storage profile defaults

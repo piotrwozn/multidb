@@ -635,12 +635,8 @@ impl PlanBuilder<'_> {
             ));
             return Ok(());
         };
-        let binding_path = resolved
-            .storage_profile
-            .is_on_disk()
-            .then(|| PathBuf::from("provisioning-plan.redb"));
-        match resolved.bind(ReplicationKind::Cp, binding_path) {
-            Ok(binding) => self.desired_manifest = Some(binding.manifest),
+        match desired_manifest(&resolved) {
+            Ok(manifest) => self.desired_manifest = Some(manifest),
             Err(error) => self.issues.push(issue(
                 "PROVISION_PROFILE_UNRESOLVED",
                 ValidationSeverity::Error,
@@ -1388,20 +1384,7 @@ impl PlanBuilder<'_> {
                 DriftResolution::Unsupported,
             ));
         }
-        let managed_roles = record
-            .as_ref()
-            .map(|record| record.managed_roles.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|name| !RESERVED_ROLE_NAMES.contains(&name.as_str()))
-            .collect::<BTreeSet<_>>();
-        let managed_users = record
-            .as_ref()
-            .map(|record| record.managed_principals.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|name| !RESERVED_PRINCIPAL_NAMES.contains(&name.as_str()))
-            .collect::<BTreeSet<_>>();
+        let (managed_roles, managed_users) = managed_security_names(record.as_ref());
         let security = self.spec.security.clone().unwrap_or_default();
         let (mut planned, post_roles) =
             plan_roles(&security, &self.desired, &live_policy, &managed_roles);
@@ -2876,6 +2859,65 @@ fn plan_principals(
         }
     }
     (planned, post_principals)
+}
+
+/// The roles and principals a record manages, without the reserved bootstrap names, which
+/// provisioning never touches.
+fn managed_security_names(
+    record: Option<&ProvisionRecord>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let roles = record
+        .map(|record| record.managed_roles.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !RESERVED_ROLE_NAMES.contains(&name.as_str()))
+        .collect();
+    let users = record
+        .map(|record| record.managed_principals.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !RESERVED_PRINCIPAL_NAMES.contains(&name.as_str()))
+        .collect();
+    (roles, users)
+}
+
+/// The RBAC state an apply of `spec` leaves: the live policy and registry with the roles and
+/// principals `record` manages replaced by the spec's, and everything else untouched. The same
+/// merge the plan's `ApplySecurity` steps describe, so the executor commits exactly what was
+/// planned.
+pub(super) fn security_post_state(
+    spec: &DatabaseSpec,
+    desired: &[DesiredObject],
+    live_policy: &AuthzPolicy,
+    live_registry: &PrincipalRegistry,
+    record: Option<&ProvisionRecord>,
+) -> (AuthzPolicy, PrincipalRegistry) {
+    let (managed_roles, managed_users) = managed_security_names(record);
+    let security = spec.security.clone().unwrap_or_default();
+    let (_, roles) = plan_roles(&security, desired, live_policy, &managed_roles);
+    let (_, principals) = plan_principals(&security, live_registry, &managed_users);
+    let registry = principals
+        .into_iter()
+        .fold(PrincipalRegistry::new(), |registry, (user, principal)| {
+            registry.with_principal(user, principal)
+        });
+    (AuthzPolicy::new(roles.into_values()), registry)
+}
+
+/// The profile manifest `resolved` binds to: what a new database records and what an apply
+/// writes to an existing one. The manifest does not depend on the database path.
+/// # Errors
+/// Fails when the profile cannot be bound to a single-node database.
+pub(super) fn desired_manifest(
+    resolved: &ResolvedProfile,
+) -> Result<PersistedProfileManifest, crate::db::ConfigError> {
+    let binding_path = resolved
+        .storage_profile
+        .is_on_disk()
+        .then(|| PathBuf::from("provisioning-plan.redb"));
+    resolved
+        .bind(ReplicationKind::Cp, binding_path)
+        .map(|binding| binding.manifest)
 }
 
 /// One planned RBAC change.

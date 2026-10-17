@@ -11,10 +11,15 @@
 //!   the options, the surface, the target or the binary changes.
 //! - [`drift`] reports how a live database differs from a spec, and [`export_spec`] describes a
 //!   live database as a spec.
+//! - [`apply_provision`] applies a confirmed plan to an open database, and
+//!   [`provision_new_database`] creates a database from a spec at an absent target. Audit comes
+//!   first, progress is journaled in the provision record after every step, and applying again
+//!   after a failure converges.
 //!
 //! Planning, drift and export are read-only: they never create a file or write a database.
 //! See `docs/provisioning.md`.
 
+mod execute;
 mod export;
 mod guarantees;
 mod live;
@@ -25,6 +30,12 @@ pub(crate) mod record;
 #[cfg(test)]
 mod tests;
 
+pub use execute::{
+    AppliedStep, Confirmation, ProvisionActor, ProvisionApplyReport, ProvisionOutcome,
+    ProvisionRecordSummary, StepOutcome, apply_provision, provision_new_database,
+};
+#[cfg(test)]
+pub(crate) use execute::{fail_provision_step_for_tests, perturb_new_database_for_tests};
 pub use export::{ExportSource, ExportedSpec, export_spec};
 pub use guarantees::{EnforcementStatus, GuaranteeEnforcement};
 pub use plan::{

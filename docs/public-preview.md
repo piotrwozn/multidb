@@ -113,9 +113,11 @@ multidb profile knobs
   `auto` as with a named profile. `restore` does not accept `auto`, because
   its target must be empty.
 
-Only the Rust API (`db::create_database_with_profile`) creates databases from
-profile knobs in this build; the CLI writes and inspects specs and opens
-existing databases with their persisted profile.
+Only the Rust API (`db::create_database_with_profile`, and spec provisioning
+with `provision::provision_new_database` and `provision::apply_provision`,
+see [provisioning.md](provisioning.md)) creates databases from profile knobs
+in this build; the CLI writes and inspects specs and opens existing databases
+with their persisted profile.
 
 ## Docker Quickstart
 

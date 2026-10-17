@@ -202,9 +202,45 @@ All notable public changes will be recorded here.
   newer `record_version` or a corrupt one is refused.
 - `config_spec::canonical_spec_json` and `config_spec::spec_digest` (`spec_`
   and 32 hex characters of blake3 over the canonical JSON).
+- `multidb::provision::apply_provision`, which applies a spec to an open
+  single-node database (preview, Rust API). It recomputes the plan, accepts
+  only the current `prov_` id (`Confirmation::PlanId`; another `prov_` id is
+  `PlanChanged`, anything else a `rejected` report) or
+  `Confirmation::AutoApproveAdditive` for an `auto_approvable` plan, and runs
+  as a `ProvisionActor`: a principal with `System:Admin` and `Database:Admin`,
+  whose objects are created through the audited `*_as` APIs, or a local
+  operator (`local:cli`, `local:serve`, `local:embedded`) audited with
+  `provision_create_object`. Audit comes first: it is turned on as the first
+  step or the apply is refused (`AuditRequired`), `provision_apply_started` is
+  audited before any change and `provision_apply_completed` (or
+  `provision_apply_failed`) after it, and turning audit off runs last. The
+  provision record is journaled after every step and gets a history entry
+  (`Database::provision_history`, at most 100); a failed step gives a
+  `partially_applied` report and a `failed` record, and the next plan holds
+  only what remains. Objects are only created or adopted, releases keep the
+  data, RBAC changes touch managed names only and commit in one batch, and
+  the storage format upgrade writes the value-framing manifest and
+  `schema_version` 2 together, taking effect at the next open. See
+  `docs/provisioning.md`.
+- `multidb::provision::provision_new_database`, which creates a database from
+  a spec at an absent target with `create_database_with_profile` (audit on,
+  the environment's audit key and, on the Rust API, a `LocalEnvelope`
+  encryption config), checks that the plan recomputed against it equals the
+  confirmed one and applies it under the confirmed plan id.
+- `Database::set_security_state_as`, which replaces the RBAC policy and the
+  principal registry in one persisted batch after checking `System:Admin`,
+  audited as `set_security_state`.
 
 ### Changed
 
+- The `history.system_versioning`, `history.keep_history`,
+  `time_series.default_chunk_millis` and `time_series.default_retention_millis`
+  knobs are `enforced` in `KNOB_REGISTRY`: provisioning applies them to the
+  tables and series it creates. Explain says that every-open knobs apply to
+  databases created with `db::create_database_with_profile` or by
+  provisioning, that provisioning-timing knobs are applied by provisioning to
+  the objects it creates, and that enabling compression on an existing
+  database is the provisioning format upgrade (`allow_format_upgrade`).
 - Explain wording: `$.compiled_policy.storage_profile` names the storage class
   and engine instead of "storage profile selected", encryption at rest reads
   "requested; enforced only on the Rust API with an encryption config in this

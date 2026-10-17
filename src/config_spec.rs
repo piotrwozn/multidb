@@ -2583,8 +2583,7 @@ fn explain_compiled_policy(policy: &CompiledPolicy, decisions: &mut Vec<ExplainD
 
 /// Outcome of every knob applied at each open.
 const EVERY_OPEN_OUTCOME: &str = "persisted in __meta.profile_manifest and applied at every open of \
-     a database created with db::create_database_with_profile; the CLI, serve and Control Plane \
-     do not create databases from specs in this build";
+     a database created with db::create_database_with_profile or by provisioning";
 
 /// What a spec cannot configure in this build, reported by explain under
 /// `$.profile.not_configurable`.
@@ -2712,16 +2711,14 @@ fn knob_outcome(
                 "no value framing: the database keeps schema_version 1".to_owned()
             } else {
                 "forward-only format change: schema_version 2 (value framing, refused by older \
-                 binaries); applied only by db::create_database_with_profile in this build"
+                 binaries); applied by db::create_database_with_profile and by provisioning, \
+                 which upgrades an existing database only with allow_format_upgrade"
                     .to_owned()
             }
         }
         KnobTiming::Creation => fixed_at_creation.to_owned(),
         KnobTiming::EveryOpen => EVERY_OPEN_OUTCOME.to_owned(),
-        KnobTiming::Provisioning => {
-            "recorded only; applied by provisioning, which is not available in this build"
-                .to_owned()
-        }
+        KnobTiming::Provisioning => "applied by provisioning to the objects it creates".to_owned(),
         KnobTiming::GenerationDefault => {
             "default for generated specs (guided init and templates); no runtime effect".to_owned()
         }
@@ -6056,13 +6053,17 @@ mod tests {
                 }
                 _ if definition.timing == super::KnobTiming::EveryOpen => {
                     assert!(
-                        knob.outcome.contains("db::create_database_with_profile")
-                            && knob.outcome.contains("do not create databases from specs"),
+                        knob.outcome
+                            .contains("db::create_database_with_profile or by provisioning")
+                            && !knob.outcome.contains("do not create databases from specs"),
                         "{knob:?}"
                     );
                 }
                 _ if definition.timing == super::KnobTiming::Provisioning => {
-                    assert!(knob.outcome.starts_with("recorded only"), "{knob:?}");
+                    assert_eq!(
+                        knob.outcome, "applied by provisioning to the objects it creates",
+                        "{knob:?}"
+                    );
                 }
                 _ => {}
             }
@@ -6085,10 +6086,11 @@ mod tests {
             decision("$.profile.knobs.query.timeout_ms")?.source,
             "preset:secure_app"
         );
+        let compression = decision("$.profile.knobs.compression.algorithm")?;
+        assert!(compression.outcome.contains("schema_version 2"));
         assert!(
-            decision("$.profile.knobs.compression.algorithm")?
-                .outcome
-                .contains("schema_version 2")
+            compression.outcome.contains("allow_format_upgrade"),
+            "{compression:?}"
         );
         let storage = decision("$.profile.storage_profile")?;
         assert_eq!(storage.source, "derived:storage_class");

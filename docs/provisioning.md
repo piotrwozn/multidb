@@ -4,11 +4,13 @@ Status: **Preview**. Provisioning builds and converges a database from a
 `DatabaseSpec`. This page grows with it: this build has the spec version 2
 provisioning fields, their validation, the physical projection
 (`multidb::provision::physical::project`), per-table layout
-(`Database::create_table_with_layout`) and read-only planning, drift and export
-(`multidb::provision::{plan_provision, drift, export_spec}`). Applying a plan,
-and the CLI, `serve` and Control Plane entry points, come in later changes;
-until then nothing creates or changes a database from a spec, and
-`config apply --plan` stays audit-only.
+(`Database::create_table_with_layout`), read-only planning, drift and export
+(`multidb::provision::{plan_provision, drift, export_spec}`), and applying a
+plan through the Rust API (`multidb::provision::{apply_provision,
+provision_new_database}`, see [Applying plans](#applying-plans)). The CLI,
+`serve` and Control Plane entry points come in later changes; until then they
+never create or change a database from a spec, and `config apply --plan` stays
+audit-only.
 
 ## Spec version 2 provisioning fields
 
@@ -318,8 +320,9 @@ not give is a `STEP_REQUIRES_FLAG` issue. The outcome is:
 - otherwise `noop` when there is no step, and `ready` when there is.
 
 `auto_approvable` is true for a ready plan whose steps are all additive,
-metadata or strengthening, without RBAC steps on an existing database; the
-CLI `--auto-approve` and `init --apply` will accept only such plans. Creating
+metadata or strengthening, without RBAC steps on an existing database;
+`Confirmation::AutoApproveAdditive` accepts only such plans, and so will the
+CLI `--auto-approve` and `init --apply`. Creating
 a full-text or geo index on a collection that already holds documents is
 medium impact, and the step names the document count.
 
@@ -467,18 +470,142 @@ Planning the exported spec against the same database only adopts objects,
 the profile and RBAC and records metadata. An unreadable record makes export
 fail with `RecordUnreadable`.
 
+## Applying plans
+
+`apply_provision(db, actor, spec, confirmation, options, environment)` applies
+a spec to an open single-node database under exclusive `&mut Database`:
+
+1. **The plan is recomputed** from the live database; a client plan is never
+   trusted.
+2. **The confirmation is checked** against the recomputed plan.
+   `Confirmation::PlanId` must name its `prov_` id: another `prov_` id is
+   `ProvisionError::PlanChanged` (the live state, the spec, the options, the
+   surface, the target or the build changed since the plan was reviewed), and
+   anything else, such as a `plan_` id of `config plan`, gives a report with
+   status `rejected` and changes nothing. `Confirmation::AutoApproveAdditive`
+   accepts only an `auto_approvable` plan, otherwise `ConfirmationRequired`.
+3. **The outcome is checked.** A `noop` returns a `noop` report without
+   writing anything, not even an audit event. A `blocked` plan is
+   `ProvisionError::Blocked`, or `AuditRequired` when audit is off and the
+   spec keeps it off; `needs_flags` is `NeedsFlags`.
+4. **The actor is authorized.** `ProvisionActor::Principal` needs
+   `System:Admin` and `Database:Admin` (`PermissionMissing` otherwise, the
+   denial is audited), and the plan is recomputed with it as
+   `ProvisionEnvironment.principal`, so `RBAC_SELF_LOCKOUT` covers the
+   principal that applies. `ProvisionActor::LocalOperator` (`local:cli`,
+   `local:serve`, `local:embedded`) relies on filesystem trust, like `backup`
+   and `restore`; its audit events carry the label as the principal name.
+5. **Audit comes first.** When audit is off, the plan's first step turns it on
+   (`set_audit_enabled`); without that step the apply is `AuditRequired`.
+   Then `provision_apply_started` is audited with the plan id, the surface,
+   the step count and the flags, and this write must succeed before anything
+   else changes.
+6. **The record is journaled** as `in_progress`, holding the spec being
+   applied, and rewritten after every step with its completed steps and the
+   objects it owns.
+7. **The steps run in plan order.** Each first checks whether it is already
+   satisfied. A principal creates through the audited `*_as` APIs (one
+   `create_*` event per object, ids allocated by the `_auto_id_as` variants);
+   a local operator uses the base creates and audits one
+   `provision_create_object` per object. Time series are built only through
+   `physical::time_series_config`. Every `apply_security` step commits with
+   the first one, in one batch (`Database::set_security_state[_as]`, audited
+   as `set_security_state`). Profile steps write the desired profile manifest
+   once (`provision_write_profile_manifest`). Releases only change the record
+   (`provision_release_object`). Recorded guarantees, metadata and the applied
+   spec are written with the final record.
+8. **The record becomes `applied`**, a history entry with the flags is
+   appended, and `provision_apply_completed` is audited with
+   `data_mutated: true`.
+9. **Audit is disabled last**, after the completion event, when the spec asks
+   for it and `--allow-weakening guarantees.audit.enabled` was given.
+
+The `ProvisionApplyReport` has the `status` (`applied`, `noop`, `rejected`,
+`partially_applied`; `blocked` and `plan_changed` exist for surfaces that
+answer with a report), the confirmation `check` (`data_mutated` is true only
+for `applied` and `partially_applied`), the confirmed `plan_id`, one
+`applied_steps` entry per step (`applied`, `already_satisfied` or `failed`,
+with an `error_kind` such as `catalog_object_exists` for a failed one), the
+`failed_step`, a summary of the record, the plan's Warnings and
+`session_pending_restart`.
+
+### Partial applies and recovery
+
+Applying is not atomic across objects: each create is its own batch. A step
+that fails leaves the steps before it applied: the record says `failed` with
+its `failed_step` and `completed_steps`, a history entry is written,
+`provision_apply_failed` is audited, and the report is `partially_applied`.
+The next plan reports `DRIFT_INTERRUPTED_APPLY` and holds only what remains:
+objects the failed apply created are already managed, so they are satisfied.
+Because the journal already holds the spec being applied, metadata and
+guarantee changes it recorded are not planned again; the applied spec is
+always recorded again. Applying that plan converges, and a further plan is a
+`noop`. When the failure itself cannot be recorded, the report carries the
+Warning `PROVISION_FAILURE_NOT_RECORDED` and the record still says
+`in_progress`, which the next plan treats the same way. Batching every
+container of a plan into one write is a follow-up of the single write
+pipeline (#11).
+
+### Releasing objects
+
+Removing a collection from the spec releases it: the step is `destructive`
+and needs `--allow-destructive collections.<name>`
+(`ProvisionOptions.allow_destructive`). There is no drop API: the object and
+its data stay, the record stops managing it and lists it under
+`released_objects`, and drift reports it as information only. Declaring it
+again adopts it back when it still matches.
+
+### The storage format upgrade
+
+Turning compression on for a database created without it is the
+`format_upgrade` step and needs `--allow-format-upgrade`. It writes the
+value-framing profile manifest and `schema_version` 2 in one batch. It is
+forward-only: older binaries refuse the database, and value framing can never
+be turned off again. The running session keeps its unframed engine, so the
+report sets `session_pending_restart`; from the next open the engine frames
+every value it writes, and values written before the upgrade stay readable
+because frames are recognised by their magic. A legacy value that happens to
+start with the frame magic (`MDBC1`) fails its checksum and is reported as
+corruption, never misread. Retunes are written the same way and also take
+effect at the next open.
+
+### New databases
+
+`provision_new_database(spec, path, confirmation, options, environment)`
+creates a database from a spec at an absent target: `path`, else
+`deployment.storage_path` (relative to the working directory), else a new
+in-memory database (Rust API only).
+
+1. The plan is computed against the absent target; a target that holds a
+   database is `AlreadyInitialized`, and a confirmation that is not a
+   provisioning plan id is `ConfirmationRequired`.
+2. The database is created with `create_database_with_profile`: audit on,
+   `ProvisionEnvironment.audit` as its audit key and anchor, and
+   `ProvisionEnvironment.encryption` (a `LocalEnvelope` config, Rust API only)
+   as its encryption. `create_*_with_ops` is never used on an existing
+   database, since it would overwrite its security state.
+3. The plan is recomputed against the new database. Its steps must equal the
+   confirmed ones minus `create_database` (kinds, paths, objects, safety
+   classes and flags), otherwise the apply stops with `PlanChanged` and the
+   new database is kept as it is. `auto_approvable` is not compared: RBAC
+   steps on an existing database are never auto-approvable, but a new
+   database with roles may be auto-approved.
+4. The steps run as the local operator of the surface, under the confirmed
+   plan id. The Control Plane never creates databases.
+
 ## The provision record
 
 Provisioning keeps what it owns in the system table `__provision`: the
 record (`ProvisionRecord`, key `record`) holds the status of the last apply,
-its plan id, the applied spec and its digest, the managed objects, roles and
-principals, released objects, guarantee statuses, completed and failed steps,
-flags, actor and binary version; `history/{seq:020}` keys hold one entry per
-apply. Backup and restore carry the table like every registered keyspace,
-and older binaries ignore it. `record_version` is read before the typed
-decode: a record of a newer build, or a corrupt one, is
-`PROVISION_RECORD_UNREADABLE` and blocks every plan.
-`Database::provision_state()` returns the record.
+its plan id, the applied spec and its digest, the managed objects (with the
+collection or graph id each one got), roles and principals, released
+objects, guarantee statuses, completed and failed steps, flags, actor and
+binary version; `history/{seq:020}` keys hold one entry per finished or
+failed apply, at most 100 (`Database::provision_history()`). Backup and
+restore carry the table like every registered keyspace, and older binaries
+ignore it. `record_version` is read before the typed decode: a record of a
+newer build, or a corrupt one, is `PROVISION_RECORD_UNREADABLE` and blocks
+every plan. `Database::provision_state()` returns the record.
 
 ## Validation codes
 
@@ -509,6 +636,7 @@ Plans add their own issues, whatever the spec version:
 | `DRIFT_UNMANAGED` | Warning, Error under `unmanaged: fail` | an undeclared, unmanaged live object |
 | `DRIFT_ORPHAN`, `DRIFT_INTERRUPTED_APPLY` | Warning | a managed object is missing; the last apply did not finish |
 | `STEP_REQUIRES_FLAG` | Error | a step needs a flag the options do not give |
+| `PROVISION_FAILURE_NOT_RECORDED` | Warning | in an apply report: a failed apply could not write its `failed` record or audit event |
 
 Version 1 issues keep their order: the new version 1 Warnings come after every
 existing issue. The physical checks of version 2 validation run only on
@@ -544,7 +672,17 @@ they are applied by provisioning, not by `config apply`.
   `provision::drift(db, spec, options)` returns a `DriftReport`, and
   `provision::export_spec(db)` an `ExportedSpec`. Errors are
   `ProvisionError`.
-- `Database::provision_state()` returns the `ProvisionRecord`, if any.
+- `Database::provision_state()` returns the `ProvisionRecord`, if any, and
+  `Database::provision_history()` its history, oldest first.
+- `multidb::provision::apply_provision(db, actor, spec, confirmation,
+  options, environment)` applies a spec to an open database and
+  `provision_new_database(spec, path, confirmation, options, environment)`
+  creates one (`Confirmation`, `ProvisionActor`, `ProvisionApplyReport`,
+  `ProvisionOutcome`, `AppliedStep`, `StepOutcome`,
+  `ProvisionRecordSummary`).
+- `Database::set_security_state_as(principal, policy, principals)` replaces
+  the RBAC policy and the principal registry in one persisted batch after
+  checking `System:Admin`, audited as `set_security_state`.
 - `config_spec::canonical_spec_json` and `config_spec::spec_digest` give the
   canonical form and digest of a spec.
 - The spec types live in `multidb::config_spec`: `PhysicalObjectSpec`,

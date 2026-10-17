@@ -6,41 +6,49 @@ use std::path::Path;
 use serde_json::{Value as JsonValue, json};
 
 use super::live::LiveState;
-use super::physical::project;
+use super::physical::{entry_kind, project};
 use super::plan::{PlanIdInputs, canonical_target_path, desired_role, plan_id_for};
 use super::record::{RECORD_KEY, RecordState, decode_record};
 use super::{
-    DriftKind, DriftResolution, EnforcementStatus, ExportSource, ManagedObject, ObjectKind,
-    ObjectState, PlanOutcome, ProvisionEnvironment, ProvisionError, ProvisionOptions,
-    ProvisionPlan, ProvisionRecord, ProvisionRecordStatus, ProvisionStepKind, ProvisionSurface,
-    ProvisionTargetRef, RECORD_VERSION, StepSafety, TargetKind, drift, export_spec, plan_provision,
+    Confirmation, DriftKind, DriftResolution, EnforcementStatus, ExportSource, ManagedObject,
+    ObjectKind, ObjectState, PlanOutcome, ProvisionActor, ProvisionApplyReport,
+    ProvisionEnvironment, ProvisionError, ProvisionOptions, ProvisionOutcome, ProvisionPlan,
+    ProvisionRecord, ProvisionRecordStatus, ProvisionStep, ProvisionStepKind, ProvisionSurface,
+    ProvisionTargetRef, RECORD_VERSION, StepOutcome, StepSafety, TargetKind, apply_provision,
+    drift, export_spec, fail_provision_step_for_tests, perturb_new_database_for_tests,
+    plan_provision, provision_new_database,
 };
+use crate::backup::{BackupConfig, RestoreTarget, full_backup, restore_backup, verify_backup};
 use crate::cdc::{AggregateKind, AggregateSpec, MaterializedViewSpec};
 use crate::config_spec::{
-    ConflictResolution, ConsistencyDomainSpec, ConsistencyMode, DATABASE_SPEC_VERSION_V2,
-    DatabaseSpec, DeploymentMode, ExtensionManifestRef, ExtensionStability, GuaranteeValidator,
-    ReplicationMode, ResolvedProfile, RiskLevel, UnmanagedPolicy, ValidationSeverity,
-    resolve_profile, spec_digest,
+    ApplyStatus, ConflictResolution, ConsistencyDomainSpec, ConsistencyMode,
+    DATABASE_SPEC_VERSION_V2, DatabaseSpec, DeploymentMode, ExtensionManifestRef,
+    ExtensionStability, GuaranteeValidator, ReplicationMode, ResolvedProfile, RiskLevel,
+    UnmanagedPolicy, ValidationSeverity, resolve_profile, spec_digest,
     spec_io::{SpecFormat, decode_spec_bytes},
 };
 use crate::db::{
-    AuditConfig, CatalogEntry, ConfigError, Database, DbConfig, EncryptionConfig,
+    AuditConfig, CatalogEntry, ConfigError, Database, DbConfig, DbError, EncryptionConfig,
     OperationalConfig, PROVISION_TABLE, Profile, ReplicationKind, SecurityConfig, create_database,
     create_database_with_ops, create_database_with_profile, open_database, open_database_with_ops,
 };
 use crate::extension::{LimitPolicy, PolicyConfig};
-use crate::geo::GeoIndexConfig;
+use crate::geo::{GeoIndexConfig, GeoPoint};
 use crate::graph::GraphId;
 use crate::model::{CollectionId, FieldPath, IndexId, IndexSpec, Value};
 use crate::query::{
-    ColumnDef, ColumnType, DocField, RelIndexExpression, RelIndexSpec, RelPredicate, TableLayout,
-    TableSchema,
+    ColumnDef, ColumnType, DocField, RelIndexExpression, RelIndexSpec, RelPredicate, SqlOutput,
+    SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{Op, ReadConsistency, Replication, propose_system};
-use crate::security::{AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role};
+use crate::security::{
+    AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role,
+};
+use crate::storage::{EngineKind, ReadTransaction, RedbEngine, StorageEngine};
 use crate::temporal::TemporalRetention;
 use crate::text::FullTextIndexConfig;
 use crate::timeseries::TimeSeriesConfig;
+use crate::txn;
 use crate::vector::{VectorCollectionConfig, VectorMetric};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2365,5 +2373,1444 @@ fn records_decode_only_their_own_version() -> TestResult {
         decode_record(&serde_json::to_vec(&minimal)?),
         RecordState::Readable(_)
     ));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Applying plans
+// ---------------------------------------------------------------------------------------------
+
+fn cli_operator() -> ProvisionActor {
+    ProvisionActor::local_operator("local:cli")
+}
+
+/// Plans `spec` against `db` and applies it as `actor`, confirming the plan's id.
+fn apply_as(
+    db: &mut Database,
+    actor: &ProvisionActor,
+    spec: &DatabaseSpec,
+    opts: &ProvisionOptions,
+    environment: &ProvisionEnvironment,
+) -> Result<ProvisionApplyReport, ProvisionError> {
+    let plan = plan_provision(spec, ProvisionTargetRef::Open(db), opts, environment)?;
+    apply_provision(
+        db,
+        actor,
+        spec,
+        &Confirmation::PlanId(plan.plan_id),
+        opts,
+        environment,
+    )
+}
+
+/// Plans and applies `spec` on the CLI surface as `local:cli`.
+fn apply_cli(
+    db: &mut Database,
+    spec: &DatabaseSpec,
+    opts: &ProvisionOptions,
+) -> Result<ProvisionApplyReport, ProvisionError> {
+    apply_as(db, &cli_operator(), spec, opts, &env(ProvisionSurface::Cli))
+}
+
+fn assert_applied(report: &ProvisionApplyReport) {
+    assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+    assert!(report.check.data_mutated && report.check.audit_recorded);
+    assert!(report.failed_step.is_none());
+    assert!(
+        report
+            .applied_steps
+            .iter()
+            .all(|step| step.outcome != StepOutcome::Failed)
+    );
+}
+
+fn actions(events: &[AuditEvent]) -> Vec<&str> {
+    events.iter().map(|event| event.action.as_str()).collect()
+}
+
+/// A new in-memory database with the resolved profile of `spec`.
+fn create_in_memory(spec: &DatabaseSpec) -> Result<Database, Error> {
+    let binding = resolved(spec)?.bind(ReplicationKind::Cp, None)?;
+    Ok(create_database_with_profile(
+        &binding,
+        OperationalConfig::new(),
+    )?)
+}
+
+/// The commit-log records committed after `lsn`.
+fn commit_records_after(db: &Database, lsn: u64) -> Result<Vec<txn::CommitLogRecord>, Error> {
+    Ok(
+        Replication::range(db, txn::COMMIT_LOG_TABLE, &[], &[], ReadConsistency::Strong)?
+            .into_iter()
+            .map(|(_, value)| txn::decode_commit_log_record(&value))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|record| record.txn_id > lsn)
+            .collect(),
+    )
+}
+
+fn latest_lsn(db: &Database) -> Result<u64, Error> {
+    Ok(commit_records_after(db, 0)?
+        .iter()
+        .map(|record| record.txn_id)
+        .max()
+        .unwrap_or_default())
+}
+
+/// The keys of `table` each commit-log record after `lsn` writes, for the records that write it.
+fn table_commits(db: &Database, lsn: u64, table: &str) -> Result<Vec<BTreeSet<Vec<u8>>>, Error> {
+    Ok(commit_records_after(db, lsn)?
+        .into_iter()
+        .map(|record| {
+            record
+                .writes
+                .into_iter()
+                .filter(|write| write.table == table)
+                .map(|write| write.key)
+                .collect::<BTreeSet<_>>()
+        })
+        .filter(|keys| !keys.is_empty())
+        .collect())
+}
+
+/// An order with notes and a shipping location.
+fn shipped_order(customer: &str, notes: &str, lon: f64, lat: f64) -> Value {
+    Value::Object(
+        [
+            (
+                "customer".to_owned(),
+                Value::Object([("id".to_owned(), Value::Str(customer.to_owned()))].into()),
+            ),
+            ("notes".to_owned(), Value::Str(notes.to_owned())),
+            (
+                "shipping".to_owned(),
+                Value::Object(
+                    [(
+                        "location".to_owned(),
+                        Value::Object(
+                            [
+                                ("lon".to_owned(), Value::Float(lon)),
+                                ("lat".to_owned(), Value::Float(lat)),
+                            ]
+                            .into(),
+                        ),
+                    )]
+                    .into(),
+                ),
+            ),
+        ]
+        .into(),
+    )
+}
+
+/// `orders` plus a document collection `notes`.
+fn with_notes(mut spec: DatabaseSpec) -> Result<DatabaseSpec, Error> {
+    spec.collections.push(serde_json::from_value(json!({
+        "name": "notes", "role": "document_entity", "domain": "primary", "indexes": ["primary"]
+    }))?);
+    Ok(spec)
+}
+
+fn security(spec: DatabaseSpec, grants: &JsonValue) -> Result<DatabaseSpec, Error> {
+    with_security(
+        spec,
+        &json!({
+            "roles": [{ "name": "order_writer", "grants": grants }],
+            "principals": [{ "user": "orders_svc", "roles": ["order_writer"] }]
+        }),
+    )
+}
+
+fn weakening(path: &str) -> ProvisionOptions {
+    ProvisionOptions {
+        allow_weakening: BTreeSet::from([path.to_owned()]),
+        ..ProvisionOptions::default()
+    }
+}
+
+fn destructive(paths: &[&str]) -> ProvisionOptions {
+    ProvisionOptions {
+        allow_destructive: paths.iter().map(|path| (*path).to_owned()).collect(),
+        ..ProvisionOptions::default()
+    }
+}
+
+/// Turns the step failure injection off when dropped.
+struct InjectedFailure;
+
+impl InjectedFailure {
+    fn at(index: usize) -> Self {
+        fail_provision_step_for_tests(Some(index));
+        Self
+    }
+}
+
+impl Drop for InjectedFailure {
+    fn drop(&mut self) {
+        fail_provision_step_for_tests(None);
+    }
+}
+
+/// Turns the new-database perturbation off when dropped.
+struct Perturbation;
+
+impl Perturbation {
+    fn run(hook: fn(&mut Database)) -> Self {
+        perturb_new_database_for_tests(Some(hook));
+        Self
+    }
+}
+
+impl Drop for Perturbation {
+    fn drop(&mut self) {
+        perturb_new_database_for_tests(None);
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn executor_builds_every_object_kind() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("orders.redb");
+    let spec = full_spec()?;
+    let rows = SqlOutput::Rows(SqlRows {
+        columns: vec!["id".to_owned(), "revenue".to_owned()],
+        rows: vec![
+            vec![Value::Str("a".to_owned()), Value::Float(1.5)],
+            vec![Value::Str("b".to_owned()), Value::Float(2.5)],
+        ],
+    });
+    {
+        let mut db = create_with_profile(&path, &spec)?;
+        assert_eq!(db.layout(), TableLayout::Row);
+        let plan = plan_open(&spec, &db)?;
+        let report = apply_cli(&mut db, &spec, &ProvisionOptions::default())?;
+        assert_applied(&report);
+        assert_eq!(report.plan_id, plan.plan_id);
+        assert!(!report.session_pending_restart);
+        assert_eq!(
+            report
+                .applied_steps
+                .iter()
+                .map(|step| step.step_id.as_str())
+                .collect::<Vec<_>>(),
+            plan.steps
+                .iter()
+                .map(|step| step.step_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        for (name, kind) in [
+            ("orders", ObjectKind::Document),
+            ("memories", ObjectKind::Vector),
+            ("ledger", ObjectKind::Table),
+            ("rollups", ObjectKind::Table),
+            ("metrics", ObjectKind::TimeSeries),
+            ("social", ObjectKind::Graph),
+            ("orders_notes_fts", ObjectKind::FullText),
+            ("orders_shipping_location_geo", ObjectKind::Geo),
+            ("ledger_history", ObjectKind::History),
+        ] {
+            assert_eq!(db.catalog().get(name).map(entry_kind), Some(kind), "{name}");
+        }
+        match db.catalog().get("memories") {
+            Some(CatalogEntry::Vector { dim, hnsw, .. }) => {
+                assert_eq!(*dim, 3);
+                assert_eq!(
+                    (hnsw.m, hnsw.ef_construction, hnsw.ef_search),
+                    (16, 200, 48)
+                );
+            }
+            other => return Err(format!("memories: {other:?}").into()),
+        }
+        match db.catalog().get("metrics") {
+            Some(CatalogEntry::TimeSeries { config }) => {
+                assert_eq!(config.chunk_millis, 3_600_000);
+                assert_eq!(config.retention_millis, None);
+            }
+            other => return Err(format!("metrics: {other:?}").into()),
+        }
+        match db.catalog().get("ledger_history") {
+            Some(CatalogEntry::TemporalTable {
+                base_table,
+                retention,
+                ..
+            }) => {
+                assert_eq!(base_table, "ledger");
+                assert!(retention.keep_history);
+            }
+            other => return Err(format!("ledger_history: {other:?}").into()),
+        }
+        assert_eq!(db.table("ledger")?.layout(), TableLayout::Row);
+        assert_eq!(db.table("rollups")?.layout(), TableLayout::Columnar);
+
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        assert_eq!(record.status, ProvisionRecordStatus::Applied);
+        assert_eq!(record.plan_id, plan.plan_id);
+        assert_eq!(record.spec_digest, spec_digest(&spec));
+        assert_eq!(record.applied_spec, spec);
+        assert_eq!(record.objects.len(), 9);
+        assert!(record.objects.values().all(|object| !object.adopted));
+        for name in ["orders", "memories", "social"] {
+            assert!(
+                record
+                    .objects
+                    .get(name)
+                    .is_some_and(|object| object.allocated_id.is_some()),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            record.managed_roles,
+            BTreeSet::from(["order_writer".to_owned()])
+        );
+        assert_eq!(
+            record.managed_principals,
+            BTreeSet::from(["orders_svc".to_owned()])
+        );
+        assert_eq!(
+            record.completed_steps,
+            plan.steps
+                .iter()
+                .map(|step| step.step_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(record.applied_by, "local:cli");
+        assert_eq!(db.provision_history()?.len(), 1);
+        assert!(db.authz_policy().roles().contains_key("order_writer"));
+        assert_eq!(
+            db.principal_for_user("orders_svc").roles(),
+            &BTreeSet::from(["order_writer".to_owned()])
+        );
+
+        // Documents inserted after provisioning are found once the indexes are refreshed.
+        let id =
+            db.collection("orders")?
+                .insert(&shipped_order("c-1", "fragile glass", 13.4, 52.5))?;
+        db.collection("orders")?
+            .insert(&shipped_order("c-2", "books", -70.0, -30.0))?;
+        db.full_text_index("orders_notes_fts")?.refresh_full()?;
+        let hits = db
+            .full_text_index("orders_notes_fts")?
+            .search("fragile", 10)?;
+        assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![id]);
+        db.geo_index("orders_shipping_location_geo")?
+            .refresh_full()?;
+        let near = db
+            .geo_index("orders_shipping_location_geo")?
+            .within_radius(GeoPoint::new(13.4, 52.5)?, 1_000.0)?;
+        assert_eq!(near.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![id]);
+
+        // SQL on the columnar table inside the row-class database.
+        assert_eq!(
+            db.query("INSERT INTO rollups (id, revenue) VALUES ('a', 1.5), ('b', 2.5)")
+                .await?,
+            SqlOutput::AffectedRows(2)
+        );
+        assert_eq!(
+            db.query("SELECT id, revenue FROM rollups ORDER BY id")
+                .await?,
+            rows
+        );
+    }
+
+    let db = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &path),
+        &OperationalConfig::new(),
+    )?;
+    assert_eq!(db.table("rollups")?.layout(), TableLayout::Columnar);
+    assert_eq!(
+        db.query("SELECT id, revenue FROM rollups ORDER BY id")
+            .await?,
+        rows
+    );
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+#[test]
+fn applying_again_is_a_noop_without_audit_events_and_drift_is_in_sync() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = full_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("again.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let events = db.audit_events()?.len();
+    let record = db.provision_state()?;
+
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.steps);
+    assert!(plan.steps.is_empty());
+    assert!(plan.required_confirmation.is_none());
+    for confirmation in [
+        Confirmation::PlanId(plan.plan_id.clone()),
+        Confirmation::AutoApproveAdditive,
+    ] {
+        let report = apply_provision(
+            &mut db,
+            &cli_operator(),
+            &spec,
+            &confirmation,
+            &ProvisionOptions::default(),
+            &env(ProvisionSurface::Cli),
+        )?;
+        assert_eq!(report.status, ProvisionOutcome::Noop);
+        assert!(!report.check.data_mutated && !report.check.audit_recorded);
+        assert!(report.applied_steps.is_empty());
+        assert_eq!(
+            report.record.as_ref().map(|summary| summary.objects),
+            Some(9)
+        );
+    }
+    assert_eq!(db.audit_events()?.len(), events);
+    assert_eq!(db.provision_state()?, record);
+    assert!(drift(&db, &spec, &ProvisionOptions::default())?.in_sync);
+    Ok(())
+}
+
+#[test]
+fn a_local_operator_audits_intent_first_each_object_and_completion() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = with_notes(full_spec()?)?;
+    let mut db = create_with_profile(&temp_dir.path().join("audit.redb"), &spec)?;
+    let before = db.audit_events()?.len();
+    let report = apply_cli(&mut db, &spec, &ProvisionOptions::default())?;
+    assert_applied(&report);
+
+    let events = db.audit_events()?.split_off(before);
+    let actions = actions(&events);
+    assert_eq!(actions.first(), Some(&"provision_apply_started"));
+    assert_eq!(actions.last(), Some(&"provision_apply_completed"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.principal.as_deref() == Some("local:cli"))
+    );
+    let started = events.first().ok_or("the intent event")?;
+    let detail = started.detail.as_deref().unwrap_or_default();
+    assert!(detail.contains(&report.plan_id), "{detail}");
+    assert!(detail.contains("surface: cli") && detail.contains("flags: none"));
+    let completed = events.last().ok_or("the completion event")?;
+    assert!(
+        completed
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("data_mutated: true"))
+    );
+    // One provision_create_object per object, between the intent and the completion; no
+    // principal-only create_* events.
+    let created = events
+        .iter()
+        .filter(|event| event.action == "provision_create_object")
+        .map(|event| event.resource.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(created.len(), 10);
+    assert!(created.contains(&Resource::Collection("notes".to_owned())));
+    assert!(created.contains(&Resource::Table("ledger_history".to_owned())));
+    assert!(!actions.iter().any(|action| action.starts_with("create_")));
+    assert!(actions.contains(&"set_security_state"));
+    db.verify_audit_chain()?;
+    Ok(())
+}
+
+#[test]
+fn a_principal_actor_needs_admin_and_gets_per_object_create_events() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("principal.redb");
+    let spec = full_spec()?;
+    let binding = resolved(&spec)?.bind(ReplicationKind::Cp, Some(path))?;
+    let mut db = create_database_with_profile(
+        &binding,
+        OperationalConfig::new().with_security(SecurityConfig {
+            authz_policy: AuthzPolicy::new([
+                Role::new("ops")
+                    .grant(Resource::System, Permission::Admin)
+                    .grant(Resource::Database, Permission::Admin),
+                Role::new("reader").grant(Resource::Database, Permission::Read),
+            ]),
+            principals: PrincipalRegistry::new()
+                .with_principal("ops", Principal::new("ops").with_role("ops"))
+                .with_principal("ada", Principal::new("ada").with_role("reader")),
+            ..SecurityConfig::default()
+        }),
+    )?;
+    let control = env(ProvisionSurface::ControlPlane);
+    let reader = ProvisionActor::Principal(db.principal_for_user("ada"));
+    match apply_as(
+        &mut db,
+        &reader,
+        &spec,
+        &ProvisionOptions::default(),
+        &control,
+    ) {
+        Err(ProvisionError::PermissionMissing(message)) => {
+            assert!(message.contains("System:Admin"), "{message}");
+        }
+        other => return Err(format!("expected PermissionMissing, got {other:?}").into()),
+    }
+    assert!(db.catalog().is_empty());
+    assert_eq!(db.provision_state()?, None);
+
+    let before = db.audit_events()?.len();
+    let ops = ProvisionActor::Principal(db.principal_for_user("ops"));
+    let report = apply_as(&mut db, &ops, &spec, &ProvisionOptions::default(), &control)?;
+    assert_applied(&report);
+    let events = db.audit_events()?.split_off(before);
+    let actions = actions(&events);
+    assert_eq!(actions.first(), Some(&"provision_apply_started"));
+    assert_eq!(actions.last(), Some(&"provision_apply_completed"));
+    for action in [
+        "create_collection",
+        "create_vector_collection",
+        "create_table",
+        "create_time_series",
+        "create_graph",
+        "create_full_text_index",
+        "create_geo_index",
+        "enable_system_versioning",
+        "set_security_state",
+    ] {
+        assert!(actions.contains(&action), "{action}: {actions:?}");
+    }
+    assert!(!actions.contains(&"provision_create_object"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.principal.as_deref() == Some("ops"))
+    );
+    // Unpinned ids were allocated through the audited _auto_id_as creates.
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    for name in ["orders", "memories", "social"] {
+        assert!(
+            record
+                .objects
+                .get(name)
+                .is_some_and(|object| object.allocated_id.is_some())
+        );
+    }
+    assert_eq!(record.applied_by, "ops");
+    // The roles provisioning does not manage are left alone.
+    assert!(db.authz_policy().roles().contains_key("ops"));
+    assert!(db.authz_policy().roles().contains_key("reader"));
+    Ok(())
+}
+
+#[test]
+fn audit_is_enabled_first_disabled_last_and_required_in_between() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("audit-gate.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+
+    // Disabling audit is weakening: it needs its flag and runs after the completion event.
+    let mut off = spec.clone();
+    off.guarantees.audit.enabled = false;
+    assert!(matches!(
+        apply_cli(&mut db, &off, &ProvisionOptions::default()),
+        Err(ProvisionError::NeedsFlags(plan))
+            if plan.required_flags == ["allow_weakening:guarantees.audit.enabled"]
+    ));
+    let before = db.audit_events()?.len();
+    let allow = weakening("guarantees.audit.enabled");
+    assert!(matches!(
+        apply_provision(
+            &mut db,
+            &cli_operator(),
+            &off,
+            &Confirmation::AutoApproveAdditive,
+            &allow,
+            &env(ProvisionSurface::Cli),
+        ),
+        Err(ProvisionError::ConfirmationRequired(_))
+    ));
+    let report = apply_cli(&mut db, &off, &allow)?;
+    assert_applied(&report);
+    assert_eq!(
+        report.applied_steps.last().map(|step| step.kind),
+        Some(ProvisionStepKind::DisableAudit)
+    );
+    assert!(!db.audit_enabled());
+    assert!(!db.persisted_security_state()?.audit_enabled);
+    let events = db.audit_events()?.split_off(before);
+    assert_eq!(
+        actions(&events),
+        vec![
+            "provision_apply_started",
+            "provision_apply_completed",
+            "set_audit_enabled"
+        ]
+    );
+    assert_eq!(
+        events.last().and_then(|event| event.detail.as_deref()),
+        Some("enabled: false")
+    );
+    assert_eq!(
+        events.last().and_then(|event| event.principal.as_deref()),
+        Some("local:cli")
+    );
+    assert_eq!(
+        plan_open_with(&off, &db, &allow)?.outcome,
+        PlanOutcome::Noop
+    );
+
+    // Audit off and kept off: no change can be applied, also with every flag.
+    let more = with_notes(off)?;
+    assert!(matches!(
+        apply_cli(&mut db, &more, &allow),
+        Err(ProvisionError::AuditRequired)
+    ));
+    assert!(!db.catalog().contains_key("notes"));
+
+    // Audit off, spec on: the first step turns it on, before the intent event.
+    let on = with_notes(spec)?;
+    let events_before = db.audit_events()?.len();
+    let report = apply_cli(&mut db, &on, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert_eq!(
+        report.applied_steps.first().map(|step| step.kind),
+        Some(ProvisionStepKind::EnableAudit)
+    );
+    assert!(db.audit_enabled());
+    let events = db.audit_events()?.split_off(events_before);
+    assert_eq!(actions(&events).first().copied(), Some("set_audit_enabled"));
+    assert_eq!(
+        events.first().and_then(|event| event.detail.as_deref()),
+        Some("enabled: true")
+    );
+    assert_eq!(
+        actions(&events).get(1).copied(),
+        Some("provision_apply_started")
+    );
+    assert!(db.catalog().contains_key("notes"));
+    db.verify_audit_chain()?;
+    Ok(())
+}
+
+/// A step without its id: what it does and to what.
+type StepSignature = (ProvisionStepKind, Option<String>, String);
+
+#[test]
+fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestResult {
+    let spec = in_memory(full_spec()?);
+    let rust = env(ProvisionSurface::RustApi);
+    let embedded = ProvisionActor::local_operator("local:embedded");
+    let defaults = ProvisionOptions::default();
+    let step_count = {
+        let db = create_in_memory(&spec)?;
+        plan_rust_api(&spec, &db)?.steps.len()
+    };
+    assert!(step_count >= 12);
+    let signature = |step: &ProvisionStep| -> StepSignature {
+        (step.kind, step.object.clone(), step.path.clone())
+    };
+
+    for index in 0..step_count {
+        let mut db = create_in_memory(&spec)?;
+        let plan = plan_rust_api(&spec, &db)?;
+        let failed_id = plan.steps[index].step_id.clone();
+        let report = {
+            let _failure = InjectedFailure::at(index);
+            apply_provision(
+                &mut db,
+                &embedded,
+                &spec,
+                &Confirmation::PlanId(plan.plan_id.clone()),
+                &defaults,
+                &rust,
+            )?
+        };
+        assert_eq!(report.status, ProvisionOutcome::PartiallyApplied, "{index}");
+        assert!(report.check.data_mutated);
+        assert_eq!(report.failed_step.as_ref(), Some(&failed_id));
+        let failed = report.applied_steps.last().ok_or("the failed step")?;
+        assert_eq!(failed.outcome, StepOutcome::Failed);
+        assert_eq!(failed.error_kind.as_deref(), Some("transaction_aborted"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| warning.code != "PROVISION_FAILURE_NOT_RECORDED")
+        );
+
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        assert_eq!(record.status, ProvisionRecordStatus::Failed, "{index}");
+        assert_eq!(record.failed_step.as_ref(), Some(&failed_id));
+        assert_eq!(
+            record.completed_steps,
+            plan.steps[..index]
+                .iter()
+                .map(|step| step.step_id.clone())
+                .collect::<Vec<_>>()
+        );
+        let events = db.audit_events()?;
+        let last = events.last().ok_or("the failure event")?;
+        assert_eq!(last.action, "provision_apply_failed");
+        assert_eq!(last.outcome, AuditOutcome::Failed);
+
+        // The next plan holds only what remains: nothing that completed comes back, and every
+        // object the failed apply did not create is still planned.
+        let remaining = plan_rust_api(&spec, &db)?;
+        assert!(has_issue(
+            &remaining,
+            "DRIFT_INTERRUPTED_APPLY",
+            ValidationSeverity::Warning
+        ));
+        let left = plan.steps[index..]
+            .iter()
+            .map(signature)
+            .collect::<Vec<_>>();
+        for step in &remaining.steps {
+            assert!(left.contains(&signature(step)), "{index}: {step:?}");
+        }
+        for step in &plan.steps[index..] {
+            if step.object.is_some() && step.kind != ProvisionStepKind::ApplySecurity {
+                assert!(
+                    remaining
+                        .steps
+                        .iter()
+                        .any(|planned| signature(planned) == signature(step)),
+                    "{index}: {step:?} is missing"
+                );
+            }
+        }
+
+        let again = apply_provision(
+            &mut db,
+            &embedded,
+            &spec,
+            &Confirmation::PlanId(remaining.plan_id.clone()),
+            &defaults,
+            &rust,
+        )?;
+        assert_applied(&again);
+        assert_eq!(
+            plan_rust_api(&spec, &db)?.outcome,
+            PlanOutcome::Noop,
+            "{index}"
+        );
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        assert_eq!(record.status, ProvisionRecordStatus::Applied);
+        assert_eq!(record.objects.len(), 9);
+        assert_eq!(db.provision_history()?.len(), 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn confirmations_must_name_the_current_plan() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("confirm.redb"), &spec)?;
+    let cli = env(ProvisionSurface::Cli);
+    let defaults = ProvisionOptions::default();
+    let plan = plan_open(&spec, &db)?;
+
+    // A config plan id or anything else is rejected without a change.
+    let events = db.audit_events()?.len();
+    for confirmation in [
+        "plan_0123456789abcdef0123456789abcdef",
+        "yes",
+        "prov_short",
+        "",
+    ] {
+        let report = apply_provision(
+            &mut db,
+            &cli_operator(),
+            &spec,
+            &Confirmation::PlanId(confirmation.to_owned()),
+            &defaults,
+            &cli,
+        )?;
+        assert_eq!(report.status, ProvisionOutcome::Rejected, "{confirmation}");
+        assert_eq!(report.check.status, ApplyStatus::Rejected);
+        assert!(!report.check.data_mutated && !report.check.confirmation_matched);
+        assert!(report.check.message.contains(&plan.plan_id));
+    }
+    assert!(db.catalog().is_empty());
+    assert_eq!(db.provision_state()?, None);
+    assert_eq!(db.audit_events()?.len(), events);
+
+    // Another prov_ id is a plan change.
+    let other = format!("prov_{}", "0".repeat(32));
+    match apply_provision(
+        &mut db,
+        &cli_operator(),
+        &spec,
+        &Confirmation::PlanId(other.clone()),
+        &defaults,
+        &cli,
+    ) {
+        Err(ProvisionError::PlanChanged { confirmed, current }) => {
+            assert_eq!(confirmed, other);
+            assert_eq!(current, plan.plan_id);
+        }
+        result => return Err(format!("expected PlanChanged, got {result:?}").into()),
+    }
+
+    // An id computed on the CLI does not confirm on the Control Plane.
+    assert!(matches!(
+        apply_provision(
+            &mut db,
+            &ProvisionActor::Principal(Principal::new("root")),
+            &spec,
+            &Confirmation::PlanId(plan.plan_id.clone()),
+            &defaults,
+            &env(ProvisionSurface::ControlPlane),
+        ),
+        Err(ProvisionError::PlanChanged { .. })
+    ));
+
+    // An out-of-band change between plan and apply changes the plan.
+    db.create_collection_auto_id("notes", orders_fields(), Vec::new())?;
+    assert!(matches!(
+        apply_provision(
+            &mut db,
+            &cli_operator(),
+            &spec,
+            &Confirmation::PlanId(plan.plan_id.clone()),
+            &defaults,
+            &cli,
+        ),
+        Err(ProvisionError::PlanChanged { .. })
+    ));
+    assert!(!db.catalog().contains_key("orders"));
+    assert_eq!(db.audit_events()?.len(), events);
+
+    // Additive changes auto-approve.
+    let report = apply_provision(
+        &mut db,
+        &cli_operator(),
+        &spec,
+        &Confirmation::AutoApproveAdditive,
+        &defaults,
+        &cli,
+    )?;
+    assert_applied(&report);
+    Ok(())
+}
+
+#[test]
+fn auto_approval_refuses_retunes_weakening_and_rbac_on_an_existing_database() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let secure = spec("secure_app", &json!([]))?;
+    let mut db = create_with_profile(&temp_dir.path().join("auto.redb"), &secure)?;
+    let cli = env(ProvisionSurface::Cli);
+    let auto = |db: &mut Database, spec: &DatabaseSpec, opts: &ProvisionOptions| {
+        apply_provision(
+            db,
+            &cli_operator(),
+            spec,
+            &Confirmation::AutoApproveAdditive,
+            opts,
+            &cli,
+        )
+    };
+    assert_applied(&auto(&mut db, &secure, &ProvisionOptions::default())?);
+
+    let retune = with_custom_profile(
+        secure.clone(),
+        "orders_custom",
+        &json!({ "extends": "secure_app", "knobs": { "cache": { "max_entries": 4096 } } }),
+    )?;
+    let mut weaker = secure.clone();
+    weaker.guarantees.audit.enabled = false;
+    let rbac = with_security(
+        secure.clone(),
+        &json!({
+            "roles": [{ "name": "auditor", "grants": [{ "resource": "database", "permissions": ["read"] }] }],
+            "principals": []
+        }),
+    )?;
+    for (name, spec, opts) in [
+        ("retune", &retune, ProvisionOptions::default()),
+        ("weakening", &weaker, weakening("guarantees.audit.enabled")),
+        ("rbac", &rbac, ProvisionOptions::default()),
+    ] {
+        assert!(
+            matches!(
+                auto(&mut db, spec, &opts),
+                Err(ProvisionError::ConfirmationRequired(plan)) if plan.outcome == PlanOutcome::Ready
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(db.authz_policy().roles().len(), 0);
+    assert!(db.audit_enabled());
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn new_databases_are_created_only_at_absent_targets() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = full_spec()?;
+    let cli = env(ProvisionSurface::Cli);
+    let defaults = ProvisionOptions::default();
+
+    // A spec with roles is auto-approved for a new database: the continuation check compares
+    // steps, not auto_approvable.
+    let path = temp_dir.path().join("new.redb");
+    let plan = plan_path(&spec, &path, ProvisionSurface::Cli)?;
+    assert!(plan.auto_approvable);
+    let (db, report) = provision_new_database(
+        &spec,
+        Some(&path),
+        &Confirmation::AutoApproveAdditive,
+        &defaults,
+        &cli,
+    )?;
+    assert_applied(&report);
+    assert_eq!(report.plan_id, plan.plan_id);
+    assert_eq!(
+        report.applied_steps.first().map(|step| step.kind),
+        Some(ProvisionStepKind::CreateDatabase)
+    );
+    assert_eq!(report.applied_steps.len(), plan.steps.len());
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert_eq!(record.plan_id, plan.plan_id);
+    assert_eq!(record.applied_by, "local:cli");
+    assert_eq!(
+        record.completed_steps,
+        plan.steps
+            .iter()
+            .map(|step| step.step_id.clone())
+            .collect::<Vec<_>>()
+    );
+    let events = db.audit_events()?;
+    assert_eq!(
+        actions(&events).first().copied(),
+        Some("provision_apply_started")
+    );
+    assert!(
+        events
+            .first()
+            .and_then(|event| event.detail.as_deref())
+            .is_some_and(|detail| detail.contains(&plan.plan_id))
+    );
+    assert!(db.authz_policy().roles().contains_key("order_writer"));
+    assert!(db.probed_metadata()?.manifest.is_some());
+    drop(db);
+    let db = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &path),
+        &OperationalConfig::new(),
+    )?;
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    drop(db);
+
+    // An existing database is never created over.
+    assert!(matches!(
+        provision_new_database(
+            &spec,
+            Some(&path),
+            &Confirmation::AutoApproveAdditive,
+            &defaults,
+            &cli,
+        ),
+        Err(ProvisionError::AlreadyInitialized)
+    ));
+    // The Control Plane never creates databases.
+    assert!(matches!(
+        provision_new_database(
+            &spec,
+            Some(&temp_dir.path().join("control.redb")),
+            &Confirmation::AutoApproveAdditive,
+            &defaults,
+            &env(ProvisionSurface::ControlPlane),
+        ),
+        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
+    ));
+    // A confirmation that is not a provisioning plan id creates nothing.
+    let refused = temp_dir.path().join("refused.redb");
+    assert!(matches!(
+        provision_new_database(
+            &spec,
+            Some(&refused),
+            &Confirmation::PlanId("plan_0123".to_owned()),
+            &defaults,
+            &cli,
+        ),
+        Err(ProvisionError::ConfirmationRequired(_))
+    ));
+    assert!(!refused.exists());
+
+    // A database that differs from the confirmed plan once created aborts the apply.
+    let perturbed = temp_dir.path().join("perturbed.redb");
+    let plan = plan_path(&spec, &perturbed, ProvisionSurface::Cli)?;
+    let result = {
+        let _perturbation = Perturbation::run(|db: &mut Database| {
+            let created = db.create_collection_auto_id("orders", orders_fields(), orders_indexes());
+            assert!(created.is_ok());
+        });
+        provision_new_database(
+            &spec,
+            Some(&perturbed),
+            &Confirmation::PlanId(plan.plan_id.clone()),
+            &defaults,
+            &cli,
+        )
+    };
+    match result {
+        Err(ProvisionError::PlanChanged { confirmed, current }) => {
+            assert_eq!(confirmed, plan.plan_id);
+            assert_ne!(current, plan.plan_id);
+        }
+        Err(other) => return Err(format!("expected PlanChanged, got {other:?}").into()),
+        Ok((_, report)) => return Err(format!("expected PlanChanged, got {report:?}").into()),
+    }
+    // The created database is kept, empty but for the perturbation, and has no record.
+    let db = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &perturbed),
+        &OperationalConfig::new(),
+    )?;
+    assert_eq!(db.provision_state()?, None);
+    assert_eq!(db.catalog().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn rust_api_provisions_an_encrypted_database_with_a_local_envelope() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("encrypted.redb");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [7_u8; 32])?;
+    let encryption =
+        EncryptionConfig::local_envelope(temp_dir.path().join("keyring.json"), &kek_path);
+    let mut spec = orders_spec()?;
+    spec.guarantees.encryption.at_rest = true;
+    let environment = ProvisionEnvironment {
+        encryption: Some(encryption.clone()),
+        ..env(ProvisionSurface::RustApi)
+    };
+    let plan = plan_provision(
+        &spec,
+        ProvisionTargetRef::Path(&path),
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    let (db, report) = provision_new_database(
+        &spec,
+        Some(&path),
+        &Confirmation::PlanId(plan.plan_id.clone()),
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_applied(&report);
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert!(record.guarantees.iter().any(|entry| {
+        entry.path == "guarantees.encryption.at_rest" && entry.status == EnforcementStatus::Enforced
+    }));
+    assert!(db.catalog().contains_key("orders"));
+    drop(db);
+
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    assert!(matches!(
+        open_database(config.clone()),
+        Err(ConfigError::MetadataUnreadable { .. })
+    ));
+    let db = open_database_with_ops(
+        config,
+        &OperationalConfig::new().with_encryption(encryption),
+    )?;
+    assert!(db.catalog().contains_key("orders"));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn rbac_changes_only_managed_names_in_one_batch() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("rbac.redb");
+    let base = orders_spec()?;
+    let mut db = create_with_profile(&path, &base)?;
+    db.ensure_bootstrap_admin_principal()?;
+    let admin = db.principal_for_user("admin");
+    let policy = db
+        .authz_policy()
+        .clone()
+        .allow(Role::new("auditor").grant(Resource::Database, Permission::Read));
+    db.set_authz_policy_as(&admin, policy)?;
+
+    let writer = security(
+        base.clone(),
+        &json!([{ "object": "orders", "permissions": ["read", "write"] }]),
+    )?;
+    let before = latest_lsn(&db)?;
+    assert_applied(&apply_cli(&mut db, &writer, &ProvisionOptions::default())?);
+    let commits = table_commits(&db, before, "__authz_policy")?;
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    assert!(
+        commits[0].contains(b"policy".as_slice()) && commits[0].contains(b"principals".as_slice())
+    );
+    let roles = db.authz_policy().roles();
+    assert!(roles.contains_key("admin") && roles.contains_key("auditor"));
+    assert_eq!(
+        roles.get("order_writer").map(|role| role.grants().len()),
+        Some(1)
+    );
+    assert_eq!(db.principal_for_user("admin"), admin);
+    assert_eq!(
+        db.principal_for_user("orders_svc"),
+        Principal::new("orders_svc").with_role("order_writer")
+    );
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert_eq!(
+        record.managed_roles,
+        BTreeSet::from(["order_writer".to_owned()])
+    );
+
+    // A revoked permission is weakening.
+    let reader = security(
+        base.clone(),
+        &json!([{ "object": "orders", "permissions": ["read"] }]),
+    )?;
+    assert!(matches!(
+        apply_cli(&mut db, &reader, &ProvisionOptions::default()),
+        Err(ProvisionError::NeedsFlags(plan))
+            if plan.required_flags == ["allow_weakening:security.roles.order_writer"]
+    ));
+    assert_applied(&apply_cli(
+        &mut db,
+        &reader,
+        &weakening("security.roles.order_writer"),
+    )?);
+    let order_writer = db
+        .authz_policy()
+        .roles()
+        .get("order_writer")
+        .cloned()
+        .ok_or("the managed role")?;
+    assert!(order_writer.allows(&Resource::Collection("orders".to_owned()), Permission::Read));
+    assert!(!order_writer.allows(
+        &Resource::Collection("orders".to_owned()),
+        Permission::Write
+    ));
+
+    // Dropping the managed role and principal is destructive.
+    let flags = [
+        "security.roles.order_writer",
+        "security.principals.orders_svc",
+    ];
+    match apply_cli(&mut db, &base, &ProvisionOptions::default()) {
+        Err(ProvisionError::NeedsFlags(plan)) => assert_eq!(
+            plan.required_flags,
+            flags
+                .iter()
+                .map(|path| format!("allow_destructive:{path}"))
+                .collect::<Vec<_>>()
+        ),
+        other => return Err(format!("expected NeedsFlags, got {other:?}").into()),
+    }
+    assert_applied(&apply_cli(&mut db, &base, &destructive(&flags))?);
+    assert!(!db.authz_policy().roles().contains_key("order_writer"));
+    assert!(
+        !db.principal_registry()
+            .principals()
+            .contains_key("orders_svc")
+    );
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert!(record.managed_roles.is_empty() && record.managed_principals.is_empty());
+    drop(db);
+
+    // The bootstrap administrator and the unmanaged role survive a reopen.
+    let db = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &path),
+        &OperationalConfig::new(),
+    )?;
+    assert!(db.authz_policy().roles().contains_key("admin"));
+    assert!(db.authz_policy().roles().contains_key("auditor"));
+    assert_eq!(db.principal_for_user("admin"), admin);
+    assert_eq!(plan_open(&base, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+#[test]
+fn a_principal_cannot_apply_a_plan_that_locks_it_out() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let base = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("lockout.redb"), &base)?;
+    let ops = |grants: JsonValue| {
+        with_security(
+            base.clone(),
+            &json!({
+                "roles": [{ "name": "ops", "grants": grants }],
+                "principals": [{ "user": "ops", "roles": ["ops"] }]
+            }),
+        )
+    };
+    let administrators = ops(json!([{ "resource": "database", "permissions": ["admin"] }]))?;
+    assert_applied(&apply_cli(
+        &mut db,
+        &administrators,
+        &ProvisionOptions::default(),
+    )?);
+
+    let narrowed = ops(json!([{ "object": "orders", "permissions": ["read"] }]))?;
+    let allow = weakening("security.roles.ops");
+    let actor = ProvisionActor::Principal(db.principal_for_user("ops"));
+    match apply_as(
+        &mut db,
+        &actor,
+        &narrowed,
+        &allow,
+        &env(ProvisionSurface::ControlPlane),
+    ) {
+        Err(ProvisionError::Blocked(plan)) => assert!(has_issue(
+            &plan,
+            "RBAC_SELF_LOCKOUT",
+            ValidationSeverity::Error
+        )),
+        other => return Err(format!("expected a lockout, got {other:?}").into()),
+    }
+    assert!(
+        db.authz_policy()
+            .roles()
+            .get("ops")
+            .is_some_and(|role| role.allows(&Resource::System, Permission::Admin))
+    );
+    // A local operator relies on filesystem trust, not on the role.
+    assert_applied(&apply_cli(&mut db, &narrowed, &allow)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_spec_granted_role_runs_sql_and_others_are_denied() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let ledger = spec(
+        "balanced",
+        &json!([{
+            "name": "ledger", "role": "document_entity", "domain": "primary", "indexes": ["primary"],
+            "physical": {
+                "kind": "table",
+                "columns": [
+                    { "name": "entry_id", "type": "int" },
+                    { "name": "amount", "type": "float" }
+                ],
+                "primary_key": "entry_id"
+            }
+        }]),
+    )?;
+    let spec = with_security(
+        ledger,
+        &json!({
+            "roles": [{
+                "name": "ledger_reader",
+                "grants": [{ "object": "ledger", "permissions": ["read"] }]
+            }],
+            "principals": [{ "user": "analyst", "roles": ["ledger_reader"] }]
+        }),
+    )?;
+    let mut db = create_with_profile(&temp_dir.path().join("sql.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    db.query("INSERT INTO ledger (entry_id, amount) VALUES (1, 2.5)")
+        .await?;
+
+    let analyst = db.principal_for_user("analyst");
+    assert_eq!(
+        db.query_as(&analyst, "SELECT entry_id FROM ledger").await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["entry_id".to_owned()],
+            rows: vec![vec![Value::Int(1)]],
+        })
+    );
+    assert!(matches!(
+        db.query_as(
+            &analyst,
+            "INSERT INTO ledger (entry_id, amount) VALUES (2, 1.0)"
+        )
+        .await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    let stranger = db.principal_for_user("stranger");
+    assert!(matches!(
+        db.query_as(&stranger, "SELECT entry_id FROM ledger").await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn releasing_a_managed_object_needs_its_flag_and_keeps_its_data() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let both = with_notes(orders_spec()?)?;
+    let mut db = create_with_profile(&temp_dir.path().join("release.redb"), &both)?;
+    assert_applied(&apply_cli(&mut db, &both, &ProvisionOptions::default())?);
+    let id = db.collection("orders")?.insert(&order_document("c-1"))?;
+
+    let mut notes_only = both.clone();
+    notes_only
+        .collections
+        .retain(|collection| collection.name == "notes");
+    assert!(matches!(
+        apply_cli(&mut db, &notes_only, &ProvisionOptions::default()),
+        Err(ProvisionError::NeedsFlags(plan))
+            if plan.required_flags == ["allow_destructive:collections.orders"]
+    ));
+    let events = db.audit_events()?.len();
+    let report = apply_cli(&mut db, &notes_only, &destructive(&["collections.orders"]))?;
+    assert_applied(&report);
+    assert!(db.collection("orders")?.get(id)?.is_some());
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert!(!record.objects.contains_key("orders"));
+    assert!(record.released_objects.contains("orders"));
+    assert!(
+        record
+            .flags
+            .contains(&"allow_destructive:collections.orders".to_owned())
+    );
+    let released = db.audit_events()?.split_off(events);
+    assert!(actions(&released).contains(&"provision_release_object"));
+    assert!(drift(&db, &notes_only, &ProvisionOptions::default())?.in_sync);
+    assert_eq!(plan_open(&notes_only, &db)?.outcome, PlanOutcome::Noop);
+
+    // Declaring it again adopts it back.
+    let report = apply_cli(&mut db, &both, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert!(
+        report
+            .applied_steps
+            .iter()
+            .any(|step| step.kind == ProvisionStepKind::AdoptObject)
+    );
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert!(
+        record
+            .objects
+            .get("orders")
+            .is_some_and(|object| object.adopted)
+    );
+    assert!(record.released_objects.is_empty());
+    Ok(())
+}
+
+#[test]
+fn the_storage_format_upgrade_writes_manifest_and_version_together() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("upgrade.redb");
+    let base = orders_spec()?;
+    let zstd = with_custom_profile(
+        base.clone(),
+        "orders_zstd",
+        &json!({ "extends": "balanced", "knobs": { "compression": { "algorithm": "zstd" } } }),
+    )?;
+    let (old, new) = {
+        let mut db = create_with_profile(&path, &base)?;
+        assert_applied(&apply_cli(&mut db, &base, &ProvisionOptions::default())?);
+        let old = db.collection("orders")?.insert(&order_document("old"))?;
+
+        assert!(matches!(
+            apply_cli(&mut db, &zstd, &ProvisionOptions::default()),
+            Err(ProvisionError::NeedsFlags(plan)) if plan.required_flags == ["allow_format_upgrade"]
+        ));
+        let allow = ProvisionOptions {
+            allow_format_upgrade: true,
+            ..ProvisionOptions::default()
+        };
+        let before = latest_lsn(&db)?;
+        let report = apply_cli(&mut db, &zstd, &allow)?;
+        assert_applied(&report);
+        assert!(report.session_pending_restart);
+        let commits = table_commits(&db, before, "__meta")?;
+        assert_eq!(
+            commits,
+            vec![BTreeSet::from([
+                b"profile_manifest".to_vec(),
+                b"schema_version".to_vec()
+            ])]
+        );
+        let metadata = db.probed_metadata()?;
+        assert_eq!(metadata.schema_version, 2);
+        let manifest = metadata.manifest.ok_or("a manifest")?;
+        assert!(manifest.storage_format.value_framing);
+        assert_eq!(manifest.profile, "orders_zstd");
+        // The session keeps its unframed engine until the database is opened again.
+        assert_eq!(db.engine_kind(), EngineKind::Redb);
+        assert_eq!(
+            plan_open_with(&zstd, &db, &allow)?
+                .drift
+                .items
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            vec![DriftKind::SessionPendingRestart]
+        );
+        drop(db);
+
+        match crate::db::inspect_database_metadata(&path) {
+            crate::db::MetadataProbe::Initialized(probe) => assert_eq!(probe.schema_version, 2),
+            other => return Err(format!("expected an initialized database, got {other:?}").into()),
+        }
+        let db = open_database_with_ops(
+            DbConfig::on_disk(Profile::Balanced, &path),
+            &OperationalConfig::new(),
+        )?;
+        assert_eq!(db.engine_kind(), EngineKind::CompressedRedb);
+        assert!(db.collection("orders")?.get(old)?.is_some());
+        let new = db.collection("orders")?.insert(&order_document("new"))?;
+        assert_eq!(plan_open(&zstd, &db)?.outcome, PlanOutcome::Noop);
+        assert!(drift(&db, &zstd, &ProvisionOptions::default())?.in_sync);
+        let collection_id = match db.catalog().get("orders") {
+            Some(CatalogEntry::Collection { collection_id, .. }) => *collection_id,
+            other => return Err(format!("orders: {other:?}").into()),
+        };
+        drop(db);
+        (old, (new, collection_id))
+    };
+
+    // Old values stay unframed and new ones are framed.
+    let (new, collection_id) = new;
+    let engine = RedbEngine::open(&path)?;
+    let read = engine.begin_read()?;
+    let (start, end) = crate::model::collection_range_bounds(collection_id);
+    let documents = read
+        .range(crate::model::DOCUMENT_TABLE, &start, &end)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            crate::model::document_id_from_key(&key).map(|id| (id, value.starts_with(b"MDBC1")))
+        })
+        .collect::<Vec<_>>();
+    assert!(documents.contains(&(old, false)), "{documents:?}");
+    assert!(documents.contains(&(new, true)), "{documents:?}");
+    Ok(())
+}
+
+#[test]
+fn backup_and_restore_carry_the_record_and_the_manifest() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = full_spec()?;
+    let path = temp_dir.path().join("source.redb");
+    let mut db = create_with_profile(&path, &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let record = db.provision_state()?;
+    let manifest = db.probed_metadata()?.manifest;
+    assert!(
+        manifest
+            .as_ref()
+            .is_some_and(|manifest| !manifest.knobs.floors.encryption_at_rest)
+    );
+    let history = db.provision_history()?;
+
+    let backup = full_backup(
+        &db,
+        temp_dir.path().join("backups"),
+        &BackupConfig::default(),
+    )?;
+    verify_backup(&backup.path)?;
+    drop(db);
+    let restored_path = temp_dir.path().join("restored.redb");
+    restore_backup(
+        &backup.path,
+        DbConfig::on_disk(Profile::Balanced, &restored_path),
+        RestoreTarget::Latest,
+    )?;
+    let restored = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &restored_path),
+        &OperationalConfig::new(),
+    )?;
+    assert_eq!(restored.provision_state()?, record);
+    assert_eq!(restored.provision_history()?, history);
+    assert_eq!(restored.probed_metadata()?.manifest, manifest);
+    assert_eq!(plan_open(&spec, &restored)?.outcome, PlanOutcome::Noop);
     Ok(())
 }

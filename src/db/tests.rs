@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, io, path::Path, sync::Arc, thread};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    path::Path,
+    sync::Arc,
+    thread,
+};
 
 use serde_json::json;
 
@@ -39,6 +45,9 @@ use crate::performance::{
     BenchmarkReport, CompressionAlgorithm, PerformanceConfig, RegressionGate,
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
+use crate::provision::{
+    ProvisionActor, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus, RECORD_VERSION,
+};
 use crate::query::{
     ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, REL_ROWS_TABLE, RelIndexSpec,
     RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
@@ -1767,6 +1776,393 @@ fn provisioning_views_match_the_file_and_refuse_replicated_backends()
         sharded.probed_metadata(),
         Err(DbError::Config(ConfigError::Unsupported(_)))
     ));
+    Ok(())
+}
+
+/// A provision record with the given plan id and nothing managed.
+fn provision_record(plan_id: &str) -> ProvisionRecord {
+    ProvisionRecord {
+        record_version: RECORD_VERSION,
+        status: ProvisionRecordStatus::Applied,
+        plan_id: plan_id.to_owned(),
+        spec_digest: "spec_test".to_owned(),
+        applied_spec: DatabaseSpec::from_db_config("app", &DbConfig::new(Profile::InMemory)),
+        profile_digest: "prof_test".to_owned(),
+        objects: BTreeMap::new(),
+        managed_roles: BTreeSet::new(),
+        managed_principals: BTreeSet::new(),
+        released_objects: BTreeSet::new(),
+        guarantees: Vec::new(),
+        completed_steps: Vec::new(),
+        failed_step: None,
+        flags: Vec::new(),
+        seed_digest: None,
+        applied_at_millis: 1,
+        applied_by: "local:test".to_owned(),
+        binary_version: "test".to_owned(),
+    }
+}
+
+/// The commit-log records committed after `lsn`.
+fn commit_records_after(
+    database: &Database,
+    lsn: u64,
+) -> Result<Vec<txn::CommitLogRecord>, Box<dyn std::error::Error>> {
+    Ok(database
+        .range(txn::COMMIT_LOG_TABLE, &[], &[], ReadConsistency::Strong)?
+        .into_iter()
+        .map(|(_, value)| txn::decode_commit_log_record(&value))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|record| record.txn_id > lsn)
+        .collect())
+}
+
+#[test]
+fn provision_records_round_trip_and_history_keeps_the_newest_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+    assert!(database.provision_history()?.is_empty());
+
+    for at_millis in 1..=105_u64 {
+        let record = provision_record(&format!("prov_{at_millis}"));
+        let entry = ProvisionHistoryEntry {
+            plan_id: record.plan_id.clone(),
+            status: ProvisionRecordStatus::Applied,
+            flags: vec!["allow_format_upgrade".to_owned()],
+            actor: "local:test".to_owned(),
+            at_millis,
+        };
+        database.write_provision_record(&record, Some(&entry))?;
+    }
+    // A record without a history entry leaves the history alone.
+    let last = provision_record("prov_last");
+    database.write_provision_record(&last, None)?;
+    assert_eq!(database.provision_state()?, Some(last));
+
+    let history = database.provision_history()?;
+    assert_eq!(history.len(), super::provisioning::HISTORY_LIMIT);
+    assert_eq!(history.first().map(|entry| entry.at_millis), Some(6));
+    assert_eq!(history.last().map(|entry| entry.at_millis), Some(105));
+    assert!(
+        history
+            .iter()
+            .all(|entry| entry.flags == ["allow_format_upgrade"])
+    );
+    let keys = database
+        .range(
+            super::PROVISION_TABLE,
+            b"history/",
+            b"history0",
+            ReadConsistency::Strong,
+        )?
+        .into_iter()
+        .map(|(key, _)| String::from_utf8(key))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(keys.len(), 100);
+    assert_eq!(
+        keys.first().map(String::as_str),
+        Some("history/00000000000000000006")
+    );
+    assert_eq!(
+        keys.last().map(String::as_str),
+        Some("history/00000000000000000105")
+    );
+    Ok(())
+}
+
+#[test]
+fn provision_events_need_audit_and_local_operators_toggle_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let actor = ProvisionActor::local_operator("local:test");
+    database.record_provision_event(
+        &actor,
+        "provision_apply_started",
+        Resource::System,
+        AuditOutcome::Succeeded,
+        "plan_id: prov_test",
+    )?;
+    let events = database.audit_events()?;
+    let started = events.last().ok_or("an event")?;
+    assert_eq!(started.action, "provision_apply_started");
+    assert_eq!(started.principal.as_deref(), Some("local:test"));
+
+    database.set_audit_enabled_by_provisioning("local:test", false)?;
+    assert!(!database.audit_enabled());
+    let disabled = database.audit_events()?;
+    let toggle = disabled.last().ok_or("the disable event")?;
+    assert_eq!(toggle.action, "set_audit_enabled");
+    assert_eq!(toggle.principal.as_deref(), Some("local:test"));
+    assert_eq!(toggle.detail.as_deref(), Some("enabled: false"));
+    assert!(!database.persisted_security_state()?.audit_enabled);
+    assert!(matches!(
+        database.record_provision_event(
+            &actor,
+            "provision_apply_started",
+            Resource::System,
+            AuditOutcome::Succeeded,
+            "plan_id: prov_test",
+        ),
+        Err(DbError::AuditIntegrity(_))
+    ));
+    assert_eq!(database.audit_events()?.len(), disabled.len());
+
+    database.set_audit_enabled_by_provisioning("local:test", true)?;
+    assert!(database.audit_enabled());
+    let enabled = database.audit_events()?;
+    assert_eq!(
+        enabled.last().and_then(|event| event.detail.as_deref()),
+        Some("enabled: true")
+    );
+    database.verify_audit_chain()?;
+    Ok(())
+}
+
+#[test]
+fn local_operators_cannot_disable_audit_below_the_audit_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("audit-floor.redb");
+    let overrides: ProfileKnobOverrides = serde_json::from_value(json!({}))?;
+    let resolution = resolve_named_profile("balanced", &overrides);
+    let mut resolved = resolution.resolved().cloned().ok_or("balanced resolves")?;
+    resolved.knobs.floors.audit = true;
+    resolved.digest = crate::config_spec::profile_digest(&resolved.knobs, resolved.storage_profile);
+    let binding = resolved.bind(ReplicationKind::Cp, Some(path))?;
+    let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+
+    assert!(matches!(
+        database.set_audit_enabled_by_provisioning("local:test", false),
+        Err(DbError::Config(ConfigError::ProfileFloorNotMet {
+            floor: "floors.audit",
+            ..
+        }))
+    ));
+    assert!(database.audit_enabled());
+    let events = database.audit_events()?;
+    let refused = events.last().ok_or("the refusal event")?;
+    assert_eq!(refused.outcome, AuditOutcome::Failed);
+    assert_eq!(refused.principal.as_deref(), Some("local:test"));
+    Ok(())
+}
+
+#[test]
+fn set_security_state_as_requires_system_admin_and_writes_one_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database_with_ops(
+        DbConfig::new(Profile::InMemory),
+        OperationalConfig::new().with_security(SecurityConfig {
+            authz_policy: AuthzPolicy::new([
+                Role::new("admin").grant(Resource::System, Permission::Admin),
+                Role::new("reader").grant(Resource::Database, Permission::Read),
+            ]),
+            ..SecurityConfig::default()
+        }),
+    )?;
+    let admin = Principal::new("root").with_role("admin");
+    let reader = Principal::new("ada").with_role("reader");
+    let policy = AuthzPolicy::new([
+        Role::new("admin").grant(Resource::System, Permission::Admin),
+        Role::new("writer").grant(Resource::Collection("orders".to_owned()), Permission::Write),
+    ]);
+    let principals = PrincipalRegistry::new()
+        .with_principal("svc", Principal::new("svc").with_role("writer"))
+        .with_principal("root", admin.clone());
+
+    assert!(matches!(
+        database.set_security_state_as(&reader, policy.clone(), principals.clone()),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(database.principal_registry().principals().is_empty());
+
+    let before = latest_lsn(&database)?;
+    database.set_security_state_as(&admin, policy.clone(), principals.clone())?;
+    assert_eq!(database.authz_policy(), &policy);
+    assert_eq!(database.principal_registry(), &principals);
+    let persisted = database.persisted_security_state()?;
+    assert_eq!(persisted.authz_policy, policy);
+    assert_eq!(persisted.principals, principals);
+
+    let security_records = commit_records_after(&database, before)?
+        .into_iter()
+        .filter(|record| record.writes.iter().any(|write| write.table == AUTHZ_TABLE))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        security_records.len(),
+        1,
+        "one batch for the policy and principals"
+    );
+    let keys = security_records[0]
+        .writes
+        .iter()
+        .filter(|write| write.table == AUTHZ_TABLE)
+        .map(|write| write.key.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(keys.contains(b"policy".as_slice()) && keys.contains(b"principals".as_slice()));
+
+    let events = database.audit_events()?;
+    let changed = events.last().ok_or("an event")?;
+    assert_eq!(changed.action, "set_security_state");
+    assert_eq!(changed.principal.as_deref(), Some("root"));
+    assert_eq!(changed.outcome, AuditOutcome::Succeeded);
+    Ok(())
+}
+
+#[test]
+fn auto_id_creates_as_need_database_admin_and_return_the_allocated_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("admin").grant(Resource::Database, Permission::Admin),
+        Role::new("reader").grant(Resource::Database, Permission::Read),
+    ]));
+    let admin = Principal::new("root").with_role("admin");
+    let reader = Principal::new("ada").with_role("reader");
+    let fields = || vec![DocField::document_id("id")];
+
+    assert!(matches!(
+        database.create_collection_auto_id_as(&reader, "orders", fields(), Vec::new()),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(matches!(
+        database.create_vector_collection_auto_id_as(
+            &reader,
+            "memories",
+            3,
+            VectorMetric::Cosine,
+            HnswParams::default(),
+        ),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(matches!(
+        database.create_graph_auto_id_as(&reader, "social"),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(database.catalog().is_empty());
+
+    database.create_collection("pinned", CollectionId::new(7), fields(), Vec::new())?;
+    assert_eq!(
+        database.create_collection_auto_id_as(&admin, "orders", fields(), Vec::new())?,
+        CollectionId::new(8)
+    );
+    assert_eq!(
+        database.create_vector_collection_auto_id_as(
+            &admin,
+            "memories",
+            3,
+            VectorMetric::L2,
+            HnswParams::default(),
+        )?,
+        CollectionId::new(9)
+    );
+    assert_eq!(
+        database.create_graph_auto_id_as(&admin, "social")?,
+        GraphId::new(1)
+    );
+    assert!(matches!(
+        database.catalog().get("memories"),
+        Some(super::CatalogEntry::Vector {
+            dim: 3,
+            metric: VectorMetric::L2,
+            ..
+        })
+    ));
+
+    let created = database
+        .audit_events()?
+        .into_iter()
+        .filter(|event| event.outcome == AuditOutcome::Succeeded)
+        .map(|event| (event.action, event.resource))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created,
+        vec![
+            (
+                "create_collection".to_owned(),
+                Resource::Collection("orders".to_owned())
+            ),
+            (
+                "create_vector_collection".to_owned(),
+                Resource::VectorCollection("memories".to_owned())
+            ),
+            (
+                "create_graph".to_owned(),
+                Resource::Graph("social".to_owned())
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn write_profile_manifest_validates_and_writes_manifest_and_version_together()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("upgrade.redb");
+    let plain = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&path))?;
+    let zstd = named_binding(
+        "balanced",
+        json!({ "compression": { "algorithm": "zstd" } }),
+        ReplicationKind::Cp,
+        Some(&path),
+    )?;
+    {
+        let database = create_database_with_profile(&plain, OperationalConfig::new())?;
+        assert!(matches!(
+            database.write_profile_manifest(&plain.manifest, 2),
+            Err(DbError::Config(ConfigError::ProfileManifestInvalid(_)))
+        ));
+        assert!(matches!(
+            database.write_profile_manifest(&zstd.manifest, 1),
+            Err(DbError::Config(ConfigError::ProfileManifestInvalid(_)))
+        ));
+        let mut tampered = zstd.manifest.clone();
+        tampered.digest = "prof_tampered".to_owned();
+        assert!(matches!(
+            database.write_profile_manifest(&tampered, 2),
+            Err(DbError::Config(ConfigError::ProfileManifestInvalid(_)))
+        ));
+        let mut floored = plain.manifest.clone();
+        floored.knobs.floors.encryption_at_rest = true;
+        floored.digest =
+            crate::config_spec::profile_digest(&floored.knobs, floored.storage_profile);
+        assert!(matches!(
+            database.write_profile_manifest(&floored, 1),
+            Err(DbError::Config(ConfigError::ProfileFloorNotMet {
+                floor: "floors.encryption_at_rest",
+                ..
+            }))
+        ));
+        assert_eq!(database.probed_metadata()?.schema_version, 1);
+
+        let before = latest_lsn(&database)?;
+        database.write_profile_manifest(&zstd.manifest, 2)?;
+        let records = commit_records_after(&database, before)?;
+        assert_eq!(records.len(), 1);
+        let keys = records[0]
+            .writes
+            .iter()
+            .filter(|write| write.table == META_TABLE)
+            .map(|write| write.key.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([KEY_PROFILE_MANIFEST.to_vec(), KEY_SCHEMA_VERSION.to_vec()])
+        );
+        let probed = database.probed_metadata()?;
+        assert_eq!(probed.schema_version, 2);
+        assert_eq!(probed.manifest.as_ref(), Some(&zstd.manifest));
+        // The session keeps its engine: framing applies from the next open.
+        assert_eq!(database.engine_kind(), EngineKind::Redb);
+        assert!(matches!(
+            database.write_profile_manifest(&plain.manifest, 1),
+            Err(DbError::Config(ConfigError::StorageFormatMismatch(_)))
+        ));
+    }
+    let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    assert_eq!(database.performance_config(), &zstd.performance);
     Ok(())
 }
 
