@@ -1543,7 +1543,9 @@ mod tests {
             restored
                 .find("profiles", &city_eq("Krakow"))?
                 .documents
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            restored.find("profiles", &city_eq("Krakow"))?.documents
         );
 
         let mut first_writer = restored.begin_transaction()?;
@@ -1622,7 +1624,9 @@ mod tests {
         assert!(
             as_of_rows(&restored, grace_sql, fixture.lsn_delete)
                 .await?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            as_of_rows(&restored, grace_sql, fixture.lsn_delete).await?
         );
 
         assert_restored_transactions(&restored, &fixture)
