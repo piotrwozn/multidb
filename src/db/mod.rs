@@ -103,7 +103,8 @@ mod provisioning;
 mod runtime;
 
 pub(crate) use profile_binding::{
-    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, validate_manifest,
+    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
+    validate_manifest,
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
@@ -139,6 +140,9 @@ const KEY_AUTHZ_POLICY: &[u8] = b"policy";
 const KEY_PRINCIPAL_REGISTRY: &[u8] = b"principals";
 const KEY_AUDIT_ENABLED: &[u8] = b"audit_enabled";
 const ADMIN_AUTH_TABLE: &str = "__admin_auth";
+/// The system table of spec provisioning: the provision record (key `record`) and its history
+/// (keys `history/{seq:020}`). Backup and restore carry it like every registered keyspace.
+pub(crate) const PROVISION_TABLE: &str = "__provision";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Profile {

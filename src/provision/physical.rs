@@ -8,19 +8,24 @@
 //! geo precision 6, index ids at position + 1, chunk and retention from the profile knobs), so
 //! a later build projects the same objects from the same spec.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value as JsonValue, json};
 
+use super::record::ObjectKind;
 use crate::config_spec::{
     CertificationImpact, CheckMode, ColumnSpec, ColumnTypeSpec, DatabaseSpec, LayoutKnob,
     PlannedDocIndex, PlannedField, PlannedKind, PlannedObject, PlannedTableIndex, ResolvedProfile,
     SpecPath, ValidationIssue, ValidationSeverity, VectorMetricSpec, plan_catalog,
 };
+use crate::db::CatalogEntry;
 use crate::graph::GraphId;
 use crate::model::{CollectionId, FieldPath, IndexId, IndexSpec};
 use crate::query::{
     ColumnDef, ColumnType, DocField, DocFieldSource, RelIndexExpression, RelIndexSpec, TableLayout,
     TableSchema,
 };
+use crate::text::TextSource;
 use crate::timeseries::TimeSeriesConfig;
 use crate::vector::{HnswParams, VectorMetric};
 
@@ -107,89 +112,237 @@ impl DesiredObject {
     /// default filled in. Stable across builds, so plans can show and diff them.
     #[must_use]
     pub fn params_json(&self) -> JsonValue {
-        let kind = self.kind.slug();
         match &self.kind {
             DesiredKind::Document {
                 collection_id,
                 fields,
                 indexes,
-            } => json!({
-                "kind": kind,
-                "collection_id": collection_id.map(CollectionId::as_u32),
-                "fields": fields.iter().map(field_json).collect::<Vec<_>>(),
-                "document_indexes": indexes
-                    .iter()
-                    .map(|index| json!({ "path": path_text(&index.path), "id": index.id.as_u32() }))
-                    .collect::<Vec<_>>(),
-            }),
+            } => document_json(collection_id.map(CollectionId::as_u32), fields, indexes),
             DesiredKind::Table {
                 layout,
                 schema,
                 indexes,
-            } => table_json(kind, *layout, schema.as_ref(), indexes),
+            } => table_json(*layout, schema.as_ref(), indexes),
             DesiredKind::Vector {
                 collection_id,
                 dim,
                 metric,
                 hnsw,
-            } => json!({
-                "kind": kind,
-                "collection_id": collection_id.map(CollectionId::as_u32),
-                "dim": dim,
-                "metric": match metric {
-                    VectorMetric::Cosine => "cosine",
-                    VectorMetric::L2 => "l2",
-                },
-                "hnsw": {
-                    "m": hnsw.m,
-                    "ef_construction": hnsw.ef_construction,
-                    "ef_search": hnsw.ef_search,
-                },
-            }),
+            } => vector_json(collection_id.map(CollectionId::as_u32), *dim, *metric, hnsw),
             DesiredKind::TimeSeries {
                 chunk_millis,
                 retention_millis,
-            } => json!({
-                "kind": kind,
-                "chunk_millis": chunk_millis,
-                "retention_millis": retention_millis,
-            }),
-            DesiredKind::Graph { graph_id } => json!({
-                "kind": kind,
-                "graph_id": graph_id.map(GraphId::as_u32),
-            }),
+            } => time_series_json(*chunk_millis, *retention_millis),
+            DesiredKind::Graph { graph_id } => graph_json(graph_id.map(GraphId::as_u32)),
             DesiredKind::FullText {
                 source,
                 path,
                 language,
                 refresh_lag_target,
-            } => json!({
-                "kind": kind,
-                "source": source,
-                "path": path_text(path),
-                "language": language,
-                "refresh_lag_target": refresh_lag_target,
-            }),
+            } => full_text_json(source, path, language, *refresh_lag_target),
             DesiredKind::Geo {
                 source,
                 path,
                 precision,
-            } => json!({
-                "kind": kind,
-                "source": source,
-                "path": path_text(path),
-                "precision": precision,
-            }),
+            } => geo_json(source, path, *precision),
             DesiredKind::History {
                 base_table,
                 keep_history,
-            } => json!({
-                "kind": kind,
-                "base_table": base_table,
-                "keep_history": keep_history,
-            }),
+            } => history_json(base_table, *keep_history),
         }
     }
+}
+
+impl DesiredKind {
+    /// The kind in the vocabulary of provision records and plans.
+    #[must_use]
+    pub const fn object_kind(&self) -> ObjectKind {
+        match self {
+            Self::Document { .. } => ObjectKind::Document,
+            Self::Table { .. } => ObjectKind::Table,
+            Self::Vector { .. } => ObjectKind::Vector,
+            Self::TimeSeries { .. } => ObjectKind::TimeSeries,
+            Self::Graph { .. } => ObjectKind::Graph,
+            Self::FullText { .. } => ObjectKind::FullText,
+            Self::Geo { .. } => ObjectKind::Geo,
+            Self::History { .. } => ObjectKind::History,
+        }
+    }
+}
+
+/// The kind of a live catalog entry.
+pub(crate) const fn entry_kind(entry: &CatalogEntry) -> ObjectKind {
+    match entry {
+        CatalogEntry::Collection { .. } => ObjectKind::Document,
+        CatalogEntry::Table { .. } => ObjectKind::Table,
+        CatalogEntry::Vector { .. } => ObjectKind::Vector,
+        CatalogEntry::FullTextIndex { .. } => ObjectKind::FullText,
+        CatalogEntry::TimeSeries { .. } => ObjectKind::TimeSeries,
+        CatalogEntry::Graph { .. } => ObjectKind::Graph,
+        CatalogEntry::GeoIndex { .. } => ObjectKind::Geo,
+        CatalogEntry::ForeignTable { .. } => ObjectKind::ForeignTable,
+        CatalogEntry::MaterializedView { .. } => ObjectKind::MaterializedView,
+        CatalogEntry::TemporalTable { .. } => ObjectKind::History,
+    }
+}
+
+/// The parameters of a live catalog entry in the vocabulary of [`DesiredObject::params_json`],
+/// so a plan can show what differs. Full-text and geo sources are named by the live collection
+/// that holds their collection id (`#<id>` when none does). A partial table index, which a spec
+/// cannot express, adds `"partial_indexes": true`.
+pub(crate) fn live_params_json(
+    name: &str,
+    entry: &CatalogEntry,
+    catalog: &BTreeMap<String, CatalogEntry>,
+    schemas: &BTreeMap<String, TableSchema>,
+) -> JsonValue {
+    match entry {
+        CatalogEntry::Collection {
+            collection_id,
+            fields,
+            indexes,
+        } => document_json(Some(collection_id.as_u32()), fields, indexes),
+        CatalogEntry::Table { indexes, layout } => {
+            let mut params = table_json(*layout, schemas.get(name), indexes);
+            if indexes.iter().any(|index| index.predicate.is_some()) {
+                params["partial_indexes"] = json!(true);
+            }
+            params
+        }
+        CatalogEntry::Vector {
+            collection_id,
+            dim,
+            metric,
+            hnsw,
+            ..
+        } => vector_json(Some(collection_id.as_u32()), *dim, *metric, hnsw),
+        CatalogEntry::FullTextIndex { config } => {
+            let TextSource::Collection {
+                collection_id,
+                path,
+            } = &config.source;
+            full_text_json(
+                &source_name(catalog, *collection_id),
+                path,
+                &config.language,
+                config.refresh_lag_target,
+            )
+        }
+        CatalogEntry::TimeSeries { config } => {
+            time_series_json(config.chunk_millis, config.retention_millis)
+        }
+        CatalogEntry::Graph { graph_id } => graph_json(Some(graph_id.as_u32())),
+        CatalogEntry::GeoIndex { config } => geo_json(
+            &source_name(catalog, config.collection_id),
+            &config.path,
+            config.precision,
+        ),
+        CatalogEntry::ForeignTable { .. } => json!({ "kind": "foreign_table" }),
+        CatalogEntry::MaterializedView { .. } => json!({ "kind": "materialized_view" }),
+        CatalogEntry::TemporalTable {
+            base_table,
+            retention,
+            ..
+        } => history_json(base_table, retention.keep_history),
+    }
+}
+
+/// The name of the live document collection with `collection_id`, or `#<id>`.
+pub(crate) fn source_name(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    collection_id: CollectionId,
+) -> String {
+    catalog
+        .iter()
+        .find_map(|(name, entry)| match entry {
+            CatalogEntry::Collection {
+                collection_id: id, ..
+            } if *id == collection_id => Some(name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("#{}", collection_id.as_u32()))
+}
+
+fn document_json(
+    collection_id: Option<u32>,
+    fields: &[DocField],
+    indexes: &[IndexSpec],
+) -> JsonValue {
+    json!({
+        "kind": "document",
+        "collection_id": collection_id,
+        "fields": fields.iter().map(field_json).collect::<Vec<_>>(),
+        "document_indexes": indexes
+            .iter()
+            .map(|index| json!({ "path": path_text(&index.path), "id": index.id.as_u32() }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn vector_json(
+    collection_id: Option<u32>,
+    dim: usize,
+    metric: VectorMetric,
+    hnsw: &HnswParams,
+) -> JsonValue {
+    json!({
+        "kind": "vector",
+        "collection_id": collection_id,
+        "dim": dim,
+        "metric": match metric {
+            VectorMetric::Cosine => "cosine",
+            VectorMetric::L2 => "l2",
+        },
+        "hnsw": {
+            "m": hnsw.m,
+            "ef_construction": hnsw.ef_construction,
+            "ef_search": hnsw.ef_search,
+        },
+    })
+}
+
+fn time_series_json(chunk_millis: i64, retention_millis: Option<i64>) -> JsonValue {
+    json!({
+        "kind": "time_series",
+        "chunk_millis": chunk_millis,
+        "retention_millis": retention_millis,
+    })
+}
+
+fn graph_json(graph_id: Option<u32>) -> JsonValue {
+    json!({ "kind": "graph", "graph_id": graph_id })
+}
+
+fn full_text_json(
+    source: &str,
+    path: &FieldPath,
+    language: &str,
+    refresh_lag_target: u64,
+) -> JsonValue {
+    json!({
+        "kind": "full_text",
+        "source": source,
+        "path": path_text(path),
+        "language": language,
+        "refresh_lag_target": refresh_lag_target,
+    })
+}
+
+fn geo_json(source: &str, path: &FieldPath, precision: u8) -> JsonValue {
+    json!({
+        "kind": "geo",
+        "source": source,
+        "path": path_text(path),
+        "precision": precision,
+    })
+}
+
+fn history_json(base_table: &str, keep_history: bool) -> JsonValue {
+    json!({
+        "kind": "history",
+        "base_table": base_table,
+        "keep_history": keep_history,
+    })
 }
 
 /// The [`TimeSeriesConfig`] of a time-series object, or `None` for any other kind. The only
@@ -447,7 +600,6 @@ fn field_json(field: &DocField) -> JsonValue {
 }
 
 fn table_json(
-    kind: &str,
     layout: TableLayout,
     schema: Option<&TableSchema>,
     indexes: &[RelIndexSpec],
@@ -458,7 +610,7 @@ fn table_json(
             .map_or_else(|| json!(column), |column| json!(column.name))
     };
     json!({
-        "kind": kind,
+        "kind": "table",
         "layout": match layout {
             TableLayout::Row => "row",
             TableLayout::Columnar => "columnar",

@@ -1843,6 +1843,19 @@ impl PolicyCompiler {
         Ok(Self::compile_valid(spec, resolution.as_ref()))
     }
 
+    /// Validates `spec` and, when the report has no errors, compiles it from the same profile
+    /// resolution, so provisioning resolves the profile once.
+    pub(crate) fn validate_and_compile(
+        spec: &DatabaseSpec,
+    ) -> (ValidationReport, Option<CompiledPolicy>) {
+        let (report, resolution) = GuaranteeValidator::validate_with_resolution(spec);
+        if report.has_errors() {
+            return (report, None);
+        }
+        let policy = Self::compile_valid(spec, resolution.as_ref());
+        (report, Some(policy))
+    }
+
     /// Compiles a spec whose validation report has no errors, from the profile resolution that
     /// validation produced.
     fn compile_valid(
@@ -3350,7 +3363,7 @@ fn aggregate_impact(steps: &[MigrationStep]) -> PlanImpact {
     impact
 }
 
-fn merge_impact(target: &mut PlanImpact, source: &PlanImpact) {
+pub(crate) fn merge_impact(target: &mut PlanImpact, source: &PlanImpact) {
     target.downtime = target.downtime.max(source.downtime);
     target.disk = target.disk.max(source.disk);
     target.cpu = target.cpu.max(source.cpu);
@@ -3364,11 +3377,11 @@ fn merge_impact(target: &mut PlanImpact, source: &PlanImpact) {
     }
 }
 
-fn impact_none() -> PlanImpact {
+pub(crate) fn impact_none() -> PlanImpact {
     PlanImpact::default()
 }
 
-fn low_risk_impact(note: &str) -> PlanImpact {
+pub(crate) fn low_risk_impact(note: &str) -> PlanImpact {
     PlanImpact {
         downtime: ImpactLevel::None,
         disk: ImpactLevel::None,
@@ -3380,7 +3393,7 @@ fn low_risk_impact(note: &str) -> PlanImpact {
     }
 }
 
-fn medium_impact(note: &str) -> PlanImpact {
+pub(crate) fn medium_impact(note: &str) -> PlanImpact {
     PlanImpact {
         downtime: ImpactLevel::Low,
         disk: ImpactLevel::Low,
@@ -3407,6 +3420,24 @@ fn unsupported_impact(note: &str) -> PlanImpact {
     }
 }
 
+/// The canonical JSON form of a spec: `serde_json` in struct field order, with every map sorted
+/// by key (`BTreeMap`) and unset optional fields left out. Two specs that mean the same thing
+/// serialize to the same bytes, so digests and provisioning plan ids are stable across builds.
+#[must_use]
+pub fn canonical_spec_json(spec: &DatabaseSpec) -> String {
+    describe_value(spec)
+}
+
+/// The digest of a spec: `spec_` and 32 hex characters of
+/// blake3("multidb-spec-v1" ‖ [`canonical_spec_json`]).
+#[must_use]
+pub fn spec_digest(spec: &DatabaseSpec) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"multidb-spec-v1");
+    hasher.update(canonical_spec_json(spec).as_bytes());
+    format!("spec_{}", hex_prefix(hasher.finalize().as_bytes(), 16))
+}
+
 fn stable_plan_id(current: &DatabaseSpec, desired: &DatabaseSpec) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"multidb-config-migration-plan-v1");
@@ -3423,7 +3454,7 @@ fn update_hash_with_json<T: Serialize>(hasher: &mut blake3::Hasher, value: &T) {
     };
 }
 
-fn hex_prefix(bytes: &[u8], len: usize) -> String {
+pub(crate) fn hex_prefix(bytes: &[u8], len: usize) -> String {
     let mut output = String::with_capacity(len.saturating_mul(2));
     for byte in bytes.iter().take(len) {
         output.push(hex_digit(byte >> 4));

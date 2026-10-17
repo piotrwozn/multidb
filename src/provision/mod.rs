@@ -1,10 +1,133 @@
 //! Spec-driven provisioning (preview): building and converging a database from a
 //! [`DatabaseSpec`](crate::config_spec::DatabaseSpec).
 //!
-//! [`physical::project`] maps every collection of a version 2 spec, plus the full-text, geo and
-//! history objects it derives, onto the runtime objects the `Database::create_*` APIs build.
-//! Projection is pure: it validates and describes, and never touches a database.
+//! - [`physical::project`] maps every collection of a version 2 spec, plus the full-text, geo
+//!   and history objects it derives, onto the runtime objects the `Database::create_*` APIs
+//!   build. Projection is pure: it validates and describes, and never touches a database.
+//! - [`plan_provision`] computes a [`ProvisionPlan`] against an absent target or an open
+//!   single-node database: every step with its safety class, the flags weakening, destructive
+//!   and format-upgrade steps need, how each guarantee is enforced on the calling surface, the
+//!   drift of the live database and a `prov_` id that changes whenever the spec, the live state,
+//!   the options, the surface, the target or the binary changes.
+//! - [`drift`] reports how a live database differs from a spec, and [`export_spec`] describes a
+//!   live database as a spec.
 //!
+//! Planning, drift and export are read-only: they never create a file or write a database.
 //! See `docs/provisioning.md`.
 
+mod export;
+mod guarantees;
+mod live;
 pub mod physical;
+mod plan;
+pub(crate) mod record;
+
+#[cfg(test)]
+mod tests;
+
+pub use export::{ExportSource, ExportedSpec, export_spec};
+pub use guarantees::{EnforcementStatus, GuaranteeEnforcement};
+pub use plan::{
+    DriftItem, DriftKind, DriftReport, DriftResolution, FieldDiff, ObjectState, PLAN_FORMAT,
+    PlanOutcome, PlannedObject, PlannedTarget, ProvisionEnvironment, ProvisionOptions,
+    ProvisionPlan, ProvisionStep, ProvisionStepKind, ProvisionSurface, ProvisionTargetRef,
+    StepSafety, TargetKind, drift, plan_provision,
+};
+pub use record::{
+    ManagedObject, ObjectKind, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus,
+    RECORD_VERSION,
+};
+
+use crate::config_spec::{
+    CertificationImpact, ValidationIssue, ValidationReport, ValidationSeverity,
+};
+use crate::db::{ConfigError, DbError};
+
+/// Why provisioning refused or failed.
+#[derive(thiserror::Error, Debug)]
+pub enum ProvisionError {
+    #[error("the spec is invalid: {}", issue_summary(&.0.issues))]
+    InvalidSpec(Box<ValidationReport>),
+
+    #[error("provisioning plan {} is blocked: {}", .0.plan_id, issue_summary(&.0.issues))]
+    Blocked(Box<ProvisionPlan>),
+
+    #[error(
+        "provisioning plan {} needs flags: {}",
+        .0.plan_id,
+        .0.required_flags.join(", ")
+    )]
+    NeedsFlags(Box<ProvisionPlan>),
+
+    #[error("provisioning plan {} needs a confirmation: --confirm {}", .0.plan_id, .0.plan_id)]
+    ConfirmationRequired(Box<ProvisionPlan>),
+
+    #[error(
+        "the plan changed since it was confirmed: confirmed {confirmed}, current {current}; \
+         review the new plan and confirm it"
+    )]
+    PlanChanged { confirmed: String, current: String },
+
+    #[error(
+        "the target already holds a database: provisioning creates databases only at absent \
+         targets; plan an existing database through its open handle"
+    )]
+    AlreadyInitialized,
+
+    #[error("audit must be enabled to apply a provisioning plan")]
+    AuditRequired,
+
+    #[error("permission missing: {0}")]
+    PermissionMissing(String),
+
+    #[error("database is locked: {0}")]
+    Locked(String),
+
+    #[error("the provision record is unreadable: {0}")]
+    RecordUnreadable(String),
+
+    #[error("database: {0}")]
+    Db(#[from] DbError),
+
+    #[error("config: {0}")]
+    Config(#[from] ConfigError),
+
+    #[error("io: {0}")]
+    Io(String),
+}
+
+/// The codes of the Errors among `issues`, for error messages.
+fn issue_summary(issues: &[ValidationIssue]) -> String {
+    let codes = issues
+        .iter()
+        .filter(|issue| issue.severity == ValidationSeverity::Error)
+        .map(|issue| format!("{} at {}", issue.code, issue.path))
+        .collect::<Vec<_>>();
+    if codes.is_empty() {
+        "see the plan".to_owned()
+    } else {
+        codes.join("; ")
+    }
+}
+
+/// A provisioning issue. Errors block certification; Warnings and Advice do not.
+fn issue(
+    code: &str,
+    severity: ValidationSeverity,
+    path: impl Into<String>,
+    message: impl Into<String>,
+    suggestion: impl Into<String>,
+) -> ValidationIssue {
+    ValidationIssue {
+        code: code.to_owned(),
+        severity,
+        path: path.into(),
+        message: message.into(),
+        suggestion: suggestion.into(),
+        certification_impact: if severity == ValidationSeverity::Error {
+            CertificationImpact::BlocksCertified
+        } else {
+            CertificationImpact::None
+        },
+    }
+}

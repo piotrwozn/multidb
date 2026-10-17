@@ -166,6 +166,42 @@ All notable public changes will be recorded here.
 - `config plan` (the version 1 migration planner) reports changes of
   `collections[].physical`, `security` and `provisioning` as unsupported
   steps; specs without them plan exactly as before, with the same plan ids.
+- `multidb::provision::plan_provision`, a read-only provisioning planner
+  (preview). It computes a `ProvisionPlan` for a spec against an absent
+  target (`ProvisionTargetRef::Path` of a missing or empty file, or
+  `Volatile`) or an open single-node CP database (`Open`): steps in a fixed
+  phase order with a safety class each (`additive`, `metadata`, `retune`,
+  `strengthening`, `weakening`, `destructive`, `format_upgrade`,
+  `unsupported`), the per-path `allow_weakening` and `allow_destructive`
+  flags and `allow_format_upgrade` they need (`ProvisionOptions`), an
+  outcome (`noop`, `ready`, `needs_flags`, `blocked`), `auto_approvable`, the
+  planned objects with field diffs, how every guarantee is enforced on the
+  calling surface (`GuaranteeEnforcement`, for example `operator_managed`
+  backups, `enforced_with_development_key` audit, `not_enforceable` encryption
+  at rest outside the Rust API) and a `prov_` plan id over the canonical
+  spec, a live fingerprint, the options, the surface
+  (`ProvisionSurface`), the canonical target path and the crate version.
+  Objects that already match are adopted; differing ones are conflicts,
+  since there is no alter API; managed objects the spec drops are released
+  with their data kept; RBAC is managed-only and never touches the bootstrap
+  administrator. Planning never creates a file or writes a database. New
+  plan issue codes include `PROVISION_ENGINE_MISMATCH`,
+  `PROVISION_FORMAT_MISMATCH`, `PROVISION_OBJECT_CONFLICT`,
+  `PROVISION_SECURITY_STATE_STALE`, `RBAC_SELF_LOCKOUT`,
+  `AUDIT_REQUIRED_FOR_APPLY`, `GUARANTEE_NOT_ENFORCEABLE` and
+  `STEP_REQUIRES_FLAG`. Nothing applies a plan yet. See
+  `docs/provisioning.md`.
+- `provision::drift`, which reports how an open database differs from a spec
+  (`DriftReport` with `in_sync` and typed items), and `provision::export_spec`,
+  which describes an open database as a version 2 spec: the applied spec of
+  its provision record, or one inferred from the catalog, profile manifest,
+  RBAC and audit state with every id pinned and what a spec cannot express
+  listed in `operation_hints["export.unsupported_objects"]`.
+- `Database::provision_state`, which reads the provision record
+  (`ProvisionRecord`) from the new system table `__provision`; a record of a
+  newer `record_version` or a corrupt one is refused.
+- `config_spec::canonical_spec_json` and `config_spec::spec_digest` (`spec_`
+  and 32 hex characters of blake3 over the canonical JSON).
 
 ### Changed
 

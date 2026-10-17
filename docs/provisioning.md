@@ -1,12 +1,14 @@
 # Provisioning
 
 Status: **Preview**. Provisioning builds and converges a database from a
-`DatabaseSpec`. This page grows with it: this build adds the spec version 2
+`DatabaseSpec`. This page grows with it: this build has the spec version 2
 provisioning fields, their validation, the physical projection
-(`multidb::provision::physical::project`) and per-table layout
-(`Database::create_table_with_layout`). Planning, applying, drift and export
-come in later changes; until then nothing creates or changes a database from a
-spec, and `config apply --plan` stays audit-only.
+(`multidb::provision::physical::project`), per-table layout
+(`Database::create_table_with_layout`) and read-only planning, drift and export
+(`multidb::provision::{plan_provision, drift, export_spec}`). Applying a plan,
+and the CLI, `serve` and Control Plane entry points, come in later changes;
+until then nothing creates or changes a database from a spec, and
+`config apply --plan` stays audit-only.
 
 ## Spec version 2 provisioning fields
 
@@ -225,6 +227,259 @@ provisioning always refuses it (`SPEC_LIMIT_EXCEEDED`):
 - `overrides` and `operation_hints`: at most 512 entries, keys of at most 256
   bytes and values of at most 4 KiB.
 
+## Plans
+
+`plan_provision(spec, target, options, environment)` computes a
+`ProvisionPlan`: every step it takes to converge the target to the spec, with
+its safety class, the flags it needs, how each guarantee is enforced on the
+calling surface and how the live database drifts from the spec. Planning is a
+dry run: it never creates a file and never writes a database.
+
+- **Targets.** `ProvisionTargetRef::Path` is a database file that does not
+  exist yet, or an empty one; it is probed read-only
+  (`inspect_database_metadata`). A path that already holds a database is
+  refused with `AlreadyInitialized`, one that another handle holds open with
+  `Locked`: an existing database is planned through its open handle,
+  `ProvisionTargetRef::Open`, so a dry run never opens a database implicitly.
+  `ProvisionTargetRef::Volatile` is a new in-memory database (Rust API only).
+  Only single-node CP databases are planned; CP cluster, AP and sharded
+  handles are refused.
+- **Surfaces.** `ProvisionEnvironment.surface` is `rust_api`, `cli`, `serve`
+  or `control_plane`. `ProvisionEnvironment.encryption` is accepted on the
+  Rust API only, as a `LocalEnvelope` config; with an open database it must
+  equal the config the database was opened with. `ProvisionEnvironment.audit`
+  must equal the audit config of an open handle (`open_database_with_ops` does
+  not apply `OperationalConfig.security.audit`, so a different one would be
+  silently ignored). `ProvisionEnvironment.principal`, the principal that will
+  apply the plan, is checked for `RBAC_SELF_LOCKOUT`.
+- **Options.** `ProvisionOptions` (`allow_weakening` and `allow_destructive`
+  path sets, `allow_format_upgrade`, `unmanaged`) are per run and never stored
+  in a spec.
+- **An invalid spec** gives a blocked plan with the validation report in
+  `validation`; provisioning issues are in `issues`.
+
+### Plan ids
+
+`plan_id` is `prov_` and 32 hex characters of blake3 over the canonical spec
+JSON (`config_spec::canonical_spec_json`), the live fingerprint (or `absent`),
+the canonical options JSON, the surface, the canonical target path (or
+`volatile`) and the crate version. So:
+
+- an id computed on one surface never confirms an apply on another, and
+  `prov_` and the `plan_` ids of `config plan` never confirm each other;
+- any change to the live catalog, table schemas, RBAC state, audit flag or
+  key, encryption, extension policies, session performance, profile manifest
+  or provision record changes the id, while inserting data does not: the
+  fingerprint (`live_` and 32 hex characters) leaves document counts out;
+- symlinked and relative spellings of one file give one id: the path is
+  canonicalized (the parent directory for a file that does not exist yet).
+
+`spec_digest` is `config_spec::spec_digest`: `spec_` and 32 hex characters of
+blake3("multidb-spec-v1" ‖ canonical JSON). `required_confirmation` is the
+plan id, or `None` for a noop.
+
+### Steps, safety classes and flags
+
+Steps run in a fixed order and are numbered `pstep-001`, `pstep-002`, ...:
+
+1. create the database (a new target);
+2. enable audit;
+3. containers: objects with a pinned collection or graph id first, so ids
+   allocated when an object is created never take a pinned one; then
+   documents, vectors, tables, time series and graphs, in spec order;
+4. dependents: full-text and geo indexes after their source, then system
+   versioning;
+5. the profile manifest;
+6. RBAC;
+7. releases;
+8. recorded guarantees and metadata;
+9. the applied spec;
+10. disable audit.
+
+| safety | what it means | gate |
+| --- | --- | --- |
+| `additive` | creates or adopts an object, role or principal | none |
+| `metadata` | records labels, guarantees, the applied spec or a manifest rewrite without runtime effect | none |
+| `strengthening` | turns audit on | none |
+| `retune` | rewrites session knobs in the profile manifest; they take effect at the next open | a confirmation |
+| `weakening` | weakens a guarantee, a floor or a grant | `allow_weakening` for the step path |
+| `destructive` | removes a managed role or principal, or releases a managed object | `allow_destructive` for the step path |
+| `format_upgrade` | turns value framing on (`schema_version` 2), forward-only | `allow_format_upgrade` |
+| `unsupported` | no runtime API performs it | blocks the plan |
+
+Flags are listed in `required_flags` as `allow_weakening:<path>`,
+`allow_destructive:<path>` or `allow_format_upgrade`; each one the options do
+not give is a `STEP_REQUIRES_FLAG` issue. The outcome is:
+
+- `blocked` when the spec is invalid, any issue is an Error (other than
+  `STEP_REQUIRES_FLAG`), any step is unsupported or any guarantee is not
+  enforceable;
+- otherwise `needs_flags` when a flag is missing;
+- otherwise `noop` when there is no step, and `ready` when there is.
+
+`auto_approvable` is true for a ready plan whose steps are all additive,
+metadata or strengthening, without RBAC steps on an existing database; the
+CLI `--auto-approve` and `init --apply` will accept only such plans. Creating
+a full-text or geo index on a collection that already holds documents is
+medium impact, and the step names the document count.
+
+### What a plan compares
+
+| change | safety |
+| --- | --- |
+| new database | `additive` (`create_database`) |
+| legacy database without a profile manifest, same storage profile | `adopt_profile`: `metadata` when the session already runs the desired knobs, else `retune` |
+| storage profile or layout differs | `unsupported`, `PROVISION_ENGINE_MISMATCH` |
+| manifest knobs that cannot change after creation (`storage.*`, `durability.commit`) | `unsupported`, `PROVISION_ENGINE_MISMATCH` |
+| session knobs (`cache.*`, `query.*`, `durability.group_commit_window_ms`, `compression.min_bytes`, `compression.zstd_level`) | `retune_profile`, `retune` |
+| compression algorithm between lz4 and zstd on a value-framed database | `retune` (frames are self-describing) |
+| compression `none` to lz4 or zstd, also for a legacy database | `upgrade_storage_format`, `format_upgrade` |
+| compression that would turn value framing off, also on a legacy framed database | `unsupported`, `PROVISION_FORMAT_MISMATCH` |
+| `history.*`, `time_series.*`, `limits.*`, `consistency.default_domain`, `compatible_roles`, raised floors, profile identity (slug, kind, variant, `extends`) | `adopt_profile`, `metadata`; existing objects keep their parameters, so a new time-series default shows up as an object conflict |
+| a lowered floor | `adopt_profile`, `weakening`, flag `custom_profile.floors.<name>` |
+| a missing object | `create_*`, `additive` |
+| an object that matches the spec and is not managed yet | `adopt_object`, `additive` |
+| an object that differs, or has another kind | `unsupported`, `PROVISION_OBJECT_CONFLICT` with a field diff |
+| a managed object the spec no longer declares | `release_object`, `destructive`, flag `collections.<name>` (`collections.<collection>.<index or history name>` for derived objects); the object and its data stay |
+| audit off, spec on | `enable_audit`, `strengthening`, first |
+| audit on, spec off | `disable_audit`, `weakening`, flag `guarantees.audit.enabled`, last; `unsupported` while `floors.audit` is set |
+| audit off, spec off | `AUDIT_REQUIRED_FOR_APPLY` unless the plan is a noop |
+| a role or principal to create, or permissions to add | `apply_security`, `additive` |
+| an unmanaged role or principal identical to the spec | `apply_security`, `metadata` (adopted) |
+| an unmanaged role or principal that differs | `unsupported`, `PROVISION_OBJECT_CONFLICT` |
+| a revoked permission on a managed role, a narrowed managed principal | `weakening`, flag `security.roles.<name>` or `security.principals.<user>` |
+| a managed role or principal the spec dropped | `destructive`, same flag paths |
+| a declared guarantee weaker than the last applied spec | `record_guarantees`, `weakening`, flag at its path; stronger ones are `metadata` |
+| domains, overrides, operation hints, extension references | `record_metadata`, `metadata` |
+| a spec other than the last applied one | `record_applied_spec`, `metadata`, last before audit is disabled |
+
+Matching compares only what a spec controls: kind, fields, index paths
+(index ids only when pinned), table layout, schema (when columns are given)
+and index set, vector dimension, metric and HNSW parameters, time-series
+chunk and retention, full-text and geo source, path, language, lag and
+precision, history base table and `keep_history`, and collection and graph
+ids when the spec pins them or the record allocated them.
+`deployment.storage_path` is never compared.
+
+Live objects the spec does not declare follow `provisioning.unmanaged`
+(`ProvisionOptions.unmanaged` overrides it): `ignore` leaves them out,
+`report` (the default) gives the Warning `DRIFT_UNMANAGED`, `fail` makes it an
+Error. An object released by an earlier apply is information only. A managed
+object missing from the database is `DRIFT_ORPHAN`: it is created again when
+the spec still declares it, and removed from the record otherwise. An apply
+that did not finish is `DRIFT_INTERRUPTED_APPLY`, and the plan holds only what
+remains.
+
+### RBAC
+
+RBAC is managed-only: the spec's roles replace their managed namesakes,
+managed roles and principals the spec dropped are removed, and every other
+role and principal, including the bootstrap administrator (role `admin`,
+principals `admin` and `root`), is left alone. Grants are resolved to the
+resource of their object (`Collection`, `VectorCollection`, `Table` for
+tables and `<table>_history`, `TimeSeries`, `Graph`, `FullTextIndex`,
+`GeoIndex`, or `Database`). A plan that would take system administration away
+from `ProvisionEnvironment.principal` is `RBAC_SELF_LOCKOUT`.
+
+A handle whose RBAC state or audit flag differs from what is persisted in the
+database is `PROVISION_SECURITY_STATE_STALE` (blocks): the plain openers
+(`create_database`, `open_database`) do not load persisted RBAC in this
+build, and `set_authz_policy` and `set_principal_registry` do not persist.
+Open the database with `open_database_with_ops` to plan it.
+
+### Guarantees
+
+| guarantee | single-node status |
+| --- | --- |
+| `write_ack`, `conflict_resolution: none`, `strict_cross_domain_transactions`, `local_snapshot` and `strong_cp` domains | `trivially_satisfied`: one replica, redb `Durability::Immediate`, one replication mode |
+| `backup.enabled`, `backup.pitr` | `operator_managed` with the `multidb backup`, `verify` and `restore` runbook and the Warning `GUARANTEE_OPERATOR_MANAGED`, when requested; there is no scheduler |
+| `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): there is no re-encryption |
+| `sensitive_data` | follows `encryption.at_rest`; the development audit key warns but never blocks it |
+| `audit.enabled` | `enforced` with a configured audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one, which is always the case on the CLI and `serve` |
+| `cache` TTL and eviction, `event_log` append-only | `not_enforced`, the Warning `ROLE_CONSTRAINT_NOT_ENFORCED` |
+
+A guarantee the spec does not ask for is `not_requested`.
+
+### Scope
+
+Provisioning builds embedded and single-node CP databases with one replica and
+one shard. Everything else fails closed:
+
+- cluster deployments and other topologies: `PROVISION_DEPLOYMENT_UNSUPPORTED`;
+- AP replication (in the spec or in the database) and conflict policies other
+  than `none`: `PROVISION_REPLICATION_UNSUPPORTED`; `eventual_ap` domains:
+  `DOMAIN_MODE_INCOMPATIBLE_WITH_REPLICATION`;
+- volatile profiles outside the Rust API: `PROVISION_VOLATILE_ON_SURFACE`; a
+  durable profile without a path: `PROVISION_STORAGE_PATH_REQUIRED`; a
+  volatile profile at a path: `PROFILE_DEPLOYMENT_MISMATCH`;
+- extensions: a built-in manifest with the same version is recorded as
+  metadata, an experimental one gives the Warning
+  `PROVISION_EXTENSION_EXPERIMENTAL`, a custom or unknown one is
+  `PROVISION_EXTENSION_UNAVAILABLE` and another version
+  `EXTENSION_VERSION_INCOMPATIBLE`;
+- a version 1 profile that does not resolve to built-in knobs:
+  `PROVISION_PROFILE_UNRESOLVED`.
+
+## Drift
+
+`drift(db, spec, options)` reports how an open database differs from a spec:
+the drift of the plan on the Rust API surface, or `InvalidSpec` for a spec
+that does not validate. Each item has a path, a kind (`missing_object`,
+`object_conflict`, `unmanaged_object`, `orphaned_object`, `released_object`,
+`setting_differs`, `storage_class_mismatch`, `format_mismatch`,
+`encryption_mismatch`, `guarantee_not_enforceable`, `session_pending_restart`,
+`interrupted_apply` or `spec_changed`), the expected and actual values,
+whether it blocks and what resolves it (`create`, `adopt`, `apply`, `retune`,
+`release`, `restart`, `unsupported` or `none`). `in_sync` is true when the
+plan is not blocked and every item is information only: released objects and
+unmanaged objects under `report` or `ignore`. Guarantee statuses such as
+`operator_managed` or `enforced_with_development_key` are reported in the
+plan, not as drift. `session_pending_restart` means the session runs other
+knobs than the profile manifest, for example after a retune; a restart
+resolves it.
+
+## Export
+
+`export_spec(db)` describes an open database as a spec (`ExportedSpec` with
+`spec`, `source` and `notes`):
+
+- a database provisioning applied a spec to returns that spec from its record
+  (`source: applied_record`);
+- any other database gets an inferred version 2 spec
+  (`source: inferred`): document collections become `document_entity`,
+  vector collections `vector_memory`, row tables `document_entity` with
+  `kind: table`, columnar tables `analytics`, time series `time_series` and
+  graphs `graph`; full-text and geo indexes and history tables attach to
+  their source; every id and index id is pinned. The profile is the
+  manifest's (a custom profile is rebuilt from its knobs; its description is
+  lost), or the storage profile alias for a legacy database. RBAC is exported
+  minus the bootstrap administrator. Audit and encryption follow the
+  database; backup and PITR are true only when the profile floors require
+  them. The required built-in extensions are listed.
+- What a spec cannot express is left out and listed in the notes and in
+  `operation_hints["export.unsupported_objects"]`: foreign tables,
+  materialized views, null-typed fields, partial indexes, `__` names, roles
+  with system grants or grants on objects the spec does not declare, and
+  principals with such roles. `operation_hints["export.inferred_roles"]`
+  lists the inferred roles.
+
+Planning the exported spec against the same database only adopts objects,
+the profile and RBAC and records metadata. An unreadable record makes export
+fail with `RecordUnreadable`.
+
+## The provision record
+
+Provisioning keeps what it owns in the system table `__provision`: the
+record (`ProvisionRecord`, key `record`) holds the status of the last apply,
+its plan id, the applied spec and its digest, the managed objects, roles and
+principals, released objects, guarantee statuses, completed and failed steps,
+flags, actor and binary version; `history/{seq:020}` keys hold one entry per
+apply. Backup and restore carry the table like every registered keyspace,
+and older binaries ignore it. `record_version` is read before the typed
+decode: a record of a newer build, or a corrupt one, is
+`PROVISION_RECORD_UNREADABLE` and blocks every plan.
+`Database::provision_state()` returns the record.
+
 ## Validation codes
 
 | code | version 1 | version 2 | provisioning |
@@ -235,6 +490,25 @@ provisioning always refuses it (`SPEC_LIMIT_EXCEEDED`):
 | `PHYSICAL_KIND_INCOMPATIBLE_WITH_ROLE`, `PHYSICAL_FIELD_NOT_APPLICABLE`, `PHYSICAL_NAME_INVALID`, `PROVISION_INDEX_KIND_MISSING`, `INDEX_SOURCE_NOT_DOCUMENT`, `PROVISION_PATH_INVALID`, `ID_CONFLICT`, `VECTOR_DIM_OUT_OF_RANGE`, `VECTOR_PARAMS_OUT_OF_RANGE`, `GEO_PARAMS_OUT_OF_RANGE`, `TIME_SERIES_PARAMS_INVALID`, `TABLE_PRIMARY_KEY_UNKNOWN`, `TABLE_COLUMN_DUPLICATE`, `TABLE_INDEX_COLUMN_UNKNOWN`, `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME` | – | Error where `physical` is set | Error |
 | `SECURITY_NAME_INVALID`, `SECURITY_RESERVED_NAME`, `SECURITY_SYSTEM_GRANT_FORBIDDEN`, `SECURITY_GRANT_TARGET_INVALID`, `SECURITY_GRANT_UNKNOWN_OBJECT`, `SECURITY_PRINCIPAL_UNKNOWN_ROLE`, `SECURITY_DUPLICATE` | – | Error | – |
 | `SECURITY_BROAD_GRANT`, `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ` | – | Warning | – |
+
+Plans add their own issues, whatever the spec version:
+
+| code | severity | rule |
+| --- | --- | --- |
+| `PROVISION_PROFILE_UNRESOLVED` | Error | the profile does not resolve to built-in knobs |
+| `PROVISION_DEPLOYMENT_UNSUPPORTED`, `PROVISION_REPLICATION_UNSUPPORTED`, `DOMAIN_MODE_INCOMPATIBLE_WITH_REPLICATION` | Error | outside single-node CP with one replica and one shard |
+| `PROVISION_VOLATILE_ON_SURFACE`, `PROVISION_STORAGE_PATH_REQUIRED`, `PROFILE_DEPLOYMENT_MISMATCH` | Error | the medium does not fit the surface or target |
+| `PROVISION_EXTENSION_UNAVAILABLE`, `EXTENSION_VERSION_INCOMPATIBLE` | Error | not a built-in extension manifest of this version |
+| `PROVISION_EXTENSION_EXPERIMENTAL` | Warning | an experimental extension |
+| `PROVISION_ENGINE_MISMATCH`, `PROVISION_FORMAT_MISMATCH`, `PROVISION_ENCRYPTION_MISMATCH` | Error | the database cannot be changed to the spec |
+| `PROVISION_OBJECT_CONFLICT` | Error | a live object, role or principal differs and cannot be altered |
+| `ID_CONFLICT` | Error | a pinned id is used by another live object |
+| `PROVISION_RECORD_UNREADABLE`, `PROVISION_SECURITY_STATE_STALE`, `RBAC_SELF_LOCKOUT`, `AUDIT_REQUIRED_FOR_APPLY` | Error | see above |
+| `GUARANTEE_NOT_ENFORCEABLE` | Error | a guarantee this surface or database cannot enforce |
+| `GUARANTEE_OPERATOR_MANAGED`, `AUDIT_DEVELOPMENT_KEY`, `ROLE_CONSTRAINT_NOT_ENFORCED` | Warning | how a guarantee is enforced |
+| `DRIFT_UNMANAGED` | Warning, Error under `unmanaged: fail` | an undeclared, unmanaged live object |
+| `DRIFT_ORPHAN`, `DRIFT_INTERRUPTED_APPLY` | Warning | a managed object is missing; the last apply did not finish |
+| `STEP_REQUIRES_FLAG` | Error | a step needs a flag the options do not give |
 
 Version 1 issues keep their order: the new version 1 Warnings come after every
 existing issue. The physical checks of version 2 validation run only on
@@ -261,6 +535,18 @@ they are applied by provisioning, not by `config apply`.
   a table with an explicit layout; `create_table` uses the database layout.
   `create_table_with_layout_as(principal, ...)` checks `Admin` on the database
   and is audited like `create_table_as`, with the layout in the event detail.
+- `multidb::provision::plan_provision(spec, target, options, environment)`
+  returns a `ProvisionPlan` (`plan_format` 1, `plan_id`, `surface`, `target`,
+  `spec_digest`, `live_fingerprint`, `resolved_profile`, `validation`,
+  `issues`, `objects`, `guarantees`, `drift`, `steps`, `spec_migration`,
+  `outcome`, `required_flags`, `auto_approvable`, `impact`, `rollback`,
+  `required_confirmation`; decoded with `deny_unknown_fields`).
+  `provision::drift(db, spec, options)` returns a `DriftReport`, and
+  `provision::export_spec(db)` an `ExportedSpec`. Errors are
+  `ProvisionError`.
+- `Database::provision_state()` returns the `ProvisionRecord`, if any.
+- `config_spec::canonical_spec_json` and `config_spec::spec_digest` give the
+  canonical form and digest of a spec.
 - The spec types live in `multidb::config_spec`: `PhysicalObjectSpec`,
   `PhysicalKind`, `SecuritySpec`, `RoleSpec`, `GrantSpec`, `PrincipalSpec`,
   `ProvisioningPolicySpec`, `UnmanagedPolicy`, the pinned `DEFAULT_*`

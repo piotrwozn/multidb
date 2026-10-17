@@ -1654,6 +1654,123 @@ fn is_valid_catalog_name_matches_validate_catalog_name() {
 }
 
 #[test]
+fn provision_state_reads_the_record_and_refuses_unreadable_ones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+    assert_eq!(database.provision_state()?, None);
+
+    let spec = DatabaseSpec::from_db_config("app", database.config());
+    let record = json!({
+        "record_version": 1,
+        "status": "applied",
+        "plan_id": "prov_0123",
+        "spec_digest": "spec_0123",
+        "applied_spec": spec,
+        "profile_digest": "prof_0123",
+        "applied_at_millis": 1,
+        "applied_by": "local:test",
+        "binary_version": "0.1.0"
+    });
+    let put = |value: &serde_json::Value| -> Result<(), Box<dyn std::error::Error>> {
+        propose_system(
+            &database,
+            Op::Put {
+                table: super::PROVISION_TABLE.to_owned(),
+                key: b"record".to_vec(),
+                value: serde_json::to_vec(value)?,
+            },
+        )?;
+        Ok(())
+    };
+    put(&record)?;
+    let state = database.provision_state()?.ok_or("a record")?;
+    assert_eq!(state.plan_id, "prov_0123");
+    assert_eq!(state.applied_spec, spec);
+    assert!(state.objects.is_empty() && state.released_objects.is_empty());
+
+    let mut newer = record;
+    newer["record_version"] = json!(2);
+    put(&newer)?;
+    assert!(matches!(
+        database.provision_state(),
+        Err(DbError::Serde(message)) if message.contains("record_version 2")
+    ));
+    Ok(())
+}
+
+#[test]
+fn document_count_counts_the_documents_of_one_collection() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_collection("users", CollectionId::new(1), user_doc_fields(), Vec::new())?;
+    database.create_collection(
+        "others",
+        CollectionId::new(2),
+        user_doc_fields(),
+        vec![IndexSpec::new(IndexId::new(1), FieldPath::new(["name"]))],
+    )?;
+    assert_eq!(database.document_count(CollectionId::new(1))?, 0);
+    for name in ["Ada", "Grace", "Linus"] {
+        database.collection("users")?.insert(&Value::Object(
+            [("name".to_owned(), Value::Str(name.to_owned()))].into(),
+        ))?;
+    }
+    database.collection("others")?.insert(&Value::Object(
+        [("name".to_owned(), Value::Str("Alan".to_owned()))].into(),
+    ))?;
+    assert_eq!(database.document_count(CollectionId::new(1))?, 3);
+    assert_eq!(database.document_count(CollectionId::new(2))?, 1);
+    assert_eq!(database.document_count(CollectionId::new(9))?, 0);
+    Ok(())
+}
+
+#[test]
+fn provisioning_views_match_the_file_and_refuse_replicated_backends()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("views.redb");
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    let security = SecurityConfig {
+        authz_policy: AuthzPolicy::new([
+            Role::new("reader").grant(Resource::Collection("users".to_owned()), Permission::Read)
+        ]),
+        ..SecurityConfig::default()
+    };
+    drop(create_database_with_ops(
+        config.clone(),
+        OperationalConfig::new().with_security(security.clone()),
+    )?);
+    let MetadataProbe::Initialized(probe) = inspect_database_metadata(&path) else {
+        return Err("the closed database is initialized".into());
+    };
+
+    let plain = open_database(config.clone())?;
+    assert_eq!(plain.probed_metadata()?, *probe);
+    assert_eq!(plain.persisted_security_state()?, security);
+    assert_eq!(*plain.authz_policy(), AuthzPolicy::default());
+    assert!(!plain.encryption_configured());
+    assert!(!plain.audit_key_configured());
+    assert_eq!(*plain.audit_config(), super::AuditConfig::default());
+    drop(plain);
+
+    let fresh = create_database(DbConfig::new(Profile::InMemory))?;
+    assert_eq!(fresh.persisted_security_state()?, SecurityConfig::default());
+    assert!(!fresh.probed_metadata()?.values_framed);
+
+    let cp = create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    assert!(matches!(
+        cp.probed_metadata(),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    let sharded = create_sharded_database(DbConfig::new(Profile::InMemory), sharded_config())?;
+    assert!(matches!(
+        sharded.probed_metadata(),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    Ok(())
+}
+
+#[test]
 fn open_database_rejects_layout_mismatch() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let path = temp_dir.path().join("layout-mismatch.redb");
