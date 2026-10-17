@@ -2089,7 +2089,7 @@ mod tests {
             temp.path().join("objects"),
         ));
         let report = hibernate_database(&database, &config)?;
-        assert!(!report.backup_id.is_empty());
+        assert!(!report.backup_id.is_empty(), "expected a non-empty value");
         assert_eq!(report.fencing_token, report.lease_id);
         let marker = read_hibernation_marker(&config.object_store.uri)?;
         assert_eq!(marker.backup_id, report.backup_id);
