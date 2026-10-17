@@ -10,7 +10,7 @@ use crate::config_spec::{
     DatabaseSpec, DeploymentMode, DeploymentSpec, ExtensionManifestRef, ExtensionStability,
     GuaranteeSpec, GuaranteeValidator, ReplicationMode, SupportStatus, TopologySpec,
     ValidationReport, built_in_extension_manifest, built_in_profile, collection_role_definition,
-    consistency_domain_definition,
+    consistency_domain_definition, index_required_extensions, role_required_extensions,
 };
 
 const DEFAULT_DOMAIN: &str = "primary";
@@ -391,6 +391,8 @@ fn template_database_spec(
         overrides: BTreeMap::new(),
         operation_hints: template_operation_hints(template),
         custom_profile: None,
+        security: None,
+        provisioning: None,
     })
 }
 
@@ -414,6 +416,7 @@ fn template_collections(template: &TemplateSpec) -> Vec<CollectionRoleSpec> {
             role: collection.role,
             domain: DEFAULT_DOMAIN.to_owned(),
             indexes: collection.indexes.to_vec(),
+            physical: None,
         })
         .collect()
 }
@@ -450,46 +453,6 @@ fn template_extensions(
         });
     }
     Ok(extensions)
-}
-
-fn role_required_extensions(role: CollectionRole) -> &'static [&'static str] {
-    match role {
-        CollectionRole::EventLog => &["cdc"],
-        CollectionRole::VectorMemory => &["vector_hnsw"],
-        CollectionRole::Audit => &["audit"],
-        CollectionRole::Graph => &["graph_index"],
-        CollectionRole::Analytics => &["columnar_layout"],
-        CollectionRole::TimeSeries => &["time_series"],
-        CollectionRole::DocumentEntity | CollectionRole::KeyValue | CollectionRole::Cache => &[],
-    }
-}
-
-fn index_required_extensions(indexes: &[CollectionIndexKind]) -> Vec<String> {
-    let mut required = BTreeSet::new();
-    for index in indexes {
-        match index {
-            CollectionIndexKind::Document => {
-                required.insert("document_index");
-            }
-            CollectionIndexKind::Vector => {
-                required.insert("vector_hnsw");
-            }
-            CollectionIndexKind::Graph => {
-                required.insert("graph_index");
-            }
-            CollectionIndexKind::FullText => {
-                required.insert("full_text");
-            }
-            CollectionIndexKind::Columnar => {
-                required.insert("columnar_layout");
-            }
-            CollectionIndexKind::TimeSeries => {
-                required.insert("time_series");
-            }
-            CollectionIndexKind::Primary => {}
-        }
-    }
-    required.into_iter().map(str::to_owned).collect()
 }
 
 fn template_operation_hints(template: &TemplateSpec) -> BTreeMap<String, String> {
@@ -689,6 +652,7 @@ const fn index_slug(index: CollectionIndexKind) -> &'static str {
         CollectionIndexKind::FullText => "full_text",
         CollectionIndexKind::Columnar => "columnar",
         CollectionIndexKind::TimeSeries => "time_series",
+        CollectionIndexKind::Geo => "geo",
     }
 }
 

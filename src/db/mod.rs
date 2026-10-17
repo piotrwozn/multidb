@@ -62,7 +62,7 @@ use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row, SqlEngine, SqlOutput,
-    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes, schema_put_op,
+    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -99,6 +99,7 @@ use crate::vector::{
 };
 
 mod profile_binding;
+mod provisioning;
 mod runtime;
 
 pub(crate) use profile_binding::{
@@ -1729,32 +1730,8 @@ impl Database {
         schema: Option<TableSchema>,
         indexes: Vec<RelIndexSpec>,
     ) -> Result<RelTable, DbError> {
-        let name = name.into();
-        self.ensure_name_available(&name)?;
         let layout = self.layout();
-        let table = RelTable::handle_with_layout(
-            self.replication_handle(),
-            name.clone(),
-            schema,
-            indexes,
-            layout,
-        )?;
-
-        let mut ops = Vec::new();
-        if let Some(schema) = table.schema() {
-            ops.push(schema_put_op(table.name(), schema)?);
-        }
-
-        let entry = CatalogEntry::Table {
-            indexes: table.indexes().to_vec(),
-            layout,
-        };
-        ops.push(catalog_put_op(&name, &entry)?);
-        propose_system_batch(&self.repl, ops)?;
-        self.catalog.insert(name, entry);
-        self.invalidate_plan_cache();
-
-        Ok(table)
+        self.create_table_with_layout(name, schema, indexes, layout)
     }
 
     /// Creates a foreign table backed by a local object-store file or remote PG-compatible source.
@@ -7526,17 +7503,25 @@ fn next_graph_id_op(next: u32) -> Result<Op, DbError> {
 }
 
 fn validate_catalog_name(name: &str) -> Result<(), DbError> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
+    if name.is_empty() {
         return Err(DbError::InvalidCatalogName("empty name".to_owned()));
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(DbError::InvalidCatalogName(name.to_owned()));
     }
-    if name.len() > 128 || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+    if !is_valid_catalog_name(name) {
         return Err(DbError::InvalidCatalogName(name.to_owned()));
     }
     Ok(())
+}
+
+/// The catalog naming rule every `create_*` call enforces: an ASCII letter or `_`, then ASCII
+/// letters, digits or `_`, at most 128 bytes. Spec validation applies the same rule.
+pub(crate) fn is_valid_catalog_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && name.len() <= 128
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn kind_mismatch(name: &str, expected: &'static str, entry: &CatalogEntry) -> DbError {

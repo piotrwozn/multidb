@@ -262,6 +262,15 @@ other leaves as `variant` or `preset`.
 - **`compatible_roles`** adds and removes collection roles; collections with
   other roles get `ROLE_OUTSIDE_PROFILE_CERTIFICATION`, as for built-ins.
 
+Version 2 also carries the optional provisioning fields:
+`collections[].physical` (how each collection is built: kind, fields, indexes,
+columns, vector dimension, chunk width), the `geo` index kind, `security`
+(managed roles and principals) and `provisioning` (what a plan does with
+undeclared objects).
+Their defaults come from the profile knobs, for example
+`time_series.default_chunk_millis` and `history.system_versioning`; see
+[provisioning.md](provisioning.md) for the fields and their validation codes.
+
 ### Version 1 and version 2 severities
 
 New checks never make a version 1 document that decoded before invalid:
@@ -294,7 +303,7 @@ codes are in the table above.
 | `SPEC_TOO_COMPLEX` | Error | YAML anchors and aliases expand beyond the node or scalar-byte budget |
 | `MISSING_VERSION` | Error | no integer `version` at the root of a mapping |
 | `UNSUPPORTED_VERSION` | Error | `version` is not 1 or 2 |
-| `FIELD_REQUIRES_SPEC_V2` | Error | a version 2 field (`custom_profile`) in a version 1 document |
+| `FIELD_REQUIRES_SPEC_V2` | Error | a version 2 field (`custom_profile`, `security`, `provisioning`, `collections[].physical` or a `geo` index kind) in a version 1 document, at its path |
 | `PROFILE_UNKNOWN` | Error (version 2) | `profile` is no built-in slug or alias and there is no `custom_profile` |
 | `PROFILE_NOT_PROVISIONABLE` | Advice (version 1) | the same, in a version 1 document; follows `CUSTOM_PROFILE` |
 | `GUARANTEE_BELOW_PROFILE_FLOOR` | Error | a resolved floor is not met by its guarantee |
@@ -363,9 +372,10 @@ Syntax errors and decode errors keep exit code 1 and HTTP 400
 ### JSON schema
 
 `docs/schemas/database-spec-v2.schema.json` (`database_spec_v2_schema()`) is
-the version 1 schema with `version: 2` and `custom_profile`. Its knob bounds,
-role enum and index enum are generated from `KNOB_REGISTRY` and the Rust
-enums; `auto` and `unlimited` are `oneOf` a constant or an integer range.
+the version 1 schema with `version: 2`, `custom_profile`, `security`,
+`provisioning`, `collections[].physical` and the `geo` index kind. Its knob
+bounds, role enum and index enum are generated from `KNOB_REGISTRY` and the
+Rust enums; `auto` and `unlimited` are `oneOf` a constant or an integer range.
 `docs/schemas/database-spec-v1.schema.json` is unchanged.
 
 ## Persistence and format

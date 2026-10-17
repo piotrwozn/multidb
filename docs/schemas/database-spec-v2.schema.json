@@ -16,7 +16,8 @@
               "graph",
               "full_text",
               "columnar",
-              "time_series"
+              "time_series",
+              "geo"
             ],
             "type": "string"
           },
@@ -25,6 +26,9 @@
         "name": {
           "minLength": 1,
           "type": "string"
+        },
+        "physical": {
+          "$ref": "#/$defs/physical"
         },
         "role": {
           "enum": [
@@ -299,6 +303,320 @@
       ],
       "type": "object"
     },
+    "physical": {
+      "additionalProperties": false,
+      "description": "How provisioning builds the collection. Every property is optional and applies to the kinds its description names (PHYSICAL_FIELD_NOT_APPLICABLE otherwise).",
+      "properties": {
+        "chunk_millis": {
+          "description": "time_series: chunk width; defaults to the time_series.default_chunk_millis knob.",
+          "maximum": 2678400000,
+          "minimum": 1000,
+          "type": "integer"
+        },
+        "collection_id": {
+          "description": "document, vector: a pinned collection id; unpinned ids are allocated at creation.",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "columns": {
+          "description": "table: typed columns; empty means a schemaless row table.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "description": "Column name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "nullable": {
+                "description": "Default false.",
+                "type": "boolean"
+              },
+              "type": {
+                "description": "Value type.",
+                "enum": [
+                  "int",
+                  "float",
+                  "str",
+                  "bool",
+                  "bytes"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
+        "dim": {
+          "description": "vector: the dimension, fixed at creation; required.",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "document_indexes": {
+          "description": "document: secondary indexes; required by the document index kind.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "description": "Index id; defaults to position + 1.",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "path": {
+                "description": "Dotted document path.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "fields": {
+          "description": "document: SQL-visible fields; empty means one field id holding the document id.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "description": "Field name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "path": {
+                "description": "Dotted document path, or $id for the document id (type bytes).",
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": {
+                "description": "Value type.",
+                "enum": [
+                  "int",
+                  "float",
+                  "str",
+                  "bool",
+                  "bytes"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "path",
+              "type"
+            ],
+            "type": "object"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
+        "full_text": {
+          "description": "document: full-text indexes, named <collection>_<path>_fts unless name is set; required by the full_text index kind.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "language": {
+                "description": "Tokenizer language; only simple in this build.",
+                "enum": [
+                  "simple"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "description": "Index name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "path": {
+                "description": "Dotted document path of the text.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "refresh_lag_target": {
+                "description": "Refresh lag target (default 1).",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "geo": {
+          "description": "document: geo indexes, named <collection>_<path>_geo unless name is set; required by the geo index kind.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "description": "Index name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "path": {
+                "description": "Dotted document path of the point.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "precision": {
+                "description": "Geohash precision (default 6).",
+                "maximum": 12,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "graph_id": {
+          "description": "graph: a pinned graph id; unpinned ids are allocated at creation.",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hnsw": {
+          "additionalProperties": false,
+          "description": "vector: HNSW parameters (default 16/200/48); ef_construction must be at least m.",
+          "properties": {
+            "ef_construction": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "ef_search": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "m": {
+              "maximum": 255,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "keep_history": {
+          "description": "table: keep history rows; defaults to the history.keep_history knob.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "All kinds: the runtime object. Defaults to the first kind the role allows.",
+          "enum": [
+            "document",
+            "table",
+            "vector",
+            "time_series",
+            "graph"
+          ],
+          "type": "string"
+        },
+        "layout": {
+          "description": "table: physical layout; defaults to columnar for analytics and to the database layout otherwise.",
+          "enum": [
+            "row",
+            "columnar"
+          ],
+          "type": "string"
+        },
+        "max_future_skew_millis": {
+          "description": "time_series: reserved; refused until the runtime supports a future-skew bound.",
+          "type": "integer"
+        },
+        "metric": {
+          "description": "vector: distance metric (default cosine).",
+          "enum": [
+            "cosine",
+            "l2"
+          ],
+          "type": "string"
+        },
+        "primary_key": {
+          "description": "table: the primary key column; required when columns are given.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retention_millis": {
+          "description": "time_series: retention, at least one chunk; defaults to the time_series.default_retention_millis knob.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "system_versioning": {
+          "description": "table: keep system-versioned history in <table>_history (typed row tables); defaults to the history.system_versioning knob.",
+          "type": "boolean"
+        },
+        "table_indexes": {
+          "description": "table: B-tree indexes of a row table; required by the document index kind.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "column": {
+                "description": "Indexed column.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "expression": {
+                "description": "What the index keys on (default column); lower_ascii needs a str column.",
+                "enum": [
+                  "column",
+                  "lower_ascii"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "description": "Index id; defaults to position + 1.",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "include": {
+                "description": "Covered columns.",
+                "items": {
+                  "description": "Column name.",
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "column"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "profile_knob_overrides": {
       "additionalProperties": false,
       "properties": {
@@ -562,6 +880,133 @@
       },
       "type": "object"
     },
+    "provisioning": {
+      "additionalProperties": false,
+      "properties": {
+        "unmanaged": {
+          "description": "What a plan does with catalog objects the spec does not declare (default report).",
+          "enum": [
+            "ignore",
+            "report",
+            "fail"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "security": {
+      "additionalProperties": false,
+      "description": "Roles and principals provisioning manages; others are never changed. The role admin and the principals admin and root are reserved.",
+      "properties": {
+        "principals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "principal": {
+                "description": "Principal name; defaults to the user.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "roles": {
+                "items": {
+                  "description": "A role of security.roles.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "user": {
+                "description": "Login user name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "user",
+              "roles"
+            ],
+            "type": "object"
+          },
+          "maxItems": 4096,
+          "type": "array"
+        },
+        "roles": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "grants": {
+                "items": {
+                  "additionalProperties": false,
+                  "description": "Exactly one of object or resource.",
+                  "oneOf": [
+                    {
+                      "required": [
+                        "object"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "resource"
+                      ]
+                    }
+                  ],
+                  "properties": {
+                    "object": {
+                      "description": "A collection, or a full-text, geo or history object of the spec.",
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "permissions": {
+                      "items": {
+                        "description": "Permission.",
+                        "enum": [
+                          "read",
+                          "write",
+                          "admin"
+                        ],
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "resource": {
+                      "description": "The whole database.",
+                      "enum": [
+                        "database"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "permissions"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 1024,
+                "type": "array"
+              },
+              "name": {
+                "description": "Role name, ^[a-z][a-z0-9_]{0,63}$.",
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "grants"
+            ],
+            "type": "object"
+          },
+          "maxItems": 256,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "string_map": {
       "additionalProperties": {
         "type": "string"
@@ -600,6 +1045,7 @@
       "items": {
         "$ref": "#/$defs/collection_role"
       },
+      "maxItems": 1024,
       "type": "array"
     },
     "custom_profile": {
@@ -639,6 +1085,12 @@
     "profile": {
       "minLength": 1,
       "type": "string"
+    },
+    "provisioning": {
+      "$ref": "#/$defs/provisioning"
+    },
+    "security": {
+      "$ref": "#/$defs/security"
     },
     "topology": {
       "$ref": "#/$defs/topology"

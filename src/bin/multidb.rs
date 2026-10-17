@@ -2212,6 +2212,8 @@ fn guided_spec_for_domain(
         overrides: std::collections::BTreeMap::new(),
         operation_hints: std::collections::BTreeMap::new(),
         custom_profile: None,
+        security: None,
+        provisioning: None,
     }
 }
 
@@ -2259,6 +2261,7 @@ const fn template_index_slug(index: multidb::config_spec::CollectionIndexKind) -
         multidb::config_spec::CollectionIndexKind::FullText => "full_text",
         multidb::config_spec::CollectionIndexKind::Columnar => "columnar",
         multidb::config_spec::CollectionIndexKind::TimeSeries => "time_series",
+        multidb::config_spec::CollectionIndexKind::Geo => "geo",
     }
 }
 
@@ -3190,6 +3193,7 @@ mod tests {
             role: CollectionRole::VectorMemory,
             domain: "primary".to_owned(),
             indexes: Vec::new(),
+            physical: None,
         });
         write_spec(&spec_path, &spec)?;
 
@@ -3268,6 +3272,7 @@ mod tests {
             role: CollectionRole::VectorMemory,
             domain: "primary".to_owned(),
             indexes: vec![multidb::config_spec::CollectionIndexKind::Vector],
+            physical: None,
         });
         write_spec(&spec_path, &spec)?;
 
@@ -3629,6 +3634,7 @@ mod tests {
             role: CollectionRole::VectorMemory,
             domain: "primary".to_owned(),
             indexes: vec![multidb::config_spec::CollectionIndexKind::Vector],
+            physical: None,
         });
         write_yaml_spec(&spec_path, &spec)?;
 

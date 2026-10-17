@@ -114,6 +114,58 @@ All notable public changes will be recorded here.
 - TypeScript SDK types: `DatabaseSpec.custom_profile` (`CustomProfileSpec`),
   `ProfileVariantSummary`, and optional `variants` and `knobs` on
   `ProfileSummary`. `DatabaseSpec.version` stays `number` (1 or 2).
+- Spec version 2 provisioning fields (preview): `collections[].physical`
+  (`PhysicalObjectSpec`, one flat struct for every kind: `kind`, pinned ids,
+  document `fields`, `document_indexes`, `full_text` and `geo` entries, table
+  `layout`, `columns`, `primary_key`, `table_indexes`, `system_versioning` and
+  `keep_history`, vector `dim`, `metric` and `hnsw`, time-series
+  `chunk_millis` and `retention_millis`), `security` (`SecuritySpec`: managed
+  roles whose grants name spec objects or the whole database, and principals
+  mapping users to roles; no secrets and no system scope) and `provisioning`
+  (`ProvisioningPolicySpec.unmanaged`: `ignore`, `report` or `fail`). A
+  version 1 document that sets one fails with `FIELD_REQUIRES_SPEC_V2` at its
+  path. Defaults are pinned (HNSW 16/200/48, full-text language `simple` with
+  refresh lag 1, geo precision 6, index ids at position + 1, chunk and
+  retention from the profile knobs), as are the derived names
+  `<collection>_<path>_fts`, `<collection>_<path>_geo` and `<table>_history`.
+  See `docs/provisioning.md`.
+- `CollectionIndexKind::Geo` (`geo`), a version 2 index kind that needs
+  `physical.geo` and no extension.
+- New validation codes: `COLLECTION_NAME_INVALID`,
+  `COLLECTION_NAME_RESERVED`, `OBJECT_NAME_COLLISION` and
+  `SPEC_LIMIT_EXCEEDED` (Warnings in version 1, Errors in version 2);
+  `PHYSICAL_PARAMETER_REQUIRED` (Advice in version 2); the version 2 Errors
+  `PHYSICAL_KIND_INCOMPATIBLE_WITH_ROLE`, `PHYSICAL_FIELD_NOT_APPLICABLE`,
+  `PHYSICAL_NAME_INVALID`, `PROVISION_INDEX_KIND_MISSING`,
+  `INDEX_SOURCE_NOT_DOCUMENT`, `PROVISION_PATH_INVALID`, `ID_CONFLICT`,
+  `VECTOR_DIM_OUT_OF_RANGE`, `VECTOR_PARAMS_OUT_OF_RANGE`,
+  `GEO_PARAMS_OUT_OF_RANGE`, `TIME_SERIES_PARAMS_INVALID`,
+  `TABLE_PRIMARY_KEY_UNKNOWN`, `TABLE_COLUMN_DUPLICATE`,
+  `TABLE_INDEX_COLUMN_UNKNOWN`, `SECURITY_NAME_INVALID`,
+  `SECURITY_RESERVED_NAME`, `SECURITY_SYSTEM_GRANT_FORBIDDEN`,
+  `SECURITY_GRANT_TARGET_INVALID`, `SECURITY_GRANT_UNKNOWN_OBJECT`,
+  `SECURITY_PRINCIPAL_UNKNOWN_ROLE` and `SECURITY_DUPLICATE`; and the version
+  2 Warnings `SECURITY_BROAD_GRANT` and
+  `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
+  `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME` also covers
+  `physical.max_future_skew_millis` and full-text languages other than
+  `simple`.
+- `database_spec_v2_schema()` and `docs/schemas/database-spec-v2.schema.json`
+  describe `physical`, `security`, `provisioning` and `geo`.
+- `multidb::provision::physical::project`, which projects a spec onto the
+  catalog objects provisioning would build (`DesiredObject`, `DesiredKind`
+  with runtime types, `DesiredObject::params_json`,
+  `physical::time_series_config`). It is always strict and never touches a
+  database: a version 1 collection whose index kinds lack parameters (for
+  example a `document` index without `physical.document_indexes`) fails with
+  `PHYSICAL_PARAMETER_REQUIRED`.
+- `Database::create_table_with_layout` and `create_table_with_layout_as`
+  create a table with an explicit layout, so a columnar table can live in a
+  row-class database; the layout is persisted with the table and kept across
+  reopens. `create_table` delegates with the database layout.
+- `config plan` (the version 1 migration planner) reports changes of
+  `collections[].physical`, `security` and `provisioning` as unsupported
+  steps; specs without them plan exactly as before, with the same plan ids.
 
 ### Changed
 
@@ -123,6 +175,10 @@ All notable public changes will be recorded here.
   build" instead of "encrypted storage required", and `RuntimeLimits` is
   labelled advisory catalog guidance that this build does not enforce (its
   values are unchanged).
+- Version 1 specs also gain the Warnings `COLLECTION_NAME_INVALID`,
+  `COLLECTION_NAME_RESERVED` and `SPEC_LIMIT_EXCEEDED` after every existing
+  issue, for collection names the runtime would refuse and for oversized
+  `overrides`, `operation_hints` and collection lists.
 - Version 1 specs gain only Advice and Warnings, no new Errors:
   `PROFILE_NOT_PROVISIONABLE` after `CUSTOM_PROFILE` for unknown profiles,
   `OVERRIDE_IS_METADATA_ONLY` for `overrides` keys in a knob namespace
@@ -185,8 +241,11 @@ All notable public changes will be recorded here.
 
 ### Breaking
 
-- `DatabaseSpec` struct literals must set the new `custom_profile` field;
-  `None` keeps today's behaviour.
+- `DatabaseSpec` struct literals must set the new `custom_profile`,
+  `security` and `provisioning` fields, and `CollectionRoleSpec` literals the
+  new `physical` field; `None` keeps today's behaviour.
+- `CollectionIndexKind` gains `Geo`; exhaustive matches outside the crate must
+  handle it.
 - `ConfigSpecError::UnsupportedVersion` gains a `supported` range field.
 - `CompiledPolicy` struct literals must set the new `resolved_profile` field.
 - `ConfigError` gains `AlreadyInitialized`, `StorageFormatMismatch`,

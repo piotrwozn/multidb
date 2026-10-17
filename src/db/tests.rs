@@ -1461,6 +1461,198 @@ fn analytical_layout_persists_and_reopens() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Gates per-table layout for provisioning: a columnar table inside a row-class database takes
+/// SQL writes and reads and keeps its layout across a reopen. A handful of rows keeps the table
+/// within one columnar segment.
+#[tokio::test]
+async fn create_table_with_layout_columnar_in_balanced_database_supports_sql_and_survives_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("balanced-columnar.redb");
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    let expected = SqlOutput::Rows(SqlRows {
+        columns: vec!["id".to_owned(), "category".to_owned(), "price".to_owned()],
+        rows: vec![
+            vec![
+                Value::Int(1),
+                Value::Str("a".to_owned()),
+                Value::Float(10.0),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Str("b".to_owned()),
+                Value::Float(20.5),
+            ],
+        ],
+    });
+
+    {
+        let mut database = create_database(config.clone())?;
+        assert_eq!(database.layout(), TableLayout::Row);
+        let rollups = database.create_table_with_layout(
+            "rollups",
+            Some(sales_schema()),
+            Vec::new(),
+            TableLayout::Columnar,
+        )?;
+        assert_eq!(rollups.layout(), TableLayout::Columnar);
+        let orders = database.create_table("orders", Some(sales_schema()), Vec::new())?;
+        assert_eq!(orders.layout(), TableLayout::Row);
+
+        assert_eq!(
+            database
+                .query(
+                    "INSERT INTO rollups (id, category, price) VALUES (1, 'a', 10.0), (2, 'b', 20.5)"
+                )
+                .await?,
+            SqlOutput::AffectedRows(2)
+        );
+        database
+            .query("INSERT INTO orders (id, category, price) VALUES (7, 'row', 1.0)")
+            .await?;
+        assert_eq!(
+            database
+                .query("SELECT id, category, price FROM rollups ORDER BY id")
+                .await?,
+            expected
+        );
+    }
+
+    let database = open_database(config)?;
+    assert_eq!(database.layout(), TableLayout::Row);
+    assert!(matches!(
+        database.catalog.get("rollups"),
+        Some(super::CatalogEntry::Table {
+            layout: TableLayout::Columnar,
+            ..
+        })
+    ));
+    assert!(matches!(
+        database.catalog.get("orders"),
+        Some(super::CatalogEntry::Table {
+            layout: TableLayout::Row,
+            ..
+        })
+    ));
+    assert_eq!(database.table("rollups")?.layout(), TableLayout::Columnar);
+    assert_eq!(
+        database
+            .query("SELECT id, category, price FROM rollups ORDER BY id")
+            .await?,
+        expected
+    );
+    assert_eq!(
+        database.query("SELECT count(*) AS n FROM orders").await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["n".to_owned()],
+            rows: vec![vec![Value::Int(1)]],
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn create_table_with_layout_refuses_columnar_without_schema_or_with_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+
+    assert!(
+        database
+            .create_table_with_layout("loose", None, Vec::new(), TableLayout::Columnar)
+            .is_err()
+    );
+    assert!(
+        database
+            .create_table_with_layout(
+                "indexed",
+                Some(sales_schema()),
+                vec![RelIndexSpec::new(1, 1)],
+                TableLayout::Columnar,
+            )
+            .is_err()
+    );
+    assert!(database.table("loose").is_err());
+    assert!(database.table("indexed").is_err());
+    Ok(())
+}
+
+#[test]
+fn create_table_with_layout_as_requires_database_admin_and_audits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("admin").grant(Resource::Database, Permission::Admin),
+        Role::new("reader").grant(Resource::Database, Permission::Read),
+    ]));
+    let admin = Principal::new("root").with_role("admin");
+    let reader = Principal::new("ada").with_role("reader");
+
+    assert!(matches!(
+        database.create_table_with_layout_as(
+            &reader,
+            "rollups",
+            Some(sales_schema()),
+            Vec::new(),
+            TableLayout::Columnar,
+        ),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(database.table("rollups").is_err());
+
+    let table = database.create_table_with_layout_as(
+        &admin,
+        "rollups",
+        Some(sales_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    assert_eq!(table.layout(), TableLayout::Columnar);
+
+    let audit = database.audit_events()?;
+    assert!(audit.iter().any(|event| {
+        event.action == "create_table"
+            && event.outcome == AuditOutcome::Denied
+            && event.principal.as_deref() == Some("ada")
+    }));
+    assert!(audit.iter().any(|event| {
+        event.action == "create_table"
+            && event.outcome == AuditOutcome::Succeeded
+            && event.resource == Resource::Table("rollups".to_owned())
+            && event.detail.as_deref() == Some("layout: columnar")
+    }));
+    Ok(())
+}
+
+#[test]
+fn is_valid_catalog_name_matches_validate_catalog_name() {
+    let long = "a".repeat(128);
+    let too_long = "a".repeat(129);
+    for name in [
+        "",
+        "_",
+        "__provision",
+        "orders",
+        "Orders_2",
+        "orders_notes_fts",
+        long.as_str(),
+        too_long.as_str(),
+        "1orders",
+        "order-items",
+        "order items",
+        "zamówienia",
+        "orders.notes",
+    ] {
+        assert_eq!(
+            super::is_valid_catalog_name(name),
+            super::validate_catalog_name(name).is_ok(),
+            "{name}"
+        );
+    }
+    assert!(super::is_valid_catalog_name(&long));
+    assert!(!super::is_valid_catalog_name(&too_long));
+    assert!(!super::is_valid_catalog_name(""));
+}
+
 #[test]
 fn open_database_rejects_layout_mismatch() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
