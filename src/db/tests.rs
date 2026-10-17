@@ -288,7 +288,7 @@ async fn phase21_workload_system_view_requires_rbac_and_records_queries()
         panic!("system workload should return rows");
     };
     assert!(rows.columns.contains(&"fingerprint".to_owned()));
-    assert!(!rows.rows.is_empty());
+    assert!(!rows.rows.is_empty(), "expected a non-empty value");
     Ok(())
 }
 
@@ -855,7 +855,11 @@ fn phase29_vector_handles_share_fresh_index_state() -> Result<(), Box<dyn std::e
 
     assert_eq!(second.knn(&[1.0, 0.0, 0.0], 1)?[0].id, id);
     second.delete_vector(id)?;
-    assert!(first.knn(&[1.0, 0.0, 0.0], 1)?.is_empty());
+    assert!(
+        first.knn(&[1.0, 0.0, 0.0], 1)?.is_empty(),
+        "expected an empty value, got {:?}",
+        first.knn(&[1.0, 0.0, 0.0], 1)?
+    );
     Ok(())
 }
 
