@@ -3714,7 +3714,9 @@ mod tests {
         assert!(
             audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
                 .await?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?
         );
         Ok(())
     }
@@ -3854,7 +3856,9 @@ mod tests {
         assert!(
             audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
                 .await?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?
         );
 
         let admin = app
@@ -3897,7 +3901,11 @@ mod tests {
         assert_eq!(retry_after, Some("1"));
         let body = json_body(busy).await?;
         assert_eq!(body["error"]["code"], "auth_busy");
-        assert!(login_audit_actions(&database).await?.is_empty());
+        assert!(
+            login_audit_actions(&database).await?.is_empty(),
+            "expected an empty value, got {:?}",
+            login_audit_actions(&database).await?
+        );
 
         drop(permits);
         let admitted = app
@@ -3981,7 +3989,11 @@ mod tests {
         assert_eq!(long_password.status(), StatusCode::BAD_REQUEST);
         let body = json_body(long_password).await?;
         assert_eq!(body["error"]["code"], "invalid_value");
-        assert!(login_audit_actions(&database).await?.is_empty());
+        assert!(
+            login_audit_actions(&database).await?.is_empty(),
+            "expected an empty value, got {:?}",
+            login_audit_actions(&database).await?
+        );
 
         let admitted = app
             .oneshot(login_request("admin", "correct", None)?)
