@@ -2766,11 +2766,19 @@ async fn phase32_before_wasm_trigger_rejects_sql_and_table_writes()
         "rejected write",
     );
 
-    assert!(database.table("accounts")?.scan()?.is_empty());
+    assert!(
+        database.table("accounts")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.table("accounts")?.scan()?
+    );
     let SqlOutput::Rows(rows) = database.query("SELECT id FROM accounts").await? else {
         panic!("SELECT must return rows");
     };
-    assert!(rows.rows.is_empty());
+    assert!(
+        rows.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        rows.rows
+    );
     Ok(())
 }
 
@@ -3026,7 +3034,11 @@ fn phase32_wasm_triggers_are_refused_on_columnar_tables() -> Result<(), Box<dyn 
         table.insert(account_row(1, "Ada", 37)),
         "cannot replace columnar table segments",
     );
-    assert!(database.table("accounts")?.scan()?.is_empty());
+    assert!(
+        database.table("accounts")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.table("accounts")?.scan()?
+    );
     Ok(())
 }
 
@@ -3155,7 +3167,9 @@ async fn after_commit_hook_failure_is_recorded_not_returned()
     assert!(
         database
             .range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
-            .is_empty()
+            .is_empty(),
+        "expected an empty value, got {:?}",
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
     );
     Ok(())
 }
@@ -3220,7 +3234,11 @@ fn hook_targets_are_scoped_to_named_objects() -> Result<(), Box<dyn std::error::
             .is_err()
     );
     assert_eq!(database.collection("b")?.scan()?.len(), 1);
-    assert!(database.collection("a")?.scan()?.is_empty());
+    assert!(
+        database.collection("a")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.collection("a")?.scan()?
+    );
 
     let edge = |graph: &str| -> Result<(), Box<dyn std::error::Error>> {
         database.graph(graph)?.add_edge(
@@ -3235,7 +3253,9 @@ fn hook_targets_are_scoped_to_named_objects() -> Result<(), Box<dyn std::error::
     assert!(
         database
             .range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
-            .is_empty()
+            .is_empty(),
+        "expected an empty value, got {:?}",
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
     );
     edge("g1")?;
     let deliveries =
