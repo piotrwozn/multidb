@@ -2505,7 +2505,9 @@ mod tests {
             assert!(
                 hooked
                     .range(HOOK_DELIVERIES_TABLE, &[], &[], ReadConsistency::Strong)?
-                    .is_empty()
+                    .is_empty(),
+                "expected an empty value, got {:?}",
+                hooked.range(HOOK_DELIVERIES_TABLE, &[], &[], ReadConsistency::Strong)?
             );
             Ok(())
         }

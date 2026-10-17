@@ -907,7 +907,11 @@ mod tests {
         run_until_done(&engine, &HistoryGcBatchPlan::new(5, 1_024, None))?;
 
         let read = engine.begin_read()?;
-        assert!(mvcc_versions(&read, b"a")?.is_empty());
+        assert!(
+            mvcc_versions(&read, b"a")?.is_empty(),
+            "expected an empty value, got {:?}",
+            mvcc_versions(&read, b"a")?
+        );
         assert_eq!(last_key_version_from(&read, "t", b"a")?, 2);
         assert_eq!(mvcc_versions(&read, b"b")?, vec![4, 6]);
         assert_eq!(visible_at(&read, b"b", 5)?, Some((4, None)));
