@@ -760,7 +760,11 @@ mod tests {
         };
         assert_eq!(phase.title, "extensibility");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
     }
 
     #[test]
@@ -788,7 +792,11 @@ mod tests {
         };
         assert_eq!(phase.title, "production ready");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
     }
 
     #[test]
@@ -798,7 +806,11 @@ mod tests {
         };
         assert_eq!(phase.title, "roadmap honesty and repo baseline");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
     }
 
     #[test]
@@ -808,7 +820,11 @@ mod tests {
         };
         assert_eq!(phase.title, "configuration specification");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -824,7 +840,11 @@ mod tests {
         };
         assert_eq!(phase.title, "profiles roles and consistency domains");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -840,7 +860,11 @@ mod tests {
         };
         assert_eq!(phase.title, "guarantee validator and policy compiler");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -856,7 +880,11 @@ mod tests {
         };
         assert_eq!(phase.title, "explain config and migration planner");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -872,7 +900,11 @@ mod tests {
         };
         assert_eq!(phase.title, "cli product layer");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -888,7 +920,11 @@ mod tests {
         };
         assert_eq!(phase.title, "control plane api");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -904,7 +940,11 @@ mod tests {
         };
         assert_eq!(phase.title, "multidb studio");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(phase.evidence.iter().any(|entry| entry.contains("Studio")));
     }
 
@@ -915,7 +955,11 @@ mod tests {
         };
         assert_eq!(phase.title, "extension manifest and marketplace contract");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -931,7 +975,11 @@ mod tests {
         };
         assert_eq!(phase.title, "runtime advisor v2");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -947,7 +995,11 @@ mod tests {
         };
         assert_eq!(phase.title, "cluster ga");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -963,7 +1015,11 @@ mod tests {
         };
         assert_eq!(phase.title, "performance truth");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -979,7 +1035,11 @@ mod tests {
         };
         assert_eq!(phase.title, "sdks examples and templates");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -995,7 +1055,11 @@ mod tests {
         };
         assert_eq!(phase.title, "public preview packaging");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -1011,7 +1075,11 @@ mod tests {
         };
         assert_eq!(phase.title, "docker runtime");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -1027,7 +1095,11 @@ mod tests {
         };
         assert_eq!(phase.title, "admin login and sessions");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -1043,7 +1115,11 @@ mod tests {
         };
         assert_eq!(phase.title, "studio full ui");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -1059,7 +1135,11 @@ mod tests {
         };
         assert_eq!(phase.title, "sdk api ecosystem");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
@@ -1081,7 +1161,11 @@ mod tests {
         };
         assert_eq!(phase.title, "ga hardening");
         assert_eq!(phase.status, ReadinessStatus::Complete);
-        assert!(phase.gaps.is_empty());
+        assert!(
+            phase.gaps.is_empty(),
+            "expected an empty value, got {:?}",
+            phase.gaps
+        );
         assert!(
             phase
                 .evidence
