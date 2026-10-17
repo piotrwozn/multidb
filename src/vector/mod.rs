@@ -503,10 +503,8 @@ pub fn decode_vector(bytes: &[u8], expected_dim: usize) -> Result<Vec<f32>, Vect
     }
 
     let mut vector = Vec::with_capacity(expected_dim);
-    for chunk in bytes.chunks_exact(F32_BYTES) {
-        let array = <[u8; F32_BYTES]>::try_from(chunk)
-            .map_err(|error| VectorError::Corruption(error.to_string()))?;
-        vector.push(f32::from_le_bytes(array));
+    for chunk in bytes.as_chunks::<F32_BYTES>().0 {
+        vector.push(f32::from_le_bytes(*chunk));
     }
     Ok(vector)
 }
@@ -969,7 +967,7 @@ mod tests {
         let (start, end) = vector_range_bounds(CollectionId::new(u32::MAX));
 
         assert_eq!(start, vec![0xFF; 4]);
-        assert!(end.is_empty());
+        assert!(end.is_empty(), "expected an empty value, got {end:?}");
     }
 
     #[test]

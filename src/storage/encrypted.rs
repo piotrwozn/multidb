@@ -1111,7 +1111,7 @@ fn parse_key_file(bytes: &[u8]) -> Result<[u8; KEY_LEN], StorageError> {
 
 fn decode_hex_key(text: &str) -> Result<[u8; KEY_LEN], StorageError> {
     let mut key = [0; KEY_LEN];
-    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_value(chunk[0])?;
         let low = hex_value(chunk[1])?;
         key[index] = (high << 4) | low;

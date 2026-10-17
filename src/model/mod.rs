@@ -1606,7 +1606,11 @@ mod tests {
             value: Value::Int(38),
         })?;
 
-        assert!(old.documents.is_empty());
+        assert!(
+            old.documents.is_empty(),
+            "expected an empty value, got {:?}",
+            old.documents
+        );
         assert_eq!(names(new.documents), vec!["Ada"]);
 
         Ok(())
@@ -1629,7 +1633,11 @@ mod tests {
             value: Value::Int(37),
         })?;
 
-        assert!(result.documents.is_empty());
+        assert!(
+            result.documents.is_empty(),
+            "expected an empty value, got {:?}",
+            result.documents
+        );
 
         Ok(())
     }
@@ -1656,7 +1664,11 @@ mod tests {
             value: Value::Str("Bad".to_owned()),
         })?;
 
-        assert!(result.documents.is_empty());
+        assert!(
+            result.documents.is_empty(),
+            "expected an empty value, got {:?}",
+            result.documents
+        );
 
         Ok(())
     }
