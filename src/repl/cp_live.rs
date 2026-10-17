@@ -592,6 +592,10 @@ impl<S: StorageEngine> InternalRaftEndpoint for LiveCpRuntime<S> {
     }
 }
 
+// openraft's storage and network traits are async, but these impls do
+// synchronous storage work and have no await points. `unknown_lints` keeps
+// clippy versions without this lint quiet.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl<S: StorageEngine> RaftLogStorage<CpOpenRaftTypeConfig> for CpLogStore<S> {
     type LogReader = Self;
 
@@ -698,6 +702,10 @@ impl<S: StorageEngine> RaftLogStorage<CpOpenRaftTypeConfig> for CpLogStore<S> {
     }
 }
 
+// openraft's storage and network traits are async, but these impls do
+// synchronous storage work and have no await points. `unknown_lints` keeps
+// clippy versions without this lint quiet.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl<S: StorageEngine> RaftLogReader<CpOpenRaftTypeConfig> for CpLogStore<S> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
@@ -731,6 +739,10 @@ impl<S: StorageEngine> RaftLogReader<CpOpenRaftTypeConfig> for CpLogStore<S> {
     }
 }
 
+// openraft's storage and network traits are async, but these impls do
+// synchronous storage work and have no await points. `unknown_lints` keeps
+// clippy versions without this lint quiet.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl<S: StorageEngine> RaftStateMachine<CpOpenRaftTypeConfig> for CpStateMachine<S> {
     type SnapshotBuilder = CpSnapshotBuilder<S>;
 
@@ -948,6 +960,10 @@ impl<S: StorageEngine> CpStateMachine<S> {
     }
 }
 
+// openraft's storage and network traits are async, but these impls do
+// synchronous storage work and have no await points. `unknown_lints` keeps
+// clippy versions without this lint quiet.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl<S: StorageEngine> RaftSnapshotBuilder<CpOpenRaftTypeConfig> for CpSnapshotBuilder<S> {
     async fn build_snapshot(&mut self) -> Result<CpSnapshot, io::Error> {
         let read = self.storage.begin_read().map_err(to_io)?;
@@ -994,6 +1010,10 @@ impl<S: StorageEngine> RaftSnapshotBuilder<CpOpenRaftTypeConfig> for CpSnapshotB
     }
 }
 
+// openraft's storage and network traits are async, but these impls do
+// synchronous storage work and have no await points. `unknown_lints` keeps
+// clippy versions without this lint quiet.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl RaftNetworkFactory<CpOpenRaftTypeConfig> for CpNetworkFactory {
     type Network = CpNetwork;
 

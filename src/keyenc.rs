@@ -118,7 +118,7 @@ mod tests {
         let (start, end) = u32_prefix_range(u32::MAX);
 
         assert_eq!(start, vec![0xFF; 4]);
-        assert!(end.is_empty());
+        assert!(end.is_empty(), "expected an empty value, got {end:?}");
     }
 
     #[test]
