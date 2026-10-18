@@ -111,7 +111,7 @@ multidb profile knobs
   hand. It is idempotent, writes `--out` in the format of its extension
   (stdout keeps the input format), does not keep YAML comments, refuses to
   overwrite a file without `--force`, and never writes a result that does not
-  validate (exit 2).
+  validate or that grows past 1 MiB when re-serialized (exit 2).
 - Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
   (as before), a product slug or alias in snake or kebab case, or `auto`,
   which reads the storage profile of the existing database without writing

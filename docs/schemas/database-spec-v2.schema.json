@@ -402,7 +402,7 @@
           "additionalProperties": false,
           "properties": {
             "max_batch_ops": {
-              "description": "Largest accepted write batch; only unlimited is accepted until #11.",
+              "description": "Largest accepted write batch; only unlimited is accepted until the single write pipeline lands.",
               "oneOf": [
                 {
                   "const": "unlimited"
@@ -415,7 +415,7 @@
               ]
             },
             "max_value_bytes": {
-              "description": "Largest accepted user value; only unlimited is accepted until #11.",
+              "description": "Largest accepted user value; only unlimited is accepted until the single write pipeline lands.",
               "oneOf": [
                 {
                   "const": "unlimited"
@@ -477,7 +477,7 @@
               "type": "integer"
             },
             "parser_recursion_limit": {
-              "description": "SQL parser recursion depth.",
+              "description": "SQL parser recursion depth; SELECTs that DataFusion plans stay capped at DataFusion's own limit of 50.",
               "maximum": 1024,
               "minimum": 16,
               "type": "integer"

@@ -56,13 +56,15 @@ use crate::model::{
 use crate::observability;
 use crate::observability::MetricsConfig;
 use crate::performance::{
-    BenchmarkReport, CompressionAlgorithm, PerformanceCache, PerformanceConfig, RegressionGate,
+    BenchmarkReport, CompressionAlgorithm, PerformanceCache, PerformanceConfig,
+    QueryExecutionConfig, RegressionGate,
 };
 use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row, SqlEngine, SqlOutput,
-    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes, schema_put_op,
+    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes, parse_with_limits,
+    schema_put_op,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -3278,9 +3280,12 @@ impl Database {
                 .map(|_| SqlOutput::AffectedRows(1));
             return self.finish_query(sql, started, result);
         }
-        if let Some(output) =
-            compat::execute_compat_sql(sql, &self.config, &self.compat_catalog_snapshot())?
-        {
+        if let Some(output) = compat::execute_compat_sql(
+            sql,
+            &self.config,
+            &self.compat_catalog_snapshot(),
+            &self.performance.query,
+        )? {
             return self.finish_query(sql, started, Ok(output));
         }
         if let Some(output) = self.execute_tuning_system_sql(sql)? {
@@ -3476,7 +3481,7 @@ impl Database {
     /// # Errors
     /// Fails when authorization, catalog metadata, or query execution fails.
     pub async fn query_as(&self, principal: &Principal, sql: &str) -> Result<SqlOutput, DbError> {
-        let requirements = sql_requirements(sql, &self.catalog)?;
+        let requirements = sql_requirements(sql, &self.catalog, &self.performance.query)?;
         for (resource, permission) in &requirements {
             self.authorize_or_audit(principal, resource, *permission, "query")?;
         }
@@ -3509,7 +3514,7 @@ impl Database {
         sql: &str,
         point: TemporalPoint,
     ) -> Result<SqlOutput, DbError> {
-        let requirements = sql_requirements(sql, &self.catalog)?;
+        let requirements = sql_requirements(sql, &self.catalog, &self.performance.query)?;
         for (resource, permission) in &requirements {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
@@ -4070,9 +4075,7 @@ impl Database {
     }
 
     fn validate_temporal_retention_for_sql(&self, sql: &str, lsn: TxnId) -> Result<(), DbError> {
-        let dialect = PostgreSqlDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
-            .map_err(|error| QueryError::Parse(error.to_string()))?;
+        let statements = parse_with_limits(sql, &self.performance.query)?;
         let mut names = BTreeSet::new();
         for statement in statements {
             if let Statement::Query(query) = statement {
@@ -6225,8 +6228,9 @@ pub fn profile_validation_report(
 fn sql_requirements(
     sql: &str,
     catalog: &BTreeMap<String, CatalogEntry>,
+    limits: &QueryExecutionConfig,
 ) -> Result<Vec<(Resource, Permission)>, DbError> {
-    if compat::compat_sql_requirements(sql)? {
+    if compat::compat_sql_requirements(sql, limits)? {
         return Ok(vec![(Resource::Database, Permission::Read)]);
     }
 
@@ -6255,9 +6259,7 @@ fn sql_requirements(
         return Ok(vec![(Resource::Database, Permission::Write)]);
     }
 
-    let dialect = PostgreSqlDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|error| QueryError::Parse(error.to_string()))?;
+    let statements = parse_with_limits(sql, limits)?;
     if statements.is_empty() {
         return Err(QueryError::Unsupported("empty SQL".to_owned()).into());
     }
@@ -6299,7 +6301,7 @@ fn sql_requirements(
                 }
             }
             Statement::Explain { statement, .. } => {
-                requirements.extend(sql_requirements(&statement.to_string(), catalog)?);
+                requirements.extend(sql_requirements(&statement.to_string(), catalog, limits)?);
             }
             other => return Err(QueryError::Unsupported(other.to_string()).into()),
         }

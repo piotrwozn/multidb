@@ -328,7 +328,9 @@ fn run_config_apply(args: &[String]) -> Result<CliRun, CliError> {
 
 /// `config upgrade`: converts a spec to version 2 (see `upgrade_spec`) and validates it. A valid
 /// result goes to `--out`, in the format its extension names, or to stdout in the input's
-/// format. An invalid result exits 2 and is never written to `--out`.
+/// format. An invalid result exits 2 and is never written to `--out`. A result over
+/// `spec_io::MAX_SPEC_BYTES`, which multidb could not read back, exits 2 with `SPEC_TOO_LARGE`
+/// and is written nowhere, not even to stdout.
 fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
@@ -349,6 +351,19 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
             SpecFormat::Json => "json",
         };
     let content = serialize_spec(&upgraded, format)?;
+    // Re-serializing can grow a compact spec past the size limit, and with `--force` the
+    // result would replace an input that multidb can read with one it refuses.
+    if content.len() > spec_io::MAX_SPEC_BYTES {
+        let too_large = SpecIoError::TooLarge {
+            limit: spec_io::MAX_SPEC_BYTES,
+            found: u64::try_from(content.len()).unwrap_or(u64::MAX),
+        };
+        let report = too_large
+            .validation_report()
+            .ok_or_else(|| CliError::Runtime(too_large.to_string()))?;
+        let source = out_path.as_deref().map(|out_path| ("--out", out_path));
+        return spec_report_run(&report, &output, source);
+    }
     // An invalid result is not written: with `--force` it could replace a valid input.
     let written = match &out_path {
         Some(out_path) if report.valid => {
@@ -3038,7 +3053,7 @@ mod tests {
             CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, DeploymentMode,
             GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, PolicyCompiler, ProfileResolution,
             RESERVED_KNOBS, WriteAck, resolve_named_profile,
-            spec_io::{SpecFormat, decode_spec_bytes},
+            spec_io::{MAX_SPEC_BYTES, SpecFormat, decode_spec_bytes},
         },
         db::{
             ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
@@ -4571,7 +4586,7 @@ mod tests {
         assert_eq!(commit["timing"], "creation");
         assert_eq!(
             knob_row(&report, "limits.max_value_bytes")?["enforcement"]["planned"]["tracking"],
-            "#11 single write pipeline"
+            "single write pipeline"
         );
 
         let text = run(strings(&["profile", "show", "high_durability"]))?;
@@ -5079,6 +5094,47 @@ mod tests {
         let upgraded = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&input)?)?;
         assert_eq!(upgraded.version, 2);
         assert!(upgraded.custom_profile.is_some());
+        assert_eq!(upgrade_temp_files(temp.path())?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// Pretty-printing can grow a compact spec past `MAX_SPEC_BYTES`. Such a result is written
+    /// nowhere, so `--force` never replaces an input multidb reads with one it refuses.
+    #[test]
+    fn config_upgrade_refuses_results_over_the_spec_size_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("compact.json");
+        let mut spec = studio_style_spec();
+        spec.operation_hints
+            .extend((0..70_000).map(|index| (format!("h{index}"), String::new())));
+        let compact = serde_json::to_string(&spec)?;
+        assert!(compact.len() < MAX_SPEC_BYTES, "{}", compact.len());
+        assert!(serde_json::to_string_pretty(&spec)?.len() > MAX_SPEC_BYTES);
+        std::fs::write(&input, &compact)?;
+        let out = temp.path().join("upgraded.json");
+        let (input_arg, out_arg) = (path_arg(&input), path_arg(&out));
+
+        for extra in [
+            vec![],
+            vec!["--json"],
+            vec!["--out", out_arg.as_str()],
+            vec!["--out", out_arg.as_str(), "--json"],
+            vec!["--out", input_arg.as_str(), "--force"],
+        ] {
+            let mut args = vec!["config", "upgrade", "--spec", input_arg.as_str()];
+            args.extend(extra);
+            let outcome = run(strings(&args))?;
+            assert_eq!(outcome.exit_code, 2, "{args:?}: {}", outcome.message);
+            assert!(
+                outcome.message.contains("SPEC_TOO_LARGE")
+                    && !outcome.message.contains("operation_hints"),
+                "{args:?}: {}",
+                outcome.message
+            );
+        }
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(&input)?, compact);
         assert_eq!(upgrade_temp_files(temp.path())?, Vec::<String>::new());
         Ok(())
     }

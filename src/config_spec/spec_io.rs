@@ -426,11 +426,17 @@ impl<'de> Visitor<'de> for Peek<'_> {
         })
     }
 
+    /// YAML hands a node with a local tag (`!Tag`, or a bare `!`) to `visit_enum`. The typed
+    /// decode ignores such tags, so the tagged node keeps its place: a tagged root mapping is
+    /// still the root, and a tagged key or value is peeked like an untagged one.
     fn visit_enum<A: EnumAccess<'de>>(mut self, data: A) -> Result<PeekedNode, A::Error> {
         self.budget.charge(0)?;
         let (_, variant) = data.variant_seed(self.nested())?;
-        de::VariantAccess::newtype_variant_seed(variant, self.nested())?;
-        Ok(PeekedNode::Other)
+        let tagged = Peek {
+            budget: &mut *self.budget,
+            root: self.root,
+        };
+        de::VariantAccess::newtype_variant_seed(variant, tagged)
     }
 }
 
@@ -576,6 +582,40 @@ mod tests {
                 .ok_or("YAML must fail")?;
             assert_eq!(report_code(&error).as_deref(), Some("MISSING_VERSION"));
         }
+        Ok(())
+    }
+
+    /// YAML hands a node with a local tag to the peek as an enum. The typed decode ignores the
+    /// tag, so a tagged root mapping, key or value must peek like the untagged node.
+    #[test]
+    fn local_yaml_tags_decode_like_untagged_nodes() -> Result<(), Box<dyn std::error::Error>> {
+        let untagged = serde_norway::to_string(&base_spec())?;
+        let expected = decode_spec_bytes(untagged.as_bytes(), SpecFormat::Yaml)?;
+        let head = "version: 1\nname: orders\n";
+        assert!(untagged.starts_with(head), "{untagged}");
+        let nested = untagged.replacen(head, "!key version: !n 1\nname: !s orders\n", 1);
+
+        for tagged in [
+            format!("--- !DatabaseSpec\n{untagged}"),
+            format!("--- !\n{untagged}"),
+            nested.clone(),
+            format!("--- !DatabaseSpec\n{nested}"),
+        ] {
+            let decoded = decode_spec_bytes(tagged.as_bytes(), SpecFormat::Yaml)?;
+            assert_eq!(decoded, expected, "{tagged}");
+        }
+
+        let error = decode_spec_bytes(b"--- !DatabaseSpec\nname: x\n", SpecFormat::Yaml)
+            .err()
+            .ok_or("a tagged root without a version must fail")?;
+        assert!(
+            matches!(&error, SpecIoError::MissingVersion { detail } if detail == "the document has no version field"),
+            "{error:?}"
+        );
+        let error = decode_spec_bytes(b"--- !\nversion: 3\n", SpecFormat::Yaml)
+            .err()
+            .ok_or("a tagged root with version 3 must fail")?;
+        assert_eq!(report_code(&error).as_deref(), Some("UNSUPPORTED_VERSION"));
         Ok(())
     }
 

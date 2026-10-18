@@ -12,7 +12,7 @@ const MIB_U64: u64 = 1_024 * 1_024;
 const GIB_U64: u64 = 1_024 * MIB_U64;
 const TIB_U64: u64 = 1_024 * GIB_U64;
 const PLANNED_WRITE_PIPELINE: KnobEnforcement = KnobEnforcement::Planned {
-    tracking: "#11 single write pipeline",
+    tracking: "single write pipeline",
 };
 
 /// One profile knob: its value domain, when it takes effect, where the runtime reads it and
@@ -333,10 +333,12 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
             max: 1_024,
         },
         timing: KnobTiming::EveryOpen,
-        sink: "QueryExecutionConfig.parser_recursion_limit -> SQL parser limits",
+        sink: "QueryExecutionConfig.parser_recursion_limit -> SQL parser limits (DataFusion \
+               parses the SELECTs it plans again, with its own fixed limit of 50)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::Retune,
-        description: "SQL parser recursion depth.",
+        description: "SQL parser recursion depth; SELECTs that DataFusion plans stay capped at \
+                      DataFusion's own limit of 50.",
     },
     KnobDefinition {
         path: "limits.max_value_bytes",
@@ -348,7 +350,8 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         sink: "LimitPolicy.max_value_bytes (no user write path checks it yet)",
         enforcement: PLANNED_WRITE_PIPELINE,
         after_creation: ChangePolicy::Provisioning,
-        description: "Largest accepted user value; only unlimited is accepted until #11.",
+        description: "Largest accepted user value; only unlimited is accepted until the single \
+                      write pipeline lands.",
     },
     KnobDefinition {
         path: "limits.max_batch_ops",
@@ -360,7 +363,8 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         sink: "LimitPolicy.max_batch_ops (no user write path checks it yet)",
         enforcement: PLANNED_WRITE_PIPELINE,
         after_creation: ChangePolicy::Provisioning,
-        description: "Largest accepted write batch; only unlimited is accepted until #11.",
+        description: "Largest accepted write batch; only unlimited is accepted until the single \
+                      write pipeline lands.",
     },
     KnobDefinition {
         path: "history.system_versioning",
@@ -478,7 +482,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
 pub const RESERVED_KNOBS: &[ReservedKnob] = &[
     ReservedKnob {
         path: "history.mvcc_retention_millis",
-        reason: "waits for MVCC and commit-log GC (#12)",
+        reason: "waits for MVCC and commit-log GC",
     },
     ReservedKnob {
         path: "cache.ttl_millis",

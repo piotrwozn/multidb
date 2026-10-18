@@ -2511,7 +2511,7 @@ const NOT_CONFIGURABLE: &[(&str, &str)] = &[
     (
         "mvcc_retention",
         "MVCC and commit-log retention are not profile knobs; history.mvcc_retention_millis is \
-         reserved until MVCC and commit-log GC (#12) lands.",
+         reserved until MVCC and commit-log GC lands.",
     ),
     (
         "cache_ttl",
@@ -2623,7 +2623,7 @@ fn knob_outcome(
     fixed_at_creation: &str,
 ) -> String {
     if let KnobEnforcement::Planned { tracking } = definition.enforcement {
-        return format!("planned: not enforced until the single write pipeline lands ({tracking})");
+        return format!("planned: not enforced until the {tracking} lands");
     }
     match definition.timing {
         KnobTiming::Creation if definition.path == "compression.algorithm" => {

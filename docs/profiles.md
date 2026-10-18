@@ -70,8 +70,9 @@ Values every preset shares:
 - query `max_concurrent_queries: auto` (four permits per available thread,
   today's value) and `target_partitions: auto` (the storage profile default);
   the other query limits are the runtime defaults: 1 MiB SQL, 32 statements,
-  10 000 VALUES rows, parser recursion 128, batches of 1024 rows, queue
-  timeout 100 ms, timeout 30 s and a 2 GiB spill limit;
+  10 000 VALUES rows, parser recursion 128 (50 for the SELECTs DataFusion
+  plans, see the [knob reference](#knob-reference)), batches of 1024 rows,
+  queue timeout 100 ms, timeout 30 s and a 2 GiB spill limit;
 - limits `unlimited` / `unlimited`, which is what the runtime enforces today;
 - history `system_versioning: off`, `keep_history: true`;
 - time series chunk 3 600 000 ms, retention `null`;
@@ -133,9 +134,9 @@ profile.
 | `query.max_sql_bytes` | 1 KiB..=16 MiB | every open | SQL parser limits | enforced | retune |
 | `query.max_statements` | 1..=1024 | every open | SQL parser limits | enforced | retune |
 | `query.max_values_rows` | 1..=1000000 | every open | SQL parser limits | enforced | retune |
-| `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits | enforced | retune |
-| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (#11 single write pipeline): only `unlimited` is accepted | provisioning |
-| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (#11 single write pipeline): only `unlimited` is accepted | provisioning |
+| `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits; DataFusion parses the SELECTs it plans again, with its own fixed limit of 50 | enforced | retune |
+| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
+| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
 | `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | declarative: recorded only until provisioning exists | provisioning |
 | `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | declarative: recorded only until provisioning exists | provisioning |
 | `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
@@ -152,6 +153,16 @@ profile.
 benchmark settings are deliberately not knobs, because nothing reads them at
 runtime; they always come from `PerformanceConfig::for_profile`.
 
+The four SQL parser limits (`query.max_sql_bytes`, `max_statements`,
+`max_values_rows`, `parser_recursion_limit`) bind every parse of a query: the
+engine's, the compatibility-query check of `Database::query`, the RBAC check
+of `query_as` and `query_as_of_as` and the retention check of `query_as_of`.
+DataFusion parses the SELECTs it plans (every SELECT except indexed
+single-table equality lookups and the built-in system views and functions,
+and every `AS OF` query) a second time with its own fixed recursion limit of
+50, so a `query.parser_recursion_limit` above 50 deepens only the statements
+multidb executes itself, such as `INSERT` and indexed equality lookups.
+
 `multidb::config_spec::parse_knob_assignment("cache.max_entries=8192")`
 parses one `path=value` against the registry: enum names, integers, `auto`,
 `unlimited`, `true` / `false`, and `null` (inherit) for the retention. A
@@ -166,7 +177,7 @@ them and any value is refused with `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME`:
 
 | path | reason |
 | --- | --- |
-| `history.mvcc_retention_millis` | waits for MVCC and commit-log GC (#12) |
+| `history.mvcc_retention_millis` | waits for MVCC and commit-log GC |
 | `cache.ttl_millis` | no runtime implementation |
 
 ## Resolution and status rules
@@ -677,7 +688,10 @@ converts a spec to version 2:
 - the result is validated: exit 2 when it is invalid, for example
   `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
   `profile.custom.base`, and an invalid result is never written to `--out`,
-  so `--force` cannot replace a valid input with it.
+  so `--force` cannot replace a valid input with it;
+- a result larger than 1 MiB, which re-serializing can make of a compact
+  input under the limit, is refused with `SPEC_TOO_LARGE` (exit 2) and is
+  written nowhere, neither to `--out` nor to stdout.
 
 It re-serializes the spec, so YAML comments and formatting are not kept and
 defaulted fields such as `topology` are written out. Knob-like `overrides`

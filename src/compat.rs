@@ -2,16 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use sqlparser::{
-    ast::{Expr, ObjectName, Query, SelectItem, SetExpr, Statement},
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
+use sqlparser::ast::{Expr, ObjectName, Query, SelectItem, SetExpr, Statement};
 
 use crate::{
     db::{CatalogEntry, DbConfig, DbError},
     model::Value,
-    query::{ColumnType, QueryError, SqlOutput, SqlRows, TableLayout, TableSchema},
+    performance::QueryExecutionConfig,
+    query::{
+        ColumnType, QueryError, SqlOutput, SqlRows, TableLayout, TableSchema, parse_with_limits,
+    },
     repl::ReplError,
     storage::StorageError,
 };
@@ -162,12 +161,15 @@ impl PgCatalogSnapshot {
     }
 }
 
+/// Answers the `PostgreSQL` compatibility queries (`version()`, `pg_catalog`,
+/// `information_schema`, `system.*`). `limits` are the SQL parser limits of the query engine.
 pub fn execute_compat_sql(
     sql: &str,
     config: &DbConfig,
     snapshot: &PgCatalogSnapshot,
+    limits: &QueryExecutionConfig,
 ) -> Result<Option<SqlOutput>, QueryError> {
-    let Some(request) = parse_compat_request(sql)? else {
+    let Some(request) = parse_compat_request(sql, limits)? else {
         return Ok(None);
     };
 
@@ -195,8 +197,11 @@ pub fn execute_compat_sql(
     Ok(Some(output))
 }
 
-pub fn compat_sql_requirements(sql: &str) -> Result<bool, QueryError> {
-    parse_compat_request(sql).map(|request| request.is_some())
+pub fn compat_sql_requirements(
+    sql: &str,
+    limits: &QueryExecutionConfig,
+) -> Result<bool, QueryError> {
+    parse_compat_request(sql, limits).map(|request| request.is_some())
 }
 
 #[must_use]
@@ -273,7 +278,10 @@ enum CompatRequest {
     ServerStatus,
 }
 
-fn parse_compat_request(sql: &str) -> Result<Option<CompatRequest>, QueryError> {
+fn parse_compat_request(
+    sql: &str,
+    limits: &QueryExecutionConfig,
+) -> Result<Option<CompatRequest>, QueryError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if !trimmed
         .get(..trimmed.len().min(6))
@@ -281,8 +289,7 @@ fn parse_compat_request(sql: &str) -> Result<Option<CompatRequest>, QueryError> 
     {
         return Ok(None);
     }
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, trimmed)
-        .map_err(|error| QueryError::Parse(error.to_string()))?;
+    let statements = parse_with_limits(trimmed, limits)?;
     let [Statement::Query(query)] = statements.as_slice() else {
         return Ok(None);
     };
@@ -575,6 +582,7 @@ mod tests {
     use crate::{
         db::{DbConfig, Profile},
         model::Value,
+        performance::QueryExecutionConfig,
         query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
     };
 
@@ -598,6 +606,7 @@ mod tests {
             "SELECT * FROM information_schema.columns",
             &DbConfig::new(Profile::InMemory),
             &snapshot,
+            &QueryExecutionConfig::default(),
         )?
         .ok_or("missing compat output")?;
         assert!(matches!(output, SqlOutput::Rows(rows) if rows.rows.len() == 2));
@@ -606,11 +615,13 @@ mod tests {
 
     #[test]
     fn version_and_requirements_are_detected() -> Result<(), Box<dyn std::error::Error>> {
-        assert!(compat_sql_requirements("SELECT version()")?);
+        let limits = QueryExecutionConfig::default();
+        assert!(compat_sql_requirements("SELECT version()", &limits)?);
         let output = execute_compat_sql(
             "SELECT version()",
             &DbConfig::new(Profile::InMemory),
             &PgCatalogSnapshot::default(),
+            &limits,
         )?;
         assert!(matches!(
             output,

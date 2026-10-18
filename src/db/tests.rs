@@ -2778,6 +2778,107 @@ async fn phase32_temporal_as_of_lsn_and_retention() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// `SELECT name FROM users WHERE id = ++...+2` with `depth` unary plus signs, each one parser
+/// recursion level deeper. The engine answers it from the `id` index, without `DataFusion`, whose
+/// own parser stops at a fixed depth of 50.
+fn nested_select(depth: usize) -> String {
+    format!("SELECT name FROM users WHERE id = {}2", "+".repeat(depth))
+}
+
+/// Seeds `users` and `orders`, keeps `users` history, lets `alice` read `users` and lets the
+/// role `writer` write it.
+fn seed_parser_limit_database(
+    database: &mut Database,
+) -> Result<(Principal, u64), Box<dyn std::error::Error>> {
+    seed_orders(database)?;
+    database.enable_system_versioning("users", TemporalRetention::default())?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+        Role::new("writer").grant(Resource::Table("users".to_owned()), Permission::Write),
+    ]));
+    Ok((
+        Principal::new("alice").with_role("reader"),
+        latest_lsn(database)?,
+    ))
+}
+
+/// The SQL parser limits (`query.parser_recursion_limit`, `query.max_sql_bytes`, ...) bind every
+/// parse of a query, not only the engine's: the compatibility, RBAC and temporal pre-parses
+/// parse with the configured limits instead of the sqlparser defaults.
+#[tokio::test]
+async fn sql_parser_limits_bind_every_parse_of_a_query() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let (reader, lsn) = seed_parser_limit_database(&mut database)?;
+    assert_eq!(
+        database.performance_config().query.parser_recursion_limit,
+        128
+    );
+
+    // Deeper than the sqlparser default of 50, within the preset.
+    let deep = nested_select(80);
+    let grace = SqlOutput::Rows(SqlRows {
+        columns: vec!["name".to_owned()],
+        rows: vec![vec![Value::Str("Grace".to_owned())]],
+    });
+    assert_eq!(database.query(&deep).await?, grace);
+    assert_eq!(database.query_as(&reader, &deep).await?, grace);
+    let insert = format!(
+        "INSERT INTO users (id, name, age) VALUES (3, 'Lin', {}41)",
+        "+".repeat(80)
+    );
+    let writer = Principal::new("bob").with_role("writer");
+    assert_eq!(
+        database.query_as(&writer, &insert).await?,
+        SqlOutput::AffectedRows(1)
+    );
+    // An AS OF query always goes to DataFusion, whose parser keeps its own limit of 50.
+    let capped = database.query_as_of(&deep, TemporalPoint::Lsn(lsn)).await;
+    assert!(
+        matches!(&capped, Err(DbError::Query(QueryError::DataFusion(message)))
+            if message.contains("RecursionLimitExceeded")),
+        "{capped:?}"
+    );
+
+    let mut performance = PerformanceConfig::for_profile(Profile::InMemory);
+    performance.query.parser_recursion_limit = 20;
+    performance.query.max_sql_bytes = 256;
+    let mut limited = create_database_with_ops(
+        DbConfig::new(Profile::InMemory),
+        OperationalConfig::new().with_performance(performance),
+    )?;
+    let (reader, lsn) = seed_parser_limit_database(&mut limited)?;
+    let too_deep = nested_select(30);
+    for result in [
+        limited.query(&too_deep).await,
+        limited.query_as(&reader, &too_deep).await,
+        limited
+            .query_as_of(&too_deep, TemporalPoint::Lsn(lsn))
+            .await,
+    ] {
+        assert!(
+            matches!(&result, Err(DbError::Query(QueryError::Parse(message)))
+                if message.contains("recursion limit exceeded")),
+            "{result:?}"
+        );
+    }
+    // The compatibility pre-parse answers `SELECT version()`, but not past max_sql_bytes.
+    let padded = format!("SELECT version() -- {}", "x".repeat(300));
+    for result in [
+        limited.query(&padded).await,
+        limited.query_as(&reader, &padded).await,
+    ] {
+        assert!(
+            matches!(&result, Err(DbError::Query(QueryError::InputLimit(_)))),
+            "{result:?}"
+        );
+    }
+    assert!(matches!(
+        limited.query("SELECT version()").await?,
+        SqlOutput::Rows(_)
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn phase32_cataloged_materialized_view_is_queryable() -> Result<(), Box<dyn std::error::Error>>
 {

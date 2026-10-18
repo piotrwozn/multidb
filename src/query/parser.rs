@@ -14,7 +14,11 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
     parse_with_limits(sql, &QueryExecutionConfig::default())
 }
 
-pub(super) fn parse_with_limits(
+/// Parses SQL text with the `PostgreSQL` dialect under the configured SQL text size, statement
+/// count, `VALUES` row and parser recursion limits. The engine and every pre-parse of
+/// `Database::query` and its RBAC and temporal checks parse through it, so they agree on what
+/// SQL is accepted.
+pub(crate) fn parse_with_limits(
     sql: &str,
     limits: &QueryExecutionConfig,
 ) -> Result<Vec<Statement>, QueryError> {

@@ -65,9 +65,10 @@ pub use optimizer::{
     PlanDependency, PlannerFeedback, QueryFingerprint, STATS_TABLE, SimpleSelectPlan, StatsCatalog,
     StatsObjectKind, TableStats,
 };
+pub(crate) use parser::parse_with_limits;
 pub use parser::{parse, parse_analyze_for_authz};
 
-use parser::{parse_analyze_command, parse_limit, parse_with_limits};
+use parser::{parse_analyze_command, parse_limit};
 
 pub const REL_ROWS_TABLE: &str = "rel_rows";
 pub const REL_COLUMNAR_SEGMENTS_TABLE: &str = "rel_columnar_segments";

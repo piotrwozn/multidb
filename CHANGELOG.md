@@ -29,9 +29,11 @@ All notable public changes will be recorded here.
   `built_in_profile` stays an exact match).
 - `DatabaseSpec.custom_profile`, a spec version 2 field. A version 1 document
   that sets it fails validation with `FIELD_REQUIRES_SPEC_V2`, and
-  `resolve_profile` returns that issue as `ProfileResolution::Invalid`;
-  documents without it serialize, validate and plan exactly as before, pinned
-  by the frozen corpus in `tests/fixtures/spec-v1/`.
+  `resolve_profile` returns that issue as `ProfileResolution::Invalid`.
+  Version 1 documents without it serialize and plan exactly as before (same
+  plan ids) and keep their existing issues, order, status and validity,
+  gaining only the Advice and Warnings listed under Changed; the frozen
+  corpus in `tests/fixtures/spec-v1/` pins this.
 - `CollectionRole` derives `PartialOrd` and `Ord`.
 - `DatabaseSpec` version 2 (`DATABASE_SPEC_VERSION_V2`,
   `SUPPORTED_SPEC_VERSIONS = 1..=2`): a version 1 spec plus `custom_profile`
@@ -127,7 +129,8 @@ All notable public changes will be recorded here.
   extension, refuses to overwrite files without `--force`, writes through a
   new, randomly named sibling file that it renames into place (a planted
   symlink cannot redirect the write), and exits 2 without writing when the
-  result does not validate.
+  result does not validate, or with `SPEC_TOO_LARGE` and no output at all
+  when the re-serialized result exceeds 1 MiB.
 - `multidb init --guided --profile <p> --override path=value...
   [--profile-name <slug>]` writes a version 2 spec with a `custom_profile`
   that extends `<p>`. Without `--override` guided init is unchanged.
@@ -169,6 +172,19 @@ All notable public changes will be recorded here.
   2). Control Plane request bodies over 1 MiB stay HTTP 400 `invalid_json`
   from the router's body limit, and JSON bodies cannot reach
   `SPEC_TOO_COMPLEX`.
+- The SQL parser limits of `QueryExecutionConfig` (the `query.max_sql_bytes`,
+  `max_statements`, `max_values_rows` and `parser_recursion_limit` knobs) now
+  bind the pre-parses of `Database::query` (the PostgreSQL compatibility
+  queries), `query_as` and `query_as_of_as` (RBAC) and `query_as_of`
+  (temporal retention), which used sqlparser's defaults (recursion depth 50,
+  no size or statement limits): a configured lower limit fails every path
+  with the same parser error, `SELECT version()` and the catalog views no
+  longer bypass `max_sql_bytes`, and statements multidb executes itself, such
+  as `INSERT` and indexed equality lookups, may nest to the configured depth
+  through `query` and `query_as`. DataFusion still parses the SELECTs it
+  plans with its own fixed recursion limit of 50. `compat::execute_compat_sql`
+  and `compat::compat_sql_requirements` take the `QueryExecutionConfig` whose
+  limits they apply.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
   with `StorageFormatMismatch` (previously an opaque serde error). Every
