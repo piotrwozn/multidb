@@ -2038,7 +2038,11 @@ fn commit_records_after(
 fn provision_records_round_trip_and_history_keeps_the_newest_entries()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = create_database(DbConfig::new(Profile::InMemory))?;
-    assert!(database.provision_history()?.is_empty());
+    let history = database.provision_history()?;
+    assert!(
+        history.is_empty(),
+        "expected an empty value, got {history:?}"
+    );
 
     for at_millis in 1..=105_u64 {
         let record = provision_record(&format!("prov_{at_millis}"));

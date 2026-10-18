@@ -401,7 +401,7 @@ fn new_database_plan_is_deterministic_ordered_ready_and_auto_approvable() -> Tes
         plan.required_confirmation.as_deref(),
         Some(plan.plan_id.as_str())
     );
-    assert!(plan.required_flags.is_empty());
+    assert_eq!(plan.required_flags, Vec::<String>::new());
     assert_eq!(plan.target.kind, TargetKind::NewDatabase);
     assert_eq!(plan.target.storage_profile, Some(Profile::Balanced));
     assert_eq!(plan.target.schema_version, Some(1));
@@ -1087,37 +1087,6 @@ fn unsupported_scopes_and_surfaces_block_the_plan() -> TestResult {
         |issue| issue.path == "topology" && issue.suggestion.contains("repl::start_cp_cluster")
     ));
 
-    // The public CP cluster constructors fail closed, so no CP handle reaches the planner from
-    // outside the crate; the in-crate simulated one is refused before anything is planned.
-    let cluster_config = || {
-        CpClusterConfig::new(
-            1,
-            "127.0.0.1:7101",
-            vec![
-                RaftNode::new(1, "127.0.0.1:7101"),
-                RaftNode::new(2, "127.0.0.1:7102"),
-                RaftNode::new(3, "127.0.0.1:7103"),
-            ],
-        )
-        .with_transport(InternalTransportConfig::new(
-            "127.0.0.1:7101",
-            InternalTransportSecurity::PlaintextForTests,
-        ))
-    };
-    assert!(matches!(
-        create_cluster_database(DbConfig::new(Profile::InMemory), cluster_config()),
-        Err(ConfigError::Unsupported(_))
-    ));
-    let simulated =
-        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cluster_config())?;
-    assert!(matches!(
-        plan_open(&orders_spec()?, &simulated),
-        Err(ProvisionError::Db(DbError::Config(
-            ConfigError::Unsupported(_)
-        )))
-    ));
-    drop(simulated);
-
     let mut ap = orders_spec()?;
     ap.defaults.replication = ReplicationMode::Ap;
     ap.guarantees.conflict_resolution = ConflictResolution::VectorClock;
@@ -1178,6 +1147,41 @@ fn unsupported_scopes_and_surfaces_block_the_plan() -> TestResult {
         |step| step.kind == ProvisionStepKind::RecordMetadata && step.path == "extensions"
     ));
     assert!(!path.exists());
+    Ok(())
+}
+
+/// The public CP cluster constructors fail closed, so no CP handle reaches the planner from
+/// outside the crate; the in-crate simulated one is refused before anything is planned.
+#[test]
+fn cp_cluster_handles_never_reach_the_planner() -> TestResult {
+    let cluster_config = || {
+        CpClusterConfig::new(
+            1,
+            "127.0.0.1:7101",
+            vec![
+                RaftNode::new(1, "127.0.0.1:7101"),
+                RaftNode::new(2, "127.0.0.1:7102"),
+                RaftNode::new(3, "127.0.0.1:7103"),
+            ],
+        )
+        .with_transport(InternalTransportConfig::new(
+            "127.0.0.1:7101",
+            InternalTransportSecurity::PlaintextForTests,
+        ))
+    };
+    assert!(matches!(
+        create_cluster_database(DbConfig::new(Profile::InMemory), cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let simulated =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cluster_config())?;
+    assert!(matches!(
+        plan_open(&orders_spec()?, &simulated),
+        Err(ProvisionError::Db(DbError::Config(
+            ConfigError::Unsupported(_)
+        )))
+    ));
+    drop(simulated);
     Ok(())
 }
 
@@ -1249,7 +1253,11 @@ fn specs_provisioning_cannot_build_are_blocked() -> TestResult {
         let plan = plan_path(&named, &path, ProvisionSurface::Cli)?;
         assert!(!plan.validation.valid, "{name}");
         assert_blocked(&plan, code);
-        assert!(plan.steps.is_empty());
+        assert!(
+            plan.steps.is_empty(),
+            "expected an empty value, got {:?}",
+            plan.steps
+        );
     }
 
     let plan = plan_provision(
@@ -1326,18 +1334,6 @@ fn live_state_problems_block_the_plan() -> TestResult {
         DbConfig::on_disk(Profile::Balanced, &stale_path),
         OperationalConfig::new().with_security(security),
     )?);
-    // Plain openers reload the persisted RBAC state, so a plainly opened handle is not stale;
-    // an RBAC change held only in memory (set_authz_policy does not persist) makes it stale.
-    let mut plainly_opened = open_database(DbConfig::on_disk(Profile::Balanced, &stale_path))?;
-    let plan = plan_open(&empty, &plainly_opened)?;
-    assert!(!issue_codes(&plan).contains(&"PROVISION_SECURITY_STATE_STALE"));
-    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
-    plainly_opened.set_authz_policy(AuthzPolicy::default());
-    assert_blocked(
-        &plan_open(&empty, &plainly_opened)?,
-        "PROVISION_SECURITY_STATE_STALE",
-    );
-    drop(plainly_opened);
     let loaded = open_database_with_ops(
         DbConfig::on_disk(Profile::Balanced, &stale_path),
         &OperationalConfig::new(),
@@ -1395,6 +1391,36 @@ fn live_state_problems_block_the_plan() -> TestResult {
         plan_path(&empty, &stale_path, ProvisionSurface::Cli),
         Err(ProvisionError::AlreadyInitialized)
     ));
+    Ok(())
+}
+
+/// Every opener loads the persisted RBAC state, so only an RBAC change held in memory
+/// (`set_authz_policy` does not persist) makes a handle stale.
+#[test]
+fn only_in_memory_rbac_changes_make_a_handle_stale() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let empty = spec("balanced", &json!([]))?;
+    let stale_path = temp_dir.path().join("stale.redb");
+    let security = SecurityConfig {
+        authz_policy: AuthzPolicy::new([
+            Role::new("reader").grant(Resource::Collection("orders".to_owned()), Permission::Read)
+        ]),
+        ..SecurityConfig::default()
+    };
+    drop(create_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &stale_path),
+        OperationalConfig::new().with_security(security),
+    )?);
+    let mut plainly_opened = open_database(DbConfig::on_disk(Profile::Balanced, &stale_path))?;
+    let plan = plan_open(&empty, &plainly_opened)?;
+    assert!(!issue_codes(&plan).contains(&"PROVISION_SECURITY_STATE_STALE"));
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    plainly_opened.set_authz_policy(AuthzPolicy::default());
+    assert_blocked(
+        &plan_open(&empty, &plainly_opened)?,
+        "PROVISION_SECURITY_STATE_STALE",
+    );
+    drop(plainly_opened);
     Ok(())
 }
 
@@ -2156,7 +2182,7 @@ fn dry_runs_never_write() -> TestResult {
     spec.guarantees.audit.enabled = false;
     spec.guarantees.backup.enabled = true;
     let plan = plan_open(&spec, &db)?;
-    assert!(!plan.steps.is_empty());
+    assert!(!plan.steps.is_empty(), "expected a non-empty value");
     drift(&db, &spec, &ProvisionOptions::default())?;
     export_spec(&db)?;
     assert_eq!(ranges(&db, &tables)?, before);
@@ -2949,7 +2975,11 @@ fn applying_again_is_a_noop_without_audit_events_and_drift_is_in_sync() -> TestR
 
     let plan = plan_open(&spec, &db)?;
     assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.steps);
-    assert!(plan.steps.is_empty());
+    assert!(
+        plan.steps.is_empty(),
+        "expected an empty value, got {:?}",
+        plan.steps
+    );
     assert!(plan.required_confirmation.is_none());
     for confirmation in [
         Confirmation::PlanId(plan.plan_id.clone()),
@@ -2965,7 +2995,11 @@ fn applying_again_is_a_noop_without_audit_events_and_drift_is_in_sync() -> TestR
         )?;
         assert_eq!(report.status, ProvisionOutcome::Noop);
         assert!(!report.check.data_mutated && !report.check.audit_recorded);
-        assert!(report.applied_steps.is_empty());
+        assert!(
+            report.applied_steps.is_empty(),
+            "expected an empty value, got {:?}",
+            report.applied_steps
+        );
         assert_eq!(
             report.record.as_ref().map(|summary| summary.objects),
             Some(9)
@@ -3382,7 +3416,10 @@ fn an_unfinished_apply_does_not_carry_its_weakened_guarantees() -> TestResult {
             .any(|step| step.kind == ProvisionStepKind::RecordGuarantees && step.path == flag)
     );
     let spec_migration = resumed.spec_migration.ok_or("a spec migration")?;
-    assert!(!spec_migration.steps.is_empty());
+    assert!(
+        !spec_migration.steps.is_empty(),
+        "expected a non-empty value"
+    );
 
     assert_applied(&apply_as(&mut db, &embedded, &relaxed, &allow, &rust)?);
     let record = db.provision_state()?.ok_or("a provision record")?;

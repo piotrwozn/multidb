@@ -1000,7 +1000,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["id", "bucket", "metric", "value"]
         );
-        assert!(aggregates.table_indexes.is_empty());
+        assert!(
+            aggregates.table_indexes.is_empty(),
+            "expected an empty value, got {:?}",
+            aggregates.table_indexes
+        );
 
         let desktop = materialize_template("desktop-embedded", "Desk", TemplateOutputFormat::Yaml)?;
         let usage = desktop.spec.collections[3]
