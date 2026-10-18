@@ -51,7 +51,7 @@ use crate::security::{
 use crate::storage::{EngineKind, ReadTransaction, RedbEngine, StorageEngine};
 use crate::temporal::TemporalRetention;
 use crate::text::FullTextIndexConfig;
-use crate::timeseries::TimeSeriesConfig;
+use crate::timeseries::{TimePoint, TimeSeriesConfig};
 use crate::txn;
 use crate::vector::{VectorCollectionConfig, VectorMetric};
 
@@ -2833,6 +2833,10 @@ async fn executor_builds_every_object_kind() -> TestResult {
             Some(CatalogEntry::TimeSeries { config }) => {
                 assert_eq!(config.chunk_millis, 3_600_000);
                 assert_eq!(config.retention_millis, None);
+                assert_eq!(
+                    config.max_future_skew_millis,
+                    crate::timeseries::DEFAULT_MAX_FUTURE_SKEW_MILLIS
+                );
             }
             other => return Err(format!("metrics: {other:?}").into()),
         }
@@ -3951,6 +3955,115 @@ fn rbac_changes_only_managed_names_in_one_batch() -> TestResult {
     assert!(db.authz_policy().roles().contains_key("auditor"));
     assert_eq!(db.principal_for_user("admin"), admin);
     assert_eq!(plan_open(&base, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+/// `physical.max_future_skew_millis` is created, enforced, compared and exported end to end. A
+/// series persisted before the bound existed accepts any future timestamp: it conflicts with a
+/// spec that leaves the bound at its default, and its export pins it, so the export adopts it.
+#[test]
+fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let series = |physical: JsonValue| {
+        spec(
+            "balanced",
+            &json!([{
+                "name": "metrics", "role": "time_series", "domain": "primary",
+                "indexes": ["time_series"], "physical": physical
+            }]),
+        )
+    };
+    let skew_of = |db: &Database| match db.catalog().get("metrics") {
+        Some(CatalogEntry::TimeSeries { config }) => Some(config.max_future_skew_millis),
+        _ => None,
+    };
+    let strict = series(json!({ "max_future_skew_millis": 0 }))?;
+    let mut db = create_with_profile(&temp_dir.path().join("skew.redb"), &strict)?;
+    assert_applied(&apply_cli(&mut db, &strict, &ProvisionOptions::default())?);
+    assert_eq!(skew_of(&db), Some(0));
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let metrics = db.time_series("metrics")?;
+    metrics.insert_point(
+        "cpu",
+        TimePoint {
+            timestamp_millis: now - 1_000,
+            value: 1.0,
+        },
+    )?;
+    assert!(
+        metrics
+            .insert_point(
+                "cpu",
+                TimePoint {
+                    timestamp_millis: now + 60_000,
+                    value: 2.0,
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(plan_open(&strict, &db)?.outcome, PlanOutcome::Noop);
+
+    // Any other bound, the default one included, is a conflict: there is no alter API.
+    for other in [
+        series(json!({}))?,
+        series(json!({ "max_future_skew_millis": 5_000 }))?,
+    ] {
+        let plan = plan_open(&other, &db)?;
+        assert_blocked(&plan, "PROVISION_OBJECT_CONFLICT");
+        let object = plan
+            .objects
+            .iter()
+            .find(|object| object.name == "metrics")
+            .ok_or("metrics")?;
+        assert_eq!(
+            object
+                .diff
+                .iter()
+                .map(|diff| diff.field.as_str())
+                .collect::<Vec<_>>(),
+            ["max_future_skew_millis"]
+        );
+    }
+    drop(db);
+
+    let defaulted = series(json!({}))?;
+    let mut legacy = create_with_profile(&temp_dir.path().join("legacy.redb"), &defaulted)?;
+    legacy.create_time_series(
+        TimeSeriesConfig::new("metrics")
+            .with_chunk_millis(3_600_000)
+            .with_max_future_skew_millis(i64::MAX),
+    )?;
+    assert_blocked(
+        &plan_open(&defaulted, &legacy)?,
+        "PROVISION_OBJECT_CONFLICT",
+    );
+    let exported = export_spec(&legacy)?;
+    assert_eq!(
+        exported.spec.collections[0]
+            .physical
+            .as_ref()
+            .and_then(|physical| physical.max_future_skew_millis),
+        Some(i64::MAX)
+    );
+    assert!(
+        exported
+            .notes
+            .iter()
+            .any(|note| note.contains("accepts any of them")),
+        "{:#?}",
+        exported.notes
+    );
+    let plan = plan_open(&exported.spec, &legacy)?;
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    assert!(has_step(
+        &plan,
+        ProvisionStepKind::AdoptObject,
+        StepSafety::Additive
+    ));
     Ok(())
 }
 

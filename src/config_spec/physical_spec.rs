@@ -32,6 +32,9 @@ pub const MAX_VECTOR_DIM: u32 = 65_536;
 pub const MIN_CHUNK_MILLIS: i64 = 1_000;
 /// The widest time-series chunk a spec may declare: 31 days.
 pub const MAX_CHUNK_MILLIS: i64 = 2_678_400_000;
+/// Time-series future-skew bound when `physical.max_future_skew_millis` is not set: the
+/// runtime default for new collections, [`crate::timeseries::DEFAULT_MAX_FUTURE_SKEW_MILLIS`].
+pub const DEFAULT_MAX_FUTURE_SKEW_MILLIS: i64 = crate::timeseries::DEFAULT_MAX_FUTURE_SKEW_MILLIS;
 /// The most segments a field path may have.
 pub const MAX_PATH_SEGMENTS: usize = 16;
 /// The field path of the generated document id, allowed for `physical.fields` only.
@@ -145,7 +148,9 @@ pub struct PhysicalObjectSpec {
         deserialize_with = "retention_not_null"
     )]
     pub retention_millis: Option<i64>,
-    /// Time series: reserved; this build's runtime has no future-skew bound.
+    /// Time series: how far ahead of the server clock a point's timestamp may lie, at least 0;
+    /// later points are refused. Defaults to [`DEFAULT_MAX_FUTURE_SKEW_MILLIS`], and is fixed
+    /// at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_future_skew_millis: Option<i64>,
     /// Graph: a pinned graph id. Unpinned ids are allocated at apply time.
@@ -407,6 +412,7 @@ pub(crate) enum PlannedKind {
     TimeSeries {
         chunk_millis: i64,
         retention_millis: Option<i64>,
+        max_future_skew_millis: i64,
     },
     Graph {
         graph_id: Option<u32>,
@@ -1578,17 +1584,17 @@ impl Planner<'_> {
                 );
             }
         }
-        if physical.max_future_skew_millis.is_some() {
-            self.push(
-                Class::Physical,
-                context.checked,
-                "PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME",
-                context.path("max_future_skew_millis"),
+        let max_future_skew_millis = physical
+            .max_future_skew_millis
+            .unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MILLIS);
+        if max_future_skew_millis < 0 {
+            self.time_series_invalid(
+                context,
+                "max_future_skew_millis",
                 format!(
-                    "time series {name} sets max_future_skew_millis, which this build's runtime \
-                     does not support"
+                    "time series {name} has max_future_skew_millis {max_future_skew_millis}; it \
+                     cannot be negative"
                 ),
-                "Remove physical.max_future_skew_millis.",
             );
         }
         self.objects.push(PlannedObject {
@@ -1598,6 +1604,7 @@ impl Planner<'_> {
             kind: PlannedKind::TimeSeries {
                 chunk_millis,
                 retention_millis,
+                max_future_skew_millis,
             },
         });
     }
@@ -1614,8 +1621,8 @@ impl Planner<'_> {
             "TIME_SERIES_PARAMS_INVALID",
             context.path(field),
             message,
-            "Use chunk_millis between 1000 and 2678400000, and a retention_millis of at least \
-             one chunk (or none).",
+            "Use chunk_millis between 1000 and 2678400000, a positive retention_millis of at \
+             least one chunk (or none), and a max_future_skew_millis of at least 0.",
         );
     }
 
@@ -1810,6 +1817,7 @@ fn default_container(kind: PhysicalKind) -> PlannedKind {
         PhysicalKind::TimeSeries => PlannedKind::TimeSeries {
             chunk_millis: 3_600_000,
             retention_millis: None,
+            max_future_skew_millis: DEFAULT_MAX_FUTURE_SKEW_MILLIS,
         },
         PhysicalKind::Graph => PlannedKind::Graph { graph_id: None },
     }

@@ -2716,6 +2716,7 @@ fn other_differences(
             DesiredKind::TimeSeries {
                 chunk_millis,
                 retention_millis,
+                max_future_skew_millis,
             },
             CatalogEntry::TimeSeries { config },
         ) => {
@@ -2723,6 +2724,10 @@ fn other_differences(
             differs(
                 "retention_millis",
                 *retention_millis != config.retention_millis,
+            );
+            differs(
+                "max_future_skew_millis",
+                *max_future_skew_millis != config.max_future_skew_millis,
             );
         }
         (DesiredKind::Graph { graph_id }, CatalogEntry::Graph { graph_id: live_id }) => differs(

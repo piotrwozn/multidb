@@ -6832,8 +6832,8 @@ mod tests {
                 "collections[0].physical.retention_millis",
             ),
             (
-                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "max_future_skew_millis": 5_000 } }]),
-                "PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME",
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "max_future_skew_millis": -1 } }]),
+                "TIME_SERIES_PARAMS_INVALID",
                 "collections[0].physical.max_future_skew_millis",
             ),
             (
@@ -6914,6 +6914,21 @@ mod tests {
             };
             assert_eq!(issue.severity, ValidationSeverity::Error, "{code} {path}");
             assert!(!report.valid, "{code} {path}");
+        }
+
+        // As in the runtime, any future-skew bound of at least 0 is accepted.
+        for skew in [0, 5_000, i64::MAX] {
+            let report = GuaranteeValidator::validate(&v2_spec_with(
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "max_future_skew_millis": skew } }]),
+            )?);
+            assert!(
+                !report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.path.contains("max_future_skew_millis")),
+                "{skew}: {:#?}",
+                report.issues
+            );
         }
 
         let mut pk = v2_spec_with(table(json!({ "columns": columns, "primary_key": "ids" })))?;

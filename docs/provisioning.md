@@ -99,7 +99,7 @@ Every collection becomes exactly one container object. Its kind is
 | `document` | `create_collection`, or `create_collection_auto_id` without a pinned id | `collection_id`; `fields` (`{name, path, type}`, empty means one field `id` holding the document id); `document_indexes` (`{path, id}`) |
 | `table` | `Database::create_table_with_layout` | `layout` (analytics: columnar; otherwise the database layout); `columns` (`{name, type, nullable: false}`; empty means a schemaless row table); `primary_key`; `table_indexes` (`{column, expression: column \| lower_ascii, include, id}`); `system_versioning`, `keep_history` |
 | `vector` | `create_vector_collection`, or `_auto_id` | `collection_id`; `dim` (1..=65536, required); `metric` (`cosine` \| `l2`, cosine); `hnsw` (`m` 1..=255, `ef_construction` >= m, `ef_search` >= 1; 16/200/48) |
-| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; left out it takes the knob, and an explicit `null` is refused when the spec is decoded, since it could mean either the knob or no retention, so a series cannot ask for no retention when its profile sets a default retention) |
+| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; left out it takes the knob, and an explicit `null` is refused when the spec is decoded, since it could mean either the knob or no retention, so a series cannot ask for no retention when its profile sets a default retention); `max_future_skew_millis` (at least 0; 300000, the runtime default for new series, when left out): how far ahead of the server clock a point's timestamp may lie, later points are refused |
 | `graph` | `create_graph`, or `create_graph_auto_id` | `graph_id` |
 
 A document collection also derives:
@@ -124,9 +124,16 @@ table; `keep_history` defaults to `history.keep_history`.
 
 Field types are `int`, `float`, `str`, `bool` and `bytes`. The full-text
 `language` accepts only `simple`, because this build tokenizes every language
-the same way. `physical.max_future_skew_millis` is reserved: the runtime has no
-future-skew bound yet, so it is refused with
-`PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME`.
+the same way.
+
+Time-series parameters follow the runtime's rules, and a breach is
+`TIME_SERIES_PARAMS_INVALID`: `retention_millis` must be positive and at
+least one chunk, and `max_future_skew_millis` at least 0. All three are fixed
+at creation and compared on every plan, the future-skew bound included, so a
+series whose bound differs from the spec (also from the 300000 default when
+the spec leaves it out) is an object conflict. A series created before the
+runtime bounded future timestamps accepts any of them: its bound reads as
+9223372036854775807 (`i64::MAX`), which `export_spec` pins, with a note.
 
 These defaults are pinned by tests: a later build projects the same objects from
 the same spec, so upgrading never creates false drift.
@@ -494,7 +501,8 @@ resolves it.
   vector collections `vector_memory`, row tables `document_entity` with
   `kind: table`, columnar tables `analytics`, time series `time_series` and
   graphs `graph`; full-text and geo indexes and history tables attach to
-  their source; every id and index id is pinned. The profile is the
+  their source; every id and index id is pinned, as are the chunk, the
+  retention and the future-skew bound of a time series. The profile is the
   manifest's (a custom profile is rebuilt from its knobs; its description is
   lost), or the storage profile alias for a legacy database. RBAC is exported
   minus the bootstrap administrator. Audit and encryption follow the

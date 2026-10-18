@@ -66,6 +66,7 @@ pub enum DesiredKind {
     TimeSeries {
         chunk_millis: i64,
         retention_millis: Option<i64>,
+        max_future_skew_millis: i64,
     },
     /// `create_graph` (pinned id) or `create_graph_auto_id`.
     Graph { graph_id: Option<GraphId> },
@@ -132,7 +133,8 @@ impl DesiredObject {
             DesiredKind::TimeSeries {
                 chunk_millis,
                 retention_millis,
-            } => time_series_json(*chunk_millis, *retention_millis),
+                max_future_skew_millis,
+            } => time_series_json(*chunk_millis, *retention_millis, *max_future_skew_millis),
             DesiredKind::Graph { graph_id } => graph_json(graph_id.map(GraphId::as_u32)),
             DesiredKind::FullText {
                 source,
@@ -228,9 +230,11 @@ pub(crate) fn live_params_json(
                 config.refresh_lag_target,
             )
         }
-        CatalogEntry::TimeSeries { config } => {
-            time_series_json(config.chunk_millis, config.retention_millis)
-        }
+        CatalogEntry::TimeSeries { config } => time_series_json(
+            config.chunk_millis,
+            config.retention_millis,
+            config.max_future_skew_millis,
+        ),
         CatalogEntry::Graph { graph_id } => graph_json(Some(graph_id.as_u32())),
         CatalogEntry::GeoIndex { config } => geo_json(
             &source_name(catalog, config.collection_id),
@@ -301,11 +305,16 @@ fn vector_json(
     })
 }
 
-fn time_series_json(chunk_millis: i64, retention_millis: Option<i64>) -> JsonValue {
+fn time_series_json(
+    chunk_millis: i64,
+    retention_millis: Option<i64>,
+    max_future_skew_millis: i64,
+) -> JsonValue {
     json!({
         "kind": "time_series",
         "chunk_millis": chunk_millis,
         "retention_millis": retention_millis,
+        "max_future_skew_millis": max_future_skew_millis,
     })
 }
 
@@ -352,11 +361,14 @@ pub fn time_series_config(name: &str, desired: &DesiredKind) -> Option<TimeSerie
     let DesiredKind::TimeSeries {
         chunk_millis,
         retention_millis,
+        max_future_skew_millis,
     } = desired
     else {
         return None;
     };
-    let config = TimeSeriesConfig::new(name).with_chunk_millis(*chunk_millis);
+    let config = TimeSeriesConfig::new(name)
+        .with_chunk_millis(*chunk_millis)
+        .with_max_future_skew_millis(*max_future_skew_millis);
     Some(match retention_millis {
         Some(retention) => config.with_retention_millis(*retention),
         None => config,
@@ -449,9 +461,11 @@ fn desired_object(planned: PlannedObject) -> Result<DesiredObject, ValidationIss
         PlannedKind::TimeSeries {
             chunk_millis,
             retention_millis,
+            max_future_skew_millis,
         } => DesiredKind::TimeSeries {
             chunk_millis,
             retention_millis,
+            max_future_skew_millis,
         },
         PlannedKind::Graph { graph_id } => DesiredKind::Graph {
             graph_id: graph_id.map(GraphId::new),
@@ -784,6 +798,7 @@ mod tests {
                     "kind": "time_series",
                     "chunk_millis": 3_600_000,
                     "retention_millis": null,
+                    "max_future_skew_millis": 300_000,
                 }),
             ),
             PhysicalKind::Graph => (
@@ -1253,6 +1268,7 @@ mod tests {
                 DesiredKind::TimeSeries {
                     chunk_millis: 3_600_000,
                     retention_millis: None,
+                    max_future_skew_millis: crate::timeseries::DEFAULT_MAX_FUTURE_SKEW_MILLIS,
                 },
             ]
         );
@@ -1267,6 +1283,10 @@ mod tests {
         let config = time_series_config("metrics", &objects[4].kind).ok_or("time series")?;
         assert_eq!(config.chunk_millis, 3_600_000);
         assert_eq!(config.retention_millis, None);
+        assert_eq!(
+            config.max_future_skew_millis,
+            crate::timeseries::DEFAULT_MAX_FUTURE_SKEW_MILLIS
+        );
         assert!(time_series_config("notes", &objects[0].kind).is_none());
         Ok(())
     }
@@ -1318,6 +1338,33 @@ mod tests {
                 base_table: "ledger".to_owned(),
                 keep_history: false,
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_future_skew_bound_reaches_the_time_series_config() -> TestResult {
+        let skewed = |skew: i64| {
+            v2_spec(
+                "balanced",
+                &[json!({
+                    "name": "metrics", "role": "time_series", "indexes": ["time_series"],
+                    "physical": { "max_future_skew_millis": skew }
+                })],
+            )
+        };
+        for skew in [0, 5_000, i64::MAX] {
+            let objects = projected(&skewed(skew)?)?;
+            assert_eq!(objects[0].params_json()["max_future_skew_millis"], skew);
+            let config = time_series_config("metrics", &objects[0].kind).ok_or("time series")?;
+            assert_eq!(config.max_future_skew_millis, skew);
+        }
+        assert_eq!(
+            rejected(&skewed(-1)?)?,
+            [pair(
+                "TIME_SERIES_PARAMS_INVALID",
+                "collections[0].physical.max_future_skew_millis"
+            )]
         );
         Ok(())
     }

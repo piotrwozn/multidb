@@ -438,6 +438,14 @@ fn container_collection(
                      retention\" when the profile sets time_series.default_retention_millis"
                 ));
             }
+            if config.max_future_skew_millis == i64::MAX {
+                findings.notes.push(format!(
+                    "time series {name} was created before time series bounded future \
+                     timestamps, so it accepts any of them; the spec pins \
+                     max_future_skew_millis {}",
+                    i64::MAX
+                ));
+            }
             Some(collection_spec(
                 name,
                 CollectionRole::TimeSeries,
@@ -446,6 +454,7 @@ fn container_collection(
                     kind: Some(PhysicalKind::TimeSeries),
                     chunk_millis: Some(config.chunk_millis),
                     retention_millis: config.retention_millis,
+                    max_future_skew_millis: Some(config.max_future_skew_millis),
                     ..PhysicalObjectSpec::default()
                 },
             ))

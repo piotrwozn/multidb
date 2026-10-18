@@ -303,8 +303,9 @@ fn physical_schema() -> JsonValue {
                 "minimum": 1
             },
             "max_future_skew_millis": {
-                "description": "time_series: reserved; refused until the runtime supports a future-skew bound.",
-                "type": "integer"
+                "description": "time_series: how far ahead of the server clock a point's timestamp may lie; later points are refused. Defaults to 300000, fixed at creation.",
+                "type": "integer",
+                "minimum": 0
             },
             "graph_id": id_schema("graph: a pinned graph id; unpinned ids are allocated at creation.")
         }

@@ -544,7 +544,8 @@
           "type": "string"
         },
         "max_future_skew_millis": {
-          "description": "time_series: reserved; refused until the runtime supports a future-skew bound.",
+          "description": "time_series: how far ahead of the server clock a point's timestamp may lie; later points are refused. Defaults to 300000, fixed at creation.",
+          "minimum": 0,
           "type": "integer"
         },
         "metric": {

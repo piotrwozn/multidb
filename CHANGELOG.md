@@ -210,9 +210,13 @@ All notable public changes will be recorded here.
   2 Warnings `SECURITY_BROAD_GRANT` (every grant on the whole database,
   which in this build also covers system reads, writes or administration) and
   `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
-  `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME` also covers
-  `physical.max_future_skew_millis` and full-text languages other than
-  `simple`.
+  `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME` also covers full-text languages
+  other than `simple`. `TIME_SERIES_PARAMS_INVALID` follows the runtime's
+  time-series rules: a positive `retention_millis` of at least one chunk and
+  a `physical.max_future_skew_millis` of at least 0. The future-skew bound
+  defaults to the runtime default for new series (300000 ms), is set at
+  creation, compared by every plan and pinned by `export_spec` (a series
+  created before the bound existed exports `i64::MAX`, with a note).
 - `database_spec_v2_schema()` and `docs/schemas/database-spec-v2.schema.json`
   describe `physical`, `security`, `provisioning` and `geo`.
 - `multidb::provision::physical::project`, which projects a spec onto the
