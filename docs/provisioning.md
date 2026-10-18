@@ -796,20 +796,18 @@ A startup apply that fails part-way leaves the steps before the failed one
 applied and a `failed` record, and `serve` does not start; the next start sees
 the interrupted apply, which only `additive` resumes. After provisioning, the
 admin password bootstrap runs as before; its `admin` and `root` names are
-reserved, so provisioning never touches them.
+reserved, so provisioning never touches them. The roles and principals
+provisioning applied survive any restart, with or without spec mode: every
+opener loads the persisted RBAC state, and the bootstrap only adds the
+reserved `admin` role and principal when they are missing.
 
-**Known limits:**
-
-- Audit is chained with the development key (`enforced_with_development_key`
-  and `AUDIT_DEVELOPMENT_KEY`): `serve` has no audit key setting. A database
-  whose audit chain was written with a configured key (on the Rust API) is
-  refused with `PROVISION_AUDIT_KEY_MISMATCH` whenever a start would change
-  it, and `serve` itself appends its admin events with the development key,
-  so serve such a database only after deciding to give up its keyed chain.
-- The roles and principals provisioning applied survive any restart, with or
-  without spec mode: every opener loads the persisted RBAC state, and the
-  admin password bootstrap only adds the reserved `admin` role and principal
-  when they are missing.
+**Known limit:** audit is chained with the development key
+(`enforced_with_development_key` and `AUDIT_DEVELOPMENT_KEY`): `serve` has no
+audit key setting. A database whose audit chain was written with a configured
+key (on the Rust API) is refused with `PROVISION_AUDIT_KEY_MISMATCH` whenever
+a start would change it, and `serve` itself appends its admin events with the
+development key, so serve such a database only after deciding to give up its
+keyed chain.
 
 **Embedded apps** use `open_from_spec(spec, path, mode, options, environment)`
 with the same decision table on the `rust_api` surface, as `local:embedded`.
