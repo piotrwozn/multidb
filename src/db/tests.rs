@@ -6,7 +6,8 @@ use super::{
     ShardedDatabaseConfig, create_ap_database, create_cluster_database, create_database,
     create_database_with_ops, create_sharded_database, engine_for, engine_for_operational,
     force_wasm_runtime_init_failure, layout_for, open_ap_database, open_cluster_database,
-    open_database, open_database_with_ops, profile_validation_report, validate,
+    open_database, open_database_with_ops, open_sharded_database, profile_validation_report,
+    validate,
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
@@ -870,6 +871,186 @@ async fn old_database_without_authz_opens_default_deny() -> Result<(), Box<dyn s
             .query_as(&Principal::new("alice"), "SELECT name FROM users")
             .await,
         Err(DbError::AuthzDenied(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn serve_reopen_keeps_persisted_security_state() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("serve-security.redb");
+    let admin = Principal::new("admin").with_role("admin");
+    let alice = Principal::new("alice").with_role("reader");
+
+    {
+        let mut database = create_database(DbConfig::on_disk(Profile::Transactional, &path))?;
+        seed_orders(&mut database)?;
+        database.ensure_bootstrap_admin_principal()?;
+        let stored_admin = database
+            .authz_policy()
+            .roles()
+            .get("admin")
+            .cloned()
+            .ok_or("missing bootstrap admin role")?;
+        database.set_authz_policy_as(
+            &admin,
+            AuthzPolicy::new([
+                stored_admin,
+                Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+            ]),
+        )?;
+        database.set_principal_registry_as(
+            &admin,
+            PrincipalRegistry::new().with_principal("alice", alice.clone()),
+        )?;
+        database.set_audit_enabled_as(&admin, false)?;
+    }
+
+    {
+        let mut database = create_database(DbConfig::on_disk(Profile::Transactional, &path))?;
+        assert!(database.authz_policy().roles().contains_key("reader"));
+        assert_eq!(database.principal_for_user("alice"), alice);
+        assert!(
+            !database
+                .principal_registry()
+                .principals()
+                .contains_key("admin")
+        );
+        assert!(!database.audit_enabled());
+        let principal = database.principal_for_user("alice");
+        assert!(matches!(
+            database
+                .query_as(&principal, "SELECT name FROM users")
+                .await?,
+            SqlOutput::Rows(_)
+        ));
+        database.ensure_bootstrap_admin_principal()?;
+    }
+
+    let database = open_database(DbConfig::on_disk(Profile::Transactional, &path))?;
+    assert_eq!(
+        database
+            .authz_policy()
+            .roles()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["admin", "reader"]
+    );
+    assert_eq!(database.principal_for_user("alice"), alice);
+    assert_eq!(database.principal_for_user("admin"), admin);
+    assert!(!database.audit_enabled());
+    let principal = database.principal_for_user("alice");
+    assert!(matches!(
+        database
+            .query_as(&principal, "SELECT name FROM users")
+            .await?,
+        SqlOutput::Rows(_)
+    ));
+    assert!(matches!(
+        database
+            .query_as(
+                &principal,
+                "INSERT INTO users (id, name, age) VALUES (3, 'Lin', 41)"
+            )
+            .await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn bootstrap_admin_merges_into_existing_security() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let users = Resource::Table("users".to_owned());
+    let reader = Role::new("reader").grant(users.clone(), Permission::Read);
+    let alice = Principal::new("alice").with_role("reader");
+    database.set_authz_policy(AuthzPolicy::new([
+        reader.clone(),
+        Role::new("admin").grant(users.clone(), Permission::Read),
+    ]));
+    database.set_principal_registry(
+        PrincipalRegistry::new()
+            .with_principal("alice", alice.clone())
+            .with_principal("admin", Principal::new("admin").with_role("ops")),
+    );
+    let initial_txn = database.read(
+        txn::TXN_META_TABLE,
+        txn::CURRENT_TXN_ID_KEY,
+        ReadConsistency::Strong,
+    )?;
+
+    database.ensure_bootstrap_admin_principal()?;
+
+    let policy = database.authz_policy();
+    assert_eq!(policy.roles().get("reader"), Some(&reader));
+    let admin_role = policy.roles().get("admin").ok_or("missing admin role")?;
+    assert!(
+        admin_role
+            .grants()
+            .get(&users)
+            .is_some_and(|permissions| permissions.contains(&Permission::Read))
+    );
+    let admin_member = Principal::new("member").with_role("admin");
+    policy.authorize(&admin_member, &Resource::System, Permission::Admin)?;
+    policy.authorize(&admin_member, &Resource::Database, Permission::Write)?;
+    assert_eq!(database.principal_for_user("alice"), alice);
+    assert_eq!(
+        database.principal_for_user("admin"),
+        Principal::new("admin").with_role("admin").with_role("ops")
+    );
+
+    let txn_after_merge = database.read(
+        txn::TXN_META_TABLE,
+        txn::CURRENT_TXN_ID_KEY,
+        ReadConsistency::Strong,
+    )?;
+    assert_ne!(txn_after_merge, initial_txn);
+    let policy_after_merge = database.authz_policy().clone();
+    let registry_after_merge = database.principal_registry().clone();
+
+    database.ensure_bootstrap_admin_principal()?;
+
+    assert_eq!(
+        database.read(
+            txn::TXN_META_TABLE,
+            txn::CURRENT_TXN_ID_KEY,
+            ReadConsistency::Strong,
+        )?,
+        txn_after_merge
+    );
+    assert_eq!(database.authz_policy(), &policy_after_merge);
+    assert_eq!(database.principal_registry(), &registry_after_merge);
+    Ok(())
+}
+
+#[test]
+fn plain_open_rejects_corrupt_persisted_security() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("corrupt-security.redb");
+    let config = DbConfig::on_disk(Profile::Transactional, &path);
+
+    {
+        let database = create_database(config.clone())?;
+        assert!(database.authz_policy().roles().is_empty());
+        assert!(database.principal_registry().principals().is_empty());
+        assert!(database.audit_enabled());
+    }
+
+    {
+        let engine = RedbEngine::open(&path)?;
+        let mut txn = engine.begin_write()?;
+        txn.put(super::AUTHZ_TABLE, super::KEY_AUTHZ_POLICY, b"not-json")?;
+        txn.commit()?;
+    }
+
+    assert!(matches!(
+        open_database(config.clone()),
+        Err(ConfigError::Serde(_))
+    ));
+    assert!(matches!(
+        create_database(config),
+        Err(ConfigError::Serde(_))
     ));
     Ok(())
 }
@@ -1751,6 +1932,47 @@ fn ap_database_persists_through_open() -> Result<(), Box<dyn std::error::Error>>
         Some(b"v".to_vec())
     );
     assert_eq!(database.read_conflict_versions("t", b"k")?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn cluster_openers_restore_persisted_security() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let cp_config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("cp-security.redb"));
+    {
+        let mut database = create_cluster_database(cp_config.clone(), cp_cluster_config())?;
+        persist_reader_security(&mut database)?;
+    }
+    let database = open_cluster_database(cp_config, cp_cluster_config())?;
+    assert_reader_security_restored(&database);
+    drop(database);
+
+    let ap_config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("ap-security.redb"))
+        .with_replication(ReplicationKind::Ap);
+    {
+        let mut database = create_ap_database(ap_config.clone(), ap_cluster_config())?;
+        persist_reader_security(&mut database)?;
+    }
+    let database = open_ap_database(ap_config, ap_cluster_config())?;
+    assert_reader_security_restored(&database);
+
+    Ok(())
+}
+
+#[test]
+fn sharded_openers_restore_persisted_security() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("router.redb"));
+
+    {
+        let mut database =
+            create_sharded_database(config.clone(), on_disk_sharded_config(temp_dir.path()))?;
+        persist_reader_security(&mut database)?;
+    }
+    let database = open_sharded_database(config, on_disk_sharded_config(temp_dir.path()))?;
+    assert_reader_security_restored(&database);
 
     Ok(())
 }
@@ -2976,6 +3198,29 @@ fn sharded_config() -> ShardedDatabaseConfig {
     )
 }
 
+fn on_disk_sharded_config(dir: &std::path::Path) -> ShardedDatabaseConfig {
+    ShardedDatabaseConfig::new(
+        PartitionStrategy::HashSlots { partitions: 16 },
+        1,
+        vec![
+            ShardSpec::new(
+                1,
+                ShardBackendConfig::Local(DbConfig::on_disk(
+                    Profile::Balanced,
+                    dir.join("s1.redb"),
+                )),
+            ),
+            ShardSpec::new(
+                2,
+                ShardBackendConfig::Local(DbConfig::on_disk(
+                    Profile::Balanced,
+                    dir.join("s2.redb"),
+                )),
+            ),
+        ],
+    )
+}
+
 fn security_for_alice_users_reader() -> SecurityConfig {
     let policy = AuthzPolicy::new([
         Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read)
@@ -2989,6 +3234,44 @@ fn security_for_alice_users_reader() -> SecurityConfig {
         audit_enabled: true,
         audit: super::AuditConfig::default(),
     }
+}
+
+/// Bootstraps the admin identity, then persists a reader role and an alice mapping as admin.
+fn persist_reader_security(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    database.ensure_bootstrap_admin_principal()?;
+    let admin = Principal::new("admin").with_role("admin");
+    let stored_admin = database
+        .authz_policy()
+        .roles()
+        .get("admin")
+        .cloned()
+        .ok_or("missing bootstrap admin role")?;
+    database.set_authz_policy_as(
+        &admin,
+        AuthzPolicy::new([
+            stored_admin,
+            Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+        ]),
+    )?;
+    database.set_principal_registry_as(
+        &admin,
+        PrincipalRegistry::new()
+            .with_principal("admin", admin.clone())
+            .with_principal("alice", Principal::new("alice").with_role("reader")),
+    )?;
+    Ok(())
+}
+
+fn assert_reader_security_restored(database: &Database) {
+    assert!(database.authz_policy().roles().contains_key("reader"));
+    assert_eq!(
+        database.principal_for_user("alice"),
+        Principal::new("alice").with_role("reader")
+    );
+    assert_eq!(
+        database.principal_for_user("admin"),
+        Principal::new("admin").with_role("admin")
+    );
 }
 
 fn assert_reserved_put_rejected(database: &Database, table: &str) {
