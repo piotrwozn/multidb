@@ -3,15 +3,17 @@ use std::{collections::BTreeMap, io, sync::Arc, thread};
 use super::{
     ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_LAYOUT, META_TABLE,
     OperationalConfig, Profile, ReplicationKind, SecurityConfig, ShardBackendConfig, ShardSpec,
-    ShardedDatabaseConfig, create_ap_database, create_cluster_database, create_database,
-    create_database_with_ops, create_sharded_database, engine_for, engine_for_operational,
+    ShardedDatabaseConfig, create_ap_database, create_cluster_database,
+    create_cluster_database_with_ops, create_database, create_database_with_ops,
+    create_sharded_database, create_simulated_cluster_database, engine_for, engine_for_operational,
     force_wasm_runtime_init_failure, layout_for, open_ap_database, open_cluster_database,
-    open_database, open_database_with_ops, open_sharded_database, profile_validation_report,
-    validate,
+    open_cluster_database_with_ops, open_database, open_database_with_ops, open_sharded_database,
+    open_simulated_cluster_database, profile_validation_report, validate,
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
-    HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewSpec, ResumeToken,
+    HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewError,
+    MaterializedViewSpec, ResumeToken, SubscriptionConfig,
 };
 use crate::cloud::ObjectStoreUri;
 use crate::config_spec::{ApplyStatus, ConsistencyMode, DatabaseSpec, MigrationPlanner};
@@ -22,7 +24,7 @@ use crate::extension::{
     AbiVersion, ExtensionError, LimitPolicy, MaskingPolicy, PolicyConfig, UdfBudget,
 };
 use crate::federation::{ForeignSource, ForeignTableOptions};
-use crate::geo::{GeoIndexConfig, GeoPoint};
+use crate::geo::{GeoError, GeoIndexConfig, GeoPoint};
 use crate::graph::{GraphId, GraphNodeId, TraversalOptions};
 use crate::model::{
     CollectionId, FieldPath, IndexId, IndexSpec, PlanKind, Predicate, Value, decode_value,
@@ -45,8 +47,8 @@ use crate::security::{
     PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{EngineKind, RedbEngine, StorageEngine, StorageError, WriteTransaction};
-use crate::temporal::{TemporalPoint, TemporalRetention};
-use crate::text::FullTextIndexConfig;
+use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
+use crate::text::{FullTextIndexConfig, TextError};
 use crate::timeseries::{TimePoint, TimeSeriesConfig, TimeSeriesError};
 use crate::tuning::{
     ParameterEnvelope, ReprofilePlan, ReprofileStatus, TunableParameter, TuningDecision,
@@ -1476,7 +1478,8 @@ fn public_writes_reject_reserved_keyspaces() -> Result<(), Box<dyn std::error::E
 
 #[test]
 fn cluster_backends_reject_public_reserved_keyspaces() -> Result<(), Box<dyn std::error::Error>> {
-    let cp = create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    let cp =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
     assert_reserved_put_rejected(&cp, AUDIT_TABLE);
     assert_reserved_condition_rejected(&cp, AUDIT_HEAD_TABLE);
 
@@ -1630,7 +1633,8 @@ fn self_healing_controller_is_only_available_for_cluster_backends()
         Err(DbError::Config(ConfigError::Unsupported(_)))
     ));
 
-    let cp = create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    let cp =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
     let cp_controller =
         cp.self_healing_controller(HealthConfig::default(), HealingPolicy::default())?;
     assert_eq!(cp_controller.backend.local_node_id(), 1);
@@ -1924,13 +1928,13 @@ fn cluster_database_rejects_even_voter_count() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
-fn cluster_database_persists_through_open() -> Result<(), Box<dyn std::error::Error>> {
+fn simulated_cluster_database_persists_through_open() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let path = temp_dir.path().join("cp-cluster.redb");
     let config = DbConfig::on_disk(Profile::Balanced, path);
 
     {
-        let database = create_cluster_database(config.clone(), cp_cluster_config())?;
+        let database = create_simulated_cluster_database(config.clone(), cp_cluster_config())?;
         database.propose(Op::Put {
             table: "t".to_owned(),
             key: b"k".to_vec(),
@@ -1938,13 +1942,83 @@ fn cluster_database_persists_through_open() -> Result<(), Box<dyn std::error::Er
         })?;
     }
 
-    let database = open_cluster_database(config, cp_cluster_config())?;
+    {
+        let database = open_simulated_cluster_database(config.clone(), cp_cluster_config())?;
+        assert_eq!(
+            database.read("t", b"k", ReadConsistency::Strong)?,
+            Some(b"v".to_vec())
+        );
+    }
+
+    let database = open_database(config)?;
     assert_eq!(
         database.read("t", b"k", ReadConsistency::Strong)?,
         Some(b"v".to_vec())
     );
 
     Ok(())
+}
+
+#[test]
+fn cluster_database_constructors_fail_closed_without_live_raft()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("cp-cluster.redb");
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+
+    match create_cluster_database(config.clone(), cp_cluster_config()) {
+        Err(ConfigError::Unsupported(message)) => {
+            assert!(message.contains("start_cp_cluster"));
+        }
+        Err(error) => panic!("expected unsupported cluster database, got {error}"),
+        Ok(_) => panic!("cluster database must fail closed without the live Raft runtime"),
+    }
+    assert!(!path.exists());
+    assert!(matches!(
+        open_cluster_database(config.clone(), cp_cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        create_cluster_database_with_ops(
+            config.clone(),
+            cp_cluster_config(),
+            OperationalConfig::new(),
+        ),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        open_cluster_database_with_ops(config, cp_cluster_config(), &OperationalConfig::new()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(!path.exists());
+
+    Ok(())
+}
+
+#[test]
+fn sharded_database_rejects_cp_shard_backends() {
+    let sharding = || {
+        ShardedDatabaseConfig::new(
+            PartitionStrategy::HashSlots { partitions: 16 },
+            1,
+            vec![ShardSpec::new(
+                1,
+                ShardBackendConfig::Cp {
+                    config: DbConfig::new(Profile::InMemory),
+                    cluster: cp_cluster_config(),
+                },
+            )],
+        )
+    };
+
+    assert!(matches!(
+        create_sharded_database(DbConfig::new(Profile::InMemory), sharding()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        open_sharded_database(DbConfig::new(Profile::InMemory), sharding()),
+        Err(ConfigError::Unsupported(_))
+    ));
 }
 
 #[test]
@@ -1986,10 +2060,11 @@ fn cluster_openers_restore_persisted_security() -> Result<(), Box<dyn std::error
 
     let cp_config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("cp-security.redb"));
     {
-        let mut database = create_cluster_database(cp_config.clone(), cp_cluster_config())?;
+        let mut database =
+            create_simulated_cluster_database(cp_config.clone(), cp_cluster_config())?;
         persist_reader_security(&mut database)?;
     }
-    let database = open_cluster_database(cp_config, cp_cluster_config())?;
+    let database = open_simulated_cluster_database(cp_config, cp_cluster_config())?;
     assert_reader_security_restored(&database);
     drop(database);
 
@@ -2032,6 +2107,197 @@ fn ap_database_rejects_snapshot_transactions() -> Result<(), Box<dyn std::error:
         database.begin_transaction(),
         Err(DbError::Config(ConfigError::Unsupported(_)))
     ));
+
+    Ok(())
+}
+
+#[test]
+fn ap_database_rejects_changefeeds_subscriptions_and_continuous_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = ap_database()?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    accounts.insert(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(37),
+    ])?;
+
+    assert!(matches!(
+        database.poll_changefeed(
+            &ResumeToken::default(),
+            &ChangefeedFilter::default(),
+            &ChangefeedOptions::default(),
+            10,
+        ),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        database.poll_changefeed_page(
+            &ResumeToken::default(),
+            &ChangefeedFilter::default(),
+            &ChangefeedOptions::default(),
+            10,
+        ),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+
+    assert!(matches!(
+        database.create_subscription(SubscriptionConfig::new("feed", ResumeToken::default())),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        database.create_subscription_as(
+            &Principal::new("alice"),
+            SubscriptionConfig::new("feed", ResumeToken::default()),
+        ),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(database.subscription_state("feed").is_err());
+
+    let spec = ContinuousQuerySpec {
+        name: "cq_accounts".to_owned(),
+        sql: "SELECT * FROM accounts".to_owned(),
+        filter: ChangefeedFilter {
+            target: ChangefeedTarget::Table("accounts".to_owned()),
+        },
+        start: ResumeToken::default(),
+        buffer_limit: 8,
+    };
+    assert!(matches!(
+        database.create_continuous_query(&spec),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(
+        database
+            .ack_continuous_query(&spec.name, ResumeToken::default())
+            .is_err()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn ap_database_rejects_materialized_views_hooks_and_system_versioning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = ap_database()?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let spec = MaterializedViewSpec {
+        name: "accounts_by_name".to_owned(),
+        source_table: "accounts".to_owned(),
+        filter: None,
+        group_by: 1,
+        aggregates: vec![AggregateSpec {
+            output_name: "count".to_owned(),
+            kind: AggregateKind::Count,
+            column: None,
+        }],
+    };
+
+    assert!(matches!(
+        database.create_materialized_view(&spec),
+        Err(DbError::MaterializedView(
+            MaterializedViewError::Unsupported(_)
+        ))
+    ));
+    assert!(matches!(
+        database.create_materialized_view_object(&spec),
+        Err(DbError::MaterializedView(
+            MaterializedViewError::Unsupported(_)
+        ))
+    ));
+    assert!(matches!(
+        database.refresh_materialized_view_to_current(&spec.name),
+        Err(DbError::MaterializedView(
+            MaterializedViewError::Unsupported(_)
+        ))
+    ));
+    assert!(!database.catalog().contains_key(&spec.name));
+
+    assert!(matches!(
+        database.register_hook(&HookSpec::after(
+            "record_after",
+            HookTarget::AnyUser,
+            HookAction::RecordAfterCommit,
+            1_000,
+        )),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    database.register_hook(&HookSpec::before(
+        "reject_empty",
+        HookTarget::AnyUser,
+        HookAction::RejectEmptyValue,
+        1_000,
+    ))?;
+
+    assert!(matches!(
+        database.enable_system_versioning(
+            "accounts",
+            TemporalRetention {
+                min_lsn: 0,
+                keep_history: true,
+            },
+        ),
+        Err(DbError::Temporal(TemporalError::Unsupported(_)))
+    ));
+    assert!(!database.catalog().contains_key("accounts_history"));
+
+    Ok(())
+}
+
+#[test]
+fn ap_database_rejects_incremental_full_text_and_geo_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut ap = ap_database()?;
+    insert_located_post(&mut ap)?;
+    let catalog = ap.catalog().clone();
+    let text = ap.create_full_text_index(posts_text_index())?;
+    assert!(matches!(
+        text.refresh_incremental(&catalog),
+        Err(TextError::Repl(ReplError::Unsupported(_)))
+    ));
+    let geo = ap.create_geo_index(posts_geo_index())?;
+    assert!(matches!(
+        geo.refresh_incremental(&catalog),
+        Err(GeoError::Repl(ReplError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        ap.full_text_index("posts_text")?
+            .refresh_incremental(ap.catalog()),
+        Err(TextError::Repl(ReplError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        ap.geo_index("posts_geo")?.refresh_incremental(ap.catalog()),
+        Err(GeoError::Repl(ReplError::Unsupported(_)))
+    ));
+    assert_eq!(
+        ap.full_text_index("posts_text")?
+            .refresh_full()?
+            .indexed_documents,
+        1
+    );
+    assert_eq!(ap.geo_index("posts_geo")?.refresh_full()?, 1);
+
+    let mut local = create_database(DbConfig::new(Profile::InMemory))?;
+    insert_located_post(&mut local)?;
+    local.create_full_text_index(posts_text_index())?;
+    local.create_geo_index(posts_geo_index())?;
+    assert_eq!(
+        local
+            .full_text_index("posts_text")?
+            .refresh_incremental(local.catalog())?
+            .indexed_documents,
+        1
+    );
+    local
+        .geo_index("posts_geo")?
+        .refresh_incremental(local.catalog())?;
+    assert_eq!(
+        local
+            .geo_index("posts_geo")?
+            .within_radius(GeoPoint::new(21.0122, 52.2297)?, 10.0)?
+            .len(),
+        1
+    );
 
     Ok(())
 }
@@ -3223,6 +3489,56 @@ fn cp_cluster_config() -> CpClusterConfig {
 
 fn ap_cluster_config() -> ApClusterConfig {
     ApClusterConfig::single_node_for_tests(1)
+}
+
+fn ap_database() -> Result<Database, ConfigError> {
+    create_ap_database(
+        DbConfig::new(Profile::InMemory).with_replication(ReplicationKind::Ap),
+        ap_cluster_config(),
+    )
+}
+
+fn insert_located_post(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    let posts = database.create_collection(
+        "posts",
+        CollectionId::new(190),
+        vec![DocField::path(
+            "body",
+            FieldPath::new(["body"]),
+            ColumnType::Str,
+        )],
+        Vec::new(),
+    )?;
+    posts.insert(&Value::Object(BTreeMap::from([
+        (
+            "body".to_owned(),
+            Value::Str("rust database search storage".to_owned()),
+        ),
+        (
+            "point".to_owned(),
+            Value::GeoPoint {
+                lon: 21.0122,
+                lat: 52.2297,
+            },
+        ),
+    ])))?;
+    Ok(())
+}
+
+fn posts_text_index() -> FullTextIndexConfig {
+    FullTextIndexConfig::collection(
+        "posts_text",
+        CollectionId::new(190),
+        FieldPath::new(["body"]),
+    )
+}
+
+fn posts_geo_index() -> GeoIndexConfig {
+    GeoIndexConfig::new(
+        "posts_geo",
+        CollectionId::new(190),
+        FieldPath::new(["point"]),
+    )
 }
 
 fn sharded_config() -> ShardedDatabaseConfig {
