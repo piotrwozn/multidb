@@ -69,6 +69,13 @@ Environment:
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.
 
+RBAC roles, PG-user principal mappings and the audit on/off flag saved through
+`POST /security` / Studio Security (or the `set_audit_enabled_as` library API)
+are stored in the database file and reloaded on every start. Admin password
+bootstrap and login only restore the built-in `admin` role, its standard grants
+and the `admin` mapping when something is missing; they never replace other
+stored roles, mappings or the audit flag.
+
 Production mode fails closed unless a stored admin credential, admin password,
 or legacy admin token is available. It also requires PG password and PG TLS
 certificate/key paths.
