@@ -954,9 +954,12 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         let pg_database = Arc::clone(&database);
 
         let admin_task = tokio::spawn(async move {
-            axum::serve(admin_listener, admin_router)
-                .await
-                .map_err(CliError::Io)
+            axum::serve(
+                admin_listener,
+                admin_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(CliError::Io)
         });
         let pg_task = tokio::spawn(async move {
             PgServer::serve_shared(pg_listener, pg_database, pg_config)
@@ -1054,7 +1057,12 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     ));
                 }
                 let listener = tokio::net::TcpListener::bind(bind).await?;
-                axum::serve(listener, multidb::admin::router(state)).await?;
+                axum::serve(
+                    listener,
+                    multidb::admin::router(state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await?;
                 Ok::<(), std::io::Error>(())
             })?;
             Ok(format!("admin server stopped on {bind}"))

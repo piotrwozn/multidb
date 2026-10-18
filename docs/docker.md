@@ -56,9 +56,9 @@ Environment:
 | `MULTIDB_ADMIN_PASSWORD` / `_FILE` | yes* | none | Bootstrap password for the durable `admin` credential. `_FILE` wins over the env var. |
 | `MULTIDB_ADMIN_PASSWORD_RESET` | no | unset | Set to `1` to overwrite an existing stored admin credential from env/file. |
 | `MULTIDB_ADMIN_SESSION_TTL_SECONDS` | no | `28800` | Browser session TTL, clamped to 60 seconds through 24 hours. |
-| `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` | no | `5` | Failed login attempts before lockout; clamped to at least 1. |
-| `MULTIDB_ADMIN_LOGIN_WINDOW_SECONDS` | no | `300` | Rolling failure window for login lockout; clamped to at least 1. |
-| `MULTIDB_ADMIN_LOGIN_LOCKOUT_SECONDS` | no | `300` | Neutral `401` lockout duration; clamped to at least 1. |
+| `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` | no | `5` | Failed `admin` password checks per client IP (IPv6 /64) before that client is locked out; the server-wide soft ceiling is 20x this per window. Clamped to at least 1. |
+| `MULTIDB_ADMIN_LOGIN_WINDOW_SECONDS` | no | `300` | Failure window for the per-client lockout and the soft ceiling; clamped to at least 1. |
+| `MULTIDB_ADMIN_LOGIN_LOCKOUT_SECONDS` | no | `300` | Neutral `401` per-client lockout duration; clamped to at least 1. |
 | `MULTIDB_ADMIN_TOKEN` / `_FILE` | no | none | Legacy Bearer token for automation and compatibility. |
 | `MULTIDB_PG_USER` | no | `multidb` | PostgreSQL SCRAM user. |
 | `MULTIDB_PG_PASSWORD` / `_FILE` | yes | none | PostgreSQL SCRAM password. |
@@ -100,6 +100,38 @@ capability manifest endpoint, not the HTML app. Browser sessions are
 stored only in server memory and React state; restarting the server signs
 Studio users out without changing the durable admin password hash.
 
+Control Plane login limits:
+
+- Failed `admin` password checks are counted per client IP address (IPv6
+  clients per /64). After `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` failures in the
+  window, that client gets a neutral `401` for the lockout duration, even with
+  the correct password. A successful login clears the client's failures.
+- Across all clients, at most 20x `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` failed
+  checks per window are allowed before the soft ceiling applies. Past it, only
+  clients without a failure in the current window may try. Clients with a
+  clean window are never refused.
+- Logins for any other username are rejected without a password check and
+  never lock anyone out.
+- The client address is the TCP peer. `X-Forwarded-For` is not trusted, so
+  behind a reverse proxy, an ingress, or a Kubernetes Service that rewrites
+  source addresses, all clients share one address and one lockout. Use a
+  strong admin password.
+- At most 2 password checks run at once. Additional login or change-password
+  requests get `503` with error code `auth_busy` and `Retry-After: 1`. These
+  requests are not counted as failures.
+- The username is limited to 256 bytes and passwords to 1024 bytes. Longer
+  values get `400` with error code `invalid_value`. The same password limit
+  applies to change-password and to `MULTIDB_ADMIN_PASSWORD`; a longer
+  bootstrap password stops startup when it would be stored (no stored
+  credential yet, or `MULTIDB_ADMIN_PASSWORD_RESET`).
+- Audit: every failed `admin` password check is recorded as `login`/`Failed`
+  with the client address. Refused attempts are recorded as
+  `login_rate_limited`/`Denied` once per client per lockout. Reaching the soft
+  ceiling records one `login_rate_limited` event with `scope: global`. Failed
+  logins for other usernames are recorded up to 20x
+  `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` per window, followed by one
+  `login_audit_coalesced` event.
+
 ## Concurrency
 
 - One database is shared between PostgreSQL wire and the Control Plane
@@ -109,6 +141,14 @@ Studio users out without changing the durable admin password hash.
   running statements, and new requests wait behind them. Admin login and
   password change take it only when the bootstrap `admin` role or principal
   is missing or was changed, for example by a `/security` update.
+- Admin login and password change read the stored credential under the
+  shared lock and release it before the Argon2id password check, which runs on
+  the blocking pool, so a check in progress never delays `/builder/*` or
+  `/security` updates. Password checks have their own limit, separate from the
+  query governor: at most 2 run at once, and further login or password change
+  requests get HTTP 503 with error code `auth_busy` and `Retry-After: 1` and
+  are not counted as failed logins. A client locked out by the login limits
+  above gets a neutral `401` without `Retry-After`.
 - By default at most 4 x available CPUs statements execute at once; a
   container CPU limit lowers that number. `MULTIDB_MAX_CONCURRENT_QUERIES`
   overrides it. PostgreSQL wire admits up to that many statements, and never
