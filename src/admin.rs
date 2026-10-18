@@ -3321,7 +3321,7 @@ mod tests {
     use crate::{
         config_spec::{ApplyStatus, DatabaseSpec, MigrationPlanner},
         db::{DbConfig, DbError, Profile, create_database, open_database},
-        query::QueryError,
+        query::{QueryError, SqlOutput},
         repl::ReplError,
         runtime_advisor::{
             RuntimeAdviceDecisionRequest, RuntimeAdvicePlanRequest, RuntimeAdviceStatus,
@@ -3719,6 +3719,139 @@ mod tests {
         let token = login_token(&app, "new-secret").await?;
         assert!(token.starts_with(super::SESSION_TOKEN_PREFIX));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn security_state_survives_serve_restart() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("serve-security.redb");
+        {
+            let state = AdminState::from_database(create_database(DbConfig::on_disk(
+                Profile::Transactional,
+                &db_path,
+            ))?);
+            state
+                .bootstrap_admin_password("secret".to_owned(), false)
+                .await?;
+            let app = super::router(state);
+            let token = login_token(&app, "secret").await?;
+
+            let create_table = app
+                .clone()
+                .oneshot(session_request(
+                    Method::POST,
+                    "/builder/table",
+                    &token,
+                    &serde_json::json!({
+                        "name": "orders",
+                        "schema": {
+                            "columns": [{ "name": "id", "ty": "Int", "nullable": false }],
+                            "primary_key": 0
+                        },
+                        "indexes": []
+                    }),
+                )?)
+                .await?;
+            assert_eq!(create_table.status(), StatusCode::OK);
+            let insert = app
+                .clone()
+                .oneshot(session_request(
+                    Method::POST,
+                    "/data/tables/orders/rows",
+                    &token,
+                    &serde_json::json!({ "row": [1] }),
+                )?)
+                .await?;
+            assert_eq!(insert.status(), StatusCode::OK);
+
+            let update = app
+                .oneshot(session_request(
+                    Method::POST,
+                    "/security",
+                    &token,
+                    &app_rw_security_body(),
+                )?)
+                .await?;
+            assert_eq!(update.status(), StatusCode::OK);
+        }
+
+        // Second boot mirrors `multidb serve` with MULTIDB_ADMIN_PASSWORD set.
+        let database = Arc::new(Mutex::new(create_database(DbConfig::on_disk(
+            Profile::Transactional,
+            &db_path,
+        ))?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        state
+            .bootstrap_admin_password("secret".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let token = login_token(&app, "secret").await?;
+        let security = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/security")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(security.status(), StatusCode::OK);
+        let body = json_body(security).await?;
+        let role_names = body["data"]["roles"]
+            .as_array()
+            .ok_or("roles must be an array")?
+            .iter()
+            .filter_map(|role| role["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(role_names, ["admin", "app_rw"]);
+        let principals = body["data"]["principals"]
+            .as_array()
+            .ok_or("principals must be an array")?;
+        assert!(principals.contains(&serde_json::json!({
+            "user": "multidb",
+            "principal": "app",
+            "roles": ["app_rw"]
+        })));
+        assert_eq!(body["data"]["audit_enabled"], true);
+
+        let database = database.lock().await;
+        let principal = database.principal_for_user("multidb");
+        assert_eq!(principal, Principal::new("app").with_role("app_rw"));
+        assert!(matches!(
+            database
+                .query_as(&principal, "SELECT id FROM orders")
+                .await?,
+            SqlOutput::Rows(_)
+        ));
+        Ok(())
+    }
+
+    /// Keeps the canonical admin role and maps PG user `multidb` to an `orders` read/write role.
+    fn app_rw_security_body() -> Value {
+        serde_json::json!({
+            "roles": [
+                {
+                    "name": "admin",
+                    "grants": [
+                        { "resource": "System", "permission": "Admin" },
+                        { "resource": "Database", "permission": "Read" },
+                        { "resource": "Database", "permission": "Write" },
+                        { "resource": "Database", "permission": "Admin" }
+                    ]
+                },
+                {
+                    "name": "app_rw",
+                    "grants": [
+                        { "resource": { "Table": "orders" }, "permission": "Read" },
+                        { "resource": { "Table": "orders" }, "permission": "Write" }
+                    ]
+                }
+            ],
+            "principals": [
+                { "user": "admin", "principal": "admin", "roles": ["admin"] },
+                { "user": "multidb", "principal": "app", "roles": ["app_rw"] }
+            ]
+        })
     }
 
     #[tokio::test]
@@ -5319,6 +5452,20 @@ mod tests {
             Body::empty()
         };
         Ok(builder.body(body)?)
+    }
+
+    fn session_request<T: Serialize>(
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: &T,
+    ) -> Result<Request<Body>, Box<dyn std::error::Error>> {
+        Ok(Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body)?))?)
     }
 
     fn json_request<T: Serialize>(
