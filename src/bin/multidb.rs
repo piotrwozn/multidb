@@ -18,14 +18,15 @@ use multidb::{
         SubscriptionConfig,
     },
     config_spec::{
-        ApplyCheckReport, ApplyStatus, ChangePolicy, CommitMode, CompressionKnob, ConfigExplainer,
-        ConsistencyDomainSpec, ConsistencyMode, CustomProfileSpec, DATABASE_SPEC_VERSION_V2,
-        DatabaseDefaults, DatabaseSpec, DeploymentMode, DeploymentSpec, ExplainConfigReport,
-        FloorOverrides, GuaranteeSpec, GuaranteeValidator, KNOB_REGISTRY, KnobDefinition,
-        KnobEnforcement, KnobSource, KnobTiming, LayoutKnob, MigrationPlan, MigrationPlanner,
-        ProfileKnobOverrides, ProfileKnobs, ProfileResolution, ProfileSpec, ProfileVariant,
-        RESERVED_KNOBS, ReplicationMode, ResolvedProfile, ResolvedProfileKind, RoleSetDelta,
-        StorageMedium, TopologySpec, ValidationIssue, ValidationReport, ValidationSeverity,
+        ApplyCheckReport, ApplyStatus, CertificationImpact, ChangePolicy, CommitMode,
+        CompressionKnob, ConfigExplainer, ConsistencyDomainSpec, ConsistencyMode,
+        CustomProfileSpec, DATABASE_SPEC_VERSION_V2, DatabaseDefaults, DatabaseSpec,
+        DeploymentMode, DeploymentSpec, ExplainConfigReport, FloorOverrides, GuaranteeSpec,
+        GuaranteeValidator, KNOB_REGISTRY, KnobDefinition, KnobEnforcement, KnobSource, KnobTiming,
+        LayoutKnob, MigrationPlan, MigrationPlanner, ProfileKnobOverrides, ProfileKnobs,
+        ProfileResolution, ProfileSpec, ProfileVariant, RESERVED_KNOBS, ReplicationMode,
+        ResolvedProfile, ResolvedProfileKind, RoleSetDelta, StorageMedium, TopologySpec,
+        UnmanagedPolicy, ValidationIssue, ValidationReport, ValidationSeverity,
         built_in_profile_normalized, built_in_profiles, collection_role_definition,
         collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
         parse_knob_assignment, profile_variants, resolve_named_profile, resolve_profile,
@@ -33,14 +34,20 @@ use multidb::{
         suggest_profile_name,
     },
     db::{
-        DbConfig, DbError, MetadataProbe, PersistedProfileManifest, Profile, create_database,
-        inspect_database_metadata, open_database, recover_database_file,
+        Database, DbConfig, DbError, MetadataProbe, OperationalConfig, PersistedProfileManifest,
+        ProbedMetadata, Profile, ReplicationKind, create_database, inspect_database_metadata,
+        open_database, open_database_with_ops, recover_database_file,
     },
     migration::{
         ExportFormat, ImportOptions, MigrationError, export_table_csv, export_table_jsonl,
         import_pg_dump_plain, import_table_csv, import_table_jsonl, migrate_value_codec,
     },
     network::{AuthConfig, NetworkConfig, PgServer, ScramCredential, TlsConfig, TlsMode},
+    provision::{
+        self, Confirmation, PlanOutcome, ProvisionActor, ProvisionApplyReport,
+        ProvisionEnvironment, ProvisionError, ProvisionOptions, ProvisionOutcome, ProvisionPlan,
+        ProvisionSurface, ProvisionTargetRef,
+    },
     runtime_advisor::{RuntimeAdviceDecisionRequest, RuntimeAdviceReport, RuntimeAdviceStatus},
     templates::{
         TemplateMaterialization, TemplateOutputFormat, built_in_template, built_in_templates,
@@ -148,6 +155,15 @@ impl CliRun {
             exit_code: if valid { 0 } else { 2 },
         }
     }
+
+    /// A run with an explicit exit code, such as the provisioning codes of
+    /// `provision_exit_code`.
+    fn exit(message: impl Into<String>, exit_code: u8) -> Self {
+        Self {
+            message: message.into(),
+            exit_code,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -216,6 +232,9 @@ fn run_config(args: &[String]) -> Result<CliRun, CliError> {
         "plan" => run_config_plan(&args[1..]),
         "apply" => run_config_apply(&args[1..]),
         "upgrade" => run_config_upgrade(&args[1..]),
+        "drift" => run_config_drift(&args[1..]),
+        "status" => run_config_status(&args[1..]),
+        "export" => run_config_export(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -255,6 +274,10 @@ fn run_config_explain(args: &[String]) -> Result<CliRun, CliError> {
 }
 
 fn run_config_plan(args: &[String]) -> Result<CliRun, CliError> {
+    if has_flag(args, "--spec") {
+        reject_spec_mixing(args)?;
+        return run_spec_plan(args);
+    }
     let current_path = PathBuf::from(required_value(args, "--current")?);
     let desired_path = PathBuf::from(required_value(args, "--desired")?);
     let output = output_format(args)?;
@@ -308,6 +331,10 @@ fn run_config_plan(args: &[String]) -> Result<CliRun, CliError> {
 }
 
 fn run_config_apply(args: &[String]) -> Result<CliRun, CliError> {
+    if has_flag(args, "--spec") {
+        reject_spec_mixing(args)?;
+        return run_spec_apply(args);
+    }
     let plan_path = PathBuf::from(required_value(args, "--plan")?);
     reject_yaml_plan_path(&plan_path)?;
     let output = output_format(args)?;
@@ -341,7 +368,8 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
         ensure_upgrade_target(&spec_path, out_path, has_flag(args, "--force"))?;
     }
 
-    let (upgraded, notes) = upgrade_spec(spec);
+    let (upgraded, mut notes) = upgrade_spec(spec);
+    notes.extend(provisioning_blocker_notes(&upgraded));
     let report = GuaranteeValidator::validate(&upgraded);
     let format =
         match spec_io::spec_format_for_path(out_path.as_deref().unwrap_or(spec_path.as_path())) {
@@ -480,6 +508,29 @@ fn upgrade_spec(mut spec: DatabaseSpec) -> (DatabaseSpec, Vec<String>) {
     (spec, notes)
 }
 
+/// One note per physical parameter that provisioning still needs before it can build the
+/// upgraded spec (`PHYSICAL_PARAMETER_REQUIRED` of `provision::physical::project`, which is only
+/// Advice in version 2 validation), so `config upgrade` lists what to add before `config apply
+/// --spec`. Nothing for a profile that does not resolve: validation reports that.
+fn provisioning_blocker_notes(spec: &DatabaseSpec) -> Vec<String> {
+    let ProfileResolution::Resolved { profile, .. } = resolve_profile(spec) else {
+        return Vec::new();
+    };
+    match provision::physical::project(spec, &profile) {
+        Ok(_) => Vec::new(),
+        Err(issues) => issues
+            .iter()
+            .filter(|issue| issue.code == "PHYSICAL_PARAMETER_REQUIRED")
+            .map(|issue| {
+                format!(
+                    "provisioning blocker: add {} before config apply --spec ({})",
+                    issue.path, issue.message
+                )
+            })
+            .collect(),
+    }
+}
+
 /// Refuses to replace an existing file, and in particular the input spec, without `--force`.
 fn ensure_upgrade_target(input: &Path, out: &Path, force: bool) -> Result<(), CliError> {
     if force {
@@ -506,7 +557,8 @@ fn ensure_upgrade_target(input: &Path, out: &Path, force: bool) -> Result<(), Cl
 
 /// Writes `content` to a new, randomly named file next to `path` and renames it into place, so
 /// a failed write never leaves a half-written file where the old one was (`config upgrade
-/// --force` may replace its input). See `write_through_temp_file`.
+/// --force` may replace its input; `config plan --spec --out` and `config export --out` write
+/// through it too). See `write_through_temp_file`.
 fn write_file_replacing(path: &Path, content: &str) -> Result<(), CliError> {
     let Some(file_name) = path.file_name() else {
         return Err(CliError::Usage(format!(
@@ -556,6 +608,1401 @@ fn write_through_temp_file(path: &Path, temp_path: &Path, content: &str) -> std:
     Ok(())
 }
 
+/// The local operator label of every CLI apply; its audit events carry it as the principal.
+const CLI_OPERATOR: &str = "local:cli";
+/// How many provision history entries `config status` shows, newest last.
+const STATUS_HISTORY_ENTRIES: usize = 20;
+/// The refusal for a database another handle holds open: redb takes an exclusive file lock, so
+/// a served database is planned and applied through the Control Plane instead.
+const DATABASE_IN_USE: &str =
+    "database is in use (is multidb serve running?); use POST /provision/plan";
+
+/// `--spec` belongs to provisioning; `--plan`, `--current` and `--desired` to the version 1
+/// migration plan flow, which stays audit-only.
+fn reject_spec_mixing(args: &[String]) -> Result<(), CliError> {
+    let mixed = ["--plan", "--current", "--desired"]
+        .into_iter()
+        .filter(|flag| has_flag(args, flag))
+        .collect::<Vec<_>>();
+    if mixed.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!(
+        "--spec provisions a database from a spec and cannot be combined with {}, which belong \
+         to the version 1 plan flow (config plan --current --desired, config apply --plan \
+         --confirm)",
+        mixed.join(", ")
+    )))
+}
+
+/// The value of `flag`, or a usage error when the flag is given without one.
+fn flag_value(args: &[String], flag: &str) -> Result<Option<String>, CliError> {
+    match optional_value(args, flag) {
+        Some(value) if !value.starts_with("--") => Ok(Some(value)),
+        _ if has_flag(args, flag) => Err(CliError::Usage(format!("missing value for {flag}"))),
+        _ => Ok(None),
+    }
+}
+
+/// `storage_path` of a spec resolved against `dir`, the directory of the spec file (or the
+/// output directory of `init`); an absolute path stays as it is.
+fn resolve_against(dir: &Path, storage_path: &str) -> PathBuf {
+    if dir.as_os_str().is_empty() {
+        PathBuf::from(storage_path)
+    } else {
+        dir.join(storage_path)
+    }
+}
+
+/// The directory a file lives in, `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// The provisioning options of a spec command: `--allow-weakening <path>[,<path>]` and
+/// `--allow-destructive <path>[,<path>]` (both repeatable), `--allow-format-upgrade` and
+/// `--unmanaged ignore|report|fail`. They are part of the `prov_` id, so an apply must repeat
+/// the flags of the plan it confirms.
+fn provision_options(args: &[String]) -> Result<ProvisionOptions, CliError> {
+    let unmanaged = flag_value(args, "--unmanaged")?
+        .map(|value| match value.as_str() {
+            "ignore" => Ok(UnmanagedPolicy::Ignore),
+            "report" => Ok(UnmanagedPolicy::Report),
+            "fail" => Ok(UnmanagedPolicy::Fail),
+            other => Err(CliError::Usage(format!(
+                "unsupported --unmanaged {other}; expected ignore, report or fail"
+            ))),
+        })
+        .transpose()?;
+    Ok(ProvisionOptions {
+        allow_weakening: flag_paths(args, "--allow-weakening")?,
+        allow_destructive: flag_paths(args, "--allow-destructive")?,
+        allow_format_upgrade: has_flag(args, "--allow-format-upgrade"),
+        unmanaged,
+    })
+}
+
+/// Every spec path of a repeatable `--allow-*` flag.
+fn flag_paths(args: &[String], flag: &str) -> Result<std::collections::BTreeSet<String>, CliError> {
+    let paths = values(args, flag);
+    if paths.is_empty() && has_flag(args, flag) {
+        return Err(CliError::Usage(format!(
+            "missing value for {flag}; give the spec path a step names, for example \
+             collections.orders"
+        )));
+    }
+    if let Some(flag_like) = paths.iter().find(|path| path.starts_with("--")) {
+        return Err(CliError::Usage(format!(
+            "{flag} takes a spec path, not {flag_like}"
+        )));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// The spec, target path, options and output format of `config plan|apply|drift --spec`, and
+/// of `init --apply`.
+struct SpecCommand {
+    spec_path: PathBuf,
+    spec: DatabaseSpec,
+    /// `--db`, else `deployment.storage_path` resolved against the directory of the spec file;
+    /// `None` when neither names a path.
+    db_path: Option<PathBuf>,
+    options: ProvisionOptions,
+    output: String,
+}
+
+impl SpecCommand {
+    /// Reads `--spec` through `spec_io`. A spec refused for its size or version comes back as
+    /// its report (exit 2); I/O, syntax and decode errors stay CLI errors (exit 1).
+    fn load(args: &[String]) -> Result<Result<Self, CliRun>, CliError> {
+        let spec_path = PathBuf::from(required_value(args, "--spec")?);
+        let output = output_format(args)?;
+        let options = provision_options(args)?;
+        let db = flag_value(args, "--db")?;
+        let spec = match read_spec_file(&spec_path)? {
+            Ok(spec) => spec,
+            Err(report) => {
+                return Ok(Err(spec_report_run(
+                    &report,
+                    &output,
+                    Some(("--spec", spec_path.as_path())),
+                )?));
+            }
+        };
+        let db_path = db.map(PathBuf::from).or_else(|| {
+            spec.deployment
+                .storage_path
+                .as_deref()
+                .map(|storage_path| resolve_against(parent_dir(&spec_path), storage_path))
+        });
+        Ok(Ok(Self {
+            spec_path,
+            spec,
+            db_path,
+            options,
+            output,
+        }))
+    }
+
+    fn json(&self) -> bool {
+        self.output == "json"
+    }
+}
+
+/// The database a spec command acts on.
+enum SpecTarget {
+    /// Neither `--db` nor the spec names a path: the plan is computed against a new in-memory
+    /// target, which the CLI never builds (`PROVISION_STORAGE_PATH_REQUIRED` for a durable
+    /// profile, `PROVISION_VOLATILE_ON_SURFACE` for a volatile one).
+    NoPath,
+    /// Nothing exists at the path yet, or the file is empty: planned as absent, created by
+    /// `config apply`.
+    Absent(PathBuf),
+    /// An initialized single-node CP database, open for this command.
+    Existing {
+        db: Box<Database>,
+        metadata: Box<ProbedMetadata>,
+    },
+}
+
+/// Why a spec command cannot act on its target.
+enum TargetRefusal {
+    /// Another handle holds the database open (exit 1).
+    InUse(PathBuf),
+    /// The file cannot be probed or opened (exit 1).
+    Unreadable(String),
+    /// The database exists, but provisioning cannot plan it (exit 2).
+    Blocked(Box<ValidationIssue>),
+}
+
+/// Probes `path` and opens an initialized single-node CP database with
+/// `open_database_with_ops`, which loads its persisted RBAC state. Nothing is created: a missing
+/// path stays missing. A file that was not closed cleanly first gets redb's crash recovery,
+/// which every opener runs anyway; it is the only change a dry run can make to a file.
+fn open_spec_target(path: Option<&Path>) -> Result<SpecTarget, TargetRefusal> {
+    let Some(path) = path else {
+        return Ok(SpecTarget::NoPath);
+    };
+    let probe = match inspect_database_metadata(path) {
+        MetadataProbe::NeedsRecovery => {
+            recover_database_file(path).map_err(|error| {
+                TargetRefusal::Unreadable(format!(
+                    "{} was not closed cleanly and its crash recovery failed: {error}",
+                    path.display()
+                ))
+            })?;
+            inspect_database_metadata(path)
+        }
+        probe => probe,
+    };
+    match probe {
+        MetadataProbe::NotFound | MetadataProbe::Uninitialized => {
+            Ok(SpecTarget::Absent(path.to_path_buf()))
+        }
+        MetadataProbe::Locked => Err(TargetRefusal::InUse(path.to_path_buf())),
+        MetadataProbe::NeedsRecovery => Err(TargetRefusal::Unreadable(format!(
+            "{} still needs crash recovery after recovering it",
+            path.display()
+        ))),
+        MetadataProbe::Unreadable { reason } => Err(TargetRefusal::Unreadable(format!(
+            "{} cannot be read: {reason}",
+            path.display()
+        ))),
+        MetadataProbe::Initialized(metadata) => {
+            if metadata.replication != ReplicationKind::Cp {
+                return Err(TargetRefusal::Blocked(Box::new(ValidationIssue {
+                    code: "PROVISION_REPLICATION_UNSUPPORTED".to_owned(),
+                    severity: ValidationSeverity::Error,
+                    path: "defaults.replication".to_owned(),
+                    message: format!(
+                        "the database at {} uses {:?} replication; provisioning plans and \
+                         applies single-node CP databases only",
+                        path.display(),
+                        metadata.replication
+                    ),
+                    suggestion: "Provision a single-node CP database instead.".to_owned(),
+                    certification_impact: CertificationImpact::BlocksCertified,
+                })));
+            }
+            let config = DbConfig::on_disk(metadata.storage_profile, path);
+            let db =
+                open_database_with_ops(config, &OperationalConfig::new()).map_err(|error| {
+                    TargetRefusal::Unreadable(format!(
+                        "{} cannot be opened: {error}",
+                        path.display()
+                    ))
+                })?;
+            Ok(SpecTarget::Existing {
+                db: Box::new(db),
+                metadata,
+            })
+        }
+    }
+}
+
+const fn cli_environment() -> ProvisionEnvironment {
+    ProvisionEnvironment::new(ProvisionSurface::Cli)
+}
+
+/// The plan of the spec against its target, on the CLI surface.
+fn plan_spec_target(
+    command: &SpecCommand,
+    target: &SpecTarget,
+) -> Result<ProvisionPlan, ProvisionError> {
+    let target = match target {
+        SpecTarget::NoPath => ProvisionTargetRef::Volatile,
+        SpecTarget::Absent(path) => ProvisionTargetRef::Path(path),
+        SpecTarget::Existing { db, .. } => ProvisionTargetRef::Open(db),
+    };
+    provision::plan_provision(&command.spec, target, &command.options, &cli_environment())
+}
+
+/// What a provisioning command ended with, for its exit code.
+enum ProvisionEnd<'a> {
+    /// `config plan --spec`: the dry-run plan.
+    Planned(&'a ProvisionPlan),
+    /// `config drift`: the plan whose drift is reported.
+    Drifted(&'a ProvisionPlan),
+    /// `config apply --spec` and `init --apply`.
+    Applied(&'a ProvisionApplyReport),
+    Failed(&'a ProvisionError),
+}
+
+/// The exit code of a provisioning command:
+/// - 0: a ready or noop plan, an applied or noop apply, a database in sync;
+/// - 1: a partial apply, a runtime or I/O error, a locked database;
+/// - 2: an invalid spec, a blocked plan, missing flags, a missing or rejected confirmation, a
+///   target that already holds a database; for `config drift`, an invalid spec or a spec
+///   without a database path;
+/// - 3: drift (`config drift` only);
+/// - 4: the confirmed plan changed.
+///
+/// Usage errors stay `CliError::Usage`, which `main` reports with exit 1.
+fn provision_exit_code(end: ProvisionEnd<'_>) -> u8 {
+    match end {
+        ProvisionEnd::Planned(plan) => match plan.outcome {
+            PlanOutcome::Noop | PlanOutcome::Ready => 0,
+            PlanOutcome::NeedsFlags | PlanOutcome::Blocked => 2,
+        },
+        ProvisionEnd::Drifted(plan) => {
+            if !plan.validation.valid || plan.target.path.is_none() {
+                2
+            } else if plan.drift.in_sync {
+                0
+            } else {
+                3
+            }
+        }
+        ProvisionEnd::Applied(report) => match report.status {
+            ProvisionOutcome::Applied | ProvisionOutcome::Noop => 0,
+            ProvisionOutcome::PartiallyApplied => 1,
+            ProvisionOutcome::Rejected | ProvisionOutcome::Blocked => 2,
+            ProvisionOutcome::PlanChanged => 4,
+        },
+        ProvisionEnd::Failed(error) => match error {
+            ProvisionError::PlanChanged { .. } => 4,
+            ProvisionError::InvalidSpec(_)
+            | ProvisionError::Blocked(_)
+            | ProvisionError::NeedsFlags(_)
+            | ProvisionError::ConfirmationRequired(_)
+            | ProvisionError::AlreadyInitialized
+            | ProvisionError::AuditRequired
+            | ProvisionError::PermissionMissing(_) => 2,
+            ProvisionError::Locked(_)
+            | ProvisionError::RecordUnreadable(_)
+            | ProvisionError::Db(_)
+            | ProvisionError::Config(_)
+            | ProvisionError::Io(_) => 1,
+        },
+    }
+}
+
+/// The `status` of a provisioning error in JSON output.
+const fn provision_error_status(error: &ProvisionError) -> &'static str {
+    match error {
+        ProvisionError::InvalidSpec(_) => "invalid_spec",
+        ProvisionError::Blocked(_) => "blocked",
+        ProvisionError::NeedsFlags(_) => "needs_flags",
+        ProvisionError::ConfirmationRequired(_) => "confirmation_required",
+        ProvisionError::PlanChanged { .. } => "plan_changed",
+        ProvisionError::AlreadyInitialized => "already_initialized",
+        ProvisionError::AuditRequired => "audit_required",
+        ProvisionError::PermissionMissing(_) => "permission_missing",
+        ProvisionError::Locked(_) => "in_use",
+        ProvisionError::RecordUnreadable(_) => "record_unreadable",
+        ProvisionError::Db(_) => "database_error",
+        ProvisionError::Config(_) => "config_error",
+        ProvisionError::Io(_) => "io_error",
+    }
+}
+
+fn in_use_message(path: Option<&Path>) -> String {
+    path.map_or_else(
+        || DATABASE_IN_USE.to_owned(),
+        |path| {
+            format!(
+                "{DATABASE_IN_USE} ({} is held open by another handle)",
+                path.display()
+            )
+        },
+    )
+}
+
+/// A run that only carries a message, as `{"status", "message"}` in JSON output.
+fn message_run(
+    status: &str,
+    message: String,
+    exit_code: u8,
+    json: bool,
+) -> Result<CliRun, CliError> {
+    let message = if json {
+        serde_json::to_string_pretty(&json!({ "status": status, "message": message }))?
+    } else {
+        message
+    };
+    Ok(CliRun::exit(message, exit_code))
+}
+
+fn refusal_run(refusal: &TargetRefusal, json: bool) -> Result<CliRun, CliError> {
+    match refusal {
+        TargetRefusal::InUse(path) => message_run("in_use", in_use_message(Some(path)), 1, json),
+        TargetRefusal::Unreadable(reason) => message_run("unreadable", reason.clone(), 1, json),
+        TargetRefusal::Blocked(issue) => {
+            let message = if json {
+                serde_json::to_string_pretty(&json!({
+                    "status": "blocked",
+                    "outcome": "blocked",
+                    "message": issue.message,
+                    "issues": [issue],
+                }))?
+            } else {
+                format!("provisioning blocked\n{}", format_issue(issue))
+            };
+            Ok(CliRun::exit(message, 2))
+        }
+    }
+}
+
+/// The serde name of a provisioning enum value, for text output.
+fn slug<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// A `required_flags` entry as a CLI flag: `allow_weakening:<path>` is
+/// `--allow-weakening <path>`, `allow_destructive:<path>` is `--allow-destructive <path>`.
+fn cli_flag(flag: &str) -> String {
+    if let Some(path) = flag.strip_prefix("allow_weakening:") {
+        format!("--allow-weakening {path}")
+    } else if let Some(path) = flag.strip_prefix("allow_destructive:") {
+        format!("--allow-destructive {path}")
+    } else if flag == "allow_format_upgrade" {
+        "--allow-format-upgrade".to_owned()
+    } else {
+        flag.to_owned()
+    }
+}
+
+/// The options as CLI flags, each with a leading space.
+fn option_flags(options: &ProvisionOptions) -> String {
+    let mut flags = String::new();
+    for path in &options.allow_weakening {
+        flags.push_str(&format!(" --allow-weakening {path}"));
+    }
+    for path in &options.allow_destructive {
+        flags.push_str(&format!(" --allow-destructive {path}"));
+    }
+    if options.allow_format_upgrade {
+        flags.push_str(" --allow-format-upgrade");
+    }
+    if let Some(policy) = options.unmanaged {
+        flags.push_str(&format!(" --unmanaged {}", slug(&policy)));
+    }
+    flags
+}
+
+/// `options` plus every flag of `required_flags`.
+fn options_with_flags(options: &ProvisionOptions, required_flags: &[String]) -> ProvisionOptions {
+    let mut options = options.clone();
+    for flag in required_flags {
+        if let Some(path) = flag.strip_prefix("allow_weakening:") {
+            options.allow_weakening.insert(path.to_owned());
+        } else if let Some(path) = flag.strip_prefix("allow_destructive:") {
+            options.allow_destructive.insert(path.to_owned());
+        } else if flag == "allow_format_upgrade" {
+            options.allow_format_upgrade = true;
+        }
+    }
+    options
+}
+
+/// `flag` is given by `options`.
+fn flag_given(options: &ProvisionOptions, flag: &str) -> bool {
+    if let Some(path) = flag.strip_prefix("allow_weakening:") {
+        options.allow_weakening.contains(path)
+    } else if let Some(path) = flag.strip_prefix("allow_destructive:") {
+        options.allow_destructive.contains(path)
+    } else {
+        flag == "allow_format_upgrade" && options.allow_format_upgrade
+    }
+}
+
+/// ` --db <path>`: the canonical target path of a plan when there is one, else the path of the
+/// command. Every spelling of one file gives the same `prov_` id.
+fn db_flag(command: &SpecCommand, canonical: Option<&str>) -> String {
+    canonical
+        .map(str::to_owned)
+        .or_else(|| {
+            command
+                .db_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+        })
+        .map_or_else(String::new, |path| format!(" --db {path}"))
+}
+
+fn plan_command(
+    command: &SpecCommand,
+    options: &ProvisionOptions,
+    canonical: Option<&str>,
+) -> String {
+    format!(
+        "multidb config plan --spec {}{}{}",
+        command.spec_path.display(),
+        db_flag(command, canonical),
+        option_flags(options)
+    )
+}
+
+fn apply_command(command: &SpecCommand, plan: &ProvisionPlan) -> String {
+    format!(
+        "multidb config apply --spec {}{}{} --confirm {}",
+        command.spec_path.display(),
+        db_flag(command, plan.target.path.as_deref()),
+        option_flags(&command.options),
+        plan.plan_id
+    )
+}
+
+/// What to do with a plan: the exact apply command of a ready plan, the re-plan command with
+/// the missing flags of a plan that needs them.
+fn plan_next_step(plan: &ProvisionPlan, command: &SpecCommand) -> String {
+    match plan.outcome {
+        PlanOutcome::Noop => "nothing to apply: the database already matches the spec".to_owned(),
+        PlanOutcome::Ready => format!(
+            "apply with: {}{}",
+            apply_command(command, plan),
+            if plan.auto_approvable {
+                " (or --auto-approve in place of --confirm: the plan only creates, adopts, \
+                 records or strengthens)"
+            } else {
+                ""
+            }
+        ),
+        PlanOutcome::NeedsFlags => format!(
+            "the plan needs flags; review the steps that name them, then re-plan with: {}",
+            plan_command(
+                command,
+                &options_with_flags(&command.options, &plan.required_flags),
+                plan.target.path.as_deref()
+            )
+        ),
+        PlanOutcome::Blocked => {
+            "blocked: resolve the errors above; nothing can be applied".to_owned()
+        }
+    }
+}
+
+/// The text form of a provisioning plan: header, target, steps with their safety class and
+/// flag, flags, objects, every guarantee status, issues, drift, impact and rollback.
+fn format_provision_plan(plan: &ProvisionPlan, options: &ProvisionOptions) -> String {
+    let mut lines = vec![
+        format!(
+            "provisioning plan {} outcome={} auto_approvable={} surface={}",
+            plan.plan_id,
+            slug(&plan.outcome),
+            plan.auto_approvable,
+            plan.surface.slug()
+        ),
+        format!(
+            "target {} path={} storage_profile={} schema_version={}",
+            slug(&plan.target.kind),
+            plan.target.path.as_deref().unwrap_or("(in memory)"),
+            plan.target
+                .storage_profile
+                .map_or_else(|| "unknown".to_owned(), |profile| format!("{profile:?}")),
+            plan.target
+                .schema_version
+                .map_or_else(|| "unknown".to_owned(), |version| version.to_string())
+        ),
+        format!(
+            "spec {} profile={}",
+            plan.spec_digest,
+            plan.resolved_profile
+                .as_ref()
+                .map_or("unresolved", |profile| profile.slug.as_str())
+        ),
+    ];
+    if !plan.validation.valid {
+        lines.push(format!(
+            "validation valid=false status={:?}",
+            plan.validation.status
+        ));
+        lines.extend(
+            plan.validation
+                .issues
+                .iter()
+                .map(|issue| format!("  {}", format_issue(issue))),
+        );
+    }
+    lines.extend(format_plan_steps(plan, options));
+    if !plan.objects.is_empty() {
+        lines.push("objects:".to_owned());
+        lines.extend(plan.objects.iter().map(format_planned_object));
+    }
+    lines.push("guarantees:".to_owned());
+    lines.extend(plan.guarantees.iter().map(|guarantee| {
+        let mut line = format!(
+            "  {}={} {}: {}",
+            guarantee.path,
+            guarantee.requested,
+            slug(&guarantee.status),
+            guarantee.detail
+        );
+        if !guarantee.remediation.is_empty() {
+            line.push_str(" remediation: ");
+            line.push_str(&guarantee.remediation);
+        }
+        line
+    }));
+    if !plan.issues.is_empty() {
+        lines.push("issues:".to_owned());
+        lines.extend(
+            plan.issues
+                .iter()
+                .map(|issue| format!("  {}", format_issue(issue))),
+        );
+    }
+    lines.push(format!("drift in_sync={}", plan.drift.in_sync));
+    lines.extend(plan.drift.items.iter().map(format_drift_item));
+    lines.push(format!(
+        "impact downtime={:?} disk={:?} cpu={:?} risk={:?}",
+        plan.impact.downtime, plan.impact.disk, plan.impact.cpu, plan.impact.risk
+    ));
+    lines.extend(
+        plan.impact
+            .notes
+            .iter()
+            .map(|note| format!("  note: {note}")),
+    );
+    lines.push(format!(
+        "rollback possible={}: {}",
+        plan.rollback.possible, plan.rollback.description
+    ));
+    lines.join("\n")
+}
+
+/// The steps of a plan, each with its safety class and the flag it needs, and the flags.
+fn format_plan_steps(plan: &ProvisionPlan, options: &ProvisionOptions) -> Vec<String> {
+    let mut lines = vec![format!("steps ({}):", plan.steps.len())];
+    for step in &plan.steps {
+        let mut line = format!(
+            "  {} {} {} {}",
+            step.step_id,
+            slug(&step.kind),
+            step.path,
+            slug(&step.safety)
+        );
+        if let Some(flag) = &step.requires_flag {
+            line.push_str(&format!(" needs {}", cli_flag(flag)));
+        }
+        if !step.supported {
+            line.push_str(" unsupported");
+        }
+        line.push_str(": ");
+        line.push_str(&step.action);
+        lines.push(line);
+    }
+    if plan.required_flags.is_empty() {
+        lines.push("flags: none required".to_owned());
+    } else {
+        let flags = plan
+            .required_flags
+            .iter()
+            .map(|flag| {
+                let given = if flag_given(options, flag) {
+                    "given"
+                } else {
+                    "missing"
+                };
+                format!("{} ({given})", cli_flag(flag))
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!("flags: {}", flags.join(", ")));
+    }
+    lines
+}
+
+fn format_planned_object(object: &provision::PlannedObject) -> String {
+    let mut line = format!(
+        "  {} {} {}",
+        object.name,
+        object.kind.slug(),
+        slug(&object.state)
+    );
+    for diff in &object.diff {
+        line.push_str(&format!(
+            " {}: expected {} actual {};",
+            diff.field, diff.expected, diff.actual
+        ));
+    }
+    line
+}
+
+fn format_drift_item(item: &provision::DriftItem) -> String {
+    format!(
+        "  {} {} expected={:?} actual={:?} blocking={} resolution={}",
+        item.path,
+        slug(&item.kind),
+        item.expected,
+        item.actual,
+        item.blocking,
+        slug(&item.resolution)
+    )
+}
+
+/// The text form of an apply report.
+fn format_provision_report(report: &ProvisionApplyReport, command: &SpecCommand) -> String {
+    let mut lines = vec![format!(
+        "provisioning {} plan={} data_mutated={}: {}",
+        slug(&report.status),
+        report.plan_id,
+        report.check.data_mutated,
+        report.check.message
+    )];
+    for step in &report.applied_steps {
+        lines.push(format!(
+            "  {} {}{} {}: {}",
+            step.step_id,
+            slug(&step.kind),
+            step.object
+                .as_deref()
+                .map_or_else(String::new, |object| format!(" {object}")),
+            slug(&step.outcome),
+            step.detail
+        ));
+    }
+    if let Some(record) = &report.record {
+        lines.push(format!(
+            "record status={} plan={} objects={} roles={} principals={} released={} \
+             completed_steps={} applied_by={}",
+            slug(&record.status),
+            record.plan_id,
+            record.objects,
+            record.managed_roles,
+            record.managed_principals,
+            record.released_objects,
+            record.completed_steps,
+            record.applied_by
+        ));
+    }
+    lines.extend(report.warnings.iter().map(format_issue));
+    if report.session_pending_restart {
+        lines.push(
+            "restart pending: retuned knobs and the storage format upgrade take effect at the \
+             next open"
+                .to_owned(),
+        );
+    }
+    if report.status == ProvisionOutcome::PartiallyApplied {
+        lines.push(format!(
+            "step {} failed; the steps before it stay applied and the record says failed: \
+             re-run plan ({}) to see the remaining steps, and apply that plan",
+            report.failed_step.as_deref().unwrap_or("(unknown)"),
+            plan_command(command, &command.options, None)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn apply_report_run(
+    report: &ProvisionApplyReport,
+    command: &SpecCommand,
+) -> Result<CliRun, CliError> {
+    let message = if command.json() {
+        serde_json::to_string_pretty(report)?
+    } else {
+        format_provision_report(report, command)
+    };
+    Ok(CliRun::exit(
+        message,
+        provision_exit_code(ProvisionEnd::Applied(report)),
+    ))
+}
+
+/// The text form of a provisioning error, with the plan it carries and what to do next.
+fn provision_error_text(error: &ProvisionError, command: &SpecCommand) -> String {
+    match error {
+        ProvisionError::Blocked(plan)
+        | ProvisionError::NeedsFlags(plan)
+        | ProvisionError::ConfirmationRequired(plan) => format!(
+            "{error}\n{}\n{}",
+            format_provision_plan(plan, &command.options),
+            plan_next_step(plan, command)
+        ),
+        ProvisionError::InvalidSpec(report) => {
+            format!("{error}\n{}", format_validation_report(report))
+        }
+        ProvisionError::PlanChanged { .. } => format!(
+            "{error}\nnothing was applied; re-run {} and confirm the new plan id (the \
+             --allow-* and --unmanaged flags are part of the id, so apply with the flags of the \
+             plan you reviewed)",
+            plan_command(command, &command.options, None)
+        ),
+        ProvisionError::AlreadyInitialized => format!(
+            "{error}\nconverge it with {} and config apply --confirm",
+            plan_command(command, &command.options, None)
+        ),
+        ProvisionError::AuditRequired => format!(
+            "{error}: audit is off and the spec keeps it off; set guarantees.audit.enabled to \
+             true, and the plan turns audit on first"
+        ),
+        ProvisionError::Locked(_) => in_use_message(command.db_path.as_deref()),
+        ProvisionError::PermissionMissing(_)
+        | ProvisionError::RecordUnreadable(_)
+        | ProvisionError::Db(_)
+        | ProvisionError::Config(_)
+        | ProvisionError::Io(_) => error.to_string(),
+    }
+}
+
+/// The JSON form of a provisioning error: `status`, `message` and the plan, report or ids it
+/// carries.
+fn provision_error_json(
+    error: &ProvisionError,
+    command: &SpecCommand,
+) -> Result<serde_json::Value, CliError> {
+    let message = match error {
+        ProvisionError::Locked(_) => in_use_message(command.db_path.as_deref()),
+        other => other.to_string(),
+    };
+    let mut value = json!({ "status": provision_error_status(error), "message": message });
+    match error {
+        ProvisionError::Blocked(plan)
+        | ProvisionError::NeedsFlags(plan)
+        | ProvisionError::ConfirmationRequired(plan) => {
+            value["plan"] = serde_json::to_value(plan.as_ref())?;
+        }
+        ProvisionError::InvalidSpec(report) => {
+            value["validation"] = serde_json::to_value(report.as_ref())?;
+        }
+        ProvisionError::PlanChanged { confirmed, current } => {
+            value["confirmed"] = json!(confirmed);
+            value["current"] = json!(current);
+        }
+        _ => {}
+    }
+    Ok(value)
+}
+
+fn provision_error_run(error: &ProvisionError, command: &SpecCommand) -> Result<CliRun, CliError> {
+    let message = if command.json() {
+        serde_json::to_string_pretty(&provision_error_json(error, command)?)?
+    } else {
+        provision_error_text(error, command)
+    };
+    Ok(CliRun::exit(
+        message,
+        provision_exit_code(ProvisionEnd::Failed(error)),
+    ))
+}
+
+/// `config plan --spec <file> [--db <path>] [--out <plan.json>] [flags] [--json]`: a dry run
+/// against the database at the target, or against an absent target. It never creates the
+/// database file and never writes a database; exit 0 when the plan is ready or a noop, 2 when
+/// it is blocked, the spec is invalid or flags are missing.
+fn run_spec_plan(args: &[String]) -> Result<CliRun, CliError> {
+    let command = match SpecCommand::load(args)? {
+        Ok(command) => command,
+        Err(run) => return Ok(run),
+    };
+    let out_path = flag_value(args, "--out")?.map(PathBuf::from);
+    let target = match open_spec_target(command.db_path.as_deref()) {
+        Ok(target) => target,
+        Err(refusal) => return refusal_run(&refusal, command.json()),
+    };
+    let plan = plan_spec_target(&command, &target);
+    drop(target);
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => return provision_error_run(&error, &command),
+    };
+    if let Some(out_path) = &out_path {
+        write_file_replacing(out_path, &serde_json::to_string_pretty(&plan)?)?;
+    }
+    let message = match (&out_path, command.json()) {
+        (Some(out_path), true) => serde_json::to_string_pretty(&json!({
+            "plan_id": plan.plan_id,
+            "outcome": plan.outcome,
+            "auto_approvable": plan.auto_approvable,
+            "required_flags": plan.required_flags,
+            "path": out_path.display().to_string(),
+        }))?,
+        (None, true) => serde_json::to_string_pretty(&plan)?,
+        (out_path, false) => {
+            let mut text = format!(
+                "{}\n{}",
+                format_provision_plan(&plan, &command.options),
+                plan_next_step(&plan, &command)
+            );
+            if let Some(out_path) = out_path {
+                text.push_str(&format!(
+                    "\nwrote plan {} to {}",
+                    plan.plan_id,
+                    out_path.display()
+                ));
+            }
+            text
+        }
+    };
+    Ok(CliRun::exit(
+        message,
+        provision_exit_code(ProvisionEnd::Planned(&plan)),
+    ))
+}
+
+/// `--confirm <prov_id>` or `--auto-approve`, never both; `None` without either.
+fn apply_confirmation(args: &[String]) -> Result<Option<Confirmation>, CliError> {
+    match (
+        flag_value(args, "--confirm")?,
+        has_flag(args, "--auto-approve"),
+    ) {
+        (Some(_), true) => Err(CliError::Usage(
+            "use either --confirm <prov_id> or --auto-approve, not both".to_owned(),
+        )),
+        (Some(id), false) => Ok(Some(Confirmation::PlanId(id))),
+        (None, true) => Ok(Some(Confirmation::AutoApproveAdditive)),
+        (None, false) => Ok(None),
+    }
+}
+
+/// `config apply --spec <file> [--db <path>] (--confirm <prov_id> | --auto-approve) [flags]
+/// [--json]`: recomputes the plan and applies it as the local operator `local:cli`. A missing
+/// database file is created with `provision_new_database`; an existing one is opened with
+/// `open_database_with_ops` and converged with `apply_provision`. Without a confirmation a noop
+/// exits 0 and any other plan is printed with exit 2.
+fn run_spec_apply(args: &[String]) -> Result<CliRun, CliError> {
+    let confirmation = apply_confirmation(args)?;
+    let command = match SpecCommand::load(args)? {
+        Ok(command) => command,
+        Err(run) => return Ok(run),
+    };
+    let target = match open_spec_target(command.db_path.as_deref()) {
+        Ok(target) => target,
+        Err(refusal) => return refusal_run(&refusal, command.json()),
+    };
+    let Some(confirmation) = confirmation else {
+        let plan = plan_spec_target(&command, &target);
+        drop(target);
+        return match plan {
+            Ok(plan) => unconfirmed_apply_run(&plan, &command),
+            Err(error) => provision_error_run(&error, &command),
+        };
+    };
+    let env = cli_environment();
+    let result = match target {
+        // Without a path the CLI plan is always blocked: a durable profile needs a path, and a
+        // volatile one is refused on the CLI.
+        SpecTarget::NoPath => match plan_spec_target(&command, &SpecTarget::NoPath) {
+            Ok(plan) if plan.outcome == PlanOutcome::Blocked => {
+                Err(ProvisionError::Blocked(Box::new(plan)))
+            }
+            Ok(_) => {
+                return Err(CliError::Usage(
+                    "missing --db; name the database file, or set deployment.storage_path"
+                        .to_owned(),
+                ));
+            }
+            Err(error) => Err(error),
+        },
+        SpecTarget::Absent(path) => provision::provision_new_database(
+            &command.spec,
+            Some(&path),
+            &confirmation,
+            &command.options,
+            &env,
+        )
+        .map(|(_db, report)| report),
+        SpecTarget::Existing { mut db, .. } => provision::apply_provision(
+            &mut db,
+            &ProvisionActor::local_operator(CLI_OPERATOR),
+            &command.spec,
+            &confirmation,
+            &command.options,
+            &env,
+        ),
+    };
+    match result {
+        Ok(report) => apply_report_run(&report, &command),
+        Err(error) => provision_error_run(&error, &command),
+    }
+}
+
+/// `config apply --spec` without `--confirm` or `--auto-approve`: nothing is applied.
+fn unconfirmed_apply_run(plan: &ProvisionPlan, command: &SpecCommand) -> Result<CliRun, CliError> {
+    if plan.outcome == PlanOutcome::Noop {
+        return message_run(
+            "noop",
+            format!(
+                "nothing to apply: the database already matches the spec (plan {})",
+                plan.plan_id
+            ),
+            0,
+            command.json(),
+        );
+    }
+    let (status, reason) = if plan.outcome == PlanOutcome::Blocked {
+        ("blocked", "nothing was applied: the plan is blocked")
+    } else {
+        (
+            "confirmation_required",
+            "nothing was applied: config apply --spec needs --confirm <prov_id> or \
+             --auto-approve",
+        )
+    };
+    let message = if command.json() {
+        serde_json::to_string_pretty(&json!({
+            "status": status,
+            "message": reason,
+            "plan": plan,
+        }))?
+    } else {
+        format!(
+            "{}\n{reason}\n{}",
+            format_provision_plan(plan, &command.options),
+            plan_next_step(plan, command)
+        )
+    };
+    Ok(CliRun::exit(message, 2))
+}
+
+/// `config drift --spec <file> [--db <path>] [--unmanaged ignore|report|fail] [--json]`: how the
+/// database differs from the spec. Exit 0 in sync, 3 drift (including a blocked plan or a
+/// missing database), 2 for an invalid spec or a spec without a database path. Unmanaged
+/// objects under `report` (the default) or `ignore` are information only; `--unmanaged fail`
+/// turns them into drift.
+fn run_config_drift(args: &[String]) -> Result<CliRun, CliError> {
+    reject_spec_mixing(args)?;
+    let command = match SpecCommand::load(args)? {
+        Ok(command) => command,
+        Err(run) => return Ok(run),
+    };
+    let target = match open_spec_target(command.db_path.as_deref()) {
+        Ok(target) => target,
+        Err(refusal) => return refusal_run(&refusal, command.json()),
+    };
+    let plan = plan_spec_target(&command, &target);
+    drop(target);
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => return provision_error_run(&error, &command),
+    };
+    let exit_code = provision_exit_code(ProvisionEnd::Drifted(&plan));
+    let issues = plan
+        .issues
+        .iter()
+        .filter(|issue| issue.severity != ValidationSeverity::Advice)
+        .collect::<Vec<_>>();
+    let message = if !plan.validation.valid {
+        if command.json() {
+            serde_json::to_string_pretty(&plan.validation)?
+        } else {
+            format_validation_report(&plan.validation)
+        }
+    } else if command.json() {
+        serde_json::to_string_pretty(&json!({
+            "in_sync": plan.drift.in_sync,
+            "items": plan.drift.items,
+            "plan_id": plan.plan_id,
+            "outcome": plan.outcome,
+            "issues": issues,
+        }))?
+    } else {
+        let mut lines = vec![format!(
+            "drift in_sync={} items={} plan={} outcome={}",
+            plan.drift.in_sync,
+            plan.drift.items.len(),
+            plan.plan_id,
+            slug(&plan.outcome)
+        )];
+        lines.extend(plan.drift.items.iter().map(format_drift_item));
+        lines.extend(issues.iter().map(|issue| format_issue(issue)));
+        lines.join("\n")
+    };
+    Ok(CliRun::exit(message, exit_code))
+}
+
+/// An initialized database opened for `config status` and `config export`.
+type OpenedTarget = (Box<Database>, Box<ProbedMetadata>);
+
+/// Opens the database `--db` names for `config status` and `config export`: a missing, locked
+/// or unreadable database is exit 1.
+fn open_existing_target(path: &Path, json: bool) -> Result<Result<OpenedTarget, CliRun>, CliError> {
+    match open_spec_target(Some(path)) {
+        Ok(SpecTarget::Existing { db, metadata }) => Ok(Ok((db, metadata))),
+        Ok(SpecTarget::Absent(_) | SpecTarget::NoPath) => Ok(Err(message_run(
+            "not_found",
+            format!("no database at {}", path.display()),
+            1,
+            json,
+        )?)),
+        Err(refusal) => Ok(Err(refusal_run(&refusal, json)?)),
+    }
+}
+
+/// `config status --db <path> [--json]`: the provision record, the last 20 history entries, the
+/// profile manifest and the drift of the live database against the spec the record applied.
+fn run_config_status(args: &[String]) -> Result<CliRun, CliError> {
+    let path = PathBuf::from(required_value(args, "--db")?);
+    let output = output_format(args)?;
+    let json_output = output == "json";
+    let (db, metadata) = match open_existing_target(&path, json_output)? {
+        Ok(opened) => opened,
+        Err(run) => return Ok(run),
+    };
+    let record = db.provision_state()?;
+    let history = db.provision_history()?;
+    let history_total = history.len();
+    let recent = &history[history_total.saturating_sub(STATUS_HISTORY_ENTRIES)..];
+    let drift = record
+        .as_ref()
+        .map(|record| {
+            provision::plan_provision(
+                &record.applied_spec,
+                ProvisionTargetRef::Open(&db),
+                &ProvisionOptions::default(),
+                &cli_environment(),
+            )
+            .map(|plan| plan.drift)
+        })
+        .transpose()
+        .map_err(|error| CliError::Runtime(format!("drift against the applied spec: {error}")))?;
+    drop(db);
+
+    let message = if json_output {
+        serde_json::to_string_pretty(&json!({
+            "path": path.display().to_string(),
+            "provisioned": record.is_some(),
+            "record": record,
+            "history": recent,
+            "history_total": history_total,
+            "metadata": metadata,
+            "drift": drift,
+        }))?
+    } else {
+        let mut lines = vec![format!("database {}", path.display())];
+        match &record {
+            Some(record) => lines.extend(format_provision_record(record)),
+            None => lines.push(
+                "not provisioned: no provision record (config apply --spec writes one)".to_owned(),
+            ),
+        }
+        lines.push(format!(
+            "history (last {} of {history_total}):",
+            recent.len()
+        ));
+        lines.extend(recent.iter().map(|entry| {
+            format!(
+                "  {} {} {} by {} flags={}",
+                entry.at_millis,
+                entry.plan_id,
+                slug(&entry.status),
+                entry.actor,
+                list_or_none(&entry.flags)
+            )
+        }));
+        lines.push(format_metadata_probe(
+            &path,
+            &MetadataProbe::Initialized(metadata),
+        )?);
+        if let Some(drift) = &drift {
+            lines.push(format!(
+                "drift against the applied spec: in_sync={} items={}",
+                drift.in_sync,
+                drift.items.len()
+            ));
+            lines.extend(drift.items.iter().map(format_drift_item));
+        }
+        lines.join("\n")
+    };
+    Ok(CliRun::success(message))
+}
+
+/// The text form of a provision record for `config status`.
+fn format_provision_record(record: &provision::ProvisionRecord) -> Vec<String> {
+    let objects = record
+        .objects
+        .iter()
+        .map(|(name, object)| {
+            format!(
+                "{name} ({}{})",
+                object.kind.slug(),
+                if object.adopted { ", adopted" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>();
+    vec![
+        format!(
+            "provisioned: status={} plan={} spec={} applied_by={} applied_at_millis={} binary={}",
+            slug(&record.status),
+            record.plan_id,
+            record.spec_digest,
+            record.applied_by,
+            record.applied_at_millis,
+            record.binary_version
+        ),
+        format!(
+            "managed objects ({}): {}",
+            objects.len(),
+            list_or_none(&objects)
+        ),
+        format!(
+            "managed roles: {}; managed principals: {}; released objects: {}",
+            list_or_none(&record.managed_roles),
+            list_or_none(&record.managed_principals),
+            list_or_none(&record.released_objects)
+        ),
+        format!(
+            "completed steps: {}; failed step: {}; flags: {}",
+            record.completed_steps.len(),
+            record.failed_step.as_deref().unwrap_or("none"),
+            list_or_none(&record.flags)
+        ),
+    ]
+}
+
+/// `a, b, c`, or `none`.
+fn list_or_none<'a, I>(items: I) -> String
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let items = items.into_iter().map(String::as_str).collect::<Vec<_>>();
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// `config export --db <path> [--format yaml|json] [--out <file>] [--force]`: the database as a
+/// spec (`provision::export_spec`): the spec the provision record applied, else a version 2 spec
+/// inferred from the catalog, the profile manifest and the RBAC state. Without `--out` the spec
+/// goes to stdout and the notes to stderr; `--out` refuses to replace a file without `--force`.
+fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
+    let path = PathBuf::from(required_value(args, "--db")?);
+    let out_path = flag_value(args, "--out")?.map(PathBuf::from);
+    let format = match flag_value(args, "--format")? {
+        Some(format) if format == "yaml" || format == "json" => format,
+        Some(other) => {
+            return Err(CliError::Usage(format!(
+                "unsupported --format {other}; expected yaml or json"
+            )));
+        }
+        None => match out_path.as_deref().map(spec_io::spec_format_for_path) {
+            Some(SpecFormat::Json) => "json".to_owned(),
+            Some(SpecFormat::Yaml) | None => "yaml".to_owned(),
+        },
+    };
+    if let Some(out_path) = &out_path
+        && !has_flag(args, "--force")
+        && std::fs::symlink_metadata(out_path).is_ok()
+    {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite {}; pass --force to replace it",
+            out_path.display()
+        )));
+    }
+    let (db, _) = match open_existing_target(&path, false)? {
+        Ok(opened) => opened,
+        Err(run) => return Ok(run),
+    };
+    let exported = provision::export_spec(&db);
+    drop(db);
+    let exported = match exported {
+        Ok(exported) => exported,
+        Err(error) => {
+            return Ok(CliRun::exit(
+                error.to_string(),
+                provision_exit_code(ProvisionEnd::Failed(&error)),
+            ));
+        }
+    };
+    let content = serialize_spec(&exported.spec, &format)?;
+    let Some(out_path) = out_path else {
+        // stdout carries only the spec, so it can be redirected into a file.
+        for note in &exported.notes {
+            eprintln!("note: {note}");
+        }
+        return Ok(CliRun::success(content.trim_end_matches('\n')));
+    };
+    write_file_replacing(&out_path, &content)?;
+    let mut lines = vec![format!(
+        "exported spec path={} source={} format={format} version={} profile={}",
+        out_path.display(),
+        slug(&exported.source),
+        exported.spec.version,
+        exported.spec.profile
+    )];
+    lines.extend(exported.notes.iter().map(|note| format!("note: {note}")));
+    Ok(CliRun::success(lines.join("\n")))
+}
+
+/// `init --apply [--db <path>] [--confirm <prov_id>]`.
+struct InitApply {
+    db: Option<PathBuf>,
+    confirm: Option<String>,
+}
+
+/// The `--apply` options of `init`; `--db` and `--confirm` need `--apply`.
+fn init_apply_options(args: &[String]) -> Result<Option<InitApply>, CliError> {
+    let db = flag_value(args, "--db")?.map(PathBuf::from);
+    let confirm = flag_value(args, "--confirm")?;
+    if !has_flag(args, "--apply") {
+        if db.is_some() || confirm.is_some() {
+            return Err(CliError::Usage(
+                "--db and --confirm belong to init --apply, which provisions the database"
+                    .to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(InitApply { db, confirm }))
+}
+
+/// What `init --apply` did: an exit code and the text and JSON to add to the init summary.
+struct InitProvision {
+    db_path: PathBuf,
+    exit_code: u8,
+    text: String,
+    json: serde_json::Value,
+}
+
+impl InitProvision {
+    /// Adds the database path and the provisioning result to the init summary.
+    fn extend_json(&self, summary: &mut serde_json::Value) {
+        summary["database"] = json!(self.db_path.display().to_string());
+        summary["provision"] = self.json.clone();
+    }
+
+    fn extend_text(&self, message: &mut String) {
+        message.push_str(&format!("\ndatabase path={}\n", self.db_path.display()));
+        message.push_str(&self.text);
+    }
+
+    /// The init run with the provisioning exit code when provisioning did not succeed.
+    fn finish(provision: Option<&Self>, run: CliRun) -> CliRun {
+        match provision {
+            Some(provision) if provision.exit_code != 0 => {
+                CliRun::exit(run.message, provision.exit_code)
+            }
+            _ => run,
+        }
+    }
+}
+
+/// Provisions a new database from the spec `init` just wrote, at `--db`, else the spec
+/// `storage_path` relative to `out_dir`, else `<out_dir>/<sanitized name>.redb`. An existing
+/// database is refused (exit 2; `config apply` converges it). The plan is auto-approved unless
+/// `--confirm` names its id; a blocked or not auto-approvable plan leaves the written files and
+/// exits 2.
+fn init_provision(
+    apply: &InitApply,
+    spec: &DatabaseSpec,
+    spec_path: &Path,
+    out_dir: &Path,
+    output: &str,
+) -> Result<InitProvision, CliError> {
+    let db_path = apply
+        .db
+        .clone()
+        .or_else(|| {
+            spec.deployment
+                .storage_path
+                .as_deref()
+                .map(|storage_path| resolve_against(out_dir, storage_path))
+        })
+        .unwrap_or_else(|| out_dir.join(storage_file_name(&spec.name)));
+    let command = SpecCommand {
+        spec_path: spec_path.to_path_buf(),
+        spec: spec.clone(),
+        db_path: Some(db_path.clone()),
+        options: ProvisionOptions::default(),
+        output: output.to_owned(),
+    };
+    let existing = |detail: String| {
+        Some((
+            "already_initialized",
+            format!(
+                "{detail}; init --apply only creates new databases, so converge an existing one \
+                 with {} and config apply --confirm",
+                plan_command(&command, &command.options, None)
+            ),
+            2,
+        ))
+    };
+    let refusal = match inspect_database_metadata(&db_path) {
+        MetadataProbe::NotFound | MetadataProbe::Uninitialized => None,
+        MetadataProbe::Locked => Some(("in_use", in_use_message(Some(&db_path)), 1)),
+        MetadataProbe::Initialized(_) | MetadataProbe::NeedsRecovery => existing(format!(
+            "a database already exists at {}",
+            db_path.display()
+        )),
+        MetadataProbe::Unreadable { reason } => existing(format!(
+            "{} exists and is not an empty database ({reason})",
+            db_path.display()
+        )),
+    };
+    if let Some((status, message, exit_code)) = refusal {
+        return Ok(InitProvision {
+            db_path,
+            exit_code,
+            json: json!({ "status": status, "message": message }),
+            text: message,
+        });
+    }
+    let confirmation = apply
+        .confirm
+        .clone()
+        .map_or(Confirmation::AutoApproveAdditive, Confirmation::PlanId);
+    let result = provision::provision_new_database(
+        spec,
+        Some(&db_path),
+        &confirmation,
+        &command.options,
+        &cli_environment(),
+    )
+    .map(|(_db, report)| report);
+    Ok(match &result {
+        Ok(report) => InitProvision {
+            db_path,
+            exit_code: provision_exit_code(ProvisionEnd::Applied(report)),
+            text: format_provision_report(report, &command),
+            json: serde_json::to_value(report)?,
+        },
+        Err(error) => InitProvision {
+            db_path,
+            exit_code: provision_exit_code(ProvisionEnd::Failed(error)),
+            text: provision_error_text(error, &command),
+            json: provision_error_json(error, &command)?,
+        },
+    })
+}
+
 fn run_explain(args: &[String]) -> Result<CliRun, CliError> {
     let Some(command) = args.first() else {
         return Err(usage());
@@ -585,6 +2032,7 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
         ));
     }
     let customize = has_flag(args, "--override");
+    let apply = init_apply_options(args)?;
     if let Some(template_name) = template_arg {
         if customize || has_flag(args, "--profile-name") {
             return Err(CliError::Usage(
@@ -592,7 +2040,7 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
                     .to_owned(),
             ));
         }
-        return run_init_template(args, &template_name, &name);
+        return run_init_template(args, &template_name, &name, apply.as_ref());
     }
     if !customize && has_flag(args, "--profile-name") {
         return Err(CliError::Usage(
@@ -653,6 +2101,10 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
     std::fs::write(&out_path, content.as_bytes())?;
 
     let output = output_format(args)?;
+    let provision = apply
+        .as_ref()
+        .map(|apply| init_provision(apply, &spec, &out_path, parent_dir(&out_path), &output))
+        .transpose()?;
     let extends = spec
         .custom_profile
         .as_ref()
@@ -674,6 +2126,9 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
             summary["variant"] = json!(warning.variant);
             summary["storage_profile"] = json!(warning.storage_profile);
         }
+        if let Some(provision) = &provision {
+            provision.extend_json(&mut summary);
+        }
         serde_json::to_string_pretty(&summary)?
     } else {
         let mut message = format!(
@@ -691,10 +2146,16 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
             message.push_str("\nwarning: ");
             message.push_str(&warning.message);
         }
+        if let Some(provision) = &provision {
+            provision.extend_text(&mut message);
+        }
         message
     };
 
-    Ok(CliRun::validation(message, report.valid))
+    Ok(InitProvision::finish(
+        provision.as_ref(),
+        CliRun::validation(message, report.valid),
+    ))
 }
 
 /// Warns that a version 1 guided spec records the product slug, so an alias that names a
@@ -734,7 +2195,12 @@ fn variant_warning(
     })
 }
 
-fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result<CliRun, CliError> {
+fn run_init_template(
+    args: &[String],
+    template_name: &str,
+    name: &str,
+    apply: Option<&InitApply>,
+) -> Result<CliRun, CliError> {
     let format = template_output_format(args)?;
     let materialized = materialize_template(template_name, name, format)?;
     let out_dir = optional_value(args, "--out")
@@ -743,13 +2209,25 @@ fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result
     ensure_template_output_dir(&out_dir, has_flag(args, "--force"))?;
     write_template_materialization(&out_dir, &materialized)?;
 
+    let output = output_format(args)?;
+    let provision = apply
+        .map(|apply| {
+            init_provision(
+                apply,
+                &materialized.spec,
+                &out_dir.join(format.spec_file_name()),
+                &out_dir,
+                &output,
+            )
+        })
+        .transpose()?;
     let files = materialized
         .files
         .iter()
         .map(|file| file.path.as_str())
         .collect::<Vec<_>>();
-    let message = if output_format(args)? == "json" {
-        serde_json::to_string_pretty(&json!({
+    let message = if output == "json" {
+        let mut summary = json!({
             "path": out_dir.display().to_string(),
             "name": materialized.spec.name,
             "template": materialized.template_slug,
@@ -757,9 +2235,13 @@ fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result
             "status": materialized.validation.status,
             "valid": materialized.validation.valid,
             "files": files,
-        }))?
+        });
+        if let Some(provision) = &provision {
+            provision.extend_json(&mut summary);
+        }
+        serde_json::to_string_pretty(&summary)?
     } else {
-        format!(
+        let mut message = format!(
             "created template path={} name={} template={} profile={} status={:?} valid={} files={}",
             out_dir.display(),
             materialized.spec.name,
@@ -768,10 +2250,17 @@ fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result
             materialized.validation.status,
             materialized.validation.valid,
             files.join(",")
-        )
+        );
+        if let Some(provision) = &provision {
+            provision.extend_text(&mut message);
+        }
+        message
     };
 
-    Ok(CliRun::validation(message, materialized.validation.valid))
+    Ok(InitProvision::finish(
+        provision.as_ref(),
+        CliRun::validation(message, materialized.validation.valid),
+    ))
 }
 
 fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
@@ -2949,8 +4438,8 @@ fn usage() -> CliError {
     CliError::Usage(
         "multidb serve\n\
          multidb backup full --db <path> --profile <profile> --dest <dir>\n\
-         multidb init --guided --profile <profile> --name <name> [--override <knob>=<value>]... [--profile-name <slug>] [--out <path>] [--format yaml|json] [--force] [--json]\n\
-         multidb init --guided --template <template> --name <name> [--out <dir>] [--format yaml|json] [--force] [--json]\n\
+         multidb init --guided --profile <profile> --name <name> [--override <knob>=<value>]... [--profile-name <slug>] [--out <path>] [--format yaml|json] [--force] [--apply [--db <path>] [--confirm <prov_id>]] [--json]\n\
+         multidb init --guided --template <template> --name <name> [--out <dir>] [--format yaml|json] [--force] [--apply [--db <path>] [--confirm <prov_id>]] [--json]\n\
          multidb template list [--json]\n\
          multidb template explain <template> [--name <name>] [--output text|json] [--json]\n\
          multidb profile list [--json]\n\
@@ -2965,6 +4454,11 @@ fn usage() -> CliError {
          multidb explain config --spec <json|yaml> [--output text|json] [--json]\n\
          multidb config plan --current <json|yaml> --desired <json|yaml> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb config apply --plan <json> --confirm <plan_id> [--output text|json]\n\
+         multidb config plan --spec <json|yaml> [--db <path>] [--out <plan.json>] [--allow-weakening <path>[,<path>]]... [--allow-destructive <path>[,<path>]]... [--allow-format-upgrade] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
+         multidb config apply --spec <json|yaml> [--db <path>] (--confirm <prov_id>|--auto-approve) [--allow-weakening <path>[,<path>]]... [--allow-destructive <path>[,<path>]]... [--allow-format-upgrade] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
+         multidb config drift --spec <json|yaml> [--db <path>] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
+         multidb config status --db <path> [--output text|json] [--json]\n\
+         multidb config export --db <path> [--format yaml|json] [--out <path>] [--force]\n\
          multidb config upgrade --spec <json|yaml> [--out <path>] [--force] [--output text|json] [--json]\n\
          multidb advice list --db <path> --profile <profile> [--output text|json] [--json]\n\
          multidb advice plan --db <path> --profile <profile> --advice-id <id> [--out <plan.json>] [--output text|json] [--json]\n\
@@ -2985,7 +4479,8 @@ fn usage() -> CliError {
          multidb admin serve --db <path> --profile <profile> [--bind <addr>] [--admin-password <password>|--admin-password-file <path>|--admin-token <token>|--insecure-local-admin]\n\
          multidb migrate value-codec --db <path> --profile <profile>\n\
          <profile> on --profile and MULTIDB_PROFILE: a storage profile (InMemory, Transactional, Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product slug or alias from multidb profile list (snake or kebab case), or auto to read an existing database (not accepted by restore)\n\
-         --override takes a knob path from multidb profile knobs; repeat it or separate assignments with commas"
+         --override takes a knob path from multidb profile knobs; repeat it or separate assignments with commas\n\
+         config plan|apply|drift --spec provision the database at --db, else at the spec storage_path relative to the spec file; exit 0 ready, applied or in sync, 1 runtime error, locked database or partial apply, 2 invalid, blocked, flags or confirmation missing, 3 drift, 4 plan changed"
             .to_owned(),
     )
 }
@@ -5315,6 +6810,927 @@ mod tests {
         for canonical in ["secure_app", "transactional"] {
             let outcome = init(canonical)?;
             assert!(!outcome.message.contains("warning"), "{}", outcome.message);
+        }
+        Ok(())
+    }
+
+    /// A version 2 spec for the durable `balanced` profile whose `storage_path` is the relative
+    /// `shop.redb`, so the CLI resolves it against the directory of the spec file.
+    fn provision_spec(collections: &Value) -> Result<DatabaseSpec, Box<dyn std::error::Error>> {
+        let mut spec = DatabaseSpec::from_db_config(
+            "shop",
+            &DbConfig::on_disk(Profile::Balanced, "shop.redb"),
+        );
+        spec.version = multidb::config_spec::DATABASE_SPEC_VERSION_V2;
+        spec.profile = "balanced".to_owned();
+        spec.collections = serde_json::from_value(collections.clone())?;
+        Ok(spec)
+    }
+
+    fn document_collection(name: &str) -> Value {
+        json!({ "name": name, "role": "document_entity", "domain": "primary", "indexes": ["primary"] })
+    }
+
+    /// A database created with the `balanced` profile manifest, outside provisioning.
+    fn create_balanced_database(
+        path: &std::path::Path,
+    ) -> Result<multidb::db::Database, Box<dyn std::error::Error>> {
+        let ProfileResolution::Resolved { profile, .. } = resolve_named_profile(
+            "balanced",
+            &multidb::config_spec::ProfileKnobOverrides::default(),
+        ) else {
+            return Err("balanced does not resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(path.to_path_buf()))?;
+        Ok(create_database_with_profile(
+            &binding,
+            OperationalConfig::new(),
+        )?)
+    }
+
+    fn plan_id_of(outcome: &super::CliRun) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(json_message(outcome)?["plan_id"]
+            .as_str()
+            .ok_or("missing plan_id")?
+            .to_owned())
+    }
+
+    #[test]
+    fn config_plan_spec_is_a_dry_run_against_the_spec_storage_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_dir = temp.path().join("app");
+        std::fs::create_dir(&spec_dir)?;
+        let spec_path = spec_dir.join("multidb.yaml");
+        write_yaml_spec(
+            &spec_path,
+            &provision_spec(&json!([document_collection("orders")]))?,
+        )?;
+        let spec_arg = path_arg(&spec_path);
+        let db_path = spec_dir.join("shop.redb");
+
+        let text = run(strings(&["config", "plan", "--spec", &spec_arg]))?;
+        assert_eq!(text.exit_code, 0, "{}", text.message);
+        for expected in [
+            "outcome=ready auto_approvable=true surface=cli",
+            "pstep-001 create_database",
+            "create_collection collections.orders additive",
+            "flags: none required",
+            "guarantees.audit.enabled=true enforced_with_development_key",
+            "apply with: multidb config apply --spec",
+        ] {
+            assert!(
+                text.message.contains(expected),
+                "{expected}: {}",
+                text.message
+            );
+        }
+        assert!(
+            !db_path.exists(),
+            "a dry run never creates the database file"
+        );
+
+        let json = run(strings(&["config", "plan", "--spec", &spec_arg, "--json"]))?;
+        assert_eq!(json.exit_code, 0, "{}", json.message);
+        let plan = json_message(&json)?;
+        assert_eq!(plan["outcome"], "ready");
+        assert_eq!(plan["surface"], "cli");
+        assert_eq!(plan["target"]["kind"], "new_database");
+        // The relative storage_path resolves against the directory of the spec file, not the
+        // working directory.
+        assert_eq!(
+            plan["target"]["path"],
+            json!(
+                std::fs::canonicalize(&spec_dir)?
+                    .join("shop.redb")
+                    .display()
+                    .to_string()
+            )
+        );
+        let plan_id = plan_id_of(&json)?;
+        assert!(plan_id.starts_with("prov_"), "{plan_id}");
+        let explicit = run(strings(&[
+            "config",
+            "plan",
+            "--spec",
+            &spec_arg,
+            "--db",
+            &path_arg(&db_path),
+            "--json",
+        ]))?;
+        assert_eq!(plan_id_of(&explicit)?, plan_id);
+
+        let out = temp.path().join("plan.json");
+        let written = run(strings(&[
+            "config",
+            "plan",
+            "--spec",
+            &spec_arg,
+            "--out",
+            &path_arg(&out),
+            "--json",
+        ]))?;
+        assert_eq!(written.exit_code, 0, "{}", written.message);
+        assert_eq!(plan_id_of(&written)?, plan_id);
+        let decoded = serde_json::from_str::<multidb::provision::ProvisionPlan>(
+            &std::fs::read_to_string(&out)?,
+        )?;
+        assert_eq!(decoded.plan_id, plan_id);
+        assert!(
+            !db_path.exists(),
+            "a dry run never creates the database file"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_apply_spec_creates_converges_and_checks_confirmations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        write_yaml_spec(
+            &spec_path,
+            &provision_spec(&json!([document_collection("orders")]))?,
+        )?;
+        let spec_arg = path_arg(&spec_path);
+        let db_path = temp.path().join("shop.redb");
+        let apply = |extra: &[&str]| {
+            let mut args = strings(&["config", "apply", "--spec", &spec_arg]);
+            args.extend(strings(extra));
+            run(args)
+        };
+
+        let unconfirmed = apply(&[])?;
+        assert_eq!(unconfirmed.exit_code, 2, "{}", unconfirmed.message);
+        assert!(
+            unconfirmed.message.contains("nothing was applied"),
+            "{}",
+            unconfirmed.message
+        );
+        let legacy_id = apply(&["--confirm", "plan_0123456789abcdef"])?;
+        assert_eq!(legacy_id.exit_code, 2, "{}", legacy_id.message);
+        assert!(!db_path.exists());
+        let both = apply(&["--confirm", "prov_0", "--auto-approve"]);
+        assert!(
+            matches!(both, Err(CliError::Usage(ref message)) if message.contains("not both")),
+            "unexpected result: {both:?}"
+        );
+
+        let created = apply(&["--auto-approve", "--json"])?;
+        assert_eq!(created.exit_code, 0, "{}", created.message);
+        let report = json_message(&created)?;
+        assert_eq!(report["status"], "applied");
+        assert_eq!(report["check"]["data_mutated"], true);
+        assert_eq!(report["record"]["applied_by"], "local:cli");
+        assert!(db_path.exists());
+
+        let again = apply(&["--auto-approve"])?;
+        assert_eq!(again.exit_code, 0, "{}", again.message);
+        assert!(
+            again.message.starts_with("provisioning noop"),
+            "{}",
+            again.message
+        );
+        let nothing = apply(&[])?;
+        assert_eq!(nothing.exit_code, 0, "{}", nothing.message);
+        assert!(nothing.message.contains("nothing to apply"));
+        let rejected = apply(&["--confirm", "plan_0123456789abcdef", "--json"])?;
+        assert_eq!(rejected.exit_code, 2, "{}", rejected.message);
+        assert_eq!(json_message(&rejected)?["status"], "rejected");
+
+        // A plan reviewed before an out-of-band change no longer confirms.
+        let grown_path = temp.path().join("grown.yaml");
+        write_yaml_spec(
+            &grown_path,
+            &provision_spec(&json!([
+                document_collection("orders"),
+                document_collection("events")
+            ]))?,
+        )?;
+        let grown_arg = path_arg(&grown_path);
+        let reviewed = run(strings(&["config", "plan", "--spec", &grown_arg, "--json"]))?;
+        assert_eq!(reviewed.exit_code, 0, "{}", reviewed.message);
+        let reviewed_id = plan_id_of(&reviewed)?;
+        let mut db = open_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        db.create_graph_auto_id("social")?;
+        drop(db);
+        let stale = run(strings(&[
+            "config",
+            "apply",
+            "--spec",
+            &grown_arg,
+            "--confirm",
+            &reviewed_id,
+        ]))?;
+        assert_eq!(stale.exit_code, 4, "{}", stale.message);
+        assert!(
+            stale.message.contains("the plan changed"),
+            "{}",
+            stale.message
+        );
+        let current = run(strings(&["config", "plan", "--spec", &grown_arg, "--json"]))?;
+        let current_id = plan_id_of(&current)?;
+        assert_ne!(current_id, reviewed_id);
+        let applied = run(strings(&[
+            "config",
+            "apply",
+            "--spec",
+            &grown_arg,
+            "--confirm",
+            &current_id,
+        ]))?;
+        assert_eq!(applied.exit_code, 0, "{}", applied.message);
+        assert!(
+            applied.message.starts_with("provisioning applied"),
+            "{}",
+            applied.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_drift_reports_sync_drift_and_invalid_specs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        write_yaml_spec(
+            &spec_path,
+            &provision_spec(&json!([document_collection("orders")]))?,
+        )?;
+        let spec_arg = path_arg(&spec_path);
+        let db_path = temp.path().join("shop.redb");
+        let drift = |spec: &str, extra: &[&str]| {
+            let mut args = strings(&["config", "drift", "--spec", spec]);
+            args.extend(strings(extra));
+            run(args)
+        };
+
+        let missing = drift(&spec_arg, &[])?;
+        assert_eq!(missing.exit_code, 3, "{}", missing.message);
+        let applied = run(strings(&[
+            "config",
+            "apply",
+            "--spec",
+            &spec_arg,
+            "--auto-approve",
+        ]))?;
+        assert_eq!(applied.exit_code, 0, "{}", applied.message);
+        let in_sync = drift(&spec_arg, &[])?;
+        assert_eq!(in_sync.exit_code, 0, "{}", in_sync.message);
+        assert!(in_sync.message.starts_with("drift in_sync=true"));
+
+        // An object created outside provisioning is information under the default `report`
+        // policy, and drift under `--unmanaged fail`.
+        let mut db = open_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        db.create_graph_auto_id("social")?;
+        drop(db);
+        let reported = drift(&spec_arg, &["--json"])?;
+        assert_eq!(reported.exit_code, 0, "{}", reported.message);
+        let report = json_message(&reported)?;
+        assert_eq!(report["in_sync"], true);
+        assert!(
+            report["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["kind"] == "unmanaged_object")),
+            "{report}"
+        );
+        let failed = drift(&spec_arg, &["--unmanaged", "fail"])?;
+        assert_eq!(failed.exit_code, 3, "{}", failed.message);
+
+        let grown_path = temp.path().join("grown.yaml");
+        write_yaml_spec(
+            &grown_path,
+            &provision_spec(&json!([
+                document_collection("orders"),
+                document_collection("events")
+            ]))?,
+        )?;
+        let grown = drift(&path_arg(&grown_path), &[])?;
+        assert_eq!(grown.exit_code, 3, "{}", grown.message);
+        assert!(
+            grown.message.contains("missing_object"),
+            "{}",
+            grown.message
+        );
+
+        let invalid_path = temp.path().join("invalid.yaml");
+        write_yaml_spec(
+            &invalid_path,
+            &provision_spec(&json!([document_collection("__secret")]))?,
+        )?;
+        let invalid = drift(&path_arg(&invalid_path), &[])?;
+        assert_eq!(invalid.exit_code, 2, "{}", invalid.message);
+        assert!(
+            invalid.message.contains("COLLECTION_NAME_RESERVED"),
+            "{}",
+            invalid.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_status_and_export_describe_the_database() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let spec = provision_spec(&json!([document_collection("orders")]))?;
+        write_yaml_spec(&spec_path, &spec)?;
+        let db_path = temp.path().join("shop.redb");
+        let db_arg = path_arg(&db_path);
+        let applied = run(strings(&[
+            "config",
+            "apply",
+            "--spec",
+            &path_arg(&spec_path),
+            "--auto-approve",
+        ]))?;
+        assert_eq!(applied.exit_code, 0, "{}", applied.message);
+
+        let status = run(strings(&["config", "status", "--db", &db_arg]))?;
+        assert_eq!(status.exit_code, 0, "{}", status.message);
+        for expected in [
+            "provisioned: status=applied",
+            "applied_by=local:cli",
+            "managed objects (1): orders (document)",
+            "history (last 1 of 1):",
+            "profile manifest: ",
+            "drift against the applied spec: in_sync=true",
+        ] {
+            assert!(
+                status.message.contains(expected),
+                "{expected}: {}",
+                status.message
+            );
+        }
+        let status_json = run(strings(&["config", "status", "--db", &db_arg, "--json"]))?;
+        let report = json_message(&status_json)?;
+        assert_eq!(report["provisioned"], true);
+        assert_eq!(report["record"]["status"], "applied");
+        assert_eq!(report["history"].as_array().map(Vec::len), Some(1));
+        assert_eq!(report["drift"]["in_sync"], true);
+
+        let out = temp.path().join("exported.yaml");
+        let exported = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &db_arg,
+            "--out",
+            &path_arg(&out),
+        ]))?;
+        assert_eq!(exported.exit_code, 0, "{}", exported.message);
+        assert!(
+            exported.message.contains("source=applied_record"),
+            "{}",
+            exported.message
+        );
+        assert_eq!(
+            serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&out)?)?,
+            spec
+        );
+        let overwrite = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &db_arg,
+            "--out",
+            &path_arg(&out),
+        ]));
+        assert!(
+            matches!(overwrite, Err(CliError::Usage(ref message)) if message.contains("--force")),
+            "unexpected result: {overwrite:?}"
+        );
+        let forced = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &db_arg,
+            "--out",
+            &path_arg(&out),
+            "--format",
+            "json",
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 0, "{}", forced.message);
+        assert_eq!(
+            serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&out)?)?,
+            spec
+        );
+        let stdout = run(strings(&["config", "export", "--db", &db_arg]))?;
+        assert_eq!(stdout.exit_code, 0);
+        assert_eq!(
+            serde_norway::from_str::<DatabaseSpec>(&stdout.message)?,
+            spec
+        );
+
+        // A database built outside provisioning exports an inferred spec that plans as
+        // adoption and records only.
+        let builder_path = temp.path().join("builder.redb");
+        let mut builder = create_balanced_database(&builder_path)?;
+        builder.create_graph_auto_id("social")?;
+        drop(builder);
+        let builder_arg = path_arg(&builder_path);
+        let unprovisioned = run(strings(&["config", "status", "--db", &builder_arg]))?;
+        assert_eq!(unprovisioned.exit_code, 0, "{}", unprovisioned.message);
+        assert!(
+            unprovisioned.message.contains("not provisioned"),
+            "{}",
+            unprovisioned.message
+        );
+        let inferred_path = temp.path().join("inferred.yaml");
+        let inferred = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &builder_arg,
+            "--out",
+            &path_arg(&inferred_path),
+        ]))?;
+        assert_eq!(inferred.exit_code, 0, "{}", inferred.message);
+        assert!(
+            inferred.message.contains("source=inferred"),
+            "{}",
+            inferred.message
+        );
+        let plan = run(strings(&[
+            "config",
+            "plan",
+            "--spec",
+            &path_arg(&inferred_path),
+            "--db",
+            &builder_arg,
+            "--json",
+        ]))?;
+        assert_eq!(plan.exit_code, 0, "{}", plan.message);
+        let plan = json_message(&plan)?;
+        let steps = plan["steps"].as_array().ok_or("missing steps")?;
+        assert!(!steps.is_empty());
+        for step in steps {
+            assert!(
+                [
+                    "adopt_object",
+                    "adopt_profile",
+                    "apply_security",
+                    "record_guarantees",
+                    "record_metadata",
+                    "record_applied_spec"
+                ]
+                .contains(&step["kind"].as_str().unwrap_or_default()),
+                "{step}"
+            );
+            assert!(
+                ["additive", "metadata"].contains(&step["safety"].as_str().unwrap_or_default()),
+                "{step}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn config_spec_commands_refuse_locked_pathless_and_ap_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        write_yaml_spec(
+            &spec_path,
+            &provision_spec(&json!([document_collection("orders")]))?,
+        )?;
+        let spec_arg = path_arg(&spec_path);
+
+        let locked_path = temp.path().join("locked.redb");
+        let held = create_balanced_database(&locked_path)?;
+        let locked_arg = path_arg(&locked_path);
+        for args in [
+            vec!["config", "plan", "--spec", &spec_arg, "--db", &locked_arg],
+            vec![
+                "config",
+                "apply",
+                "--spec",
+                &spec_arg,
+                "--db",
+                &locked_arg,
+                "--auto-approve",
+            ],
+            vec!["config", "drift", "--spec", &spec_arg, "--db", &locked_arg],
+            vec!["config", "status", "--db", &locked_arg],
+        ] {
+            let outcome = run(strings(&args))?;
+            assert_eq!(outcome.exit_code, 1, "{args:?}: {}", outcome.message);
+            assert!(
+                outcome
+                    .message
+                    .starts_with("database is in use (is multidb serve running?)"),
+                "{args:?}: {}",
+                outcome.message
+            );
+        }
+        drop(held);
+
+        let mut pathless = provision_spec(&json!([document_collection("orders")]))?;
+        pathless.deployment.storage_path = None;
+        let pathless_path = temp.path().join("pathless.yaml");
+        write_yaml_spec(&pathless_path, &pathless)?;
+        let pathless_arg = path_arg(&pathless_path);
+        for args in [
+            vec!["config", "plan", "--spec", &pathless_arg],
+            vec!["config", "apply", "--spec", &pathless_arg, "--auto-approve"],
+            vec!["config", "drift", "--spec", &pathless_arg],
+        ] {
+            let outcome = run(strings(&args))?;
+            assert_eq!(outcome.exit_code, 2, "{args:?}: {}", outcome.message);
+            if args[1] != "drift" {
+                assert!(
+                    outcome.message.contains("PROVISION_STORAGE_PATH_REQUIRED"),
+                    "{args:?}: {}",
+                    outcome.message
+                );
+            }
+        }
+
+        let ap_path = temp.path().join("ap.redb");
+        drop(create_database(
+            DbConfig::on_disk(Profile::Document, &ap_path).with_replication(ReplicationKind::Ap),
+        )?);
+        let before = std::fs::read(&ap_path)?;
+        let ap = run(strings(&[
+            "config",
+            "plan",
+            "--spec",
+            &spec_arg,
+            "--db",
+            &path_arg(&ap_path),
+        ]))?;
+        assert_eq!(ap.exit_code, 2, "{}", ap.message);
+        assert!(
+            ap.message.contains("PROVISION_REPLICATION_UNSUPPORTED"),
+            "{}",
+            ap.message
+        );
+        assert_eq!(std::fs::read(&ap_path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn config_spec_flags_parse_and_never_mix_with_the_v1_plan_flow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        write_yaml_spec(
+            &spec_path,
+            &provision_spec(&json!([document_collection("orders")]))?,
+        )?;
+        let spec_arg = path_arg(&spec_path);
+
+        for args in [
+            vec![
+                "config",
+                "plan",
+                "--spec",
+                &spec_arg,
+                "--current",
+                &spec_arg,
+            ],
+            vec![
+                "config",
+                "plan",
+                "--spec",
+                &spec_arg,
+                "--desired",
+                &spec_arg,
+            ],
+            vec![
+                "config",
+                "apply",
+                "--spec",
+                &spec_arg,
+                "--plan",
+                "plan.json",
+            ],
+            vec![
+                "config",
+                "drift",
+                "--spec",
+                &spec_arg,
+                "--plan",
+                "plan.json",
+            ],
+        ] {
+            let outcome = run(strings(&args));
+            assert!(
+                matches!(outcome, Err(CliError::Usage(ref message)) if message.contains("--spec")),
+                "{args:?}: unexpected result: {outcome:?}"
+            );
+        }
+        for (flags, expected) in [
+            (vec!["--unmanaged", "sometimes"], "unsupported --unmanaged"),
+            (vec!["--allow-weakening", "--json"], "takes a spec path"),
+            (
+                vec!["--allow-destructive"],
+                "missing value for --allow-destructive",
+            ),
+        ] {
+            let mut args = strings(&["config", "plan", "--spec", &spec_arg]);
+            args.extend(strings(&flags));
+            let outcome = run(args);
+            assert!(
+                matches!(outcome, Err(CliError::Usage(ref message)) if message.contains(expected)),
+                "{flags:?}: unexpected result: {outcome:?}"
+            );
+        }
+
+        // Options are part of the plan id; repeated and comma-separated flags are the same.
+        let plan = |extra: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+            let mut args = strings(&["config", "plan", "--spec", &spec_arg, "--json"]);
+            args.extend(strings(extra));
+            plan_id_of(&run(args)?)
+        };
+        let plain = plan(&[])?;
+        let comma = plan(&["--allow-destructive", "collections.a,collections.b"])?;
+        let repeated = plan(&[
+            "--allow-destructive",
+            "collections.b",
+            "--allow-destructive",
+            "collections.a",
+        ])?;
+        assert_eq!(comma, repeated);
+        assert_ne!(comma, plain);
+        assert_ne!(plan(&["--unmanaged", "fail"])?, plain);
+        Ok(())
+    }
+
+    #[test]
+    fn config_apply_plan_stays_audit_only() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let plan_path = temp.path().join("plan.json");
+        let current = DatabaseSpec::from_db_config(
+            "apply",
+            &DbConfig::on_disk(Profile::Balanced, "apply.redb"),
+        );
+        let mut desired = current.clone();
+        desired
+            .operation_hints
+            .insert("planner.sample_rows".to_owned(), "1000".to_owned());
+        let plan = MigrationPlanner::plan(&current, &desired);
+        std::fs::write(&plan_path, serde_json::to_string_pretty(&plan)?)?;
+
+        let outcome = run(strings(&[
+            "config",
+            "apply",
+            "--plan",
+            &path_arg(&plan_path),
+            "--confirm",
+            &plan.plan_id,
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        let report = json_message(&outcome)?;
+        assert_eq!(report["status"], "confirmed");
+        assert_eq!(report["data_mutated"], false);
+        assert!(!temp.path().join("apply.redb").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_apply_provisions_a_new_database_and_refuses_an_existing_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let init = |extra: &[&str]| {
+            let mut args = strings(&[
+                "init",
+                "--guided",
+                "--profile",
+                "secure_app",
+                "--name",
+                "Vault",
+                "--out",
+                &path_arg(&spec_path),
+                "--force",
+            ]);
+            args.extend(strings(extra));
+            run(args)
+        };
+        let db_path = temp.path().join("vault.redb");
+
+        let created = init(&["--apply"])?;
+        assert_eq!(created.exit_code, 0, "{}", created.message);
+        assert!(
+            created
+                .message
+                .contains(&format!("database path={}", db_path.display())),
+            "{}",
+            created.message
+        );
+        assert!(
+            created.message.contains("provisioning applied"),
+            "{}",
+            created.message
+        );
+        assert!(db_path.exists());
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        assert_eq!(spec.version, 1);
+        assert!(!spec.guarantees.encryption.at_rest);
+
+        let again = init(&["--apply", "--json"])?;
+        assert_eq!(again.exit_code, 2, "{}", again.message);
+        let summary = json_message(&again)?;
+        assert_eq!(summary["valid"], true);
+        assert_eq!(summary["provision"]["status"], "already_initialized");
+        assert!(
+            summary["provision"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("config apply")),
+            "{summary}"
+        );
+        assert!(spec_path.exists());
+
+        let custom_db = temp.path().join("custom.redb");
+        let explicit = init(&["--apply", "--db", &path_arg(&custom_db), "--json"])?;
+        assert_eq!(explicit.exit_code, 0, "{}", explicit.message);
+        let summary = json_message(&explicit)?;
+        assert_eq!(summary["database"], json!(path_arg(&custom_db)));
+        assert_eq!(summary["provision"]["status"], "applied");
+        assert!(custom_db.exists());
+
+        let without_apply = init(&["--db", &path_arg(&custom_db)]);
+        assert!(
+            matches!(without_apply, Err(CliError::Usage(ref message)) if message.contains("--apply")),
+            "unexpected result: {without_apply:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_template_apply_keeps_the_files_of_a_blocked_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let out_dir = temp.path().join("secure");
+
+        let outcome = run(strings(&[
+            "init",
+            "--guided",
+            "--template",
+            "secure-saas",
+            "--name",
+            "Secure App",
+            "--out",
+            &path_arg(&out_dir),
+            "--apply",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 2, "{}", outcome.message);
+        for file in ["multidb.yaml", "README.md", "seed.json", "smoke.ps1"] {
+            assert!(out_dir.join(file).exists(), "{file}");
+        }
+        assert!(!out_dir.join("secure_app.redb").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_lists_the_physical_parameters_provisioning_needs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/spec-v1/ai-memory.yaml");
+
+        let outcome = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&fixture),
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        let report = json_message(&outcome)?;
+        let notes = report["notes"].as_array().ok_or("missing notes")?;
+        for path in [
+            "collections[0].physical.dim",
+            "collections[1].physical.document_indexes",
+        ] {
+            let prefix = format!("provisioning blocker: add {path} before config apply --spec");
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.as_str().is_some_and(|note| note.starts_with(&prefix))),
+                "{path}: {notes:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provision_exit_code_covers_every_outcome_and_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{ProvisionEnd, provision_exit_code};
+        use multidb::config_spec::{ApplyCheckReport, ApplyStatus};
+        use multidb::provision::{
+            PlanOutcome, ProvisionApplyReport, ProvisionEnvironment, ProvisionError,
+            ProvisionOptions, ProvisionOutcome, ProvisionSurface, ProvisionTargetRef,
+            plan_provision,
+        };
+
+        let temp = tempdir()?;
+        let spec = provision_spec(&json!([document_collection("orders")]))?;
+        let mut plan = plan_provision(
+            &spec,
+            ProvisionTargetRef::Path(&temp.path().join("shop.redb")),
+            &ProvisionOptions::default(),
+            &ProvisionEnvironment::new(ProvisionSurface::Cli),
+        )?;
+        for (outcome, code) in [
+            (PlanOutcome::Noop, 0),
+            (PlanOutcome::Ready, 0),
+            (PlanOutcome::NeedsFlags, 2),
+            (PlanOutcome::Blocked, 2),
+        ] {
+            plan.outcome = outcome;
+            assert_eq!(
+                provision_exit_code(ProvisionEnd::Planned(&plan)),
+                code,
+                "{outcome:?}"
+            );
+        }
+
+        let mut drifted = plan.clone();
+        drifted.drift.in_sync = true;
+        assert_eq!(provision_exit_code(ProvisionEnd::Drifted(&drifted)), 0);
+        drifted.drift.in_sync = false;
+        assert_eq!(provision_exit_code(ProvisionEnd::Drifted(&drifted)), 3);
+        drifted.target.path = None;
+        assert_eq!(provision_exit_code(ProvisionEnd::Drifted(&drifted)), 2);
+        let mut invalid = plan.clone();
+        invalid.validation.valid = false;
+        assert_eq!(provision_exit_code(ProvisionEnd::Drifted(&invalid)), 2);
+
+        for (status, code) in [
+            (ProvisionOutcome::Applied, 0),
+            (ProvisionOutcome::Noop, 0),
+            (ProvisionOutcome::PartiallyApplied, 1),
+            (ProvisionOutcome::Rejected, 2),
+            (ProvisionOutcome::Blocked, 2),
+            (ProvisionOutcome::PlanChanged, 4),
+        ] {
+            let report = ProvisionApplyReport {
+                status,
+                check: ApplyCheckReport {
+                    plan_id: plan.plan_id.clone(),
+                    status: ApplyStatus::Confirmed,
+                    valid: true,
+                    confirmation_matched: true,
+                    audit_recorded: true,
+                    data_mutated: false,
+                    message: String::new(),
+                },
+                plan_id: plan.plan_id.clone(),
+                applied_steps: Vec::new(),
+                failed_step: None,
+                record: None,
+                warnings: Vec::new(),
+                session_pending_restart: false,
+            };
+            assert_eq!(
+                provision_exit_code(ProvisionEnd::Applied(&report)),
+                code,
+                "{status:?}"
+            );
+        }
+
+        let unsupported = || ConfigError::Unsupported("unsupported".to_owned());
+        for (error, code) in [
+            (
+                ProvisionError::InvalidSpec(Box::new(plan.validation.clone())),
+                2,
+            ),
+            (ProvisionError::Blocked(Box::new(plan.clone())), 2),
+            (ProvisionError::NeedsFlags(Box::new(plan.clone())), 2),
+            (
+                ProvisionError::ConfirmationRequired(Box::new(plan.clone())),
+                2,
+            ),
+            (
+                ProvisionError::PlanChanged {
+                    confirmed: "prov_a".to_owned(),
+                    current: "prov_b".to_owned(),
+                },
+                4,
+            ),
+            (ProvisionError::AlreadyInitialized, 2),
+            (ProvisionError::AuditRequired, 2),
+            (ProvisionError::PermissionMissing("admin".to_owned()), 2),
+            (ProvisionError::Locked("held".to_owned()), 1),
+            (ProvisionError::RecordUnreadable("newer".to_owned()), 1),
+            (
+                ProvisionError::Db(multidb::db::DbError::Config(unsupported())),
+                1,
+            ),
+            (ProvisionError::Config(unsupported()), 1),
+            (ProvisionError::Io("disk".to_owned()), 1),
+        ] {
+            assert_eq!(
+                provision_exit_code(ProvisionEnd::Failed(&error)),
+                code,
+                "{error:?}"
+            );
         }
         Ok(())
     }

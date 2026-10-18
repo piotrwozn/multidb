@@ -230,9 +230,43 @@ All notable public changes will be recorded here.
 - `Database::set_security_state_as`, which replaces the RBAC policy and the
   principal registry in one persisted batch after checking `System:Admin`,
   audited as `set_security_state`.
+- CLI provisioning (preview), as the local operator `local:cli`:
+  `multidb config plan --spec <file> [--db <path>] [--out <plan.json>]` (a
+  dry run that never creates the database file; text output lists every
+  step with its safety class and flag, every guarantee status and the exact
+  `config apply ... --confirm prov_...` command), `config apply --spec <file>
+  [--db <path>] (--confirm <prov_id> | --auto-approve)` (recomputes the plan,
+  creates a missing database with `provision_new_database` or converges an
+  existing one with `apply_provision`), `config drift --spec <file>`,
+  `config status --db <path>` (the provision record, the last 20 history
+  entries, the profile manifest and the drift against the applied spec) and
+  `config export --db <path> [--format yaml|json] [--out <file>] [--force]`.
+  `--allow-weakening` and `--allow-destructive` (repeatable or
+  comma-separated), `--allow-format-upgrade` and `--unmanaged
+  ignore|report|fail` are part of the `prov_` id. The target is `--db`, else
+  the spec `storage_path` resolved against the spec file's directory; an AP
+  database is refused with `PROVISION_REPLICATION_UNSUPPORTED`, and a
+  database another process holds open with "database is in use (is multidb
+  serve running?)". Exit codes: 0 ready, applied, noop or in sync; 1 a
+  partial apply, a runtime error or a locked database; 2 invalid, blocked,
+  flags or confirmation missing, or rejected; 3 drift (`config drift` only);
+  4 the confirmed plan changed. `--spec` cannot be combined with `--plan`,
+  `--current` or `--desired`; the version 1 `config plan --current --desired`
+  and `config apply --plan --confirm` flows are unchanged and stay
+  audit-only. See `docs/provisioning.md`.
+- `multidb init --guided (--profile | --template) ... --apply [--db <path>]
+  [--confirm <prov_id>]` writes the files as before and then provisions a new
+  database from the spec at `--db`, the spec `storage_path` relative to the
+  output directory, or `<out dir>/<name>.redb`, auto-approving a plan that
+  only creates, adopts or records. An existing database is refused, and a
+  blocked or not auto-approvable plan keeps the written files and exits 2;
+  `--json` adds `database` and `provision` to the summary.
 
 ### Changed
 
+- `multidb config upgrade` adds a note for every physical parameter
+  provisioning still needs (`PHYSICAL_PARAMETER_REQUIRED`), so an upgraded
+  version 1 spec lists what to add before `config apply --spec`.
 - The `history.system_versioning`, `history.keep_history`,
   `time_series.default_chunk_millis` and `time_series.default_retention_millis`
   knobs are `enforced` in `KNOB_REGISTRY`: provisioning applies them to the

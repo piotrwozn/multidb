@@ -86,6 +86,25 @@ multidb profile explain --spec .\orders.yaml
 
 See `docs/profiles.md` for the knob reference and the profile commands.
 
+Build a database from a spec (preview). `config plan --spec` is a dry run that
+prints every step, the flags it needs and how each guarantee is enforced;
+`config apply` recomputes the plan and applies it with the `prov_` id it
+printed, or with `--auto-approve` when the plan only creates, adopts or
+records:
+
+```powershell
+multidb init --guided --profile secure_app --name Shop --out .\shop.yaml --apply
+# after editing shop.yaml:
+multidb config plan --spec .\shop.yaml
+multidb config apply --spec .\shop.yaml --confirm <prov_id>
+multidb config drift --spec .\shop.yaml
+multidb config status --db .\shop.redb
+multidb config export --db .\shop.redb --out .\exported.yaml
+```
+
+See `docs/provisioning.md` for the spec fields, the plan, the flags and the
+exit codes.
+
 Checked-in examples are under `examples/`, with SDK examples under
 `examples/sdk/`.
 
@@ -122,8 +141,13 @@ Release-sensitive gate:
 - The CP OpenRaft profile is covered by local/process smoke tests; it does not
   claim managed Kubernetes automation, multi-region placement or an enterprise
   SLA.
-- `config apply` is confirmation/audit-only for v1 and does not perform
-  physical data migrations.
+- `config apply --plan` (the version 1 migration plan) stays
+  confirmation/audit-only. Provisioning (`config plan|apply --spec`,
+  `init --apply`) is a preview for embedded and single-node CP databases: it
+  creates and adopts objects, roles and the profile, but never drops or alters
+  an object, switches a profile or storage class, or re-encrypts; encryption
+  at rest is provisioned through the Rust API only, so a spec with
+  `encryption.at_rest: true` is blocked on the CLI.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
   migration dry-run workflows.
 - Full PostgreSQL compatibility, Mongo wire protocol, public extension

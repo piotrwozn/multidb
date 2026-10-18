@@ -5,12 +5,13 @@ Status: **Preview**. Provisioning builds and converges a database from a
 provisioning fields, their validation, the physical projection
 (`multidb::provision::physical::project`), per-table layout
 (`Database::create_table_with_layout`), read-only planning, drift and export
-(`multidb::provision::{plan_provision, drift, export_spec}`), and applying a
+(`multidb::provision::{plan_provision, drift, export_spec}`), applying a
 plan through the Rust API (`multidb::provision::{apply_provision,
-provision_new_database}`, see [Applying plans](#applying-plans)). The CLI,
-`serve` and Control Plane entry points come in later changes; until then they
-never create or change a database from a spec, and `config apply --plan` stays
-audit-only.
+provision_new_database}`, see [Applying plans](#applying-plans)) and the CLI
+commands `config plan|apply|drift --spec`, `config status`, `config export`
+and `init --apply` (see [CLI](#cli)). The `serve` and Control Plane entry
+points come in later changes; until then they never create or change a
+database from a spec. `config apply --plan` stays audit-only.
 
 ## Spec version 2 provisioning fields
 
@@ -321,7 +322,7 @@ not give is a `STEP_REQUIRES_FLAG` issue. The outcome is:
 
 `auto_approvable` is true for a ready plan whose steps are all additive,
 metadata or strengthening, without RBAC steps on an existing database;
-`Confirmation::AutoApproveAdditive` accepts only such plans, and so will the
+`Confirmation::AutoApproveAdditive` accepts only such plans, and so do the
 CLI `--auto-approve` and `init --apply`. Creating
 a full-text or geo index on a collection that already holds documents is
 medium impact, and the step names the document count.
@@ -592,6 +593,88 @@ in-memory database (Rust API only).
    database with roles may be auto-approved.
 4. The steps run as the local operator of the surface, under the confirmed
    plan id. The Control Plane never creates databases.
+
+## CLI
+
+The CLI provisions as the local operator `local:cli` on the `cli` surface. It
+relies on filesystem trust, like `backup` and `restore`, and on redb's
+exclusive file lock: a database another process holds open is refused.
+
+| command | what it does |
+| --- | --- |
+| `multidb config plan --spec <file> [--db <path>] [--out <plan.json>] [flags] [--json]` | Dry run against the database at the target, or against an absent target. Prints every step with its safety class and flag, the flags, the objects, every guarantee status, the issues, the drift, the impact and the exact `config apply ... --confirm prov_...` command; `--out` writes the plan JSON |
+| `multidb config apply --spec <file> [--db <path>] (--confirm <prov_id> \| --auto-approve) [flags] [--json]` | Recomputes the plan and applies it: a missing or empty file is created with `provision_new_database`, an existing database is opened and converged with `apply_provision`. Without `--confirm` or `--auto-approve` a noop exits 0 and any other plan is printed with exit 2 |
+| `multidb config drift --spec <file> [--db <path>] [--unmanaged ignore\|report\|fail] [--json]` | How the database differs from the spec, for CI |
+| `multidb config status --db <path> [--json]` | The provision record, the last 20 history entries, the profile manifest and the drift of the database against the spec the record applied |
+| `multidb config export --db <path> [--format yaml\|json] [--out <file>] [--force]` | `export_spec`: the applied spec, or an inferred version 2 spec. Without `--out` the spec goes to stdout and the notes to stderr; `--out` never replaces a file without `--force` |
+| `multidb init --guided (--profile <p> \| --template <t>) --name <n> ... --apply [--db <path>] [--confirm <prov_id>]` | Writes the files as `init` always does, then provisions a new database from the spec |
+
+The flags of `config plan` and `config apply` are `--allow-weakening
+<path>[,<path>]` and `--allow-destructive <path>[,<path>]` (both repeatable),
+`--allow-format-upgrade` and `--unmanaged ignore|report|fail`
+(`ProvisionOptions`). They are part of the `prov_` id, so `config apply
+--confirm` must repeat the flags of the plan it confirms; a plan that needs
+flags prints the `config plan` command that adds them. `--spec` cannot be
+combined with `--plan`, `--current` or `--desired`, which belong to the
+version 1 flow: `config plan --current --desired` and `config apply --plan
+--confirm` are unchanged and stay audit-only (`data_mutated: false`).
+
+**The target** is `--db`, else the spec `deployment.storage_path` resolved
+against the directory of the spec file (for `init --apply`, against the
+output directory; without a storage path, `init --apply` uses
+`<out dir>/<sanitized name>.redb` and prints the path it chose). A durable
+profile with neither is `PROVISION_STORAGE_PATH_REQUIRED`, and a volatile
+profile is `PROVISION_VOLATILE_ON_SURFACE`: the CLI builds durable databases
+only. The target is probed first: a missing or empty file is planned as
+absent and nothing is created by a dry run. An existing database is opened
+with `open_database_with_ops`, which loads its persisted RBAC state; only
+single-node CP databases are provisioned, so an AP database is refused with
+`PROVISION_REPLICATION_UNSUPPORTED` before it is opened.
+
+**Exit codes:**
+
+| code | meaning |
+| --- | --- |
+| 0 | the plan is ready or a noop; the apply applied or was a noop; the database is in sync |
+| 1 | a partial apply (printed with the failed step and "re-run plan"), a runtime or I/O error, a locked database, a usage error |
+| 2 | an invalid spec, a blocked plan, missing flags, a missing or rejected confirmation, a target that already holds a database (`init --apply`); for `config drift`, an invalid spec or no database path |
+| 3 | drift (`config drift` only): not in sync, including a missing database, a blocked plan and unmanaged objects under `--unmanaged fail` |
+| 4 | the confirmed `prov_` id is no longer the current plan |
+
+`config drift` treats unmanaged objects under `report` (the default) and
+`ignore` as information, as `DriftReport.in_sync` does: an object created
+outside provisioning is listed, but the exit code stays 0 unless
+`--unmanaged fail` is given.
+
+`init --apply` creates new databases only: an existing one is refused (exit
+2) with the `config plan` and `config apply` commands that converge it. The
+plan is auto-approved unless `--confirm` names its id; a blocked or not
+auto-approvable plan leaves the written files and exits 2 with the reason.
+With `--json` the init summary stays one object, with the chosen `database`
+path and the `provision` report or error.
+
+`config upgrade` lists, as notes, the physical parameters provisioning still
+needs (`PHYSICAL_PARAMETER_REQUIRED`, Advice in version 2 validation), so a
+converted version 1 spec says what to add before `config apply --spec`.
+
+### Troubleshooting
+
+- **"database is in use (is multidb serve running?)"** (exit 1): another
+  process, usually `multidb serve`, holds the redb lock. Stop it, or plan and
+  apply through the Control Plane.
+- **"the plan changed since it was confirmed"** (exit 4): the database, the
+  spec, the flags, the target or the binary changed after the plan was
+  reviewed, for example an object created outside provisioning. Nothing was
+  applied; run `config plan` again, review it and confirm the new id with the
+  same flags.
+- **A database that was not closed cleanly** (for example after `serve` was
+  killed) first gets redb's crash recovery, which every opener runs; it is
+  the only change a dry run can make to a file. A file that still cannot be
+  read, or a storage format the CLI cannot open (a legacy framed database
+  needs the Rust API), is reported with its reason (exit 1).
+- **A partial apply** (exit 1) leaves the steps before the failed one
+  applied and a `failed` record; `config plan` shows the remaining steps and
+  `config status` the record and history.
 
 ## The provision record
 

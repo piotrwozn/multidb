@@ -51,6 +51,25 @@ multidb config validate --spec .\agent-memory\multidb.yaml
 multidb config explain --spec .\agent-memory\multidb.yaml
 ```
 
+To build the database a spec describes (preview, see
+[provisioning.md](provisioning.md)):
+
+```powershell
+multidb init --guided --profile secure_app --name Shop --out .\shop.yaml --apply
+multidb config drift --spec .\shop.yaml
+multidb config export --db .\shop.redb --out .\exported.yaml
+```
+
+`init --apply` writes the spec, then creates a new database from it at
+`--db`, the spec `storage_path` or `<out dir>/<name>.redb` when the plan only
+creates, adopts or records. After editing a spec, `config plan --spec`
+prints the plan and its `prov_` id, `config apply --spec --confirm <prov_id>`
+applies it, `config drift` exits 3 when the database no longer matches and
+`config status --db` prints the provision record and history. Version 1
+template specs leave out the physical parameters provisioning needs (a
+document index path, a vector dimension), so their plan is blocked with
+`PHYSICAL_PARAMETER_REQUIRED`; `config upgrade` lists what to add.
+
 For a repository smoke test, run:
 
 ```powershell
@@ -113,11 +132,12 @@ multidb profile knobs
   `auto` as with a named profile. `restore` does not accept `auto`, because
   its target must be empty.
 
-Only the Rust API (`db::create_database_with_profile`, and spec provisioning
-with `provision::provision_new_database` and `provision::apply_provision`,
-see [provisioning.md](provisioning.md)) creates databases from profile knobs
-in this build; the CLI writes and inspects specs and opens existing databases
-with their persisted profile.
+Databases are created from profile knobs by the Rust API
+(`db::create_database_with_profile`, `provision::provision_new_database` and
+`provision::apply_provision`) and by the CLI provisioning commands
+(`config apply --spec`, `init --apply`, see [provisioning.md](provisioning.md)).
+Every other CLI command opens existing databases with their persisted
+profile.
 
 ## Docker Quickstart
 
@@ -172,8 +192,11 @@ Consistency status:
 
 - The local/process CP smoke contract is covered; the preview still does not
   claim Kubernetes automation, multi-region placement or enterprise SLA.
-- `config apply` is confirm/audit-only and does not perform physical data
-  migrations.
+- `config apply --plan` is confirm/audit-only and does not perform physical
+  data migrations. Provisioning (`config apply --spec`, `init --apply`) is a
+  preview for embedded and single-node CP databases: it creates and adopts
+  objects, roles and the profile, never drops or alters them, and refuses
+  encryption at rest outside the Rust API.
 - Studio v1 is read-only plus validation, catalog, advice and migration dry-run.
 - Mongo wire protocol, full PostgreSQL compatibility, public marketplace,
   cloud KMS/HSM and enterprise SLA are outside preview scope.

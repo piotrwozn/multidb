@@ -11,15 +11,16 @@ API in `multidb::config_spec` (`resolve_profile`, `resolve_named_profile`,
 is a version 2 field. `multidb config validate`, `config explain`,
 `config plan` and the Control Plane `/config/validate` and `/config/plan`
 resolve the profile of every spec, report its issues and explain every knob.
-Only the Rust API builds a database from a resolved profile:
+The Rust API builds a database from a resolved profile:
 `db::create_database_with_profile` persists the knobs in
 `__meta.profile_manifest`, and every single-node opener, `serve` included,
 re-applies them (see [Persistence and format](#persistence-and-format)).
 Spec provisioning (`provision::provision_new_database` and
 `provision::apply_provision`, see [provisioning.md](provisioning.md)) creates
 databases this way and writes the manifest of an adopted, retuned or
-format-upgraded database. Nothing in the CLI, `serve` or the Control Plane
-creates a database from a spec yet. The CLI inspects profiles and specs
+format-upgraded database. The CLI provisions through it (`config apply
+--spec`, `init --apply`, see [provisioning.md](provisioning.md#cli)); `serve`
+and the Control Plane do not create databases from specs yet. The CLI inspects profiles and specs
 (`multidb profile show`, `profile explain`, `profile knobs`), writes version 2
 specs (`init --override`, `config upgrade`) and reads a database's own profile
 with `--profile auto` (see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and
@@ -626,6 +627,10 @@ converts a spec to version 2:
   file and renaming it into place: the sibling is created exclusively, so a
   planted symlink cannot redirect the write, and the rename replaces a
   symlink at `--out` instead of writing through it;
+- it adds a note for every physical parameter provisioning still needs
+  (`PHYSICAL_PARAMETER_REQUIRED`, Advice in version 2 validation), for
+  example a vector `physical.dim`, so the converted spec says what to add
+  before `config apply --spec`;
 - the result is validated: exit 2 when it is invalid, for example
   `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
   `profile.custom.base`, and an invalid result is never written to `--out`,
