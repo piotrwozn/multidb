@@ -49,7 +49,7 @@ use crate::security::{
 use crate::storage::{EngineKind, RedbEngine, StorageEngine, StorageError, WriteTransaction};
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
 use crate::text::{FullTextIndexConfig, TextError};
-use crate::timeseries::{TimePoint, TimeSeriesConfig};
+use crate::timeseries::{TimePoint, TimeSeriesConfig, TimeSeriesError};
 use crate::tuning::{
     ParameterEnvelope, ReprofilePlan, ReprofileStatus, TunableParameter, TuningDecision,
     TuningPolicy, WorkloadSample,
@@ -762,6 +762,24 @@ fn phase29_hooks_fire_for_time_series_and_graph() -> Result<(), Box<dyn std::err
             .iter()
             .any(|(_, value)| { String::from_utf8_lossy(value).contains("graph_after") })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn time_bucket_sql_rejects_overflowing_timestamp() -> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+
+    assert!(matches!(
+        database
+            .query("SELECT time_bucket(60000, -9223372036854775807)")
+            .await,
+        Err(DbError::TimeSeries(TimeSeriesError::InvalidPoint(_)))
+    ));
+
+    let SqlOutput::Rows(rows) = database.query("SELECT time_bucket(1000, -1)").await? else {
+        return Err("time_bucket should return rows".into());
+    };
+    assert_eq!(rows.rows, vec![vec![Value::Int(-1_000)]]);
     Ok(())
 }
 

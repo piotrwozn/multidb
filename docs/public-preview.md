@@ -134,6 +134,11 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- Time-series retention follows the server wall clock and is enforced at chunk
+  granularity only when a series receives a write, so idle series keep expired
+  chunks until their next write. Points more than `max_future_skew_millis`
+  (default 5 minutes for new collections) ahead of the server clock, or older
+  than the retention window, are rejected.
 
 ## Migration Guide
 
