@@ -19,7 +19,7 @@ use crate::{
     db::{
         ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode,
         PersistedProfileManifest, Profile, create_restore_target, decode_profile_manifest,
-        validate_manifest,
+        unmet_profile_floors, validate_manifest,
     },
     fileio,
     model::{DOCUMENT_TABLE, INDEX_TABLE},
@@ -51,6 +51,7 @@ const FULL_DATA_FILE: &str = "data/full.json.zst";
 const WAL_DATA_FILE: &str = "wal/incremental.json.zst";
 const BACKUP_META_TABLE: &str = "__backup_meta";
 const AUTHZ_TABLE: &str = "__authz_policy";
+const KEY_AUDIT_ENABLED: &[u8] = b"audit_enabled";
 const META_TABLE: &str = "__meta";
 const KEY_PROFILE_MANIFEST: &[u8] = b"profile_manifest";
 const KEY_TIMELINE_ID: &[u8] = b"timeline_id";
@@ -79,7 +80,15 @@ pub struct BackupConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestoreConfig {
+    /// Decrypts the backup files, which are encrypted when the backup had backup encryption
+    /// (`BackupConfig.encryption`, or by default the encryption config of the database backed
+    /// up). The restore target itself is never encrypted at rest.
     pub encryption: Option<EncryptionConfig>,
+    /// Restores a backup whose profile manifest sets a floor the restored database would not
+    /// meet: `floors.encryption_at_rest`, because a restore target is never encrypted at rest,
+    /// or `floors.audit` when audit is off in the backup. Off by default, and then such a
+    /// restore fails with `BackupError::ProfileFloorsNotMet` before it creates anything.
+    pub allow_unmet_profile_floors: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -170,6 +179,18 @@ pub enum BackupError {
 
     #[error("unsupported backup operation: {0}")]
     Unsupported(String),
+
+    /// Every restore path returns it, also hibernation resume (`cloud::resume_database`,
+    /// `resume_database_guarded`), which takes no `RestoreConfig` and so has no opt-in.
+    #[error(
+        "the restored database would not meet {} of the backed-up profile manifest, so nothing \
+         was restored; to restore it anyway, set RestoreConfig.allow_unmet_profile_floors \
+         (restore_backup_with_config, cloud::restore_backup_from_uri_with_config) or pass \
+         multidb restore --allow-unmet-floors; hibernation resume (cloud::resume_database, \
+         resume_database_guarded) has no such opt-in and cannot resume below a floor",
+        describe_unmet_floors(.floors)
+    )]
+    ProfileFloorsNotMet { floors: Vec<&'static str> },
 }
 
 impl BackupConfig {
@@ -186,6 +207,28 @@ impl RestoreConfig {
         self.encryption = Some(encryption);
         self
     }
+
+    /// Sets [`allow_unmet_profile_floors`](Self::allow_unmet_profile_floors).
+    #[must_use]
+    pub fn with_unmet_profile_floors_allowed(mut self, allowed: bool) -> Self {
+        self.allow_unmet_profile_floors = allowed;
+        self
+    }
+}
+
+/// Each floor a restore would not meet, with the reason.
+fn describe_unmet_floors(floors: &[&'static str]) -> String {
+    floors
+        .iter()
+        .map(|floor| match *floor {
+            "floors.encryption_at_rest" => {
+                format!("{floor} (a restore target is never encrypted at rest)")
+            }
+            "floors.audit" => format!("{floor} (audit is off in the backup)"),
+            _ => (*floor).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -263,16 +306,30 @@ pub fn full_backup(
     })
 }
 
+/// Rejects incremental backups for databases whose writes are not recorded in the commit log.
+pub(crate) fn ensure_incremental_backup_supported(database: &Database) -> Result<(), BackupError> {
+    if database.uses_ap_replication() {
+        return Err(BackupError::Unsupported(
+            "AP replication does not support incremental backup or point-in-time restore: AP \
+             writes are not recorded in the commit log; take a full backup instead"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Takes an incremental logical backup after `parent_backup_dir`.
 ///
 /// # Errors
-/// Fails when the parent manifest is invalid, commit logs are missing, or files cannot be written.
+/// Fails when the database uses AP replication (its writes are not recorded in the commit log),
+/// the parent manifest is invalid, commit logs are missing, or files cannot be written.
 pub fn incremental_backup(
     database: &Database,
     dest_root: impl AsRef<Path>,
     parent_backup_dir: impl AsRef<Path>,
     config: &BackupConfig,
 ) -> Result<BackupReport, BackupError> {
+    ensure_incremental_backup_supported(database)?;
     let started = Instant::now();
     let parent = read_manifest(parent_backup_dir.as_ref())?;
     let storage = database.local_storage().ok_or_else(|| {
@@ -327,10 +384,13 @@ pub fn incremental_backup(
     })
 }
 
-/// Restores a full or incremental backup chain into the database described by `config`.
+/// Restores a full or incremental backup chain into the database described by `config`, with
+/// the default [`RestoreConfig`]: unencrypted backup files only, and unmet profile floors
+/// refused (see [`restore_backup_with_config`]).
 ///
 /// # Errors
-/// Fails when the backup chain is corrupt, the target is not empty, or storage rejects restored records.
+/// Fails when the backup chain is corrupt, the target is not empty, the restored database would
+/// not meet a profile floor, or storage rejects restored records.
 pub fn restore_backup(
     backup_dir: impl AsRef<Path>,
     config: DbConfig,
@@ -341,9 +401,17 @@ pub fn restore_backup(
 
 /// Restores a backup chain with explicit backup decryption settings.
 ///
+/// Every backup file is read and checked before the target is created: a first pass reads the
+/// incremental payloads one at a time, keeping only what the floor check needs, and the apply
+/// pass reads them again, so restore holds the full payload and at most one incremental payload
+/// in memory. A backup whose profile manifest sets a floor the restored database would not meet
+/// is refused unless `restore_config.allow_unmet_profile_floors` is set (see
+/// [`RestoreConfig`]).
+///
 /// # Errors
 /// Fails when the backup chain is corrupt, encrypted without a key, the target is not empty,
-/// or storage rejects restored records.
+/// the restored database would not meet a profile floor (`ProfileFloorsNotMet`), or storage
+/// rejects restored records.
 pub fn restore_backup_with_config(
     backup_dir: impl AsRef<Path>,
     config: DbConfig,
@@ -369,7 +437,14 @@ pub fn restore_backup_with_config(
         required_file(&chain[0].manifest, FULL_DATA_FILE)?,
         backup_keys.as_ref(),
     )?;
-    let database = restore_target_engine(config, &full_payload)?;
+    let manifest = restore_target_manifest(&config, &full_payload)?;
+    let audit_flag =
+        check_incremental_payloads(&chain, backup_keys.as_ref(), &full_payload, target_lsn)?;
+    if let Some(manifest) = &manifest {
+        check_restore_floors(manifest, audit_flag.as_deref(), restore_config)?;
+    }
+
+    let database = create_restore_target(config, manifest.as_ref())?;
     let storage = database.local_storage().ok_or_else(|| {
         BackupError::Unsupported("restore target must have local storage".to_owned())
     })?;
@@ -378,11 +453,7 @@ pub fn restore_backup_with_config(
 
     let mut applied = 0_usize;
     for item in chain.iter().skip(1) {
-        let payload = read_backup_payload::<CommitLogPayload>(
-            &item.path,
-            required_file(&item.manifest, WAL_DATA_FILE)?,
-            backup_keys.as_ref(),
-        )?;
+        let payload = read_incremental_payload(item, backup_keys.as_ref())?;
         for record in payload.records {
             if record.txn_id > target_lsn {
                 continue;
@@ -413,6 +484,13 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<VerifyReport, Backu
 
 /// Verifies backup checksums and performs a temporary restore drill with decryption settings.
 ///
+/// The drill restores without checking profile floors, as if
+/// `allow_unmet_profile_floors` were set: its target is a temporary redb file under
+/// [`std::env::temp_dir`] that only this verification reads and that is deleted after a
+/// successful drill, so no restored database keeps running below a floor. Like every restore
+/// target, that file is not encrypted at rest: while the drill runs it holds the restored
+/// values in plaintext, also when the backup files are encrypted.
+///
 /// # Errors
 /// Fails when any manifest, checksum, decryption, or restore step fails.
 pub fn verify_backup_with_config(
@@ -435,12 +513,12 @@ pub fn verify_backup_with_config(
 
     let restore_path = std::env::temp_dir().join(format!("multidb-verify-{}.redb", new_id()));
     let config = DbConfig::on_disk(selected.manifest.profile, &restore_path);
-    let report = restore_backup_with_config(
-        &selected.path,
-        config,
-        RestoreTarget::Latest,
-        restore_config,
-    )?;
+    let drill_config = RestoreConfig {
+        allow_unmet_profile_floors: true,
+        ..restore_config.clone()
+    };
+    let report =
+        restore_backup_with_config(&selected.path, config, RestoreTarget::Latest, &drill_config)?;
     if fs::remove_file(&restore_path).is_err() {
         tracing::debug!("temporary verify database could not be removed");
     }
@@ -946,14 +1024,14 @@ fn ensure_restore_target_empty(config: &DbConfig) -> Result<(), BackupError> {
     ))
 }
 
-/// Creates the empty restore target from the profile manifest in the full backup payload, so
-/// a restored manifest database is framed the way its manifest says. A payload without a
-/// manifest gets the target `create_database` creates. Nothing is created when the manifest is
-/// corrupt or describes another storage profile than `config`.
-fn restore_target_engine(
-    config: DbConfig,
+/// The profile manifest in the full backup payload, which `create_restore_target` builds the
+/// target from, so a restored manifest database is framed the way its manifest says; a payload
+/// without a manifest gets the target `create_database` creates. Fails, before anything is
+/// created, when the manifest is corrupt or describes another storage profile than `config`.
+fn restore_target_manifest(
+    config: &DbConfig,
     payload: &BackupDataPayload,
-) -> Result<Database, BackupError> {
+) -> Result<Option<PersistedProfileManifest>, BackupError> {
     let manifest = backed_up_profile_manifest(payload)?;
     if let Some(found) = manifest
         .as_ref()
@@ -965,7 +1043,78 @@ fn restore_target_engine(
             found,
         }));
     }
-    Ok(create_restore_target(config, manifest.as_ref())?)
+    Ok(manifest)
+}
+
+/// The commit-log payload of an incremental backup in the chain.
+fn read_incremental_payload(
+    item: &ChainItem,
+    encryption: Option<&ConfiguredKeyProvider>,
+) -> Result<CommitLogPayload, BackupError> {
+    read_backup_payload(
+        &item.path,
+        required_file(&item.manifest, WAL_DATA_FILE)?,
+        encryption,
+    )
+}
+
+/// The first pass over the incremental payloads of `chain`, before the target is created: each
+/// payload is read (checksum, decryption, decoding) and dropped before the next one, so a
+/// payload that fails leaves nothing behind and restore never holds more than one of them.
+/// Returns the stored `__authz_policy.audit_enabled` value the restored database will hold:
+/// the last commit-log write at or below `target_lsn` (`None` when it deleted the flag), else
+/// the full payload's record, else `None`.
+fn check_incremental_payloads(
+    chain: &[ChainItem],
+    encryption: Option<&ConfiguredKeyProvider>,
+    full_payload: &BackupDataPayload,
+    target_lsn: Lsn,
+) -> Result<Option<Bytes>, BackupError> {
+    let is_flag = |table: &str, key: &[u8]| table == AUTHZ_TABLE && key == KEY_AUDIT_ENABLED;
+    let mut flag = full_payload
+        .records
+        .iter()
+        .find(|record| is_flag(&record.table, &record.key))
+        .map(|record| record.value.clone());
+    for item in chain.iter().skip(1) {
+        let payload = read_incremental_payload(item, encryption)?;
+        for write in payload
+            .records
+            .iter()
+            .filter(|record| record.txn_id <= target_lsn)
+            .flat_map(|record| &record.writes)
+            .filter(|write| is_flag(&write.table, &write.key))
+        {
+            flag.clone_from(&write.value);
+        }
+    }
+    Ok(flag)
+}
+
+/// Refuses, before the target is created, a restore whose database would not meet a floor of
+/// the backed-up profile manifest, unless `restore_config.allow_unmet_profile_floors` is set.
+/// A restore target is never encrypted at rest, so `floors.encryption_at_rest` is never met,
+/// and audit is restored as backed up, so `floors.audit` is unmet when `audit_flag`, the
+/// restored `__authz_policy.audit_enabled` value, is off. A missing flag is on, as every opener
+/// reads it; a flag that is not a boolean is backup corruption. `backup` and `pitr` are
+/// operator-managed and never checked.
+fn check_restore_floors(
+    manifest: &PersistedProfileManifest,
+    audit_flag: Option<&[u8]>,
+    restore_config: &RestoreConfig,
+) -> Result<(), BackupError> {
+    let floors = manifest.knobs.floors;
+    let audit_enabled = !floors.audit
+        || audit_flag.map_or(Ok(true), |bytes| {
+            serde_json::from_slice(bytes).map_err(|error| {
+                BackupError::Corruption(format!("backed-up {AUTHZ_TABLE}.audit_enabled: {error}"))
+            })
+        })?;
+    let unmet = unmet_profile_floors(floors, audit_enabled, false);
+    if unmet.is_empty() || restore_config.allow_unmet_profile_floors {
+        return Ok(());
+    }
+    Err(BackupError::ProfileFloorsNotMet { floors: unmet })
 }
 
 /// Decodes and re-validates `__meta.profile_manifest` from a full backup payload. Payload values
@@ -1085,17 +1234,21 @@ mod tests {
     use super::{
         BackupConfig, BackupDataPayload, BackupDataRecord, BackupError, KEY_PROFILE_MANIFEST,
         META_TABLE, RestoreConfig, RestoreTarget, full_backup, incremental_backup, list_backups,
-        restore_backup, restore_backup_with_config, restore_target_engine, verify_backup,
+        restore_backup, restore_backup_with_config, restore_target_manifest, verify_backup,
         verify_backup_with_config,
     };
-    use crate::config_spec::{ProfileKnobOverrides, resolve_named_profile};
+    use crate::config_spec::{
+        PolicyCompiler, ProfileKnobOverrides, resolve_named_profile,
+        spec_io::{SpecFormat, decode_spec_bytes},
+    };
     use crate::db::{
         ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
-        ReplicationKind, RuntimeProfileBinding, create_database, create_database_with_ops,
-        create_database_with_profile, inspect_database_metadata, open_database,
+        ReplicationKind, RuntimeProfileBinding, create_ap_database, create_database,
+        create_database_with_ops, create_database_with_profile, create_restore_target,
+        inspect_database_metadata, open_database,
     };
     use crate::performance::CompressionAlgorithm;
-    use crate::repl::{Op, ReadConsistency, Replication};
+    use crate::repl::{ApClusterConfig, Op, ReadConsistency, Replication, propose_system};
     use crate::storage::{EngineKind, ReadTransaction, RedbEngine, StorageEngine};
 
     /// Binds the built-in profile `name` with knob `overrides` to a database at `path`.
@@ -1121,6 +1274,29 @@ mod tests {
         let engine = RedbEngine::open(path)?;
         let txn = engine.begin_read()?;
         Ok(txn.get(table, key)?)
+    }
+
+    /// The example custom profile (zstd, `floors.audit`) bound to `path`, with
+    /// `floors.encryption_at_rest` and the guarantee that meets it raised when
+    /// `encryption_floor` is set.
+    fn example_binding(
+        path: &Path,
+        encryption_floor: bool,
+    ) -> Result<RuntimeProfileBinding, Box<dyn std::error::Error>> {
+        let mut spec = decode_spec_bytes(
+            include_str!("../examples/custom-profile/multidb.yaml").as_bytes(),
+            SpecFormat::Yaml,
+        )?;
+        if encryption_floor {
+            spec.custom_profile
+                .as_mut()
+                .ok_or("the example sets custom_profile")?
+                .floors
+                .encryption_at_rest = Some(true);
+            spec.guarantees.encryption.at_rest = true;
+        }
+        let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+        Ok(compiled.binding(&spec.deployment, Some(path.to_path_buf()))?)
     }
 
     fn manifest_payload(value: Vec<u8>) -> BackupDataPayload {
@@ -1162,6 +1338,36 @@ mod tests {
             Some(b"v".to_vec())
         );
         assert_eq!(report.restored_lsn, backup.manifest.end_lsn);
+        Ok(())
+    }
+
+    #[test]
+    fn ap_database_rejects_incremental_backup_but_allows_full_backup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("ap.redb");
+        let database = create_ap_database(
+            DbConfig::on_disk(Profile::Balanced, &db_path).with_replication(ReplicationKind::Ap),
+            ApClusterConfig::single_node_for_tests(1),
+        )?;
+        database.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+        })?;
+        let root = temp.path().join("backups");
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        database.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"k2".to_vec(),
+            value: b"v2".to_vec(),
+        })?;
+
+        assert!(matches!(
+            incremental_backup(&database, &root, &full.path, &BackupConfig::default()),
+            Err(BackupError::Unsupported(_))
+        ));
+        assert_eq!(list_backups(&root)?.len(), 1);
         Ok(())
     }
 
@@ -1488,7 +1694,7 @@ mod tests {
         let binding = profile_binding("balanced", json!({}), &target)?;
         let manifest = serde_json::to_value(&binding.manifest)?;
 
-        let not_json = restore_target_engine(config.clone(), &manifest_payload(b"{".to_vec()));
+        let not_json = restore_target_manifest(&config, &manifest_payload(b"{".to_vec()));
         assert!(
             matches!(not_json, Err(BackupError::Corruption(_))),
             "unexpected result: {:?}",
@@ -1497,8 +1703,8 @@ mod tests {
 
         let mut out_of_range = manifest.clone();
         out_of_range["knobs"]["cache"]["max_entries"] = json!(2_000_000);
-        let out_of_range = restore_target_engine(
-            config.clone(),
+        let out_of_range = restore_target_manifest(
+            &config,
             &manifest_payload(serde_json::to_vec(&out_of_range)?),
         );
         let message = match out_of_range {
@@ -1509,10 +1715,8 @@ mod tests {
 
         let mut newer = manifest;
         newer["manifest_version"] = json!(2);
-        let newer = restore_target_engine(
-            config.clone(),
-            &manifest_payload(serde_json::to_vec(&newer)?),
-        );
+        let newer =
+            restore_target_manifest(&config, &manifest_payload(serde_json::to_vec(&newer)?));
         assert!(
             matches!(
                 newer,
@@ -1528,12 +1732,14 @@ mod tests {
             "nothing is created for a corrupt manifest"
         );
 
-        let legacy = restore_target_engine(
-            config,
+        let legacy = restore_target_manifest(
+            &config,
             &BackupDataPayload {
                 records: Vec::new(),
             },
         )?;
+        assert_eq!(legacy, None);
+        let legacy = create_restore_target(config, legacy.as_ref())?;
         assert_eq!(legacy.engine_kind(), EngineKind::Redb);
         drop(legacy);
         let MetadataProbe::Initialized(probed) = inspect_database_metadata(&target) else {
@@ -1542,6 +1748,288 @@ mod tests {
         assert_eq!(probed.schema_version, 1);
         assert_eq!(probed.manifest, None);
         assert!(!probed.values_framed);
+        Ok(())
+    }
+
+    /// A restore target is never encrypted, so restoring a backup whose manifest sets
+    /// `floors.encryption_at_rest` is refused unless the caller opts in; the opted-in restore
+    /// keeps the manifest and reports the floor as unmet. `verify_backup` restores into a
+    /// temporary file without the opt-in.
+    #[test]
+    fn restore_refuses_an_unmet_encryption_floor_without_the_opt_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let key_path = temp.path().join("key.bin");
+        std::fs::write(&key_path, [5_u8; 32])?;
+        let encryption = EncryptionConfig::file_key(&key_path);
+        let binding = example_binding(&db_path, true)?;
+        let profile = binding.db_config.profile;
+        let database = create_database_with_profile(
+            &binding,
+            OperationalConfig::new().with_encryption(encryption.clone()),
+        )?;
+        database.propose(Op::Put {
+            table: "orders".to_owned(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })?;
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        drop(database);
+        let restore_config = RestoreConfig::default().with_encryption(encryption);
+
+        let refused_path = temp.path().join("refused.redb");
+        let refused = restore_backup_with_config(
+            &backup.path,
+            DbConfig::on_disk(profile, &refused_path),
+            RestoreTarget::Latest,
+            &restore_config,
+        );
+        let message = match &refused {
+            Err(error @ BackupError::ProfileFloorsNotMet { floors })
+                if floors == &["floors.encryption_at_rest"] =>
+            {
+                error.to_string()
+            }
+            other => return Err(format!("unexpected result: {other:?}").into()),
+        };
+        // The advice names every opt-in, and says hibernation resume has none.
+        for advice in [
+            "never encrypted at rest",
+            "RestoreConfig.allow_unmet_profile_floors (restore_backup_with_config, \
+             cloud::restore_backup_from_uri_with_config)",
+            "multidb restore --allow-unmet-floors",
+            "hibernation resume (cloud::resume_database, resume_database_guarded) has no such \
+             opt-in",
+        ] {
+            assert!(message.contains(advice), "{advice}: {message}");
+        }
+        assert!(!refused_path.exists(), "nothing is created when refused");
+
+        let restored_path = temp.path().join("restored.redb");
+        restore_backup_with_config(
+            &backup.path,
+            DbConfig::on_disk(profile, &restored_path),
+            RestoreTarget::Latest,
+            &restore_config
+                .clone()
+                .with_unmet_profile_floors_allowed(true),
+        )?;
+        let MetadataProbe::Initialized(probed) = inspect_database_metadata(&restored_path) else {
+            return Err("the restored database is not initialized".into());
+        };
+        assert_eq!(probed.manifest.as_ref(), Some(&binding.manifest));
+        assert_eq!(probed.unmet_floors, vec!["floors.encryption_at_rest"]);
+        let restored = open_database(DbConfig::on_disk(profile, &restored_path))?;
+        assert_eq!(
+            restored.read("orders", b"k", ReadConsistency::Strong)?,
+            Some(b"v".to_vec())
+        );
+        drop(restored);
+
+        let verified = verify_backup_with_config(&backup.path, &restore_config)?;
+        assert_eq!(verified.restored_lsn, backup.manifest.end_lsn);
+        Ok(())
+    }
+
+    /// Audit is restored as backed up, so a backup whose audit flag is off below
+    /// `floors.audit` (written here as an older binary that ignores the manifest could) is
+    /// refused without the opt-in. Only commits up to the restore target count.
+    #[test]
+    fn restore_refuses_a_backup_whose_audit_is_off_below_the_audit_floor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let binding = example_binding(&db_path, false)?;
+        assert!(binding.manifest.knobs.floors.audit);
+        let profile = binding.db_config.profile;
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        let root = temp.path().join("backups");
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        propose_system(
+            &database,
+            Op::Put {
+                table: super::AUTHZ_TABLE.to_owned(),
+                key: super::KEY_AUDIT_ENABLED.to_vec(),
+                value: b"false".to_vec(),
+            },
+        )?;
+        let incremental =
+            incremental_backup(&database, &root, &full.path, &BackupConfig::default())?;
+        drop(database);
+
+        let before = temp.path().join("before.redb");
+        restore_backup(
+            &incremental.path,
+            DbConfig::on_disk(profile, &before),
+            RestoreTarget::Lsn(full.manifest.end_lsn),
+        )?;
+        let MetadataProbe::Initialized(probed) = inspect_database_metadata(&before) else {
+            return Err("the restored database is not initialized".into());
+        };
+        assert!(probed.unmet_floors.is_empty(), "{:?}", probed.unmet_floors);
+
+        let refused_path = temp.path().join("refused.redb");
+        let refused = restore_backup(
+            &incremental.path,
+            DbConfig::on_disk(profile, &refused_path),
+            RestoreTarget::Latest,
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(BackupError::ProfileFloorsNotMet { floors }) if floors == &["floors.audit"]
+            ),
+            "unexpected result: {refused:?}"
+        );
+        assert!(!refused_path.exists(), "nothing is created when refused");
+
+        let allowed = temp.path().join("allowed.redb");
+        restore_backup_with_config(
+            &incremental.path,
+            DbConfig::on_disk(profile, &allowed),
+            RestoreTarget::Latest,
+            &RestoreConfig::default().with_unmet_profile_floors_allowed(true),
+        )?;
+        let MetadataProbe::Initialized(probed) = inspect_database_metadata(&allowed) else {
+            return Err("the restored database is not initialized".into());
+        };
+        assert_eq!(probed.unmet_floors, vec!["floors.audit"]);
+        verify_backup(&incremental.path)?;
+        Ok(())
+    }
+
+    /// The floor check follows the audit flag across a chain of several incrementals up to the
+    /// restore target, and the apply pass, which reads the payloads again, restores every
+    /// commit up to it.
+    #[test]
+    fn restore_checks_the_audit_floor_across_several_incrementals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let binding = example_binding(&temp.path().join("source.redb"), false)?;
+        let profile = binding.db_config.profile;
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        let set_audit = |enabled: &[u8]| {
+            propose_system(
+                &database,
+                Op::Put {
+                    table: super::AUTHZ_TABLE.to_owned(),
+                    key: super::KEY_AUDIT_ENABLED.to_vec(),
+                    value: enabled.to_vec(),
+                },
+            )
+        };
+        let put = |key: &[u8]| {
+            database.propose(Op::Put {
+                table: "orders".to_owned(),
+                key: key.to_vec(),
+                value: b"v".to_vec(),
+            })
+        };
+        let root = temp.path().join("backups");
+        let config = BackupConfig::default();
+        let full = full_backup(&database, &root, &config)?;
+        put(b"a")?;
+        set_audit(b"false")?;
+        let audit_off = incremental_backup(&database, &root, &full.path, &config)?;
+        set_audit(b"true")?;
+        put(b"b")?;
+        let audit_on = incremental_backup(&database, &root, &audit_off.path, &config)?;
+        put(b"c")?;
+        let latest = incremental_backup(&database, &root, &audit_on.path, &config)?;
+        drop(database);
+
+        let refused_path = temp.path().join("refused.redb");
+        let refused = restore_backup(
+            &latest.path,
+            DbConfig::on_disk(profile, &refused_path),
+            RestoreTarget::Lsn(audit_off.manifest.end_lsn),
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(BackupError::ProfileFloorsNotMet { floors }) if floors == &["floors.audit"]
+            ),
+            "unexpected result: {refused:?}"
+        );
+        assert!(!refused_path.exists(), "nothing is created when refused");
+
+        let restored_path = temp.path().join("restored.redb");
+        let report = restore_backup(
+            &latest.path,
+            DbConfig::on_disk(profile, &restored_path),
+            RestoreTarget::Latest,
+        )?;
+        assert_eq!(report.restored_lsn, latest.manifest.end_lsn);
+        let commits = latest
+            .manifest
+            .end_lsn
+            .checked_sub(full.manifest.end_lsn)
+            .ok_or("the chain ends before the full backup")?;
+        assert_eq!(report.applied_commits, usize::try_from(commits)?);
+        let MetadataProbe::Initialized(probed) = inspect_database_metadata(&restored_path) else {
+            return Err("the restored database is not initialized".into());
+        };
+        assert!(probed.unmet_floors.is_empty(), "{:?}", probed.unmet_floors);
+        let restored = open_database(DbConfig::on_disk(profile, &restored_path))?;
+        for key in [b"a", b"b", b"c"] {
+            assert_eq!(
+                restored.read("orders", key, ReadConsistency::Strong)?,
+                Some(b"v".to_vec())
+            );
+        }
+        Ok(())
+    }
+
+    /// Every incremental payload is read and checked before the target is created, also for a
+    /// database without a manifest, so a corrupt payload in the middle of a chain leaves
+    /// nothing behind.
+    #[test]
+    fn restore_checks_every_incremental_payload_before_it_creates_the_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database = create_database(DbConfig::on_disk(
+            Profile::Balanced,
+            temp.path().join("source.redb"),
+        ))?;
+        let root = temp.path().join("backups");
+        let mut chain = vec![full_backup(&database, &root, &BackupConfig::default())?.path];
+        for key in [b"a", b"b", b"c"] {
+            database.propose(Op::Put {
+                table: "items".to_owned(),
+                key: key.to_vec(),
+                value: b"v".to_vec(),
+            })?;
+            let parent = chain.last().ok_or("the chain is empty")?;
+            let incremental =
+                incremental_backup(&database, &root, parent, &BackupConfig::default())?;
+            chain.push(incremental.path);
+        }
+        drop(database);
+        let [_, _, middle, last] = chain.as_slice() else {
+            return Err("expected a full backup and three incrementals".into());
+        };
+
+        let wal_path = middle.join("wal").join("incremental.json.zst");
+        let mut stored = std::fs::read(&wal_path)?;
+        let last_byte = stored.last_mut().ok_or("the payload is empty")?;
+        *last_byte ^= 0xFF;
+        std::fs::write(&wal_path, stored)?;
+        let target = temp.path().join("restore.redb");
+        let result = restore_backup(
+            last,
+            DbConfig::on_disk(Profile::Balanced, &target),
+            RestoreTarget::Latest,
+        );
+        assert!(
+            matches!(&result, Err(BackupError::Corruption(_))),
+            "unexpected result: {result:?}"
+        );
+        assert!(!target.exists(), "nothing is created for a corrupt payload");
         Ok(())
     }
 }

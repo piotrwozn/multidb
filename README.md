@@ -152,11 +152,17 @@ Release-sensitive gate:
 - MultiDB is a public-preview engine, not a mature production database.
 - The CP OpenRaft profile is covered by local/process smoke tests; it does not
   claim managed Kubernetes automation, multi-region placement or an enterprise
-  SLA.
+  SLA. Multi-node CP replication runs through `repl::start_cp_cluster`; the
+  embedded `Database` cluster constructors fail closed with `Unsupported`.
+- AP databases reject commit-log features (incremental backups, so no PITR,
+  changefeeds, subscriptions, continuous queries, materialized views,
+  after-commit hooks, system versioning and incremental full-text/geo refresh)
+  instead of returning empty results.
 - `config apply --plan` (the version 1 migration plan) stays
-  confirmation/audit-only. Provisioning (`config plan|apply --spec`,
-  `init --apply`, `multidb serve` spec mode and `POST /provision/apply`) is a
-  preview for embedded and single-node CP databases: it
+  confirmation/audit-only and does not perform physical data migrations.
+  Provisioning (`config plan|apply --spec`, `init --apply`, `multidb serve`
+  spec mode and `POST /provision/apply`) is a preview for embedded and
+  single-node CP databases: it
   creates and adopts objects, roles and the profile, but never drops or alters
   an object, switches a profile or storage class, or re-encrypts; encryption
   at rest is provisioned through the Rust API only, so a spec with

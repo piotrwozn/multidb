@@ -328,7 +328,7 @@ pub struct HistoryOverrides {
     pub system_versioning: Option<SystemVersioningKnob>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_history: Option<bool>,
-    /// Reserved until MVCC/commit-log GC (#12) gives it a runtime sink.
+    /// Reserved until MVCC and commit-log GC give it a runtime sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mvcc_retention_millis: Option<u64>,
 }
@@ -1086,7 +1086,7 @@ fn limit_not_enforced(path: &str) -> ValidationIssue {
         format!("{KNOB_PATH_PREFIX}.{path}"),
         format!(
             "{path} is planned but not enforced: no user write path checks it until the single \
-             write pipeline (#11) lands"
+             write pipeline lands"
         ),
         format!("Remove {path} or set it to unlimited."),
         CertificationImpact::BlocksCertified,
@@ -2579,7 +2579,11 @@ mod tests {
 
         let mut no_path = spec(2, "in_memory", None);
         no_path.deployment.storage_path = None;
-        assert!(resolve_profile(&no_path).issues().is_empty());
+        assert!(
+            resolve_profile(&no_path).issues().is_empty(),
+            "expected an empty value, got {:?}",
+            resolve_profile(&no_path).issues()
+        );
     }
 
     #[test]

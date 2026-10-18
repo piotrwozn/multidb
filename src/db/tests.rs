@@ -9,19 +9,22 @@ use std::{
 use serde_json::json;
 
 use super::{
-    AUTHZ_TABLE, ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_LAYOUT,
-    KEY_PROFILE_MANIFEST, KEY_SCHEMA_VERSION, META_TABLE, Metadata, MetadataProbe, MetadataRead,
-    OperationalConfig, PersistedProfileManifest, ProbedMetadata, Profile, ReplicationKind,
-    RuntimeProfileBinding, SecurityConfig, ShardBackendConfig, ShardSpec, ShardedDatabaseConfig,
-    create_ap_database, create_cluster_database, create_database, create_database_with_ops,
-    create_database_with_profile, create_sharded_database, engine_for, engine_for_operational,
-    force_wasm_runtime_init_failure, inspect_database_metadata, layout_for, open_ap_database,
-    open_cluster_database, open_database, open_database_with_ops, open_sharded_database,
+    AUTHZ_TABLE, ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_AUDIT_ENABLED,
+    KEY_LAYOUT, KEY_PROFILE_MANIFEST, KEY_SCHEMA_VERSION, META_TABLE, Metadata, MetadataProbe,
+    MetadataRead, OperationalConfig, PersistedProfileManifest, ProbedMetadata, Profile,
+    ReplicationKind, RuntimeProfileBinding, SecurityConfig, ShardBackendConfig, ShardSpec,
+    ShardedDatabaseConfig, create_ap_database, create_cluster_database,
+    create_cluster_database_with_ops, create_database, create_database_with_ops,
+    create_database_with_profile, create_sharded_database, create_simulated_cluster_database,
+    engine_for, engine_for_operational, force_wasm_runtime_init_failure, inspect_database_metadata,
+    layout_for, open_ap_database, open_cluster_database, open_cluster_database_with_ops,
+    open_database, open_database_with_ops, open_sharded_database, open_simulated_cluster_database,
     profile_validation_report, recover_database_file, refuse_profile_manifest, validate,
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
-    HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewSpec, ResumeToken,
+    HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewError,
+    MaterializedViewSpec, ResumeToken, SubscriptionConfig,
 };
 use crate::cloud::ObjectStoreUri;
 use crate::config_spec::{
@@ -36,7 +39,7 @@ use crate::extension::{
     AbiVersion, ExtensionError, LimitPolicy, MaskingPolicy, PolicyConfig, UdfBudget,
 };
 use crate::federation::{ForeignSource, ForeignTableOptions};
-use crate::geo::{GeoIndexConfig, GeoPoint};
+use crate::geo::{GeoError, GeoIndexConfig, GeoPoint};
 use crate::graph::{GraphId, GraphNodeId, TraversalOptions};
 use crate::model::{
     CollectionId, FieldPath, IndexId, IndexSpec, PlanKind, Predicate, Value, decode_value,
@@ -65,9 +68,9 @@ use crate::storage::{
     EngineKind, ReadTransaction, RedbEngine, StorageEngine, StorageError, WriteTransaction,
     decode_stored_value,
 };
-use crate::temporal::{TemporalPoint, TemporalRetention};
-use crate::text::FullTextIndexConfig;
-use crate::timeseries::{TimePoint, TimeSeriesConfig};
+use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
+use crate::text::{FullTextIndexConfig, TextError};
+use crate::timeseries::{TimePoint, TimeSeriesConfig, TimeSeriesError};
 use crate::tuning::{
     ParameterEnvelope, ReprofilePlan, ReprofileStatus, TunableParameter, TuningDecision,
     TuningPolicy, WorkloadSample,
@@ -309,7 +312,7 @@ async fn phase21_workload_system_view_requires_rbac_and_records_queries()
         panic!("system workload should return rows");
     };
     assert!(rows.columns.contains(&"fingerprint".to_owned()));
-    assert!(!rows.rows.is_empty());
+    assert!(!rows.rows.is_empty(), "expected a non-empty value");
     Ok(())
 }
 
@@ -728,7 +731,11 @@ fn phase29_vector_handles_share_fresh_index_state() -> Result<(), Box<dyn std::e
 
     assert_eq!(second.knn(&[1.0, 0.0, 0.0], 1)?[0].id, id);
     second.delete_vector(id)?;
-    assert!(first.knn(&[1.0, 0.0, 0.0], 1)?.is_empty());
+    assert!(
+        first.knn(&[1.0, 0.0, 0.0], 1)?.is_empty(),
+        "expected an empty value, got {:?}",
+        first.knn(&[1.0, 0.0, 0.0], 1)?
+    );
     Ok(())
 }
 
@@ -776,6 +783,24 @@ fn phase29_hooks_fire_for_time_series_and_graph() -> Result<(), Box<dyn std::err
             .iter()
             .any(|(_, value)| { String::from_utf8_lossy(value).contains("graph_after") })
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn time_bucket_sql_rejects_overflowing_timestamp() -> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+
+    assert!(matches!(
+        database
+            .query("SELECT time_bucket(60000, -9223372036854775807)")
+            .await,
+        Err(DbError::TimeSeries(TimeSeriesError::InvalidPoint(_)))
+    ));
+
+    let SqlOutput::Rows(rows) = database.query("SELECT time_bucket(1000, -1)").await? else {
+        return Err("time_bucket should return rows".into());
+    };
+    assert_eq!(rows.rows, vec![vec![Value::Int(-1_000)]]);
     Ok(())
 }
 
@@ -887,6 +912,186 @@ async fn old_database_without_authz_opens_default_deny() -> Result<(), Box<dyn s
             .query_as(&Principal::new("alice"), "SELECT name FROM users")
             .await,
         Err(DbError::AuthzDenied(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn serve_reopen_keeps_persisted_security_state() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("serve-security.redb");
+    let admin = Principal::new("admin").with_role("admin");
+    let alice = Principal::new("alice").with_role("reader");
+
+    {
+        let mut database = create_database(DbConfig::on_disk(Profile::Transactional, &path))?;
+        seed_orders(&mut database)?;
+        database.ensure_bootstrap_admin_principal()?;
+        let stored_admin = database
+            .authz_policy()
+            .roles()
+            .get("admin")
+            .cloned()
+            .ok_or("missing bootstrap admin role")?;
+        database.set_authz_policy_as(
+            &admin,
+            AuthzPolicy::new([
+                stored_admin,
+                Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+            ]),
+        )?;
+        database.set_principal_registry_as(
+            &admin,
+            PrincipalRegistry::new().with_principal("alice", alice.clone()),
+        )?;
+        database.set_audit_enabled_as(&admin, false)?;
+    }
+
+    {
+        let mut database = create_database(DbConfig::on_disk(Profile::Transactional, &path))?;
+        assert!(database.authz_policy().roles().contains_key("reader"));
+        assert_eq!(database.principal_for_user("alice"), alice);
+        assert!(
+            !database
+                .principal_registry()
+                .principals()
+                .contains_key("admin")
+        );
+        assert!(!database.audit_enabled());
+        let principal = database.principal_for_user("alice");
+        assert!(matches!(
+            database
+                .query_as(&principal, "SELECT name FROM users")
+                .await?,
+            SqlOutput::Rows(_)
+        ));
+        database.ensure_bootstrap_admin_principal()?;
+    }
+
+    let database = open_database(DbConfig::on_disk(Profile::Transactional, &path))?;
+    assert_eq!(
+        database
+            .authz_policy()
+            .roles()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["admin", "reader"]
+    );
+    assert_eq!(database.principal_for_user("alice"), alice);
+    assert_eq!(database.principal_for_user("admin"), admin);
+    assert!(!database.audit_enabled());
+    let principal = database.principal_for_user("alice");
+    assert!(matches!(
+        database
+            .query_as(&principal, "SELECT name FROM users")
+            .await?,
+        SqlOutput::Rows(_)
+    ));
+    assert!(matches!(
+        database
+            .query_as(
+                &principal,
+                "INSERT INTO users (id, name, age) VALUES (3, 'Lin', 41)"
+            )
+            .await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn bootstrap_admin_merges_into_existing_security() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let users = Resource::Table("users".to_owned());
+    let reader = Role::new("reader").grant(users.clone(), Permission::Read);
+    let alice = Principal::new("alice").with_role("reader");
+    database.set_authz_policy(AuthzPolicy::new([
+        reader.clone(),
+        Role::new("admin").grant(users.clone(), Permission::Read),
+    ]));
+    database.set_principal_registry(
+        PrincipalRegistry::new()
+            .with_principal("alice", alice.clone())
+            .with_principal("admin", Principal::new("admin").with_role("ops")),
+    );
+    let initial_txn = database.read(
+        txn::TXN_META_TABLE,
+        txn::CURRENT_TXN_ID_KEY,
+        ReadConsistency::Strong,
+    )?;
+
+    database.ensure_bootstrap_admin_principal()?;
+
+    let policy = database.authz_policy();
+    assert_eq!(policy.roles().get("reader"), Some(&reader));
+    let admin_role = policy.roles().get("admin").ok_or("missing admin role")?;
+    assert!(
+        admin_role
+            .grants()
+            .get(&users)
+            .is_some_and(|permissions| permissions.contains(&Permission::Read))
+    );
+    let admin_member = Principal::new("member").with_role("admin");
+    policy.authorize(&admin_member, &Resource::System, Permission::Admin)?;
+    policy.authorize(&admin_member, &Resource::Database, Permission::Write)?;
+    assert_eq!(database.principal_for_user("alice"), alice);
+    assert_eq!(
+        database.principal_for_user("admin"),
+        Principal::new("admin").with_role("admin").with_role("ops")
+    );
+
+    let txn_after_merge = database.read(
+        txn::TXN_META_TABLE,
+        txn::CURRENT_TXN_ID_KEY,
+        ReadConsistency::Strong,
+    )?;
+    assert_ne!(txn_after_merge, initial_txn);
+    let policy_after_merge = database.authz_policy().clone();
+    let registry_after_merge = database.principal_registry().clone();
+
+    database.ensure_bootstrap_admin_principal()?;
+
+    assert_eq!(
+        database.read(
+            txn::TXN_META_TABLE,
+            txn::CURRENT_TXN_ID_KEY,
+            ReadConsistency::Strong,
+        )?,
+        txn_after_merge
+    );
+    assert_eq!(database.authz_policy(), &policy_after_merge);
+    assert_eq!(database.principal_registry(), &registry_after_merge);
+    Ok(())
+}
+
+#[test]
+fn plain_open_rejects_corrupt_persisted_security() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("corrupt-security.redb");
+    let config = DbConfig::on_disk(Profile::Transactional, &path);
+
+    {
+        let database = create_database(config.clone())?;
+        assert!(database.authz_policy().roles().is_empty());
+        assert!(database.principal_registry().principals().is_empty());
+        assert!(database.audit_enabled());
+    }
+
+    {
+        let engine = RedbEngine::open(&path)?;
+        let mut txn = engine.begin_write()?;
+        txn.put(super::AUTHZ_TABLE, super::KEY_AUTHZ_POLICY, b"not-json")?;
+        txn.commit()?;
+    }
+
+    assert!(matches!(
+        open_database(config.clone()),
+        Err(ConfigError::Serde(_))
+    ));
+    assert!(matches!(
+        create_database(config),
+        Err(ConfigError::Serde(_))
     ));
     Ok(())
 }
@@ -1146,7 +1351,8 @@ fn public_writes_reject_reserved_keyspaces() -> Result<(), Box<dyn std::error::E
 
 #[test]
 fn cluster_backends_reject_public_reserved_keyspaces() -> Result<(), Box<dyn std::error::Error>> {
-    let cp = create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    let cp =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
     assert_reserved_put_rejected(&cp, AUDIT_TABLE);
     assert_reserved_condition_rejected(&cp, AUDIT_HEAD_TABLE);
 
@@ -1300,7 +1506,8 @@ fn self_healing_controller_is_only_available_for_cluster_backends()
         Err(DbError::Config(ConfigError::Unsupported(_)))
     ));
 
-    let cp = create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    let cp =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
     let cp_controller =
         cp.self_healing_controller(HealthConfig::default(), HealingPolicy::default())?;
     assert_eq!(cp_controller.backend.local_node_id(), 1);
@@ -2291,13 +2498,13 @@ fn cluster_database_rejects_even_voter_count() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
-fn cluster_database_persists_through_open() -> Result<(), Box<dyn std::error::Error>> {
+fn simulated_cluster_database_persists_through_open() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let path = temp_dir.path().join("cp-cluster.redb");
     let config = DbConfig::on_disk(Profile::Balanced, path);
 
     {
-        let database = create_cluster_database(config.clone(), cp_cluster_config())?;
+        let database = create_simulated_cluster_database(config.clone(), cp_cluster_config())?;
         database.propose(Op::Put {
             table: "t".to_owned(),
             key: b"k".to_vec(),
@@ -2305,13 +2512,83 @@ fn cluster_database_persists_through_open() -> Result<(), Box<dyn std::error::Er
         })?;
     }
 
-    let database = open_cluster_database(config, cp_cluster_config())?;
+    {
+        let database = open_simulated_cluster_database(config.clone(), cp_cluster_config())?;
+        assert_eq!(
+            database.read("t", b"k", ReadConsistency::Strong)?,
+            Some(b"v".to_vec())
+        );
+    }
+
+    let database = open_database(config)?;
     assert_eq!(
         database.read("t", b"k", ReadConsistency::Strong)?,
         Some(b"v".to_vec())
     );
 
     Ok(())
+}
+
+#[test]
+fn cluster_database_constructors_fail_closed_without_live_raft()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("cp-cluster.redb");
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+
+    match create_cluster_database(config.clone(), cp_cluster_config()) {
+        Err(ConfigError::Unsupported(message)) => {
+            assert!(message.contains("start_cp_cluster"));
+        }
+        Err(error) => panic!("expected unsupported cluster database, got {error}"),
+        Ok(_) => panic!("cluster database must fail closed without the live Raft runtime"),
+    }
+    assert!(!path.exists());
+    assert!(matches!(
+        open_cluster_database(config.clone(), cp_cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        create_cluster_database_with_ops(
+            config.clone(),
+            cp_cluster_config(),
+            OperationalConfig::new(),
+        ),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        open_cluster_database_with_ops(config, cp_cluster_config(), &OperationalConfig::new()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(!path.exists());
+
+    Ok(())
+}
+
+#[test]
+fn sharded_database_rejects_cp_shard_backends() {
+    let sharding = || {
+        ShardedDatabaseConfig::new(
+            PartitionStrategy::HashSlots { partitions: 16 },
+            1,
+            vec![ShardSpec::new(
+                1,
+                ShardBackendConfig::Cp {
+                    config: DbConfig::new(Profile::InMemory),
+                    cluster: cp_cluster_config(),
+                },
+            )],
+        )
+    };
+
+    assert!(matches!(
+        create_sharded_database(DbConfig::new(Profile::InMemory), sharding()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        open_sharded_database(DbConfig::new(Profile::InMemory), sharding()),
+        Err(ConfigError::Unsupported(_))
+    ));
 }
 
 #[test]
@@ -2348,6 +2625,48 @@ fn ap_database_persists_through_open() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
+fn cluster_openers_restore_persisted_security() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let cp_config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("cp-security.redb"));
+    {
+        let mut database =
+            create_simulated_cluster_database(cp_config.clone(), cp_cluster_config())?;
+        persist_reader_security(&mut database)?;
+    }
+    let database = open_simulated_cluster_database(cp_config, cp_cluster_config())?;
+    assert_reader_security_restored(&database);
+    drop(database);
+
+    let ap_config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("ap-security.redb"))
+        .with_replication(ReplicationKind::Ap);
+    {
+        let mut database = create_ap_database(ap_config.clone(), ap_cluster_config())?;
+        persist_reader_security(&mut database)?;
+    }
+    let database = open_ap_database(ap_config, ap_cluster_config())?;
+    assert_reader_security_restored(&database);
+
+    Ok(())
+}
+
+#[test]
+fn sharded_openers_restore_persisted_security() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = DbConfig::on_disk(Profile::Balanced, temp_dir.path().join("router.redb"));
+
+    {
+        let mut database =
+            create_sharded_database(config.clone(), on_disk_sharded_config(temp_dir.path()))?;
+        persist_reader_security(&mut database)?;
+    }
+    let database = open_sharded_database(config, on_disk_sharded_config(temp_dir.path()))?;
+    assert_reader_security_restored(&database);
+
+    Ok(())
+}
+
+#[test]
 fn ap_database_rejects_snapshot_transactions() -> Result<(), Box<dyn std::error::Error>> {
     let database = create_ap_database(
         DbConfig::new(Profile::InMemory).with_replication(ReplicationKind::Ap),
@@ -2358,6 +2677,197 @@ fn ap_database_rejects_snapshot_transactions() -> Result<(), Box<dyn std::error:
         database.begin_transaction(),
         Err(DbError::Config(ConfigError::Unsupported(_)))
     ));
+
+    Ok(())
+}
+
+#[test]
+fn ap_database_rejects_changefeeds_subscriptions_and_continuous_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = ap_database()?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    accounts.insert(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(37),
+    ])?;
+
+    assert!(matches!(
+        database.poll_changefeed(
+            &ResumeToken::default(),
+            &ChangefeedFilter::default(),
+            &ChangefeedOptions::default(),
+            10,
+        ),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        database.poll_changefeed_page(
+            &ResumeToken::default(),
+            &ChangefeedFilter::default(),
+            &ChangefeedOptions::default(),
+            10,
+        ),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+
+    assert!(matches!(
+        database.create_subscription(SubscriptionConfig::new("feed", ResumeToken::default())),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        database.create_subscription_as(
+            &Principal::new("alice"),
+            SubscriptionConfig::new("feed", ResumeToken::default()),
+        ),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(database.subscription_state("feed").is_err());
+
+    let spec = ContinuousQuerySpec {
+        name: "cq_accounts".to_owned(),
+        sql: "SELECT * FROM accounts".to_owned(),
+        filter: ChangefeedFilter {
+            target: ChangefeedTarget::Table("accounts".to_owned()),
+        },
+        start: ResumeToken::default(),
+        buffer_limit: 8,
+    };
+    assert!(matches!(
+        database.create_continuous_query(&spec),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(
+        database
+            .ack_continuous_query(&spec.name, ResumeToken::default())
+            .is_err()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn ap_database_rejects_materialized_views_hooks_and_system_versioning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = ap_database()?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let spec = MaterializedViewSpec {
+        name: "accounts_by_name".to_owned(),
+        source_table: "accounts".to_owned(),
+        filter: None,
+        group_by: 1,
+        aggregates: vec![AggregateSpec {
+            output_name: "count".to_owned(),
+            kind: AggregateKind::Count,
+            column: None,
+        }],
+    };
+
+    assert!(matches!(
+        database.create_materialized_view(&spec),
+        Err(DbError::MaterializedView(
+            MaterializedViewError::Unsupported(_)
+        ))
+    ));
+    assert!(matches!(
+        database.create_materialized_view_object(&spec),
+        Err(DbError::MaterializedView(
+            MaterializedViewError::Unsupported(_)
+        ))
+    ));
+    assert!(matches!(
+        database.refresh_materialized_view_to_current(&spec.name),
+        Err(DbError::MaterializedView(
+            MaterializedViewError::Unsupported(_)
+        ))
+    ));
+    assert!(!database.catalog().contains_key(&spec.name));
+
+    assert!(matches!(
+        database.register_hook(&HookSpec::after(
+            "record_after",
+            HookTarget::AnyUser,
+            HookAction::RecordAfterCommit,
+            1_000,
+        )),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    database.register_hook(&HookSpec::before(
+        "reject_empty",
+        HookTarget::AnyUser,
+        HookAction::RejectEmptyValue,
+        1_000,
+    ))?;
+
+    assert!(matches!(
+        database.enable_system_versioning(
+            "accounts",
+            TemporalRetention {
+                min_lsn: 0,
+                keep_history: true,
+            },
+        ),
+        Err(DbError::Temporal(TemporalError::Unsupported(_)))
+    ));
+    assert!(!database.catalog().contains_key("accounts_history"));
+
+    Ok(())
+}
+
+#[test]
+fn ap_database_rejects_incremental_full_text_and_geo_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut ap = ap_database()?;
+    insert_located_post(&mut ap)?;
+    let catalog = ap.catalog().clone();
+    let text = ap.create_full_text_index(posts_text_index())?;
+    assert!(matches!(
+        text.refresh_incremental(&catalog),
+        Err(TextError::Repl(ReplError::Unsupported(_)))
+    ));
+    let geo = ap.create_geo_index(posts_geo_index())?;
+    assert!(matches!(
+        geo.refresh_incremental(&catalog),
+        Err(GeoError::Repl(ReplError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        ap.full_text_index("posts_text")?
+            .refresh_incremental(ap.catalog()),
+        Err(TextError::Repl(ReplError::Unsupported(_)))
+    ));
+    assert!(matches!(
+        ap.geo_index("posts_geo")?.refresh_incremental(ap.catalog()),
+        Err(GeoError::Repl(ReplError::Unsupported(_)))
+    ));
+    assert_eq!(
+        ap.full_text_index("posts_text")?
+            .refresh_full()?
+            .indexed_documents,
+        1
+    );
+    assert_eq!(ap.geo_index("posts_geo")?.refresh_full()?, 1);
+
+    let mut local = create_database(DbConfig::new(Profile::InMemory))?;
+    insert_located_post(&mut local)?;
+    local.create_full_text_index(posts_text_index())?;
+    local.create_geo_index(posts_geo_index())?;
+    assert_eq!(
+        local
+            .full_text_index("posts_text")?
+            .refresh_incremental(local.catalog())?
+            .indexed_documents,
+        1
+    );
+    local
+        .geo_index("posts_geo")?
+        .refresh_incremental(local.catalog())?;
+    assert_eq!(
+        local
+            .geo_index("posts_geo")?
+            .within_radius(GeoPoint::new(21.0122, 52.2297)?, 10.0)?
+            .len(),
+        1
+    );
 
     Ok(())
 }
@@ -3258,6 +3768,126 @@ async fn phase32_temporal_as_of_lsn_and_retention() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// `SELECT name FROM users WHERE id = ++...+2` with `depth` unary plus signs, each one parser
+/// recursion level deeper. The engine answers it from the `id` index, without `DataFusion`, whose
+/// own parser stops at a fixed depth of 50.
+fn nested_select(depth: usize) -> String {
+    format!("SELECT name FROM users WHERE id = {}2", "+".repeat(depth))
+}
+
+/// Seeds `users` and `orders`, keeps `users` history, lets `alice` read `users` and lets the
+/// role `writer` write it.
+fn seed_parser_limit_database(
+    database: &mut Database,
+) -> Result<(Principal, u64), Box<dyn std::error::Error>> {
+    seed_orders(database)?;
+    database.enable_system_versioning("users", TemporalRetention::default())?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+        Role::new("writer").grant(Resource::Table("users".to_owned()), Permission::Write),
+    ]));
+    Ok((
+        Principal::new("alice").with_role("reader"),
+        latest_lsn(database)?,
+    ))
+}
+
+/// The SQL parser limits (`query.parser_recursion_limit`, `query.max_sql_bytes`, ...) bind the
+/// engine's parse and the compatibility, RBAC and temporal pre-parses, which parse with the
+/// configured limits instead of the sqlparser defaults.
+#[tokio::test]
+async fn sql_parser_limits_bind_the_engine_and_pre_parses() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let (reader, lsn) = seed_parser_limit_database(&mut database)?;
+    assert_eq!(
+        database.performance_config().query.parser_recursion_limit,
+        128
+    );
+
+    // Deeper than the sqlparser default of 50, within the preset.
+    let deep = nested_select(80);
+    let grace = SqlOutput::Rows(SqlRows {
+        columns: vec!["name".to_owned()],
+        rows: vec![vec![Value::Str("Grace".to_owned())]],
+    });
+    assert_eq!(database.query(&deep).await?, grace);
+    assert_eq!(database.query_as(&reader, &deep).await?, grace);
+    let insert = format!(
+        "INSERT INTO users (id, name, age) VALUES (3, 'Lin', {}41)",
+        "+".repeat(80)
+    );
+    let writer = Principal::new("bob").with_role("writer");
+    assert_eq!(
+        database.query_as(&writer, &insert).await?,
+        SqlOutput::AffectedRows(1)
+    );
+    // An AS OF query and an ordered SELECT go to DataFusion, whose parser keeps its own limit of
+    // 50. Past it they are parse errors (SQLSTATE 42601), not internal errors.
+    for capped in [
+        database.query_as_of(&deep, TemporalPoint::Lsn(lsn)).await,
+        database.query(&format!("{deep} ORDER BY name")).await,
+    ] {
+        match &capped {
+            Err(error @ DbError::Query(QueryError::Parse(message)))
+                if message.contains("RecursionLimitExceeded") =>
+            {
+                assert_eq!(crate::compat::sqlstate_for_db_error(error), "42601");
+            }
+            other => return Err(format!("expected a DataFusion parse error: {other:?}").into()),
+        }
+    }
+
+    let mut performance = PerformanceConfig::for_profile(Profile::InMemory);
+    performance.query.parser_recursion_limit = 20;
+    performance.query.max_sql_bytes = 256;
+    let mut limited = create_database_with_ops(
+        DbConfig::new(Profile::InMemory),
+        OperationalConfig::new().with_performance(performance),
+    )?;
+    let (reader, lsn) = seed_parser_limit_database(&mut limited)?;
+    let too_deep = nested_select(30);
+    for result in [
+        limited.query(&too_deep).await,
+        limited.query_as(&reader, &too_deep).await,
+        limited
+            .query_as_of(&too_deep, TemporalPoint::Lsn(lsn))
+            .await,
+    ] {
+        assert!(
+            matches!(&result, Err(DbError::Query(QueryError::Parse(message)))
+                if message.contains("recursion limit exceeded")),
+            "{result:?}"
+        );
+    }
+    // The compatibility pre-parse answers `SELECT version()` and the catalog views, but not past
+    // max_sql_bytes, which counts the whole text, trailing whitespace and semicolons included.
+    for padded in [
+        format!("SELECT version() -- {}", "x".repeat(300)),
+        format!("SELECT version(){}", " ".repeat(300)),
+        format!("SELECT version(){}", ";".repeat(300)),
+        format!("SELECT * FROM pg_catalog.pg_type{}", "; \n".repeat(100)),
+    ] {
+        for result in [
+            limited.query(&padded).await,
+            limited.query_as(&reader, &padded).await,
+        ] {
+            assert!(
+                matches!(&result, Err(DbError::Query(QueryError::InputLimit(_)))),
+                "{result:?}"
+            );
+        }
+    }
+    for sql in [
+        "SELECT version()",
+        "  SELECT version() ;; ",
+        "SELECT * FROM pg_catalog.pg_type;",
+    ] {
+        assert!(matches!(limited.query(sql).await?, SqlOutput::Rows(_)));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn phase32_cataloged_materialized_view_is_queryable() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -3551,6 +4181,56 @@ fn ap_cluster_config() -> ApClusterConfig {
     ApClusterConfig::single_node_for_tests(1)
 }
 
+fn ap_database() -> Result<Database, ConfigError> {
+    create_ap_database(
+        DbConfig::new(Profile::InMemory).with_replication(ReplicationKind::Ap),
+        ap_cluster_config(),
+    )
+}
+
+fn insert_located_post(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    let posts = database.create_collection(
+        "posts",
+        CollectionId::new(190),
+        vec![DocField::path(
+            "body",
+            FieldPath::new(["body"]),
+            ColumnType::Str,
+        )],
+        Vec::new(),
+    )?;
+    posts.insert(&Value::Object(BTreeMap::from([
+        (
+            "body".to_owned(),
+            Value::Str("rust database search storage".to_owned()),
+        ),
+        (
+            "point".to_owned(),
+            Value::GeoPoint {
+                lon: 21.0122,
+                lat: 52.2297,
+            },
+        ),
+    ])))?;
+    Ok(())
+}
+
+fn posts_text_index() -> FullTextIndexConfig {
+    FullTextIndexConfig::collection(
+        "posts_text",
+        CollectionId::new(190),
+        FieldPath::new(["body"]),
+    )
+}
+
+fn posts_geo_index() -> GeoIndexConfig {
+    GeoIndexConfig::new(
+        "posts_geo",
+        CollectionId::new(190),
+        FieldPath::new(["point"]),
+    )
+}
+
 fn sharded_config() -> ShardedDatabaseConfig {
     ShardedDatabaseConfig::new(
         PartitionStrategy::HashSlots { partitions: 16 },
@@ -3563,6 +4243,29 @@ fn sharded_config() -> ShardedDatabaseConfig {
             ShardSpec::new(
                 2,
                 ShardBackendConfig::Local(DbConfig::new(Profile::InMemory)),
+            ),
+        ],
+    )
+}
+
+fn on_disk_sharded_config(dir: &std::path::Path) -> ShardedDatabaseConfig {
+    ShardedDatabaseConfig::new(
+        PartitionStrategy::HashSlots { partitions: 16 },
+        1,
+        vec![
+            ShardSpec::new(
+                1,
+                ShardBackendConfig::Local(DbConfig::on_disk(
+                    Profile::Balanced,
+                    dir.join("s1.redb"),
+                )),
+            ),
+            ShardSpec::new(
+                2,
+                ShardBackendConfig::Local(DbConfig::on_disk(
+                    Profile::Balanced,
+                    dir.join("s2.redb"),
+                )),
             ),
         ],
     )
@@ -3581,6 +4284,44 @@ fn security_for_alice_users_reader() -> SecurityConfig {
         audit_enabled: true,
         audit: super::AuditConfig::default(),
     }
+}
+
+/// Bootstraps the admin identity, then persists a reader role and an alice mapping as admin.
+fn persist_reader_security(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
+    database.ensure_bootstrap_admin_principal()?;
+    let admin = Principal::new("admin").with_role("admin");
+    let stored_admin = database
+        .authz_policy()
+        .roles()
+        .get("admin")
+        .cloned()
+        .ok_or("missing bootstrap admin role")?;
+    database.set_authz_policy_as(
+        &admin,
+        AuthzPolicy::new([
+            stored_admin,
+            Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+        ]),
+    )?;
+    database.set_principal_registry_as(
+        &admin,
+        PrincipalRegistry::new()
+            .with_principal("admin", admin.clone())
+            .with_principal("alice", Principal::new("alice").with_role("reader")),
+    )?;
+    Ok(())
+}
+
+fn assert_reader_security_restored(database: &Database) {
+    assert!(database.authz_policy().roles().contains_key("reader"));
+    assert_eq!(
+        database.principal_for_user("alice"),
+        Principal::new("alice").with_role("reader")
+    );
+    assert_eq!(
+        database.principal_for_user("admin"),
+        Principal::new("admin").with_role("admin")
+    );
 }
 
 fn assert_reserved_put_rejected(database: &Database, table: &str) {
@@ -3763,7 +4504,7 @@ fn profile_manifest_knobs_are_reapplied_by_every_single_node_opener()
         database.set_principal_registry_as(&admin, registry.clone())?;
     }
     let authz_before = raw_rows(&path, AUTHZ_TABLE)?;
-    assert!(!authz_before.is_empty());
+    assert!(!authz_before.is_empty(), "expected a non-empty value");
 
     let config = DbConfig::on_disk(Profile::Balanced, &path);
     {
@@ -4256,6 +4997,26 @@ fn cluster_and_ap_openers_refuse_profile_manifests() -> Result<(), Box<dyn std::
         ),
         Err(ConfigError::Unsupported(_))
     ));
+    // The public CP constructors fail closed before reading metadata; the
+    // simulated adapter reads it and refuses the manifest itself.
+    for result in [
+        open_simulated_cluster_database(
+            DbConfig::on_disk(Profile::Balanced, &cp_path),
+            cp_cluster_config(),
+        ),
+        create_simulated_cluster_database(
+            DbConfig::on_disk(Profile::Balanced, &cp_path),
+            cp_cluster_config(),
+        ),
+    ] {
+        match result {
+            Err(ConfigError::Unsupported(message)) => {
+                assert!(message.contains("single-node only"), "{message}");
+            }
+            Err(error) => panic!("expected the manifest refusal, got {error:?}"),
+            Ok(_) => panic!("a simulated CP opener accepted a profile manifest"),
+        }
+    }
 
     let ap_path = temp_dir.path().join("ap.redb");
     let binding = named_binding("balanced", json!({}), ReplicationKind::Ap, Some(&ap_path))?;
@@ -4389,7 +5150,10 @@ fn inspect_database_metadata_never_creates_files() -> Result<(), Box<dyn std::er
 
 /// The probe opens files read-only: it never writes a file, and a file that needs crash
 /// recovery is `NeedsRecovery` instead of being repaired. `recover_database_file` recovers it
-/// without touching the database metadata, and leaves a cleanly closed file alone.
+/// without touching the database metadata, and leaves a cleanly closed file alone. Unix only:
+/// the crash is simulated by copying the file while the database holds it open, and Windows
+/// refuses to read a file that redb has locked.
+#[cfg(unix)]
 #[test]
 fn inspect_database_metadata_never_writes_or_repairs() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -4662,6 +5426,117 @@ fn audit_floor_keeps_audit_enabled_after_creation() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// Runs `run` with a subscriber that records what `tracing` logs on this thread, without ANSI
+/// colours.
+fn capture_logs<T>(run: impl FnOnce() -> T) -> Result<(T, String), Box<dyn std::error::Error>> {
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("the log buffer is poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, run);
+    let logs = captured
+        .0
+        .lock()
+        .map_err(|_| "the log buffer is poisoned")?
+        .clone();
+    Ok((value, String::from_utf8(logs)?))
+}
+
+/// Every single-node opener warns about each manifest floor the opened database does not meet,
+/// as the probe lists it: an unencrypted restore target that was allowed to miss
+/// `floors.encryption_at_rest`, and audit switched off below `floors.audit`. A database that
+/// meets its floors opens without a warning.
+#[test]
+fn single_node_openers_warn_about_unmet_profile_floors() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let encrypted = temp_dir.path().join("encrypted.redb");
+    let key_path = temp_dir.path().join("key.bin");
+    std::fs::write(&key_path, [4_u8; 32])?;
+    let ops = OperationalConfig::new().with_encryption(EncryptionConfig::file_key(&key_path));
+    let binding = encryption_floor_binding(&encrypted)?;
+    let config = |path: &Path| DbConfig::on_disk(binding.db_config.profile, path);
+    drop(create_database_with_profile(&binding, ops.clone())?);
+    let (opened, logs) = capture_logs(|| open_database_with_ops(config(&encrypted), &ops))?;
+    drop(opened?);
+    assert!(!logs.contains("floors."), "{logs}");
+
+    let restored = temp_dir.path().join("restored.redb");
+    drop(super::create_restore_target(
+        config(&restored),
+        Some(&binding.manifest),
+    )?);
+    for (name, open) in [
+        (
+            "open_database",
+            open_database as fn(DbConfig) -> Result<Database, ConfigError>,
+        ),
+        ("create_database", create_database),
+    ] {
+        let (opened, logs) = capture_logs(|| open(config(&restored)))?;
+        drop(opened?);
+        assert!(
+            logs.contains("WARN") && logs.contains("floors.encryption_at_rest"),
+            "{name}: {logs}"
+        );
+        // The restore target holds no security state, so audit is on.
+        assert!(!logs.contains("floors.audit"), "{name}: {logs}");
+    }
+
+    // An older binary that ignores the manifest could switch audit off.
+    let audited = temp_dir.path().join("audited.redb");
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let binding = compiled.binding(&spec.deployment, Some(audited.clone()))?;
+    let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+    propose_system(
+        &database,
+        Op::Put {
+            table: AUTHZ_TABLE.to_owned(),
+            key: KEY_AUDIT_ENABLED.to_vec(),
+            value: b"false".to_vec(),
+        },
+    )?;
+    drop(database);
+    match inspect_database_metadata(&audited) {
+        MetadataProbe::Initialized(probed) => {
+            assert_eq!(probed.unmet_floors, vec!["floors.audit"]);
+        }
+        other => return Err(format!("expected an initialized database, got {other:?}").into()),
+    }
+    let audited_config = DbConfig::on_disk(binding.db_config.profile, &audited);
+    let (opened, logs) =
+        capture_logs(|| open_database_with_ops(audited_config, &OperationalConfig::new()))?;
+    assert!(!opened?.audit_enabled());
+    assert!(
+        logs.contains("WARN") && logs.contains("floors.audit"),
+        "{logs}"
+    );
+    assert!(!logs.contains("floors.encryption_at_rest"), "{logs}");
+    Ok(())
+}
+
 /// Only single-node databases can carry a profile manifest, so the `floors.audit` check never
 /// reads `__meta` of a CP, AP or sharded database: an AP opener keeps `__meta` outside the
 /// tables `ApDynamo::read` serves, and disabling audit there must keep working.
@@ -4689,7 +5564,7 @@ fn audit_can_be_disabled_on_databases_without_a_manifest_opener()
         ap_cluster_config(),
     )?)?;
     disable_audit(&mut open_ap_database(config, ap_cluster_config())?)?;
-    disable_audit(&mut create_cluster_database(
+    disable_audit(&mut create_simulated_cluster_database(
         DbConfig::new(Profile::InMemory),
         cp_cluster_config(),
     )?)?;

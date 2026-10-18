@@ -1349,6 +1349,7 @@ pub fn incremental_backup_to_uri(
     parent_backup_id: &str,
     config: &BackupConfig,
 ) -> Result<BackupReport, CloudError> {
+    crate::backup::ensure_incremental_backup_supported(database)?;
     let parent_temp = tempfile_backup_root().join(parent_backup_id);
     download_directory(parent_uri, parent_backup_id, &parent_temp)?;
     let temp = tempfile_backup_root();
@@ -1775,18 +1776,22 @@ mod tests {
     };
 
     use crate::{
-        backup::{BackupConfig, BackupKind, BackupManifest},
+        backup::{BackupConfig, BackupError, BackupKind, BackupManifest},
         cloud::{
-            BackupGcPolicy, BackupUri, CLOUD_SEGMENTS_TABLE, CloudLease, CloudLeaseOptions,
-            ObjectStoreConfig, SegmentLocation, SegmentMetadata, TenantConfig, TenantQuota,
-            TenantRuntime, TieredSegmentPointer, TieringPolicy, TieringState,
+            BackupGcPolicy, BackupUri, CLOUD_SEGMENTS_TABLE, CloudError, CloudLease,
+            CloudLeaseOptions, ObjectStoreConfig, SegmentLocation, SegmentMetadata, TenantConfig,
+            TenantQuota, TenantRuntime, TieredSegmentPointer, TieringPolicy, TieringState,
             encode_segment_metadata, full_backup_to_uri, gc_backup_uri, hibernate_database,
             read_hibernation_marker, resolve_tiered_segment_payload, restore_backup_from_uri,
-            resume_database_guarded, tier_columnar_segments, verify_backup_uri,
+            resume_database, resume_database_guarded, tier_columnar_segments, verify_backup_uri,
+        },
+        config_spec::{
+            PolicyCompiler,
+            spec_io::{SpecFormat, decode_spec_bytes},
         },
         db::{
             DbConfig, OperationalConfig, Profile, create_database, create_database_with_ops,
-            open_database,
+            create_database_with_profile, open_database,
         },
         model::Value,
         query::{ColumnDef, ColumnType, REL_COLUMNAR_SEGMENTS_TABLE, TableSchema},
@@ -2145,7 +2150,7 @@ mod tests {
             temp.path().join("objects"),
         ));
         let report = hibernate_database(&database, &config)?;
-        assert!(!report.backup_id.is_empty());
+        assert!(!report.backup_id.is_empty(), "expected a non-empty value");
         assert_eq!(report.fencing_token, report.lease_id);
         let marker = read_hibernation_marker(&config.object_store.uri)?;
         assert_eq!(marker.backup_id, report.backup_id);
@@ -2179,6 +2184,80 @@ mod tests {
         assert!(CloudLease::acquire(config.object_store.uri.clone(), "database").is_err());
         session.release()?;
         assert!(CloudLease::acquire(config.object_store.uri.clone(), "database").is_ok());
+        Ok(())
+    }
+
+    /// Hibernation resume takes no `RestoreConfig`, so it has no opt-in for unmet profile
+    /// floors: both resume paths refuse a hibernated database whose audit is off below
+    /// `floors.audit`, create nothing, keep the marker, and say that resume cannot proceed.
+    #[test]
+    fn resume_refuses_a_hibernated_database_below_a_profile_floor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let spec = decode_spec_bytes(
+            include_str!("../examples/custom-profile/multidb.yaml").as_bytes(),
+            SpecFormat::Yaml,
+        )?;
+        let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+        let binding = compiled.binding(&spec.deployment, Some(temp.path().join("source.redb")))?;
+        assert!(binding.manifest.knobs.floors.audit);
+        let profile = binding.db_config.profile;
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        // An older binary that ignores the manifest could switch audit off.
+        propose_system(
+            &database,
+            Op::Put {
+                table: "__authz_policy".to_owned(),
+                key: b"audit_enabled".to_vec(),
+                value: b"false".to_vec(),
+            },
+        )?;
+        let guarded = crate::cloud::HibernateConfig::new(ObjectStoreConfig::local_dir(
+            temp.path().join("guarded-objects"),
+        ));
+        hibernate_database(&database, &guarded)?;
+        let plain = crate::cloud::HibernateConfig::new(ObjectStoreConfig::local_dir(
+            temp.path().join("plain-objects"),
+        ));
+        let plain_backup = hibernate_database(&database, &plain)?.backup_id;
+        drop(database);
+
+        let refusal = |result: &Result<(), CloudError>| match result {
+            Err(error @ CloudError::Backup(BackupError::ProfileFloorsNotMet { floors }))
+                if floors == &["floors.audit"] =>
+            {
+                Ok(error.to_string())
+            }
+            other => Err(format!("unexpected result: {other:?}")),
+        };
+        let guarded_target = temp.path().join("guarded.redb");
+        let message = refusal(
+            &resume_database_guarded(
+                &guarded.object_store.uri,
+                DbConfig::on_disk(profile, &guarded_target),
+            )
+            .map(drop),
+        )?;
+        assert!(
+            message.contains(
+                "hibernation resume (cloud::resume_database, resume_database_guarded) has no \
+                 such opt-in and cannot resume below a floor"
+            ),
+            "{message}"
+        );
+        assert!(!guarded_target.exists(), "nothing is created when refused");
+        assert!(read_hibernation_marker(&guarded.object_store.uri).is_ok());
+
+        let plain_target = temp.path().join("plain.redb");
+        refusal(
+            &resume_database(
+                &plain.object_store.uri,
+                &plain_backup,
+                DbConfig::on_disk(profile, &plain_target),
+            )
+            .map(drop),
+        )?;
+        assert!(!plain_target.exists(), "nothing is created when refused");
         Ok(())
     }
 

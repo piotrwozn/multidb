@@ -65,9 +65,10 @@ pub use optimizer::{
     PlanDependency, PlannerFeedback, QueryFingerprint, STATS_TABLE, SimpleSelectPlan, StatsCatalog,
     StatsObjectKind, TableStats,
 };
+pub(crate) use parser::parse_with_limits;
 pub use parser::{parse, parse_analyze_for_authz};
 
-use parser::{parse_analyze_command, parse_limit, parse_with_limits};
+use parser::{parse_analyze_command, parse_limit};
 
 pub const REL_ROWS_TABLE: &str = "rel_rows";
 pub const REL_COLUMNAR_SEGMENTS_TABLE: &str = "rel_columnar_segments";
@@ -4311,7 +4312,11 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, QueryError> {
 fn datafusion_to_query_error(error: &DataFusionError) -> QueryError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
-    if lower.contains("cancel") {
+    // DataFusion parses the SQL again: its sqlparser errors, its own recursion limit of 50
+    // included, are client errors like the engine's parse errors.
+    if matches!(error.find_root(), DataFusionError::SQL(..)) {
+        QueryError::Parse(message)
+    } else if lower.contains("cancel") {
         QueryError::Cancelled(message)
     } else if lower.contains("memory")
         || lower.contains("resource")

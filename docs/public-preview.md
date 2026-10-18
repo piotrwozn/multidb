@@ -125,9 +125,13 @@ multidb profile knobs
   view; a misspelled knob gets a did-you-mean suggestion.
 - `profile show --db <path>` prints the profile manifest a database was
   created with, or "legacy database" for databases without one. It opens the
-  file read-only and never creates or writes a file. It warns when the file
-  visibly misses a manifest floor: a restored `floors.encryption_at_rest`
-  database is not encrypted.
+  file read-only and never creates or writes a file. It warns about each
+  manifest floor the file visibly misses: `floors.encryption_at_rest`, because
+  it read the metadata without a key, so the file is not encrypted, and
+  `floors.audit` when the stored audit flag is off. `restore` refuses a backup
+  whose restored database would miss such a floor (a restore target is never
+  encrypted) and creates nothing, unless `--allow-unmet-floors` is given; it
+  then prints the same warnings.
 - `profile explain --spec <file>` resolves the profile of a spec; it exits 2
   when the profile is invalid, including a version 1 spec that sets
   `custom_profile` (`FIELD_REQUIRES_SPEC_V2`).
@@ -137,12 +141,18 @@ multidb profile knobs
   of a non-canonical variant (for example `high_durability`) gets a warning,
   because a version 1 spec records the product slug.
 - `config upgrade --spec <file> [--out <file>] [--force]` converts a spec to
-  version 2 and turns the `profile.custom.*` keys of older Studio specs into
-  a real `custom_profile` (the current Studio builder writes `custom_profile`
-  itself). It is idempotent, writes `--out` in the format of its extension
+  version 2. When `custom_profile` is unset, it turns the
+  `profile.custom.base` override of older Studio specs, with
+  `profile.custom.description`, into a real `custom_profile`, and writes the
+  `profile.custom.slug` operation hint to the spec's `profile` field (the
+  current Studio builder writes
+  `custom_profile` itself). Any other `profile.custom.*` key, these keys
+  without a base, and these keys beside an existing `custom_profile` stay in
+  place; the upgrade notes and the validation suggestions say what to move by
+  hand. It is idempotent, writes `--out` in the format of its extension
   (stdout keeps the input format), does not keep YAML comments, refuses to
   overwrite a file without `--force`, and never writes a result that does not
-  validate (exit 2).
+  validate or that grows past 1 MiB when re-serialized (exit 2).
 - Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
   (as before), a product slug or alias in snake or kebab case, or `auto`,
   which reads the storage profile of the existing database without writing
@@ -186,7 +196,7 @@ Profile status:
 | `ai_agent_memory` | Stable | Vector/document/event memory for agents. |
 | `secure_app` | Stable | Audited transactional app state; can use CP semantics without claiming enterprise SLA. |
 | `analytics_columnar` | Stable | Analytics starter path with explicit extension limits. |
-| `production_cp` | Stable | CP OpenRaft cluster profile covered by the local/process smoke gate. |
+| `production_cp` | Stable | CP OpenRaft cluster profile covered by the local/process smoke gate for the live `repl::start_cp_cluster` runtime. |
 
 Collection role status:
 
@@ -207,13 +217,24 @@ Consistency status:
 | Domain | Status | Limit |
 | --- | --- | --- |
 | `local_snapshot` | Certified | Single-process/local semantics only. |
-| `strong_cp` | Stable | CP quorum semantics covered by the local/process smoke gate. |
+| `strong_cp` | Stable | CP quorum semantics covered by the local/process smoke gate for the live `repl::start_cp_cluster` runtime. |
 | `eventual_ap` | Experimental | Conflict policy requires workload review. |
 
 ## Known Limits
 
 - The local/process CP smoke contract is covered; the preview still does not
   claim Kubernetes automation, multi-region placement or enterprise SLA.
+- Multi-node CP replication runs only through the live `repl::start_cp_cluster`
+  OpenRaft runtime. The embedded `Database` cluster constructors
+  (`create_cluster_database`, `open_cluster_database`, their `_with_ops`
+  variants and sharded `Cp` shard backends) fail closed with `Unsupported`; use
+  `create_database`/`open_database` for a single node or `start_cp_cluster`.
+- AP databases do not record writes in the commit log or MVCC history, so they
+  reject incremental backups (so no point-in-time restore beyond a full
+  backup), changefeeds, CDC subscriptions, continuous
+  queries, materialized views, after-commit hooks, system versioning and
+  incremental full-text/geo refresh with `Unsupported`. Full backups and
+  `refresh_full` remain available.
 - `config apply --plan` is confirm/audit-only and does not perform physical
   data migrations. Provisioning (`config apply --spec`, `init --apply`,
   `multidb serve` spec mode and the `/provision/*` Control Plane endpoints) is
@@ -228,6 +249,11 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- Time-series retention follows the server wall clock and is enforced at chunk
+  granularity only when a series receives a write, so idle series keep expired
+  chunks until their next write. Points more than `max_future_skew_millis`
+  (default 5 minutes for new collections) ahead of the server clock, or older
+  than the retention window, are rejected.
 
 ## Migration Guide
 

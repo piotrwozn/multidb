@@ -1,11 +1,14 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use datafusion::error::DataFusionError;
+use sqlparser::parser::ParserError;
+
 use super::{
     AccessPath, AnalyzeMode, AnalyzeTarget, CardinalityEstimator, ColumnDef, ColumnType,
     ExplainOptions, MostCommonValue, QueryError, QueryFingerprint, REL_COLUMNAR_SEGMENTS_TABLE,
     REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexExpression, RelIndexSpec, RelPlanKind, RelPredicate,
-    RelTable, SqlEngine, SqlOutput, StatsCatalog, TableLayout, TableSchema, Value, make_row_key,
-    parse,
+    RelTable, SqlEngine, SqlOutput, StatsCatalog, TableLayout, TableSchema, Value,
+    datafusion_to_query_error, make_row_key, parse,
 };
 use crate::{
     db::{DbConfig, Profile, create_database, open_database},
@@ -396,6 +399,44 @@ fn parser_enforces_phase28_input_limits() {
 }
 
 #[test]
+fn datafusion_sql_parser_errors_are_parse_errors() {
+    let recursion = DataFusionError::SQL(
+        Box::new(ParserError::RecursionLimitExceeded),
+        Some(" (current limit: 50)".to_owned()),
+    );
+    assert!(matches!(
+        datafusion_to_query_error(&recursion),
+        QueryError::Parse(message) if message.contains("RecursionLimitExceeded")
+    ));
+    let wrapped = DataFusionError::Context(
+        "planning".to_owned(),
+        Box::new(DataFusionError::SQL(
+            Box::new(ParserError::ParserError(
+                "Expected: an expression, found: memory".to_owned(),
+            )),
+            None,
+        )),
+    );
+    assert!(matches!(
+        datafusion_to_query_error(&wrapped),
+        QueryError::Parse(_)
+    ));
+
+    assert!(matches!(
+        datafusion_to_query_error(&DataFusionError::Internal("bug".to_owned())),
+        QueryError::DataFusion(_)
+    ));
+    assert!(matches!(
+        datafusion_to_query_error(&DataFusionError::Plan("bad plan".to_owned())),
+        QueryError::DataFusion(_)
+    ));
+    assert!(matches!(
+        datafusion_to_query_error(&DataFusionError::ResourcesExhausted("memory".to_owned())),
+        QueryError::ResourceLimit(_)
+    ));
+}
+
+#[test]
 fn query_fingerprint_keeps_identifier_digits() {
     assert_ne!(
         QueryFingerprint::new("select * from t1 where id = 1"),
@@ -699,11 +740,19 @@ fn relational_index_is_maintained() -> Result<(), Box<dyn std::error::Error>> {
         Value::Int(38),
         Value::Bool(true),
     ])?;
-    assert!(table.query_eq(2, &Value::Int(37))?.rows.is_empty());
+    assert!(
+        table.query_eq(2, &Value::Int(37))?.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        table.query_eq(2, &Value::Int(37))?.rows
+    );
     assert_eq!(table.query_eq(2, &Value::Int(38))?.rows.len(), 1);
 
     table.delete(&Value::Int(1))?;
-    assert!(table.query_eq(2, &Value::Int(38))?.rows.is_empty());
+    assert!(
+        table.query_eq(2, &Value::Int(38))?.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        table.query_eq(2, &Value::Int(38))?.rows
+    );
 
     let row_key = make_row_key("users", &Value::Int(2))?;
     assert!(
@@ -713,7 +762,8 @@ fn relational_index_is_maintained() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         !repl
             .range(REL_INDEX_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
-            .is_empty()
+            .is_empty(),
+        "expected a non-empty value"
     );
 
     Ok(())

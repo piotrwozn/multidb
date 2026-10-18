@@ -56,13 +56,14 @@ use crate::model::{
 use crate::observability;
 use crate::observability::MetricsConfig;
 use crate::performance::{
-    BenchmarkReport, CompressionAlgorithm, PerformanceCache, PerformanceConfig, RegressionGate,
+    BenchmarkReport, CompressionAlgorithm, PerformanceCache, PerformanceConfig,
+    QueryExecutionConfig, RegressionGate,
 };
 use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row, SqlEngine, SqlOutput,
-    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
+    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes, parse_with_limits,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -104,7 +105,7 @@ mod runtime;
 
 pub(crate) use profile_binding::{
     MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
-    validate_manifest,
+    unmet_profile_floors, validate_manifest,
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
@@ -666,6 +667,8 @@ pub type DatabaseSelfHealingController =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShardBackendConfig {
     Local(DbConfig),
+    /// Fails closed like [`create_cluster_database`] until the embedded API is
+    /// wired to the live `OpenRaft` runtime.
     Cp {
         config: DbConfig,
         cluster: CpClusterConfig,
@@ -1121,6 +1124,19 @@ impl Database {
         self.repl.storage()
     }
 
+    pub(crate) const fn uses_ap_replication(&self) -> bool {
+        self.repl.is_ap()
+    }
+
+    fn ensure_commit_log_available(&self, feature: &str) -> Result<(), ConfigError> {
+        if self.repl.is_ap() {
+            return Err(ConfigError::Unsupported(format!(
+                "AP replication does not support {feature}: AP writes are not recorded in the commit log"
+            )));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn performance_config(&self) -> &PerformanceConfig {
         &self.performance
@@ -1294,17 +1310,38 @@ impl Database {
     }
 
     /// Ensures the bootstrap admin identity can use password-backed sessions.
+    ///
+    /// Merges the bootstrap admin role and principal into the loaded security
+    /// state without replacing other roles, mappings or the audit flag; persists
+    /// only when something was missing.
     /// # Errors
     /// Fails when the updated security metadata cannot be persisted.
     pub fn ensure_bootstrap_admin_principal(&mut self) -> Result<(), DbError> {
-        let admin_role = Role::new("admin")
+        let current_role = self.authz.roles().get("admin");
+        let admin_role = current_role
+            .cloned()
+            .unwrap_or_else(|| Role::new("admin"))
             .grant(Resource::System, Permission::Admin)
             .grant(Resource::Database, Permission::Read)
             .grant(Resource::Database, Permission::Write)
             .grant(Resource::Database, Permission::Admin);
-        self.authz = self.authz.clone().allow(admin_role);
-        self.principals
-            .insert("admin", Principal::new("admin").with_role("admin"));
+        let role_changed = current_role != Some(&admin_role);
+        let current_principal = self.principals.principals().get("admin");
+        let admin_principal = current_principal
+            .cloned()
+            .unwrap_or_else(|| Principal::new("admin"))
+            .with_role("admin");
+        let principal_changed = current_principal != Some(&admin_principal);
+        if !role_changed && !principal_changed {
+            return Ok(());
+        }
+
+        if role_changed {
+            self.authz = self.authz.clone().allow(admin_role);
+        }
+        if principal_changed {
+            self.principals.insert("admin", admin_principal);
+        }
         self.persist_security_state()
     }
 
@@ -1835,12 +1872,21 @@ impl Database {
 
     /// Enables MVCC-backed system versioning for a table and registers its history object.
     /// # Errors
-    /// Fails when the base table is missing, untyped, or the history name collides.
+    /// Fails when the database uses AP replication, the base table is missing, untyped, or the
+    /// history name collides.
     pub fn enable_system_versioning(
         &mut self,
         table: &str,
         retention: TemporalRetention,
     ) -> Result<String, DbError> {
+        if self.repl.is_ap() {
+            return Err(TemporalError::Unsupported(
+                "AP replication does not support system versioning: AP writes do not record MVCC \
+                 history"
+                    .to_owned(),
+            )
+            .into());
+        }
         let base = self.table(table)?;
         let schema = base.schema().cloned().ok_or_else(|| {
             QueryError::InvalidSchema("temporal tables require schema".to_owned())
@@ -1986,7 +2032,7 @@ impl Database {
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
         let repl: &dyn Replication = self;
-        Ok(FullTextIndex::new(repl, config)?)
+        Ok(FullTextIndex::new(repl, config)?.with_commit_log(!self.repl.is_ap()))
     }
 
     /// Creates a named time-series collection and persists it in the catalog.
@@ -2075,7 +2121,7 @@ impl Database {
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
         let repl: &dyn Replication = self;
-        Ok(GeoIndex::new(repl, config)?)
+        Ok(GeoIndex::new(repl, config)?.with_commit_log(!self.repl.is_ap()))
     }
 
     /// Opens a named relational table from the catalog.
@@ -2157,7 +2203,7 @@ impl Database {
         match self.catalog.get(name) {
             Some(CatalogEntry::FullTextIndex { config }) => {
                 let repl: &dyn Replication = self;
-                Ok(FullTextIndex::new(repl, config.clone())?)
+                Ok(FullTextIndex::new(repl, config.clone())?.with_commit_log(!self.repl.is_ap()))
             }
             Some(other) => Err(kind_mismatch(name, "full-text index", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -2202,7 +2248,7 @@ impl Database {
         match self.catalog.get(name) {
             Some(CatalogEntry::GeoIndex { config }) => {
                 let repl: &dyn Replication = self;
-                Ok(GeoIndex::new(repl, config.clone())?)
+                Ok(GeoIndex::new(repl, config.clone())?.with_commit_log(!self.repl.is_ap()))
             }
             Some(other) => Err(kind_mismatch(name, "geo index", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -2665,7 +2711,8 @@ impl Database {
 
     /// Reads committed changes after a resume token.
     /// # Errors
-    /// Fails when the token is invalid or CDC metadata cannot be read.
+    /// Fails when the database uses AP replication, the token is invalid, or CDC metadata cannot
+    /// be read.
     pub fn poll_changefeed(
         &self,
         token: &ResumeToken,
@@ -2673,6 +2720,7 @@ impl Database {
         options: &ChangefeedOptions,
         max: usize,
     ) -> Result<(Vec<ChangeEvent>, ResumeToken), DbError> {
+        self.ensure_commit_log_available("changefeeds")?;
         Ok(cdc::poll_changefeed(
             self.replication_ref(),
             &self.catalog,
@@ -2685,7 +2733,8 @@ impl Database {
 
     /// Reads one page of committed changes after a resume token.
     /// # Errors
-    /// Fails when the token is invalid or CDC metadata cannot be read.
+    /// Fails when the database uses AP replication, the token is invalid, or CDC metadata cannot
+    /// be read.
     pub fn poll_changefeed_page(
         &self,
         token: &ResumeToken,
@@ -2693,6 +2742,7 @@ impl Database {
         options: &ChangefeedOptions,
         max: usize,
     ) -> Result<ChangefeedPage, DbError> {
+        self.ensure_commit_log_available("changefeeds")?;
         Ok(cdc::poll_changefeed_page(
             self.replication_ref(),
             &self.catalog,
@@ -2754,12 +2804,14 @@ impl Database {
 
     /// Creates or replaces a named CDC subscription after checking RBAC.
     /// # Errors
-    /// Fails when authorization or subscription metadata persistence fails.
+    /// Fails when the database uses AP replication, or authorization or subscription metadata
+    /// persistence fails.
     pub fn create_subscription_as(
         &self,
         principal: &Principal,
         config: SubscriptionConfig,
     ) -> Result<SubscriptionState, DbError> {
+        self.ensure_commit_log_available("CDC subscriptions")?;
         Ok(cdc::create_subscription(
             self.replication_ref(),
             &self.authz,
@@ -2770,11 +2822,12 @@ impl Database {
 
     /// Creates or replaces a named CDC subscription from trusted embedded/admin code.
     /// # Errors
-    /// Fails when subscription metadata persistence fails.
+    /// Fails when the database uses AP replication or subscription metadata persistence fails.
     pub fn create_subscription(
         &self,
         config: SubscriptionConfig,
     ) -> Result<SubscriptionState, DbError> {
+        self.ensure_commit_log_available("CDC subscriptions")?;
         Ok(cdc::create_subscription_trusted(
             self.replication_ref(),
             config,
@@ -2828,11 +2881,12 @@ impl Database {
 
     /// Creates a continuous query on top of the durable CDC subscription machinery.
     /// # Errors
-    /// Fails when metadata or subscription persistence fails.
+    /// Fails when the database uses AP replication, or metadata or subscription persistence fails.
     pub fn create_continuous_query(
         &self,
         spec: &ContinuousQuerySpec,
     ) -> Result<ContinuousQueryState, DbError> {
+        self.ensure_commit_log_available("continuous queries")?;
         let state = continuous::create_continuous_query(self.replication_ref(), spec)?;
         cdc::create_subscription_trusted(self.replication_ref(), spec.subscription_config())?;
         Ok(state)
@@ -2995,8 +3049,12 @@ impl Database {
 
     /// Registers a CDC hook.
     /// # Errors
-    /// Fails when hook metadata cannot be written.
+    /// Fails when an after-commit hook is registered on an AP database or hook metadata cannot
+    /// be written.
     pub fn register_hook(&self, hook: &HookSpec) -> Result<(), DbError> {
+        if hook.kind == cdc::HookKind::AfterCommit {
+            self.ensure_commit_log_available("after-commit hooks")?;
+        }
         Ok(cdc::register_hook(self.replication_ref(), hook)?)
     }
 
@@ -3294,9 +3352,12 @@ impl Database {
                 .map(|_| SqlOutput::AffectedRows(1));
             return self.finish_query(sql, started, result);
         }
-        if let Some(output) =
-            compat::execute_compat_sql(sql, &self.config, &self.compat_catalog_snapshot())?
-        {
+        if let Some(output) = compat::execute_compat_sql(
+            sql,
+            &self.config,
+            &self.compat_catalog_snapshot(),
+            &self.performance.query,
+        )? {
             return self.finish_query(sql, started, Ok(output));
         }
         if let Some(output) = self.execute_tuning_system_sql(sql)? {
@@ -3492,7 +3553,7 @@ impl Database {
     /// # Errors
     /// Fails when authorization, catalog metadata, or query execution fails.
     pub async fn query_as(&self, principal: &Principal, sql: &str) -> Result<SqlOutput, DbError> {
-        let requirements = sql_requirements(sql, &self.catalog)?;
+        let requirements = sql_requirements(sql, &self.catalog, &self.performance.query)?;
         for (resource, permission) in &requirements {
             self.authorize_or_audit(principal, resource, *permission, "query")?;
         }
@@ -3525,7 +3586,7 @@ impl Database {
         sql: &str,
         point: TemporalPoint,
     ) -> Result<SqlOutput, DbError> {
-        let requirements = sql_requirements(sql, &self.catalog)?;
+        let requirements = sql_requirements(sql, &self.catalog, &self.performance.query)?;
         for (resource, permission) in &requirements {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
@@ -4086,9 +4147,7 @@ impl Database {
     }
 
     fn validate_temporal_retention_for_sql(&self, sql: &str, lsn: TxnId) -> Result<(), DbError> {
-        let dialect = PostgreSqlDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
-            .map_err(|error| QueryError::Parse(error.to_string()))?;
+        let statements = parse_with_limits(sql, &self.performance.query)?;
         let mut names = BTreeSet::new();
         for statement in statements {
             if let Statement::Query(query) = statement {
@@ -4284,6 +4343,14 @@ impl Database {
         self.principals = security.principals;
         self.audit_enabled = security.audit_enabled;
         self.audit_config = security.audit;
+    }
+
+    /// Restores the persisted RBAC policy, principal registry, and audit flag when present.
+    fn load_persisted_security(&mut self) -> Result<(), ConfigError> {
+        if let Some(security) = read_security_from_repl(self.replication_ref())? {
+            self.apply_security_config(security);
+        }
+        Ok(())
     }
 
     fn apply_tenant_config(&mut self, tenant: Option<TenantConfig>) {
@@ -5375,7 +5442,8 @@ fn db_hook_to_repl(error: HookError) -> ReplError {
 
 /// Creates a database and initializes metadata when it is missing.
 /// # Errors
-/// Fails when the config is invalid, storage cannot open, or existing metadata conflicts.
+/// Fails when the config is invalid, storage cannot open, existing metadata conflicts, or
+/// persisted security metadata cannot be read or decoded.
 pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
 
@@ -5393,19 +5461,26 @@ pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
 
     let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_with_performance(config, engine, catalog, performance)
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
+    Ok(database)
 }
 
 /// Opens an existing database and validates its metadata.
 /// # Errors
-/// Fails when the config is invalid, storage cannot open, metadata is missing, or metadata conflicts.
+/// Fails when the config is invalid, storage cannot open, metadata is missing, metadata
+/// conflicts, or persisted security metadata cannot be read or decoded.
 pub fn open_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
     let read = read_metadata(&engine)?;
     ensure_metadata_matches(&config, read.metadata)?;
     let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_with_performance(config, engine, catalog, performance)
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
+    Ok(database)
 }
 
 /// Creates a database with operational security, encryption, metrics, and resource settings.
@@ -5438,6 +5513,7 @@ pub fn create_database_with_ops(
     write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(ops.security);
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
@@ -5460,13 +5536,56 @@ pub fn open_database_with_ops(
     let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
 /// Creates a database backed by a CP/Raft replication backend.
+///
+/// The embedded `Database` API is not wired to the live `OpenRaft` runtime yet,
+/// so this constructor fails closed instead of acknowledging writes without
+/// replication. Use `repl::start_cp_cluster` for replicated CP storage, or
+/// `create_database` for a single node.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config or cluster topology validation fails, and otherwise always
+/// returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
 pub fn create_cluster_database(
+    config: DbConfig,
+    cluster: CpClusterConfig,
+) -> Result<Database, ConfigError> {
+    ensure_cluster_supported(&config, &cluster)?;
+    Err(cluster_database_requires_live_raft())
+}
+
+/// Opens a database backed by a CP/Raft replication backend.
+///
+/// The embedded `Database` API is not wired to the live `OpenRaft` runtime yet,
+/// so this constructor fails closed instead of acknowledging writes without
+/// replication. Use `repl::start_cp_cluster` for replicated CP storage, or
+/// `open_database` for a single node (it also opens data written by earlier
+/// versions of this constructor).
+/// # Errors
+/// Fails when config or cluster topology validation fails, and otherwise always
+/// returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
+pub fn open_cluster_database(
+    config: DbConfig,
+    cluster: CpClusterConfig,
+) -> Result<Database, ConfigError> {
+    ensure_cluster_supported(&config, &cluster)?;
+    Err(cluster_database_requires_live_raft())
+}
+
+/// Creates a database on the in-process simulated CP adapter for in-crate tests.
+///
+/// The adapter has no `OpenRaft` runtime or transport: every node acknowledges
+/// writes locally and reports itself as leader. Never use it for a deployment.
+/// # Errors
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
+#[doc(hidden)]
+pub fn create_simulated_cluster_database(
     config: DbConfig,
     cluster: CpClusterConfig,
 ) -> Result<Database, ConfigError> {
@@ -5485,13 +5604,20 @@ pub fn create_cluster_database(
     }
 
     let catalog = read_catalog(&engine)?;
-    Database::new_cp(config, engine, catalog, cluster)
+    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
-/// Opens a database backed by a CP/Raft replication backend.
+/// Opens a database on the in-process simulated CP adapter for in-crate tests.
+///
+/// The adapter has no `OpenRaft` runtime or transport: every node acknowledges
+/// writes locally and reports itself as leader. Never use it for a deployment.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
-pub fn open_cluster_database(
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
+#[doc(hidden)]
+pub fn open_simulated_cluster_database(
     config: DbConfig,
     cluster: CpClusterConfig,
 ) -> Result<Database, ConfigError> {
@@ -5501,12 +5627,19 @@ pub fn open_cluster_database(
     ensure_metadata_matches(&config, read.metadata)?;
     refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_cp(config, engine, catalog, cluster)
+    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Creates a CP/Raft database with operational settings.
+///
+/// Fails closed like [`create_cluster_database`]: the embedded `Database` API is
+/// not wired to the live `OpenRaft` runtime yet.
 /// # Errors
-/// Fails when config, cluster topology, encryption, storage, or metadata validation fails.
+/// Fails when config, cluster topology or operational validation fails, and
+/// otherwise always returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
 pub fn create_cluster_database_with_ops(
     config: DbConfig,
     cluster: CpClusterConfig,
@@ -5514,31 +5647,17 @@ pub fn create_cluster_database_with_ops(
 ) -> Result<Database, ConfigError> {
     ensure_cluster_supported(&config, &cluster)?;
     validate_operational(&config, &ops)?;
-    let engine = engine_for_operational(&config, &ops)?;
-
-    match read_metadata(&engine) {
-        Ok(read) => {
-            ensure_metadata_matches(&config, read.metadata)?;
-            refuse_profile_manifest(&read)?;
-        }
-        Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
-            write_metadata(&engine, &config)?;
-        }
-        Err(error) => return Err(error),
-    }
-
-    let catalog = read_catalog(&engine)?;
-    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
-    database.encryption.clone_from(&ops.encryption);
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
-    database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
-    Ok(database)
+    Err(cluster_database_requires_live_raft())
 }
 
 /// Opens a CP/Raft database with operational settings.
+///
+/// Fails closed like [`open_cluster_database`]: the embedded `Database` API is
+/// not wired to the live `OpenRaft` runtime yet.
 /// # Errors
-/// Fails when config, cluster topology, encryption, storage, or metadata validation fails.
+/// Fails when config, cluster topology or operational validation fails, and
+/// otherwise always returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
 pub fn open_cluster_database_with_ops(
     config: DbConfig,
     cluster: CpClusterConfig,
@@ -5546,22 +5665,13 @@ pub fn open_cluster_database_with_ops(
 ) -> Result<Database, ConfigError> {
     ensure_cluster_supported(&config, &cluster)?;
     validate_operational(&config, ops)?;
-    let engine = engine_for_operational(&config, ops)?;
-    let read = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, read.metadata)?;
-    refuse_profile_manifest(&read)?;
-    let catalog = read_catalog(&engine)?;
-    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
-    database.encryption.clone_from(&ops.encryption);
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
-    database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(security);
-    Ok(database)
+    Err(cluster_database_requires_live_raft())
 }
 
 /// Creates a database backed by an AP/Dynamo-style replication backend.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn create_ap_database(
     config: DbConfig,
     cluster: ApClusterConfig,
@@ -5581,12 +5691,15 @@ pub fn create_ap_database(
     }
 
     let catalog = read_catalog(&engine)?;
-    Database::new_ap(config, engine, catalog, cluster)
+    let mut database = Database::new_ap(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Opens a database backed by an AP/Dynamo-style replication backend.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn open_ap_database(
     config: DbConfig,
     cluster: ApClusterConfig,
@@ -5597,7 +5710,9 @@ pub fn open_ap_database(
     ensure_metadata_matches(&config, read.metadata)?;
     refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_ap(config, engine, catalog, cluster)
+    let mut database = Database::new_ap(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Creates an AP/Dynamo database with operational settings.
@@ -5657,7 +5772,8 @@ pub fn open_ap_database_with_ops(
 
 /// Creates a sharded database backed by multiple replication groups.
 /// # Errors
-/// Fails when config, shard topology, metadata, or catalog initialization fails.
+/// Fails when config, shard topology, metadata, or catalog initialization fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn create_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
@@ -5677,12 +5793,15 @@ pub fn create_sharded_database(
     }
 
     let catalog = read_catalog_from_repl(repl.as_ref())?;
-    Database::new_sharded(config, repl, catalog)
+    let mut database = Database::new_sharded(config, repl, catalog)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Opens a sharded database backed by multiple replication groups.
 /// # Errors
-/// Fails when config, shard topology, metadata, or catalog validation fails.
+/// Fails when config, shard topology, metadata, or catalog validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn open_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
@@ -5693,7 +5812,9 @@ pub fn open_sharded_database(
     ensure_metadata_matches(&config, read.metadata)?;
     refuse_profile_manifest(&read)?;
     let catalog = read_catalog_from_repl(repl.as_ref())?;
-    Database::new_sharded(config, repl, catalog)
+    let mut database = Database::new_sharded(config, repl, catalog)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Creates a sharded database with operational settings.
@@ -6205,8 +6326,9 @@ pub fn profile_validation_report(
 fn sql_requirements(
     sql: &str,
     catalog: &BTreeMap<String, CatalogEntry>,
+    limits: &QueryExecutionConfig,
 ) -> Result<Vec<(Resource, Permission)>, DbError> {
-    if compat::compat_sql_requirements(sql)? {
+    if compat::compat_sql_requirements(sql, limits)? {
         return Ok(vec![(Resource::Database, Permission::Read)]);
     }
 
@@ -6235,9 +6357,7 @@ fn sql_requirements(
         return Ok(vec![(Resource::Database, Permission::Write)]);
     }
 
-    let dialect = PostgreSqlDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|error| QueryError::Parse(error.to_string()))?;
+    let statements = parse_with_limits(sql, limits)?;
     if statements.is_empty() {
         return Err(QueryError::Unsupported("empty SQL".to_owned()).into());
     }
@@ -6279,7 +6399,7 @@ fn sql_requirements(
                 }
             }
             Statement::Explain { statement, .. } => {
-                requirements.extend(sql_requirements(&statement.to_string(), catalog)?);
+                requirements.extend(sql_requirements(&statement.to_string(), catalog, limits)?);
             }
             other => return Err(QueryError::Unsupported(other.to_string()).into()),
         }
@@ -7089,7 +7209,8 @@ fn build_shard_backend(
 
 /// Opens one local shard, initializing its metadata when `create` is set. A local shard is a
 /// plain single-node database, except that a profile manifest on any shard is refused before
-/// the shard database is built.
+/// the shard database is built. Like `open_database`, it restores the shard's persisted security
+/// state.
 fn open_local_shard(config: DbConfig, create: bool) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
 
@@ -7106,7 +7227,9 @@ fn open_local_shard(config: DbConfig, create: bool) -> Result<Database, ConfigEr
 
     let catalog = read_catalog(&engine)?;
     let performance = PerformanceConfig::for_profile(config.profile);
-    Database::new_with_performance(config, engine, catalog, performance)
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 fn ensure_cluster_supported(
@@ -7120,6 +7243,17 @@ fn ensure_cluster_supported(
     }
 
     validate_cp_cluster_config(cluster, false).map_err(ConfigError::InvalidClusterConfig)
+}
+
+fn cluster_database_requires_live_raft() -> ConfigError {
+    ConfigError::Unsupported(
+        "multi-node CP cluster databases are not available through the embedded Database API: \
+         it is not wired to the live OpenRaft runtime, so writes would be acknowledged without \
+         replication; use repl::start_cp_cluster for replicated CP storage, or \
+         create_database/open_database for a single node (also opens data written by earlier \
+         versions)"
+            .to_owned(),
+    )
 }
 
 fn ensure_ap_supported(config: &DbConfig, cluster: &ApClusterConfig) -> Result<(), ConfigError> {
@@ -7529,7 +7663,7 @@ fn parse_audit_key_file(bytes: &[u8]) -> Result<[u8; 32], String> {
     }
 
     let mut key = [0; 32];
-    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = audit_hex_value(chunk[0])?;
         let low = audit_hex_value(chunk[1])?;
         key[index] = (high << 4) | low;

@@ -65,6 +65,7 @@ pub enum GeoError {
 pub struct GeoIndex<'repl, R: Replication + ?Sized> {
     repl: &'repl R,
     config: GeoIndexConfig,
+    commit_log_available: bool,
 }
 
 impl GeoPoint {
@@ -100,7 +101,19 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
                 "index name cannot be empty".to_owned(),
             ));
         }
-        Ok(Self { repl, config })
+        Ok(Self {
+            repl,
+            config,
+            commit_log_available: true,
+        })
+    }
+
+    /// Records whether the backing replication writes the commit log that
+    /// incremental refresh replays.
+    #[must_use]
+    pub(crate) const fn with_commit_log(mut self, available: bool) -> Self {
+        self.commit_log_available = available;
+        self
     }
 
     /// Persists index metadata.
@@ -160,11 +173,19 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
 
     /// Replays committed document changes after the stored LSN.
     /// # Errors
-    /// Fails when CDC, document decoding, or index writes fail.
+    /// Fails when the database uses AP replication (no commit log to replay; use
+    /// `refresh_full`), or CDC, document decoding, or index writes fail.
     pub fn refresh_incremental(
         &self,
         catalog: &BTreeMap<String, CatalogEntry>,
     ) -> Result<GeoIndexState, GeoError> {
+        if !self.commit_log_available {
+            return Err(GeoError::Repl(ReplError::Unsupported(
+                "AP replication does not support incremental geo refresh: AP writes are not \
+                 recorded in the commit log; use refresh_full"
+                    .to_owned(),
+            )));
+        }
         let Some(collection_name) = collection_name_for(catalog, self.config.collection_id) else {
             self.refresh_full()?;
             return self.state().map(Option::unwrap_or_default);
@@ -615,7 +636,9 @@ mod tests {
         assert!(
             index
                 .within_radius(GeoPoint::new(-179.9, 0.0)?, 50_000.0)?
-                .is_empty()
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            index.within_radius(GeoPoint::new(-179.9, 0.0)?, 50_000.0)?
         );
         Ok(())
     }

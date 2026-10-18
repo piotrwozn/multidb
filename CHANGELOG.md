@@ -4,10 +4,45 @@ All notable public changes will be recorded here.
 
 ## Unreleased
 
+- Hardened Control Plane `admin` login: failed password checks now lock out
+  only the client IP (IPv6 /64) that made them, under a server-wide soft
+  ceiling of 20x `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` per window. Other usernames
+  no longer lock out `admin`. At most 2 Argon2 password checks run at once, and
+  extra login or change-password requests get `503 auth_busy` with
+  `Retry-After: 1`. Usernames over 256 bytes and passwords over 1024 bytes are
+  rejected with `400`. A `MULTIDB_ADMIN_PASSWORD` longer than 1024 bytes stops
+  startup when it would be stored (no stored credential, or a reset). Rate-limited refusals
+  and failures for unknown usernames are coalesced in the audit log.
 - Prepared the repository for public preview publication.
 - Added public repository hygiene files, security policy, contribution guide,
   issue templates and release notes.
 - Kept local planning history out of the public source baseline.
+- Fixed `multidb serve` / `multidb admin serve` starting with an empty RBAC
+  policy after a restart, and admin bootstrap/login overwriting stored roles,
+  PG-user mappings and the audit flag; plain database openers now reload
+  persisted security state and fail closed if it is corrupt.
+- Time-series retention now computes its cutoff from server time instead of
+  the incoming point's timestamp, so one future-dated or microsecond-scaled
+  point can no longer delete a whole series. Points more than
+  `max_future_skew_millis` ahead of server time (default 300000 ms for new
+  collections, settable when the collection is created; collections created
+  before this change keep accepting future timestamps) and points older than
+  `now - retention_millis` are rejected. New collections require a positive
+  `retention_millis` that is at least `chunk_millis`; existing collections with
+  a non-positive retention stay readable but refuse writes. Time-series
+  validation errors from the Control Plane now return HTTP 400
+  `invalid_value` instead of 500, and `time_bucket` and range queries no longer
+  overflow near the `i64` bounds.
+- The public CP cluster constructors (`create_cluster_database`,
+  `open_cluster_database`, their `_with_ops` variants) and sharded `Cp` shard
+  backends now fail with `Unsupported` instead of returning a database that
+  acknowledges writes without replication. Use `repl::start_cp_cluster` for
+  replicated CP storage; data written through the old constructors still opens
+  with `open_database`. `CpRaft::new` is now test-only.
+- AP databases now reject commit-log features they cannot provide
+  (incremental backups, changefeeds, CDC subscriptions, continuous queries,
+  materialized views, after-commit hooks, system versioning and incremental
+  full-text/geo refresh) with `Unsupported` instead of returning empty results.
 
 ### Added
 
@@ -25,9 +60,11 @@ All notable public changes will be recorded here.
   `built_in_profile` stays an exact match).
 - `DatabaseSpec.custom_profile`, a spec version 2 field. A version 1 document
   that sets it fails validation with `FIELD_REQUIRES_SPEC_V2`, and
-  `resolve_profile` returns that issue as `ProfileResolution::Invalid`;
-  documents without it serialize, validate and plan exactly as before, pinned
-  by the frozen corpus in `tests/fixtures/spec-v1/`.
+  `resolve_profile` returns that issue as `ProfileResolution::Invalid`.
+  Version 1 documents without it serialize and plan exactly as before (same
+  plan ids) and keep their existing issues, order, status and validity,
+  gaining only the Advice and Warnings listed under Changed; the frozen
+  corpus in `tests/fixtures/spec-v1/` pins this.
 - `CollectionRole` derives `PartialOrd` and `Ord`.
 - `DatabaseSpec` version 2 (`DATABASE_SPEC_VERSION_V2`,
   `SUPPORTED_SPEC_VERSIONS = 1..=2`): a version 1 spec plus `custom_profile`
@@ -68,9 +105,28 @@ All notable public changes will be recorded here.
   settings that miss `floors.encryption_at_rest` (no
   `OperationalConfig.encryption`) or `floors.audit`, and
   `Database::set_audit_enabled_as` refuses to disable audit on a database
-  whose manifest sets `floors.audit`. Restore does not check floors: a
-  restored `floors.encryption_at_rest` database is not encrypted (see
-  `docs/profiles.md`). `CompiledPolicy::binding` refuses a path for a volatile
+  whose manifest sets `floors.audit`. Restore refuses
+  (`BackupError::ProfileFloorsNotMet`, naming the floors) a backup whose
+  restored database would not meet `floors.encryption_at_rest` (a restore
+  target is never encrypted) or `floors.audit` (audit off in the restored
+  state), before it creates anything, unless
+  `RestoreConfig.allow_unmet_profile_floors` (builder
+  `with_unmet_profile_floors_allowed`) or `multidb restore
+  --allow-unmet-floors` opts in; hibernation resume has no opt-in, and the
+  error message names the opt-ins and says so. `verify_backup` sets
+  the opt-in for its own drill, because its temporary, unencrypted target is
+  removed after the drill (a failed removal is only logged). `floors.encryption_at_rest` covers the database
+  file and is never checked on backup: backup files are encrypted by backup
+  encryption (`BackupConfig.encryption`, by default the encryption config of
+  the database backed up), so a backup of an encrypted database is
+  encrypted and a backup of a database below the floor is not, unless
+  `BackupConfig.encryption` is set (see `docs/profiles.md`). Every
+  single-node opener logs a `tracing::warn!` naming each manifest floor the
+  opened database does not meet; it reaches embedders that install a tracing
+  subscriber, while the `multidb` binary, `serve` included, installs none, so
+  CLI users see unmet floors through `profile show --db` and `restore
+  --allow-unmet-floors`.
+  `CompiledPolicy::binding` refuses a path for a volatile
   storage class (`VolatileWithPath`), also for a version 1 spec, where
   validation only warns. CP, AP and sharded openers refuse manifests.
   `inspect_database_metadata` (`MetadataProbe`, `ProbedMetadata`) reads a
@@ -79,8 +135,9 @@ All notable public changes will be recorded here.
   `NeedsRecovery`, and `recover_database_file` runs redb's crash recovery on
   it without touching the metadata. `ProbedMetadata.unmet_floors` lists
   `floors.encryption_at_rest` when the manifest sets it, because the probe
-  read the metadata without a key, and `profile show --db` prints it as a
-  warning. The persistent format registry
+  read the metadata without a key, and `floors.audit` when the manifest sets
+  it and the stored audit flag is off; `profile show --db` and `restore
+  --allow-unmet-floors` print them as warnings. The persistent format registry
   (`FormatRegistry::phase_24_default`) lists database metadata
   `schema_version` 2 and the profile manifest. See `docs/profiles.md`.
 - `AnyEngine::is_value_framed` and `AnyEngine::with_value_framing`, which
@@ -96,12 +153,15 @@ All notable public changes will be recorded here.
   `variants` and the canonical variant's `knobs`; the text output adds
   `variants=`.
 - `multidb config upgrade --spec <in> [--out <file>] [--force] [--json]`
-  converts a spec to version 2 and turns Studio's `profile.custom.*` keys into
-  `custom_profile`; it is idempotent, writes `--out` in the format of its
+  converts a spec to version 2 and turns Studio's `profile.custom.base` (with
+  `profile.custom.description`) into `custom_profile`; the validation
+  suggestion for a `profile.custom.*` key it leaves in place says what to
+  move by hand. It is idempotent, writes `--out` in the format of its
   extension, refuses to overwrite files without `--force`, writes through a
   new, randomly named sibling file that it renames into place (a planted
   symlink cannot redirect the write), and exits 2 without writing when the
-  result does not validate.
+  result does not validate, or with `SPEC_TOO_LARGE` and no output at all
+  when the re-serialized result exceeds 1 MiB.
 - `multidb init --guided --profile <p> --override path=value...
   [--profile-name <slug>]` writes a version 2 spec with a `custom_profile`
   that extends `<p>`. Without `--override` guided init is unchanged.
@@ -438,6 +498,23 @@ All notable public changes will be recorded here.
   2). Control Plane request bodies over 1 MiB stay HTTP 400 `invalid_json`
   from the router's body limit, and JSON bodies cannot reach
   `SPEC_TOO_COMPLEX`.
+- The SQL parser limits of `QueryExecutionConfig` (the `query.max_sql_bytes`,
+  `max_statements`, `max_values_rows` and `parser_recursion_limit` knobs) now
+  bind the pre-parses of `Database::query` (the PostgreSQL compatibility
+  queries), `query_as` and `query_as_of_as` (RBAC) and `query_as_of`
+  (temporal retention), which used sqlparser's defaults (recursion depth 50,
+  no size or statement limits): a configured lower limit fails every path
+  with the same parser error, `SELECT version()` and the catalog views no
+  longer bypass `max_sql_bytes` (the whole SQL text counts, trailing
+  whitespace and semicolons included), and statements multidb executes
+  itself, such as `INSERT` and indexed equality lookups, may nest to the
+  configured depth through `query` and `query_as`. DataFusion still parses
+  the SELECTs it plans with its own fixed recursion limit of 50; its SQL
+  errors (`DataFusionError::SQL`: its parser errors, that limit included, and
+  the planner errors it builds from them) are now `QueryError::Parse`
+  (SQLSTATE 42601) like the engine's, instead of `QueryError::DataFusion`
+  (XX000). The pgwire
+  extended-protocol Describe still pre-parses with sqlparser's defaults.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
   with `StorageFormatMismatch` (previously an opaque serde error). Every
@@ -452,9 +529,18 @@ All notable public changes will be recorded here.
   `DbConfig` whose storage profile disagrees with the backed-up manifest
   fails with `BackupError::Config(ProfileMismatch)`, and a corrupt backed-up
   manifest with `BackupError::Corruption`, before the target is created.
-  Restore now reads the full backup payload before it creates the target, so
-  a full payload that fails its checksum or decryption no longer leaves an
-  empty initialized target behind.
+  Restore now reads and checks every backup payload, full and incremental,
+  before it creates the target, so a payload that fails its checksum or
+  decryption no longer leaves an empty initialized target behind. It reads
+  each incremental payload twice (three times for a time target), one at a
+  time (a check pass that also
+  decides the profile floors, then the apply pass), so it still holds at
+  most one incremental payload in memory, beside the full payload.
+  `restore_backup_from_uri` restores with the default `RestoreConfig`, so it
+  refuses unmet profile floors too, and `restore_backup_from_uri_with_config`
+  takes the opt-in. Hibernation resume (`cloud::resume_database`,
+  `resume_database_guarded`) takes no `RestoreConfig`, so it refuses them
+  with no opt-in, before it creates the target or consumes the marker.
 - Every CLI `--profile` flag and `MULTIDB_PROFILE` also accept product slugs
   (their canonical variant), aliases in snake or kebab case, and `auto`,
   which reads the storage profile of the existing database read-only
@@ -493,6 +579,14 @@ All notable public changes will be recorded here.
   `UnsupportedProfileManifest`, `ProfileManifestInvalid`,
   `ProfileFloorNotMet` and `MetadataUnreadable`. `ConfigError` is not
   `non_exhaustive`, so exhaustive matches outside the crate must handle them.
+- `RestoreConfig` gains the public field `allow_unmet_profile_floors`, so
+  struct literals must set it (`false` keeps the refusal) or use
+  `..RestoreConfig::default()`; `RestoreConfig::default()` and the builders
+  are unchanged. `BackupError` gains `ProfileFloorsNotMet { floors }` and is
+  not `non_exhaustive` either.
+- `compat::execute_compat_sql` and `compat::compat_sql_requirements` take a
+  new `&QueryExecutionConfig` argument, the SQL parser limits they apply
+  (for example the database's `PerformanceConfig.query`).
 
 ## 0.1.0-preview.1
 

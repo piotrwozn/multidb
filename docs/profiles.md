@@ -76,8 +76,9 @@ Values every preset shares:
 - query `max_concurrent_queries: auto` (four permits per available thread,
   today's value) and `target_partitions: auto` (the storage profile default);
   the other query limits are the runtime defaults: 1 MiB SQL, 32 statements,
-  10 000 VALUES rows, parser recursion 128, batches of 1024 rows, queue
-  timeout 100 ms, timeout 30 s and a 2 GiB spill limit;
+  10 000 VALUES rows, parser recursion 128 (50 for the SELECTs DataFusion
+  plans, see the [knob reference](#knob-reference)), batches of 1024 rows,
+  queue timeout 100 ms, timeout 30 s and a 2 GiB spill limit;
 - limits `unlimited` / `unlimited`, which is what the runtime enforces today;
 - history `system_versioning: off`, `keep_history: true`;
 - time series chunk 3 600 000 ms, retention `null`;
@@ -139,24 +140,46 @@ profile.
 | `query.max_sql_bytes` | 1 KiB..=16 MiB | every open | SQL parser limits | enforced | retune |
 | `query.max_statements` | 1..=1024 | every open | SQL parser limits | enforced | retune |
 | `query.max_values_rows` | 1..=1000000 | every open | SQL parser limits | enforced | retune |
-| `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits | enforced | retune |
-| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (#11 single write pipeline): only `unlimited` is accepted | provisioning |
-| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (#11 single write pipeline): only `unlimited` is accepted | provisioning |
+| `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits; DataFusion parses the SELECTs it plans again, with its own fixed limit of 50 | enforced | retune |
+| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
+| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
 | `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | enforced: applied by provisioning to the objects it creates | provisioning |
 | `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | enforced: applied by provisioning to the objects it creates | provisioning |
 | `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
 | `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
 | `consistency.default_domain` | local_snapshot \| strong_cp \| eventual_ap | generation default | `multidb init --guided --override` (domain mode and replication of the spec it writes); guided init without `--override` and templates use the product's domain | declarative | not applicable |
-| `floors.audit` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.audit.enabled`) | enforced | not applicable |
+| `floors.audit` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.audit.enabled`); at runtime `create_database_with_profile` refuses audit off (`ProfileFloorNotMet`), `set_audit_enabled_as` keeps audit on, and restore refuses a backup with audit off unless `RestoreConfig.allow_unmet_profile_floors` (`restore --allow-unmet-floors`) | enforced | not applicable |
 | `floors.backup` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR`, or `PRODUCTION_BACKUP_DISABLED` for production_cp (`guarantees.backup.enabled`) | enforced | not applicable |
 | `floors.pitr` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.backup.pitr`) | enforced | not applicable |
-| `floors.encryption_at_rest` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.encryption.at_rest`) | enforced | not applicable |
+| `floors.encryption_at_rest` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.encryption.at_rest`); at runtime `create_database_with_profile` refuses a database without `OperationalConfig.encryption` (`ProfileFloorNotMet`), and restore, whose target is never encrypted, refuses unless `RestoreConfig.allow_unmet_profile_floors` (`restore --allow-unmet-floors`); it covers the database file and is never checked on backup, whose files are encrypted by backup encryption, by default the database's own encryption config (see [Backup and restore](#backup-and-restore)) | enforced | not applicable |
 | `compatible_roles` | a set of collection roles, changed with `add` / `remove` | validation | `ROLE_OUTSIDE_PROFILE_CERTIFICATION` | enforced | not applicable |
 
 `auto` keeps the storage profile default; `null` retention keeps data forever.
 `IoConfig.read_ahead`, `CacheConfig.scan_bypass_threshold_rows` and the
 benchmark settings are deliberately not knobs, because nothing reads them at
 runtime; they always come from `PerformanceConfig::for_profile`.
+
+The four SQL parser limits (`query.max_sql_bytes`, `max_statements`,
+`max_values_rows`, `parser_recursion_limit`) bind the engine's parse and the
+pre-parses in front of it: the compatibility-query check of `Database::query`,
+the RBAC check of `query_as` and `query_as_of_as` and the retention check of
+`query_as_of`. The size limit counts the whole SQL text, trailing whitespace
+and semicolons included; for the inline `... AS OF LSN n` / `AS OF TIMESTAMP n`
+form of `Database::query` it counts the query left after the `AS OF` clause
+is removed. DataFusion parses the SELECTs it plans (every SELECT
+except indexed single-table equality lookups and the built-in system views and
+functions, and every `AS OF` query) a second time with its own fixed recursion
+limit of 50, so a `query.parser_recursion_limit` above 50 deepens only the
+statements multidb executes itself, such as `INSERT` and indexed equality
+lookups; a SELECT that DataFusion plans and that nests deeper than 50 fails
+with a parse error (SQLSTATE 42601). The pgwire extended-protocol Describe
+pre-parse still uses sqlparser's defaults (recursion depth 50, no size or
+statement limits); moving it to these limits is left to the pgwire work.
+Best-effort internal parses also keep sqlparser's defaults: the tuning system
+views, workload sampling and the optimizer fingerprint, which leave the
+statement to the engine when they fail, and the `match`, `time_bucket`,
+`within_radius` and `graph_neighbors` calls, which multidb runs itself when
+they parse and otherwise leave to the engine.
 
 `multidb::config_spec::parse_knob_assignment("cache.max_entries=8192")`
 parses one `path=value` against the registry: enum names, integers, `auto`,
@@ -172,7 +195,7 @@ them and any value is refused with `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME`:
 
 | path | reason |
 | --- | --- |
-| `history.mvcc_retention_millis` | waits for MVCC and commit-log GC (#12) |
+| `history.mvcc_retention_millis` | waits for MVCC and commit-log GC |
 | `cache.ttl_millis` | no runtime implementation |
 
 ## Resolution and status rules
@@ -433,8 +456,9 @@ creation, `Database::set_audit_enabled_as(_, false)` on a database whose
 manifest sets `floors.audit` is refused with `ProfileFloorNotMet` and audited
 as failed, so audit stays on. Backup and PITR are operator-managed (`multidb
 backup`, no scheduler), so `floors.backup` and `floors.pitr` are checked only
-by validation, against the spec guarantees. Restore does not check floors
-(see [Backup and restore](#backup-and-restore)).
+by validation, against the spec guarantees. Restore checks the encryption and
+audit floors too, and refuses a backup whose restored database would miss
+one unless the caller opts in (see [Backup and restore](#backup-and-restore)).
 
 Every single-node opener (`create_database`, `open_database`,
 `create_database_with_ops`, `open_database_with_ops`) re-applies the manifest:
@@ -445,8 +469,19 @@ these openers, so they honour the manifest too; their `--profile` or
 `MULTIDB_PROFILE` must name the database's storage class, or be `auto` to read
 it from the database (see [CLI](#cli)). An explicit
 `OperationalConfig.performance` wins for that session and logs one warning.
-No opener writes security because of a manifest. Databases without a manifest
-open exactly as before; plain `create_database` and `serve` never write one.
+Every one of these openers also logs a warning (`tracing::warn!`, naming the
+floor) for each manifest floor the opened database does not meet: an engine
+without encryption misses `floors.encryption_at_rest`, and audit switched off
+misses `floors.audit`. Such a database comes from a restore that was allowed
+to miss a floor, or from an older binary that ignored the manifest; it still
+opens. Both warnings are `tracing` events, so they reach only an embedder
+that installs a `tracing` subscriber (for example
+`observability::init_tracing`). The `multidb` binary, `serve` included,
+installs none, so CLI and `serve` operators never see them; they find unmet
+floors with `profile show --db` and in the output of `restore
+--allow-unmet-floors`. No opener writes security because of a manifest.
+Databases without a manifest open exactly as before; plain `create_database`
+and `serve` never write one.
 
 ### Evolving the manifest
 
@@ -506,10 +541,34 @@ manifests fails CI.
 
 ### Backup and restore
 
-Backups read values through the database engine, so a backup of a framed
-manifest database holds decoded values, and its `BackupManifest.profile`
-stays the storage `Profile`. Restore looks for `__meta.profile_manifest` in
-the full backup payload before it creates anything:
+Backups read values through the database engine, so a backup payload holds
+decoded values: decompressed, and decrypted when the database is encrypted.
+Each data file of a backup stores its payload zstd-compressed and, with
+backup encryption, encrypted (XChaCha20-Poly1305); the backup's
+`manifest.json` (ids, LSNs, keyspace counts and checksums) is never
+encrypted. Backup encryption is `BackupConfig.encryption` or, by default, the
+encryption config of the database being backed up, so:
+
+- a backup of an encrypted database (every database created with a
+  `floors.encryption_at_rest` profile is one) is always encrypted: with the
+  database's keys, or with the keys `BackupConfig.encryption` names;
+- a backup of an unencrypted database is not encrypted unless
+  `BackupConfig.encryption` is set. That includes a database restored with
+  `allow_unmet_profile_floors` whose manifest still sets the floor, and every
+  `multidb backup`, which opens only unencrypted databases and sets no backup
+  encryption.
+
+`floors.encryption_at_rest` covers the database file. It is checked when a
+database is created with the profile and on restore, never on backup: a
+backup is encrypted because its database is, or because the caller asked,
+not because of the floor. Restoring or verifying an encrypted backup needs
+its keys in `RestoreConfig.encryption`. The `BackupManifest.profile` of a
+manifest database stays the storage `Profile`. Restore reads and checks every
+backup file, and looks for `__meta.profile_manifest` in the full backup
+payload, before it creates anything; it reads each incremental payload twice (three
+times for a time target, whose LSN is resolved first), one at a time (a check
+pass, then the apply pass), so it holds the full payload and at most one
+incremental payload in memory:
 
 - With a manifest, the target gets the storage format and metadata
   `create_database_with_profile` writes: when the manifest records value
@@ -517,14 +576,35 @@ the full backup payload before it creates anything:
   restored value, `__meta` included, is framed again and the restored
   database opens with its manifest performance. The restored `__meta` records
   (`schema_version`, the manifest) are copied verbatim, as before.
-- Restore does not check the manifest floors. Like every restore target in
-  this build, the target is not encrypted at rest, so a restored database
-  whose manifest sets `floors.encryption_at_rest` stores plaintext although
-  its manifest still records the floor. `inspect_database_metadata` lists
-  the floor in `unmet_floors` (it read `__meta` without a key), and
-  `profile show --db` prints it as a warning. Restore such a database only
-  where that is acceptable; an encrypted restore target is not available
-  yet.
+- Restore refuses, with `BackupError::ProfileFloorsNotMet { floors }`, a
+  backup whose restored database would not meet a manifest floor, and leaves
+  the target absent or empty. Like every restore target in this build, the
+  target is not encrypted at rest, so `floors.encryption_at_rest` is never
+  met; audit is restored as backed up, so `floors.audit` is missed when the
+  audit flag of the restored state (the last write at or below the restore
+  target) is off. `floors.backup` and `floors.pitr` are not checked.
+- `RestoreConfig.allow_unmet_profile_floors` (builder
+  `with_unmet_profile_floors_allowed(true)`, passed to
+  `restore_backup_with_config` or `cloud::restore_backup_from_uri_with_config`;
+  CLI `multidb restore --allow-unmet-floors`) restores such a backup anyway.
+  The restored database keeps its manifest, which still records the floor:
+  `inspect_database_metadata` lists the floor in `unmet_floors`, `profile
+  show --db` and `restore --allow-unmet-floors` print it as a warning, and
+  every single-node opener logs a `tracing` warning (see
+  [Persistence and format](#persistence-and-format)). Opt in only where an
+  unencrypted copy is acceptable; an encrypted restore target is not
+  available yet. `restore_backup` and `cloud::restore_backup_from_uri` use
+  the default `RestoreConfig`, so they refuse.
+- Hibernation resume (`cloud::resume_database`, `resume_database_guarded`)
+  takes no `RestoreConfig`, so it has no opt-in and cannot resume below a
+  floor: it fails with the same error, whose message says so, before it
+  creates the target or consumes the hibernation marker. The fencing lease
+  that resume takes is released only on success, so a retry within the
+  lease TTL fails with `LeaseExists`. Where an unmet floor
+  is acceptable, restore the hibernated backup (the marker's `backup_id`)
+  with `restore_backup_from_uri_with_config` instead. Without a
+  `RestoreConfig` it has no decryption key either, so it cannot read the
+  backup of an encrypted database.
 - A restore `DbConfig` whose storage profile disagrees with the backed-up
   manifest fails with `BackupError::Config(ProfileMismatch)`. A backed-up
   manifest that does not decode or fails the read-time validation is
@@ -534,7 +614,14 @@ the full backup payload before it creates anything:
 - Without a manifest, restore behaves as before.
 
 `verify_backup` restores into a temporary database the same way, so it
-works for compressed manifest databases. A legacy database created with
+works for compressed manifest databases. It does not need the opt-in: its
+target is a temporary redb file in the system temp directory that only the
+verification reads and that the drill then removes (a failed removal is
+only logged at debug level), so no restored database keeps running below a
+floor. Like every restore target,
+that file is not encrypted at rest: while the drill runs it holds the
+restored values in plaintext, also when the backup files are encrypted
+(`verify_backup_with_config`). A legacy database created with
 `OperationalConfig.performance.compression` has no manifest; it is restored
 unframed, as before.
 
@@ -558,7 +645,7 @@ without creating anything:
 | `Locked` | another handle holds the database open for writing |
 | `NeedsRecovery` | the file was not closed cleanly (a crash, or a killed `serve`) and needs redb's crash recovery before its metadata can be read |
 | `Unreadable { reason }` | the path is not a regular file (a directory, for example), or the file or its metadata cannot be read, including encrypted metadata (with the hint above) and invalid manifests |
-| `Initialized` | `schema_version`, storage profile, replication, layout, the manifest (absent for legacy databases), whether values are framed, and `unmet_floors`: `floors.encryption_at_rest` when the manifest sets it, because an encrypted file's metadata is never readable without a key |
+| `Initialized` | `schema_version`, storage profile, replication, layout, the manifest (absent for legacy databases), whether values are framed, and `unmet_floors`: `floors.audit` when the manifest sets it and the stored audit flag is off, and `floors.encryption_at_rest` when the manifest sets it, because an encrypted file's metadata is never readable without a key |
 
 It opens an existing file read-only (`redb::ReadOnlyDatabase`: no write
 access, a shared lock) and drops the handle before returning, so it never
@@ -636,12 +723,20 @@ converts a spec to version 2:
 - the result is validated: exit 2 when it is invalid, for example
   `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
   `profile.custom.base`, and an invalid result is never written to `--out`,
-  so `--force` cannot replace a valid input with it.
+  so `--force` cannot replace a valid input with it;
+- a result larger than 1 MiB, which re-serializing can make of a compact
+  input under the limit, is refused with `SPEC_TOO_LARGE` (exit 2) and is
+  written nowhere, neither to `--out` nor to stdout.
 
 It re-serializes the spec, so YAML comments and formatting are not kept and
 defaulted fields such as `topology` are written out. Knob-like `overrides`
 keys are not converted; version 2 validation reports them as
 `OVERRIDE_SHADOWS_TYPED_KNOB` with the `custom_profile.knobs` path to use.
+The suggestion for a `profile.custom.*` key points at `config upgrade` only
+when the upgrade converts it (`profile.custom.base` is present and
+`custom_profile` is unset); for a description without a base, any other
+`profile.custom.*` key, or keys beside an existing `custom_profile`, it says
+what to move into `custom_profile` by hand.
 
 Every `--profile` flag (`backup`, `restore`, `advice`, `cdc`, `view`,
 `import`, `export`, `migrate`, `admin`) and `MULTIDB_PROFILE` for
@@ -664,6 +759,11 @@ Every `--profile` flag (`backup`, `restore`, `advice`, `cdc`, `view`,
   the file holds no database metadata, the database is locked by another
   process or its metadata cannot be read. `restore` refuses `auto`, because
   its target must be absent or empty.
+
+`multidb restore` refuses a backup whose restored database would not meet a
+floor of its profile manifest (see [Backup and restore](#backup-and-restore))
+and exits 1 naming the floors. `--allow-unmet-floors` restores it anyway and
+prints a warning per unmet floor after the summary line.
 
 `multidb serve` defaults to `MULTIDB_PROFILE=transactional`, so it fails with
 `ProfileMismatch` on a database of another storage class, such as a manifest

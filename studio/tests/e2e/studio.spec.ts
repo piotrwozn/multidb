@@ -185,11 +185,11 @@ test("operator can inspect Studio data, validate config and build a dry run", as
 
   await page.getByRole("button", { name: /data explorer/i }).click();
   await page.getByRole("button", { name: /load page/i }).click();
-  await expect(page.getByText("Ada")).toBeVisible();
+  await expect(page.getByRole("cell", { name: "Ada" })).toBeVisible();
   await expect(page.getByRole("button", { name: /delete row/i })).toBeDisabled();
   await page.getByLabel("Confirm table name").fill("users");
   await page.getByRole("button", { name: /delete row/i }).click();
-  expect(tableDeleteConfirmed).toBeTruthy();
+  await expect.poll(() => tableDeleteConfirmed).toBe(true);
 
   await page.getByRole("button", { name: /profiles collection/i }).click();
   await page.getByRole("button", { name: /load page/i }).click();
@@ -197,7 +197,7 @@ test("operator can inspect Studio data, validate config and build a dry run", as
   await expect(page.getByRole("button", { name: /delete document/i })).toBeDisabled();
   await page.getByLabel("Confirm document id").fill("doc-1");
   await page.getByRole("button", { name: /delete document/i }).click();
-  expect(documentDeleteConfirmed).toBeTruthy();
+  await expect.poll(() => documentDeleteConfirmed).toBe(true);
 
   await page.getByRole("button", { name: /^config$/i }).click();
   await page.getByLabel("Deployment mode").selectOption("cluster");
@@ -224,7 +224,7 @@ test("operator can inspect Studio data, validate config and build a dry run", as
   await expect(page.getByText("admin -> admin")).toBeVisible();
   await page.getByRole("button", { name: /add user/i }).click();
   await page.getByRole("button", { name: /save changes/i }).click();
-  expect(securitySaved).toBeTruthy();
+  await expect.poll(() => securitySaved).toBe(true);
 
   await page.getByRole("button", { name: /audit/i }).click();
   await page.getByLabel("Action filter").fill("login");

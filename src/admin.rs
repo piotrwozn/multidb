@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -14,14 +14,14 @@ use argon2::{
     password_hash::SaltString,
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
-        DefaultBodyLimit, OriginalUri, Path as AxumPath, Query as AxumQuery, State,
+        ConnectInfo, DefaultBodyLimit, OriginalUri, Path as AxumPath, Query as AxumQuery, State,
         rejection::JsonRejection,
     },
     http::{
         HeaderMap, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     },
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -29,7 +29,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     compat::SERVER_VERSION,
@@ -62,7 +62,7 @@ use crate::{
         Role,
     },
     text::FullTextIndexConfig,
-    timeseries::{TimePoint, TimeSeriesConfig},
+    timeseries::{DEFAULT_MAX_FUTURE_SKEW_MILLIS, TimePoint, TimeSeriesConfig, TimeSeriesError},
     vector::{HnswParams, VectorCollectionConfig, VectorHit, VectorMetric},
 };
 
@@ -73,6 +73,15 @@ const MAX_DATA_PAGE_LIMIT: usize = 1_000;
 const ADMIN_USERNAME: &str = "admin";
 const ADMIN_ROLE: &str = "admin";
 const SESSION_TOKEN_PREFIX: &str = "mda1_session_";
+const MAX_LOGIN_USERNAME_BYTES: usize = 256;
+const MAX_ADMIN_PASSWORD_BYTES: usize = 1024;
+/// Concurrent Argon2id verifications (19 MiB each) allowed across the process.
+const ADMIN_PASSWORD_VERIFY_PERMITS: usize = 2;
+/// Server-wide soft ceiling on failed admin password checks per window, as a
+/// multiple of the per-client `max_failures`.
+const ADMIN_LOGIN_GLOBAL_FAILURE_FACTOR: u32 = 20;
+const MAX_ADMIN_LOGIN_RATE_KEYS: usize = 65_536;
+const AUDIT_LOGIN_USERNAME_CHARS: usize = 64;
 const CONTROL_PLANE_OPENAPI_JSON: &str =
     include_str!("../docs/openapi/control-plane-v1.openapi.json");
 pub const DEFAULT_ADMIN_SESSION_TTL_SECONDS: u64 = 8 * 60 * 60;
@@ -84,8 +93,17 @@ pub const DEFAULT_ADMIN_LOGIN_LOCKOUT_SECONDS: u64 = 5 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AdminLoginRateLimitConfig {
+    /// Failed admin password checks allowed per client IP address (IPv6
+    /// addresses are grouped by /64) and username within one window before
+    /// that client is locked out. The server-wide soft ceiling is 20 times this
+    /// value per window; past it, only clients without failures in the window
+    /// may try again.
     pub max_failures: u32,
+    /// Window, in seconds, over which failed checks are counted. It starts at
+    /// the first failure and resets once it has elapsed.
     pub window_seconds: u64,
+    /// How long, in seconds, a client stays locked out once it reaches
+    /// `max_failures`.
     pub lockout_seconds: u64,
 }
 
@@ -571,10 +589,38 @@ struct AdminSessionStore {
     sessions: StdMutex<BTreeMap<String, SessionRecord>>,
 }
 
+/// Tracks failed admin password checks per client and username.
+///
+/// Only attempts that reach Argon2 verification are counted, and they are
+/// reserved before hashing starts, so concurrent requests cannot outrun the
+/// limit. Usernames that cannot authenticate never create entries and never
+/// lock anyone out; they only feed a per-window audit cap.
 #[derive(Debug)]
 struct AdminLoginRateLimiter {
     config: AdminLoginRateLimitConfig,
-    buckets: StdMutex<BTreeMap<String, AdminLoginRateLimitBucket>>,
+    global_max_failures: u32,
+    max_keys: usize,
+    state: StdMutex<AdminLoginRateLimitState>,
+}
+
+#[derive(Debug, Default)]
+struct AdminLoginRateLimitState {
+    keys: BTreeMap<AdminLoginRateKey, AdminLoginRateLimitBucket>,
+    /// Soft ceiling: reserved admin password checks across all clients. It
+    /// never locks; `limited_audited` marks that the crossing was reported.
+    global: AdminLoginRateLimitBucket,
+    /// Failed logins for usernames that cannot authenticate; bounds their
+    /// audit rows only.
+    unknown_users: AdminLoginRateLimitBucket,
+    last_prune_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AdminLoginRateKey {
+    /// Canonical client address, IPv6 masked to its /64. `None` when the
+    /// server runs without connection info: all such clients share one key.
+    client: Option<IpAddr>,
+    user_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -582,6 +628,20 @@ struct AdminLoginRateLimitBucket {
     failures: u32,
     window_started_millis: u64,
     locked_until_millis: u64,
+    limited_audited: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminLoginRateDecision {
+    Allowed { ceiling_crossed: bool },
+    Limited { audit: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminLoginAuditDecision {
+    Event,
+    Coalesced,
+    Skip,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -636,77 +696,202 @@ impl AdminSessionStore {
     }
 }
 
+impl AdminLoginRateKey {
+    fn new(client: Option<IpAddr>, username: &str) -> Self {
+        let username = username.trim().to_ascii_lowercase();
+        Self {
+            client: client.map(login_rate_client),
+            user_digest: *blake3::hash(username.as_bytes()).as_bytes(),
+        }
+    }
+}
+
 impl AdminLoginRateLimiter {
     fn new(config: AdminLoginRateLimitConfig) -> Self {
         Self {
             config,
-            buckets: StdMutex::new(BTreeMap::new()),
+            global_max_failures: config
+                .max_failures
+                .saturating_mul(ADMIN_LOGIN_GLOBAL_FAILURE_FACTOR),
+            max_keys: MAX_ADMIN_LOGIN_RATE_KEYS,
+            state: StdMutex::new(AdminLoginRateLimitState::default()),
         }
     }
 
-    fn is_limited(&self, username: &str) -> bool {
-        let now = now_millis();
-        let user_key = login_username_bucket(username);
-        let Ok(mut buckets) = self.buckets.lock() else {
-            return true;
+    #[cfg(test)]
+    fn with_limits(
+        config: AdminLoginRateLimitConfig,
+        max_keys: usize,
+        global_max_failures: u32,
+    ) -> Self {
+        Self {
+            max_keys: max_keys.max(1),
+            global_max_failures: global_max_failures.max(1),
+            ..Self::new(config)
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.state.lock().map_or(0, |state| state.keys.len())
+    }
+
+    fn check(&self, key: &AdminLoginRateKey) -> AdminLoginRateDecision {
+        self.check_at(key, now_millis())
+    }
+
+    fn reserve(&self, key: &AdminLoginRateKey) -> AdminLoginRateDecision {
+        self.reserve_at(key, now_millis())
+    }
+
+    fn record_success(&self, key: &AdminLoginRateKey) {
+        self.record_success_at(key, now_millis());
+    }
+
+    fn record_unknown_user(&self) -> AdminLoginAuditDecision {
+        self.record_unknown_user_at(now_millis())
+    }
+
+    /// Reports whether `key` may attempt a password check, without counting.
+    fn check_at(&self, key: &AdminLoginRateKey, now: u64) -> AdminLoginRateDecision {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("admin login rate limiter lock poisoned; refusing login");
+            return AdminLoginRateDecision::Limited { audit: false };
         };
-        self.bucket_locked(&mut buckets, "login", now)
-            || self.bucket_locked(&mut buckets, &user_key, now)
-    }
-
-    fn record_failure(&self, username: &str) {
-        let now = now_millis();
-        let user_key = login_username_bucket(username);
-        if let Ok(mut buckets) = self.buckets.lock() {
-            self.record_bucket_failure(&mut buckets, "login", now);
-            self.record_bucket_failure(&mut buckets, &user_key, now);
+        self.prune_if_due(&mut state, now);
+        match self.refusal(&mut state, key, now) {
+            Some(audit) => AdminLoginRateDecision::Limited { audit },
+            None => AdminLoginRateDecision::Allowed {
+                ceiling_crossed: false,
+            },
         }
     }
 
-    fn record_success(&self, username: &str) {
-        let user_key = login_username_bucket(username);
-        if let Ok(mut buckets) = self.buckets.lock() {
-            buckets.remove("login");
-            buckets.remove(&user_key);
-        }
-    }
-
-    fn bucket_locked(
-        &self,
-        buckets: &mut BTreeMap<String, AdminLoginRateLimitBucket>,
-        key: &str,
-        now: u64,
-    ) -> bool {
-        let Some(bucket) = buckets.get_mut(key) else {
-            return false;
+    /// Re-checks `key` and, when allowed, counts the attempt as a failure up
+    /// front. A later `record_success` takes it back.
+    fn reserve_at(&self, key: &AdminLoginRateKey, now: u64) -> AdminLoginRateDecision {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("admin login rate limiter lock poisoned; refusing login");
+            return AdminLoginRateDecision::Limited { audit: false };
         };
-        bucket.normalize(now, self.config.window_seconds);
-        if bucket.is_empty() {
-            buckets.remove(key);
-            return false;
+        self.prune_if_due(&mut state, now);
+        if let Some(audit) = self.refusal(&mut state, key, now) {
+            return AdminLoginRateDecision::Limited { audit };
         }
-        bucket.locked_until_millis > now
-    }
+        if !state.keys.contains_key(key) && state.keys.len() >= self.max_keys {
+            self.prune(&mut state, now);
+            if state.keys.len() >= self.max_keys {
+                evict_admin_login_rate_key(&mut state.keys, now);
+            }
+        }
 
-    fn record_bucket_failure(
-        &self,
-        buckets: &mut BTreeMap<String, AdminLoginRateLimitBucket>,
-        key: &str,
-        now: u64,
-    ) {
-        let bucket = buckets.entry(key.to_owned()).or_default();
-        bucket.normalize(now, self.config.window_seconds);
-        if bucket.locked_until_millis > now {
-            return;
-        }
-        if bucket.window_started_millis == 0 {
-            bucket.window_started_millis = now;
-        }
-        bucket.failures = bucket.failures.saturating_add(1);
+        let bucket = state.keys.entry(*key).or_default();
+        bucket.count_failure(now);
+        bucket.limited_audited = false;
         if bucket.failures >= self.config.max_failures {
             bucket.locked_until_millis =
                 now.saturating_add(seconds_to_millis(self.config.lockout_seconds));
         }
+
+        let global = &mut state.global;
+        global.count_failure(now);
+        let ceiling_crossed =
+            global.failures >= self.global_max_failures && !global.limited_audited;
+        if ceiling_crossed {
+            global.limited_audited = true;
+        }
+        AdminLoginRateDecision::Allowed { ceiling_crossed }
+    }
+
+    fn record_success_at(&self, key: &AdminLoginRateKey, now: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("admin login rate limiter lock poisoned; success not recorded");
+            return;
+        };
+        state.keys.remove(key);
+        state.global.normalize(now, self.config.window_seconds);
+        state.global.failures = state.global.failures.saturating_sub(1);
+    }
+
+    /// Counts a failed login for a username that cannot authenticate and
+    /// decides whether it still gets its own audit event in this window.
+    fn record_unknown_user_at(&self, now: u64) -> AdminLoginAuditDecision {
+        let Ok(mut state) = self.state.lock() else {
+            return AdminLoginAuditDecision::Event;
+        };
+        let bucket = &mut state.unknown_users;
+        bucket.normalize(now, self.config.window_seconds);
+        bucket.count_failure(now);
+        if bucket.failures <= self.global_max_failures {
+            AdminLoginAuditDecision::Event
+        } else if bucket.limited_audited {
+            AdminLoginAuditDecision::Skip
+        } else {
+            bucket.limited_audited = true;
+            AdminLoginAuditDecision::Coalesced
+        }
+    }
+
+    /// Returns `Some(audit)` when `key` must be refused; `audit` is true only
+    /// for the first refusal of the key in its current lockout or window.
+    fn refusal(
+        &self,
+        state: &mut AdminLoginRateLimitState,
+        key: &AdminLoginRateKey,
+        now: u64,
+    ) -> Option<bool> {
+        state.global.normalize(now, self.config.window_seconds);
+        let ceiling_reached = state.global.failures >= self.global_max_failures;
+        let bucket = state.keys.get_mut(key)?;
+        bucket.normalize(now, self.config.window_seconds);
+        if bucket.is_empty() {
+            state.keys.remove(key);
+            return None;
+        }
+        let limited = bucket.locked_until_millis > now || (ceiling_reached && bucket.failures > 0);
+        if !limited {
+            return None;
+        }
+        let audit = !bucket.limited_audited;
+        bucket.limited_audited = true;
+        Some(audit)
+    }
+
+    fn prune_if_due(&self, state: &mut AdminLoginRateLimitState, now: u64) {
+        if now.saturating_sub(state.last_prune_millis)
+            > seconds_to_millis(self.config.window_seconds)
+        {
+            self.prune(state, now);
+        }
+    }
+
+    fn prune(&self, state: &mut AdminLoginRateLimitState, now: u64) {
+        let window_seconds = self.config.window_seconds;
+        state.keys.retain(|_, bucket| {
+            bucket.normalize(now, window_seconds);
+            !bucket.is_empty()
+        });
+        state.last_prune_millis = now;
+    }
+}
+
+/// Drops one entry from a full map, preferring unlocked entries and then the
+/// oldest window, so active lockouts survive.
+fn evict_admin_login_rate_key(
+    keys: &mut BTreeMap<AdminLoginRateKey, AdminLoginRateLimitBucket>,
+    now: u64,
+) {
+    let victim = keys
+        .iter()
+        .min_by_key(|(_, bucket)| {
+            (
+                bucket.locked_until_millis > now,
+                bucket.window_started_millis,
+            )
+        })
+        .map(|(key, _)| *key);
+    if let Some(victim) = victim {
+        keys.remove(&victim);
     }
 }
 
@@ -723,6 +908,13 @@ impl AdminLoginRateLimitBucket {
         {
             *self = Self::default();
         }
+    }
+
+    fn count_failure(&mut self, now: u64) {
+        if self.window_started_millis == 0 {
+            self.window_started_millis = now;
+        }
+        self.failures = self.failures.saturating_add(1);
     }
 
     fn is_empty(&self) -> bool {
@@ -871,6 +1063,8 @@ pub struct CreateTimeSeriesRequest {
     pub name: String,
     pub chunk_millis: i64,
     pub retention_millis: Option<i64>,
+    #[serde(default)]
+    pub max_future_skew_millis: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -1017,6 +1211,7 @@ pub struct AdminState {
     admin_sessions: Arc<AdminSessionStore>,
     admin_session_ttl_seconds: u64,
     admin_login_rate_limiter: Arc<AdminLoginRateLimiter>,
+    admin_password_verifier: Arc<Semaphore>,
     insecure_local_admin: bool,
     studio_assets_dir: Option<Arc<PathBuf>>,
     spec_mode: Option<ServeSpecMode>,
@@ -1038,6 +1233,7 @@ impl AdminState {
             admin_login_rate_limiter: Arc::new(AdminLoginRateLimiter::new(
                 AdminLoginRateLimitConfig::default(),
             )),
+            admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
             spec_mode: None,
@@ -1062,6 +1258,7 @@ impl AdminState {
             admin_login_rate_limiter: Arc::new(AdminLoginRateLimiter::new(
                 AdminLoginRateLimitConfig::default(),
             )),
+            admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
             spec_mode: None,
@@ -1086,6 +1283,7 @@ impl AdminState {
             admin_login_rate_limiter: Arc::new(AdminLoginRateLimiter::new(
                 AdminLoginRateLimitConfig::default(),
             )),
+            admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
             spec_mode: None,
@@ -1115,7 +1313,8 @@ impl AdminState {
     ///
     /// Existing credentials are preserved unless `reset` is true.
     /// # Errors
-    /// Fails when the password is empty, hashing fails, or persistence fails.
+    /// Fails when the password is empty or longer than 1024 bytes (even when an
+    /// existing credential would be kept), hashing fails, or persistence fails.
     pub async fn bootstrap_admin_password(
         &self,
         password: String,
@@ -1139,6 +1338,11 @@ impl AdminState {
                 .ensure_bootstrap_admin_principal()
                 .map_err(|error| error.to_string())?;
             return Ok(());
+        }
+        if password.len() > MAX_ADMIN_PASSWORD_BYTES {
+            return Err(format!(
+                "admin password must be at most {MAX_ADMIN_PASSWORD_BYTES} bytes"
+            ));
         }
 
         let password_hash = hash_admin_password(password).await?;
@@ -1280,10 +1484,19 @@ impl AdminState {
     }
 }
 
+/// Builds the Control Plane API router.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so the
+/// login lockout is tracked per client address; without connection info all
+/// clients share a single lockout.
 pub fn router(state: AdminState) -> Router {
     api_router().with_state(state)
 }
 
+/// Builds the Control Plane API router, also mounted under `/api`.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so the
+/// login lockout is tracked per client address.
 pub fn router_with_api_prefix(state: AdminState) -> Router {
     Router::new()
         .merge(api_router())
@@ -1291,6 +1504,11 @@ pub fn router_with_api_prefix(state: AdminState) -> Router {
         .with_state(state)
 }
 
+/// Builds the Control Plane API router, also mounted under `/api`, with
+/// Studio static assets as the fallback.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so the
+/// login lockout is tracked per client address.
 pub fn router_with_studio(state: AdminState) -> Router {
     Router::new()
         .merge(api_router())
@@ -1444,23 +1662,37 @@ async fn ready_handler(State(state): State<AdminState>) -> impl IntoResponse {
 
 async fn auth_login_handler(
     State(state): State<AdminState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(error) => return invalid_json(&error),
     };
-    let username = request.username.trim().to_owned();
-    if state.admin_login_rate_limiter.is_limited(&username) {
-        audit_auth_event(
-            &state,
-            None,
-            "login_rate_limited",
-            AuditOutcome::Denied,
-            Some("bucket: login"),
-        )
-        .await;
+    if request.username.len() > MAX_LOGIN_USERNAME_BYTES {
+        return invalid_json_value(format!(
+            "username must be at most {MAX_LOGIN_USERNAME_BYTES} bytes"
+        ));
+    }
+    if request.password.len() > MAX_ADMIN_PASSWORD_BYTES {
+        return invalid_json_value(format!(
+            "password must be at most {MAX_ADMIN_PASSWORD_BYTES} bytes"
+        ));
+    }
+    let client = login_client_ip(connect_info);
+    let username = request.username.trim();
+    if username != ADMIN_USERNAME {
+        return reject_unknown_login_user(&state, client, username).await;
+    }
+    let key = AdminLoginRateKey::new(client, username);
+    if let AdminLoginRateDecision::Limited { audit } = state.admin_login_rate_limiter.check(&key) {
+        if audit {
+            audit_login_refused(&state, client).await;
+        }
         return unauthorized_auth();
+    }
+    if state.admin_password_verifier.available_permits() == 0 {
+        return auth_busy();
     }
     let credential = {
         let database = state.database.lock().await;
@@ -1469,37 +1701,94 @@ async fn auth_login_handler(
             Err(error) => return db_error(&error),
         }
     };
-
     let Some(credential) = credential.filter(|credential| username == credential.username) else {
-        state.admin_login_rate_limiter.record_failure(&username);
-        audit_auth_event(
-            &state,
-            None,
-            "login",
-            AuditOutcome::Failed,
-            Some(&format!("username: {username}")),
-        )
-        .await;
-        return unauthorized_auth();
+        return reject_unknown_login_user(&state, client, username).await;
     };
 
-    let verified = verify_admin_password(credential.password_hash, request.password)
+    let Ok(permit) = Arc::clone(&state.admin_password_verifier).try_acquire_owned() else {
+        return auth_busy();
+    };
+    match state.admin_login_rate_limiter.reserve(&key) {
+        AdminLoginRateDecision::Allowed { ceiling_crossed } => {
+            if ceiling_crossed {
+                audit_auth_event(
+                    &state,
+                    None,
+                    "login_rate_limited",
+                    AuditOutcome::Denied,
+                    Some("scope: global"),
+                )
+                .await;
+            }
+        }
+        AdminLoginRateDecision::Limited { audit } => {
+            drop(permit);
+            if audit {
+                audit_login_refused(&state, client).await;
+            }
+            return unauthorized_auth();
+        }
+    }
+    let verified = verify_admin_password(permit, credential.password_hash, request.password)
         .await
         .unwrap_or(false);
     if !verified {
-        state.admin_login_rate_limiter.record_failure(&username);
-        audit_auth_event(
-            &state,
-            None,
-            "login",
-            AuditOutcome::Failed,
-            Some(&format!("username: {username}")),
-        )
-        .await;
+        audit_login_failure(&state, client, username).await;
         return unauthorized_auth();
     }
-    state.admin_login_rate_limiter.record_success(&username);
+    state.admin_login_rate_limiter.record_success(&key);
+    complete_admin_login(&state).await
+}
 
+/// Rejects a username that cannot authenticate without touching the lockout
+/// state, so junk usernames can never lock the admin out.
+async fn reject_unknown_login_user(
+    state: &AdminState,
+    client: Option<IpAddr>,
+    username: &str,
+) -> Response {
+    match state.admin_login_rate_limiter.record_unknown_user() {
+        AdminLoginAuditDecision::Event => audit_login_failure(state, client, username).await,
+        AdminLoginAuditDecision::Coalesced => {
+            audit_auth_event(
+                state,
+                None,
+                "login_audit_coalesced",
+                AuditOutcome::Failed,
+                Some("scope: unknown_user"),
+            )
+            .await;
+        }
+        AdminLoginAuditDecision::Skip => {}
+    }
+    unauthorized_auth()
+}
+
+async fn audit_login_failure(state: &AdminState, client: Option<IpAddr>, username: &str) {
+    let detail = format!(
+        "client: {} username: {}",
+        login_client_label(client),
+        audit_login_username(username)
+    );
+    audit_auth_event(state, None, "login", AuditOutcome::Failed, Some(&detail)).await;
+}
+
+async fn audit_login_refused(state: &AdminState, client: Option<IpAddr>) {
+    let detail = format!(
+        "scope: client client: {} username: {ADMIN_USERNAME}",
+        login_client_label(client)
+    );
+    audit_auth_event(
+        state,
+        None,
+        "login_rate_limited",
+        AuditOutcome::Denied,
+        Some(&detail),
+    )
+    .await;
+}
+
+async fn complete_admin_login(state: &AdminState) -> Response {
     let principal = admin_principal();
     {
         let mut database = state.database.lock().await;
@@ -1568,6 +1857,13 @@ async fn auth_change_password_handler(
         Ok(payload) => payload,
         Err(error) => return invalid_json(&error),
     };
+    if request.current_password.len() > MAX_ADMIN_PASSWORD_BYTES
+        || request.new_password.len() > MAX_ADMIN_PASSWORD_BYTES
+    {
+        return invalid_json_value(format!(
+            "passwords must be at most {MAX_ADMIN_PASSWORD_BYTES} bytes"
+        ));
+    }
     if request.new_password.trim().is_empty() {
         return invalid_json_value("new password must not be empty");
     }
@@ -1583,9 +1879,13 @@ async fn auth_change_password_handler(
             Err(error) => return db_error(&error),
         }
     };
-    let verified = verify_admin_password(credential.password_hash, request.current_password)
-        .await
-        .unwrap_or(false);
+    let Ok(permit) = Arc::clone(&state.admin_password_verifier).try_acquire_owned() else {
+        return auth_busy();
+    };
+    let verified =
+        verify_admin_password(permit, credential.password_hash, request.current_password)
+            .await
+            .unwrap_or(false);
     if !verified {
         audit_auth_event(
             &state,
@@ -2307,6 +2607,9 @@ async fn create_time_series_handler(
         name: request.name.clone(),
         chunk_millis: request.chunk_millis,
         retention_millis: request.retention_millis,
+        max_future_skew_millis: request
+            .max_future_skew_millis
+            .unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MILLIS),
     };
     match database.create_time_series_as(&principal, &config) {
         Ok(series) => api_ok(
@@ -3323,6 +3626,33 @@ fn unauthorized_auth() -> Response {
     api_error(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
 }
 
+fn auth_busy() -> Response {
+    (
+        [(RETRY_AFTER, "1")],
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_busy",
+            "too many concurrent sign-in attempts; retry shortly",
+        ),
+    )
+        .into_response()
+}
+
+fn login_client_ip(connect_info: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
+    connect_info.map(|Extension(ConnectInfo(address))| address.ip())
+}
+
+fn login_client_label(client: Option<IpAddr>) -> String {
+    client.map_or_else(
+        || "unknown".to_owned(),
+        |address| address.to_canonical().to_string(),
+    )
+}
+
+fn audit_login_username(username: &str) -> String {
+    username.chars().take(AUDIT_LOGIN_USERNAME_CHARS).collect()
+}
+
 fn admin_principal() -> Principal {
     Principal::new(ADMIN_USERNAME).with_role(ADMIN_ROLE)
 }
@@ -3364,8 +3694,16 @@ async fn hash_admin_password(password: String) -> Result<String, String> {
     .map_err(|error| error.to_string())?
 }
 
-async fn verify_admin_password(password_hash: String, password: String) -> Result<bool, String> {
+async fn verify_admin_password(
+    permit: OwnedSemaphorePermit,
+    password_hash: String,
+    password: String,
+) -> Result<bool, String> {
     tokio::task::spawn_blocking(move || {
+        // The permit lives in the blocking task, not in the request future: a
+        // client that disconnects drops the handler, but hashing keeps running
+        // and its Argon2 memory must stay counted until it finishes.
+        let _permit = permit;
         let parsed_hash = PasswordHash::new(&password_hash).map_err(|error| error.to_string())?;
         let params = Params::new(19 * 1_024, 2, 1, None).map_err(|error| error.to_string())?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -3730,6 +4068,12 @@ fn db_error(error: &DbError) -> Response {
     if matches!(error, DbError::AuthzDenied(_)) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
     }
+    if matches!(
+        error,
+        DbError::TimeSeries(TimeSeriesError::InvalidConfig(_) | TimeSeriesError::InvalidPoint(_))
+    ) {
+        return invalid_json_value(error.to_string());
+    }
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
@@ -3817,12 +4161,12 @@ fn seconds_to_millis(seconds: u64) -> u64 {
     seconds.saturating_mul(1_000)
 }
 
-fn login_username_bucket(username: &str) -> String {
-    let normalized = username.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        "user:__empty__".to_owned()
-    } else {
-        format!("user:{normalized}")
+/// Canonicalizes a client address for the login lockout; IPv6 clients are
+/// grouped by /64 because a single host usually controls the whole prefix.
+fn login_rate_client(address: IpAddr) -> IpAddr {
+    match address.to_canonical() {
+        IpAddr::V4(address) => IpAddr::V4(address),
+        IpAddr::V6(address) => IpAddr::V6(Ipv6Addr::from(u128::from(address) & (!0_u128 << 64))),
     }
 }
 
@@ -3851,16 +4195,20 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminLoginRateLimitConfig, AdminState, ConfigApplyRequest, ConfigPlanRequest,
-        local_insecure_admin_allowed,
+        ADMIN_PASSWORD_VERIFY_PERMITS, AdminLoginAuditDecision, AdminLoginRateDecision,
+        AdminLoginRateKey, AdminLoginRateLimitConfig, AdminLoginRateLimiter, AdminState,
+        ConfigApplyRequest, ConfigPlanRequest, local_insecure_admin_allowed, login_client_label,
     };
     use crate::{
         config_spec::{ApplyStatus, DatabaseSpec, MigrationPlanner},
         db::{DbConfig, Profile, create_database, open_database},
+        query::SqlOutput,
         runtime_advisor::{
             RuntimeAdviceDecisionRequest, RuntimeAdvicePlanRequest, RuntimeAdviceStatus,
         },
-        security::{AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role},
+        security::{
+            AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role,
+        },
         tuning::WorkloadSample,
     };
     use axum::{
@@ -3869,7 +4217,12 @@ mod tests {
     };
     use serde::Serialize;
     use serde_json::Value;
-    use std::{fs, net::SocketAddr, sync::Arc};
+    use std::{
+        convert::Infallible,
+        fs,
+        net::{IpAddr, SocketAddr},
+        sync::Arc,
+    };
     use tempfile::tempdir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
@@ -4041,41 +4394,669 @@ mod tests {
         for _ in 0..2 {
             let response = app
                 .clone()
-                .oneshot(json_request(
-                    Method::POST,
-                    "/auth/login",
-                    &serde_json::json!({
-                        "username": "admin",
-                        "password": "wrong"
-                    }),
-                )?)
+                .oneshot(login_request("admin", "wrong", None)?)
                 .await?;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             let body = json_body(response).await?;
             assert_eq!(body["error"]["code"], "unauthorized");
         }
 
+        for _ in 0..3 {
+            let locked = app
+                .clone()
+                .oneshot(login_request("admin", "correct", None)?)
+                .await?;
+            assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+            assert!(locked.headers().get("retry-after").is_none());
+            let body = json_body(locked).await?;
+            assert_eq!(body["error"]["code"], "unauthorized");
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            2
+        );
+        assert_eq!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?,
+            vec!["scope: client client: unknown username: admin".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn junk_username_failures_do_not_lock_out_admin() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let client = "198.51.100.7:40000".parse::<SocketAddr>()?;
+
+        let mut usernames = (0..10)
+            .map(|index| format!("ghost-{index}"))
+            .collect::<Vec<_>>();
+        usernames.extend(std::iter::repeat_n("ghost".to_owned(), 3));
+        usernames.extend(std::iter::repeat_n("Admin".to_owned(), 3));
+        for username in &usernames {
+            let response = app
+                .clone()
+                .oneshot(login_request(username, "wrong", Some(client))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let same_client = app
+            .clone()
+            .oneshot(login_request("admin", "correct", Some(client))?)
+            .await?;
+        assert_eq!(same_client.status(), StatusCode::OK);
+        let without_connect_info = app
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(without_connect_info.status(), StatusCode::OK);
+        assert!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
+                .await?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_lockout_is_scoped_to_client_ip() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let attacker = "198.51.100.7:40000".parse::<SocketAddr>()?;
+        let other = "203.0.113.9:40000".parse::<SocketAddr>()?;
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(login_request("admin", "wrong", Some(attacker))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
         let locked = app
-            .oneshot(json_request(
-                Method::POST,
-                "/auth/login",
-                &serde_json::json!({
-                    "username": "admin",
-                    "password": "correct"
-                }),
-            )?)
+            .clone()
+            .oneshot(login_request("admin", "correct", Some(attacker))?)
             .await?;
         assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
-        assert!(locked.headers().get("retry-after").is_none());
-        let body = json_body(locked).await?;
-        assert_eq!(body["error"]["code"], "unauthorized");
-        let database = database.lock().await;
-        assert!(database.audit_events()?.iter().any(|event| {
-            event.action == "login_rate_limited"
-                && event.outcome == crate::security::AuditOutcome::Denied
-                && event.detail.as_deref() == Some("bucket: login")
-        }));
+        let other_client = app
+            .oneshot(login_request("admin", "correct", Some(other))?)
+            .await?;
+        assert_eq!(other_client.status(), StatusCode::OK);
+
+        let refused = audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?;
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused
+                .iter()
+                .all(|detail| detail.contains("client: 198.51.100.7"))
+        );
+        let failures = audit_details(&database, "login", AuditOutcome::Failed).await?;
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures
+                .iter()
+                .all(|detail| detail.starts_with("client: 198.51.100.7 username: admin"))
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_ceiling_tightens_failed_clients_but_admits_clean_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let mut state = AdminState::from_database_handle(Arc::clone(&database));
+        state.admin_login_rate_limiter = Arc::new(AdminLoginRateLimiter::with_limits(
+            AdminLoginRateLimitConfig::new(5, 300, 300),
+            64,
+            2,
+        ));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let first = "198.51.100.1:40000".parse::<SocketAddr>()?;
+        let second = "198.51.100.2:40000".parse::<SocketAddr>()?;
+        let clean = "198.51.100.3:40000".parse::<SocketAddr>()?;
+
+        for client in [first, second] {
+            let response = app
+                .clone()
+                .oneshot(login_request("admin", "wrong", Some(client))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            2
+        );
+        assert_eq!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?,
+            vec!["scope: global".to_owned()]
+        );
+
+        let tightened = app
+            .clone()
+            .oneshot(login_request("admin", "correct", Some(first))?)
+            .await?;
+        assert_eq!(tightened.status(), StatusCode::UNAUTHORIZED);
+        let admitted = app
+            .oneshot(login_request("admin", "correct", Some(clean))?)
+            .await?;
+        assert_eq!(admitted.status(), StatusCode::OK);
+
+        let refused = audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?;
+        assert_eq!(refused.len(), 2);
+        assert!(refused.contains(&"scope: global".to_owned()));
+        assert!(refused.contains(&"scope: client client: 198.51.100.1 username: admin".to_owned()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_user_login_audit_is_capped_per_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(1, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+
+        for index in 1..=25 {
+            let client = format!("192.0.2.{index}:40000").parse::<SocketAddr>()?;
+            let response = app
+                .clone()
+                .oneshot(login_request(
+                    &format!("ghost-{index}"),
+                    "wrong",
+                    Some(client),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            20
+        );
+        assert_eq!(
+            audit_details(&database, "login_audit_coalesced", AuditOutcome::Failed).await?,
+            vec!["scope: unknown_user".to_owned()]
+        );
+        assert!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
+                .await?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?
+        );
+
+        let admin = app
+            .oneshot(login_request(
+                "admin",
+                "correct",
+                Some("192.0.2.1:40000".parse::<SocketAddr>()?),
+            )?)
+            .await?;
+        assert_eq!(admin.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_password_verifier_returns_busy_without_counting_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(1, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let verifier = Arc::clone(&state.admin_password_verifier);
+        let app = super::router(state);
+
+        let mut permits = Vec::new();
+        for _ in 0..ADMIN_PASSWORD_VERIFY_PERMITS {
+            permits.push(Arc::clone(&verifier).try_acquire_owned()?);
+        }
+        let busy = app
+            .clone()
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = busy
+            .headers()
+            .get("retry-after")
+            .map(|value| value.to_str())
+            .transpose()?;
+        assert_eq!(retry_after, Some("1"));
+        let body = json_body(busy).await?;
+        assert_eq!(body["error"]["code"], "auth_busy");
+        assert!(
+            login_audit_actions(&database).await?.is_empty(),
+            "expected an empty value, got {:?}",
+            login_audit_actions(&database).await?
+        );
+
+        drop(permits);
+        let admitted = app
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_wrong_password_burst_cannot_outrun_the_limiter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let client = "198.51.100.7:40000".parse::<SocketAddr>()?;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let app = app.clone();
+            let request = login_request("admin", "wrong", Some(client))?;
+            tasks.spawn(async move {
+                let response = app.oneshot(request).await?;
+                Ok::<StatusCode, Infallible>(response.status())
+            });
+        }
+        while let Some(status) = tasks.join_next().await {
+            let status = status??;
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
+                "unexpected burst status {status}"
+            );
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            2
+        );
+
+        let locked = app
+            .oneshot(login_request("admin", "correct", Some(client))?)
+            .await?;
+        assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
+                .await?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_login_fields_are_rejected_before_rate_limit_and_audit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(1, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+
+        let long_username = app
+            .clone()
+            .oneshot(login_request(&"u".repeat(257), "wrong", None)?)
+            .await?;
+        assert_eq!(long_username.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(long_username).await?;
+        assert_eq!(body["error"]["code"], "invalid_value");
+
+        let long_password = app
+            .clone()
+            .oneshot(login_request("admin", &"p".repeat(1025), None)?)
+            .await?;
+        assert_eq!(long_password.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(long_password).await?;
+        assert_eq!(body["error"]["code"], "invalid_value");
+        assert!(
+            login_audit_actions(&database).await?.is_empty(),
+            "expected an empty value, got {:?}",
+            login_audit_actions(&database).await?
+        );
+
+        let admitted = app
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_failure_audit_keeps_client_with_long_username()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let app = super::router(AdminState::from_database_handle(Arc::clone(&database)));
+        let client = "198.51.100.7:40000".parse::<SocketAddr>()?;
+
+        let response = app
+            .oneshot(login_request(&"u".repeat(256), "wrong", Some(client))?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let failures = audit_details(&database, "login", AuditOutcome::Failed).await?;
+        assert_eq!(failures.len(), 1);
+        let detail = failures.first().ok_or("missing login failure audit")?;
+        assert!(detail.len() <= 160);
+        assert_eq!(
+            detail.strip_prefix("client: 198.51.100.7 username: "),
+            Some("u".repeat(64).as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_password_length_is_capped_for_bootstrap_and_change_password()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        assert!(
+            state
+                .bootstrap_admin_password("x".repeat(1025), false)
+                .await
+                .is_err()
+        );
+        assert!(database.lock().await.admin_credential("admin")?.is_none());
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        // With a stored credential and no reset, the bootstrap value is ignored, so its
+        // length must not stop startup; a reset would store it and is refused.
+        state
+            .bootstrap_admin_password("x".repeat(1025), false)
+            .await?;
+        assert!(
+            state
+                .bootstrap_admin_password("x".repeat(1025), true)
+                .await
+                .is_err()
+        );
+        let app = super::router(state);
+
+        for request in [
+            serde_json::json!({
+                "current_password": "correct",
+                "new_password": "x".repeat(1025)
+            }),
+            serde_json::json!({
+                "current_password": "x".repeat(1025),
+                "new_password": "new-secret"
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/auth/change-password",
+                    &request,
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "invalid_value");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_reads_client_ip_from_connect_info_service()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let database = Arc::new(Mutex::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                super::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "ghost",
+            "password": "wrong"
+        }))?;
+        let exchange = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            let head = format!(
+                "POST /auth/login HTTP/1.1\r\nHost: {address}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.write_all(&body).await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            Ok::<Vec<u8>, std::io::Error>(response)
+        })
+        .await;
+        server.abort();
+        let response = String::from_utf8(exchange??)?;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+        let failures = audit_details(&database, "login", AuditOutcome::Failed).await?;
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures
+                .iter()
+                .all(|detail| detail.starts_with("client: 127.0.0.1 username: "))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_login_rate_key_normalizes_client_and_username()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key =
+            |client: &str, username: &str| -> Result<AdminLoginRateKey, std::net::AddrParseError> {
+                Ok(AdminLoginRateKey::new(Some(client.parse()?), username))
+            };
+        assert_eq!(
+            key("2001:db8::1", "admin")?,
+            key("2001:db8::ffff", "admin")?
+        );
+        assert_ne!(
+            key("2001:db8::1", "admin")?,
+            key("2001:db8:0:1::1", "admin")?
+        );
+        assert_eq!(
+            key("::ffff:192.0.2.1", "admin")?,
+            key("192.0.2.1", "admin")?
+        );
+        assert_eq!(key("192.0.2.1", " Admin ")?, key("192.0.2.1", "admin")?);
+        assert_ne!(key("192.0.2.1", "admin")?, key("192.0.2.2", "admin")?);
+        assert_ne!(
+            AdminLoginRateKey::new(None, "admin"),
+            key("192.0.2.1", "admin")?
+        );
+        assert_eq!(
+            login_client_label(Some("::ffff:192.0.2.1".parse::<IpAddr>()?)),
+            "192.0.2.1"
+        );
+        assert_eq!(
+            login_client_label(Some("2001:db8::1".parse::<IpAddr>()?)),
+            "2001:db8::1"
+        );
+        assert_eq!(login_client_label(None), "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn admin_login_limiter_reserves_before_verification_and_resets_on_success() {
+        let limiter = AdminLoginRateLimiter::new(AdminLoginRateLimitConfig::new(2, 300, 300));
+        let key = AdminLoginRateKey::new(Some(IpAddr::from([198, 51, 100, 7])), "admin");
+        let allowed = AdminLoginRateDecision::Allowed {
+            ceiling_crossed: false,
+        };
+        let now = 1_000_000;
+
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(
+            limiter.check_at(&key, now),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        assert_eq!(
+            limiter.reserve_at(&key, now),
+            AdminLoginRateDecision::Limited { audit: false }
+        );
+
+        limiter.record_success_at(&key, now);
+        assert_eq!(limiter.check_at(&key, now), allowed);
+
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(
+            limiter.check_at(&key, now + 1),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        assert_eq!(limiter.check_at(&key, now + 300_000 + 1), allowed);
+    }
+
+    #[test]
+    fn admin_login_global_ceiling_is_soft() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = AdminLoginRateLimiter::new(AdminLoginRateLimitConfig::new(2, 300, 300));
+        let keys = (0..40_u8)
+            .map(|index| AdminLoginRateKey::new(Some(IpAddr::from([198, 51, 100, index])), "admin"))
+            .collect::<Vec<_>>();
+        let first = keys.first().ok_or("missing first key")?;
+        let second = keys.get(1).ok_or("missing second key")?;
+        let fresh = AdminLoginRateKey::new(Some(IpAddr::from([203, 0, 113, 9])), "admin");
+        let allowed = AdminLoginRateDecision::Allowed {
+            ceiling_crossed: false,
+        };
+        let now = 1_000_000;
+
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                limiter.reserve_at(key, now),
+                AdminLoginRateDecision::Allowed {
+                    ceiling_crossed: index == 39
+                }
+            );
+        }
+        assert_eq!(
+            limiter.check_at(first, now),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        assert_eq!(
+            limiter.check_at(first, now),
+            AdminLoginRateDecision::Limited { audit: false }
+        );
+        assert_eq!(limiter.check_at(&fresh, now), allowed);
+        assert_eq!(limiter.reserve_at(&fresh, now), allowed);
+
+        let later = now + 300_000 + 1;
+        assert_eq!(limiter.check_at(first, later), allowed);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                limiter.reserve_at(key, later),
+                AdminLoginRateDecision::Allowed {
+                    ceiling_crossed: index == 39
+                }
+            );
+        }
+        assert_eq!(
+            limiter.check_at(first, later),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        limiter.record_success_at(second, later);
+        assert_eq!(limiter.check_at(first, later), allowed);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_login_limiter_bounds_keys_and_keeps_locked_entries() {
+        let limiter = AdminLoginRateLimiter::with_limits(
+            AdminLoginRateLimitConfig::new(2, 300, 300),
+            8,
+            1_000,
+        );
+        let locked = AdminLoginRateKey::new(Some(IpAddr::from([203, 0, 113, 9])), "admin");
+        let allowed = AdminLoginRateDecision::Allowed {
+            ceiling_crossed: false,
+        };
+        let now = 1_000_000;
+
+        assert_eq!(limiter.reserve_at(&locked, now), allowed);
+        assert_eq!(limiter.reserve_at(&locked, now), allowed);
+        for index in 0..20_u8 {
+            let key = AdminLoginRateKey::new(Some(IpAddr::from([198, 51, 100, index])), "admin");
+            assert_eq!(limiter.reserve_at(&key, now), allowed);
+        }
+        assert!(limiter.tracked_keys() <= 8);
+        assert_eq!(
+            limiter.check_at(&locked, now),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+
+        assert_eq!(
+            limiter.check_at(&locked, now + 300_000 + 300_000 + 1),
+            allowed
+        );
+        assert_eq!(limiter.tracked_keys(), 0);
+    }
+
+    #[test]
+    fn unknown_user_audit_is_coalesced_per_window() {
+        let limiter =
+            AdminLoginRateLimiter::with_limits(AdminLoginRateLimitConfig::new(2, 300, 300), 8, 3);
+        let now = 1_000_000;
+
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.record_unknown_user_at(now),
+                AdminLoginAuditDecision::Event
+            );
+        }
+        assert_eq!(
+            limiter.record_unknown_user_at(now),
+            AdminLoginAuditDecision::Coalesced
+        );
+        assert_eq!(
+            limiter.record_unknown_user_at(now),
+            AdminLoginAuditDecision::Skip
+        );
+        assert_eq!(
+            limiter.record_unknown_user_at(now),
+            AdminLoginAuditDecision::Skip
+        );
+        assert_eq!(
+            limiter.record_unknown_user_at(now + 300_000 + 1),
+            AdminLoginAuditDecision::Event
+        );
+        assert_eq!(limiter.tracked_keys(), 0);
     }
 
     #[tokio::test]
@@ -4246,6 +5227,139 @@ mod tests {
         let token = login_token(&app, "new-secret").await?;
         assert!(token.starts_with(super::SESSION_TOKEN_PREFIX));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn security_state_survives_serve_restart() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("serve-security.redb");
+        {
+            let state = AdminState::from_database(create_database(DbConfig::on_disk(
+                Profile::Transactional,
+                &db_path,
+            ))?);
+            state
+                .bootstrap_admin_password("secret".to_owned(), false)
+                .await?;
+            let app = super::router(state);
+            let token = login_token(&app, "secret").await?;
+
+            let create_table = app
+                .clone()
+                .oneshot(session_request(
+                    Method::POST,
+                    "/builder/table",
+                    &token,
+                    &serde_json::json!({
+                        "name": "orders",
+                        "schema": {
+                            "columns": [{ "name": "id", "ty": "Int", "nullable": false }],
+                            "primary_key": 0
+                        },
+                        "indexes": []
+                    }),
+                )?)
+                .await?;
+            assert_eq!(create_table.status(), StatusCode::OK);
+            let insert = app
+                .clone()
+                .oneshot(session_request(
+                    Method::POST,
+                    "/data/tables/orders/rows",
+                    &token,
+                    &serde_json::json!({ "row": [1] }),
+                )?)
+                .await?;
+            assert_eq!(insert.status(), StatusCode::OK);
+
+            let update = app
+                .oneshot(session_request(
+                    Method::POST,
+                    "/security",
+                    &token,
+                    &app_rw_security_body(),
+                )?)
+                .await?;
+            assert_eq!(update.status(), StatusCode::OK);
+        }
+
+        // Second boot mirrors `multidb serve` with MULTIDB_ADMIN_PASSWORD set.
+        let database = Arc::new(Mutex::new(create_database(DbConfig::on_disk(
+            Profile::Transactional,
+            &db_path,
+        ))?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        state
+            .bootstrap_admin_password("secret".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let token = login_token(&app, "secret").await?;
+        let security = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/security")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(security.status(), StatusCode::OK);
+        let body = json_body(security).await?;
+        let role_names = body["data"]["roles"]
+            .as_array()
+            .ok_or("roles must be an array")?
+            .iter()
+            .filter_map(|role| role["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(role_names, ["admin", "app_rw"]);
+        let principals = body["data"]["principals"]
+            .as_array()
+            .ok_or("principals must be an array")?;
+        assert!(principals.contains(&serde_json::json!({
+            "user": "multidb",
+            "principal": "app",
+            "roles": ["app_rw"]
+        })));
+        assert_eq!(body["data"]["audit_enabled"], true);
+
+        let database = database.lock().await;
+        let principal = database.principal_for_user("multidb");
+        assert_eq!(principal, Principal::new("app").with_role("app_rw"));
+        assert!(matches!(
+            database
+                .query_as(&principal, "SELECT id FROM orders")
+                .await?,
+            SqlOutput::Rows(_)
+        ));
+        Ok(())
+    }
+
+    /// Keeps the canonical admin role and maps PG user `multidb` to an `orders` read/write role.
+    fn app_rw_security_body() -> Value {
+        serde_json::json!({
+            "roles": [
+                {
+                    "name": "admin",
+                    "grants": [
+                        { "resource": "System", "permission": "Admin" },
+                        { "resource": "Database", "permission": "Read" },
+                        { "resource": "Database", "permission": "Write" },
+                        { "resource": "Database", "permission": "Admin" }
+                    ]
+                },
+                {
+                    "name": "app_rw",
+                    "grants": [
+                        { "resource": { "Table": "orders" }, "permission": "Read" },
+                        { "resource": { "Table": "orders" }, "permission": "Write" }
+                    ]
+                }
+            ],
+            "principals": [
+                { "user": "admin", "principal": "admin", "roles": ["admin"] },
+                { "user": "multidb", "principal": "app", "roles": ["app_rw"] }
+            ]
+        })
     }
 
     #[tokio::test]
@@ -5650,6 +6764,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn time_series_http_rejects_invalid_retention_and_future_points()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+
+        for body in [
+            serde_json::json!({ "name": "negative", "chunk_millis": 1000, "retention_millis": -1 }),
+            serde_json::json!({ "name": "short", "chunk_millis": 60000, "retention_millis": 1000 }),
+            serde_json::json!({
+                "name": "skew",
+                "chunk_millis": 1000,
+                "retention_millis": null,
+                "max_future_skew_millis": -1
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/builder/time-series",
+                    Some(&body),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = json_body(response).await?;
+            assert_eq!(error["error"]["code"], "invalid_value", "{body}");
+        }
+
+        let create = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/builder/time-series",
+                Some(&serde_json::json!({
+                    "name": "metrics",
+                    "chunk_millis": 1000,
+                    "retention_millis": 3_600_000
+                })),
+            )?)
+            .await?;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let now = i64::try_from(super::now_millis())?;
+        for (timestamp, expected) in [
+            (now, StatusCode::OK),
+            (now * 1_000, StatusCode::BAD_REQUEST),
+            (now - 7_200_000, StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/data/time-series/metrics/points",
+                    Some(&serde_json::json!({
+                        "series": "cpu",
+                        "point": { "timestamp_millis": timestamp, "value": 0.5 }
+                    })),
+                )?)
+                .await?;
+            assert_eq!(response.status(), expected, "{timestamp}");
+            if expected == StatusCode::BAD_REQUEST {
+                let error = json_body(response).await?;
+                assert_eq!(error["error"]["code"], "invalid_value", "{timestamp}");
+            }
+        }
+
+        let points = app
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/time-series/metrics/points?series=cpu\
+                 &start=-9223372036854775808&end=9223372036854775807",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(points.status(), StatusCode::OK);
+        let body = json_body(points).await?;
+        let points = body["data"]["points"]
+            .as_array()
+            .ok_or("time-series points must be an array")?;
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["timestamp_millis"], now);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rbac_denies_and_audits_builder_without_database_admin()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut database = create_database(DbConfig::new(Profile::InMemory))?;
@@ -6705,6 +7903,20 @@ mod tests {
         Ok(builder.body(body)?)
     }
 
+    fn session_request<T: Serialize>(
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: &T,
+    ) -> Result<Request<Body>, Box<dyn std::error::Error>> {
+        Ok(Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body)?))?)
+    }
+
     fn json_request<T: Serialize>(
         method: Method,
         uri: &str,
@@ -6715,6 +7927,53 @@ mod tests {
             .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(body)?))?)
+    }
+
+    fn login_request(
+        username: &str,
+        password: &str,
+        client: Option<SocketAddr>,
+    ) -> Result<Request<Body>, Box<dyn std::error::Error>> {
+        let mut request = json_request(
+            Method::POST,
+            "/auth/login",
+            &serde_json::json!({
+                "username": username,
+                "password": password
+            }),
+        )?;
+        if let Some(client) = client {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(client));
+        }
+        Ok(request)
+    }
+
+    async fn audit_details(
+        database: &Arc<Mutex<crate::db::Database>>,
+        action: &str,
+        outcome: AuditOutcome,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let database = database.lock().await;
+        Ok(database
+            .audit_events()?
+            .into_iter()
+            .filter(|event| event.action == action && event.outcome == outcome)
+            .map(|event| event.detail.unwrap_or_default())
+            .collect())
+    }
+
+    async fn login_audit_actions(
+        database: &Arc<Mutex<crate::db::Database>>,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let database = database.lock().await;
+        Ok(database
+            .audit_events()?
+            .into_iter()
+            .filter(|event| event.action.starts_with("login"))
+            .map(|event| event.action)
+            .collect())
     }
 
     async fn login_token(

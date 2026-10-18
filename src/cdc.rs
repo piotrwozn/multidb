@@ -828,11 +828,13 @@ async fn run_subscription_worker(
 /// Creates a materialized view and initializes it from the current source table.
 ///
 /// # Errors
-/// Fails when the spec is unsupported, source table is missing, or metadata writes fail.
+/// Fails when the database uses AP replication, the spec is unsupported, source table is
+/// missing, or metadata writes fail.
 pub fn create_materialized_view(
     database: &crate::db::Database,
     spec: &MaterializedViewSpec,
 ) -> Result<MaterializedViewRows, MaterializedViewError> {
+    ensure_view_commit_log(database)?;
     validate_view_spec(spec)?;
     let _table = database
         .table(&spec.source_table)
@@ -855,11 +857,13 @@ pub fn create_materialized_view(
 /// Refreshes a materialized view to the database current LSN.
 ///
 /// # Errors
-/// Fails when view metadata is corrupt, changefeed read fails, or state writes fail.
+/// Fails when the database uses AP replication, view metadata is corrupt, changefeed read fails,
+/// or state writes fail.
 pub fn refresh_materialized_view(
     database: &crate::db::Database,
     name: &str,
 ) -> Result<MaterializedViewRows, MaterializedViewError> {
+    ensure_view_commit_log(database)?;
     let spec = read_view_spec(database, name)?;
     let mut state = read_view_state(database, name)?;
     let token = ResumeToken::new(timeline_id(database)?, state.fresh_to_lsn);
@@ -871,6 +875,17 @@ pub fn refresh_materialized_view(
     write_view(database, &spec, &state)?;
     observability::record_materialized_view_refresh(name, state.fresh_to_lsn);
     Ok(state_to_rows(&spec, &state))
+}
+
+fn ensure_view_commit_log(database: &crate::db::Database) -> Result<(), MaterializedViewError> {
+    if database.uses_ap_replication() {
+        return Err(MaterializedViewError::Unsupported(
+            "AP replication does not support incremental materialized views: AP writes are not \
+             recorded in the commit log"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reads materialized view rows.
@@ -1910,7 +1925,7 @@ mod tests {
 
         let (again, again_token) =
             database.poll_changefeed(&token, &filter, &ChangefeedOptions::default(), 100)?;
-        assert!(again.is_empty());
+        assert!(again.is_empty(), "expected an empty value, got {again:?}");
         assert_eq!(again_token, token);
         Ok(())
     }
@@ -2117,7 +2132,7 @@ mod tests {
             },
             100,
         )?;
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "expected an empty value, got {events:?}");
         Ok(())
     }
 }

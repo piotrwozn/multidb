@@ -12,7 +12,7 @@ const MIB_U64: u64 = 1_024 * 1_024;
 const GIB_U64: u64 = 1_024 * MIB_U64;
 const TIB_U64: u64 = 1_024 * GIB_U64;
 const PLANNED_WRITE_PIPELINE: KnobEnforcement = KnobEnforcement::Planned {
-    tracking: "#11 single write pipeline",
+    tracking: "single write pipeline",
 };
 
 /// One profile knob: its value domain, when it takes effect, where the runtime reads it and
@@ -53,7 +53,8 @@ pub enum KnobTiming {
     Provisioning,
     /// A default for generated specs (guided init, templates).
     GenerationDefault,
-    /// Checked by spec validation only.
+    /// Checked by spec validation. The sink of `floors.audit` and `floors.encryption_at_rest`
+    /// also names the runtime checks of a database created with the profile.
     Validation,
 }
 
@@ -332,10 +333,12 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
             max: 1_024,
         },
         timing: KnobTiming::EveryOpen,
-        sink: "QueryExecutionConfig.parser_recursion_limit -> SQL parser limits",
+        sink: "QueryExecutionConfig.parser_recursion_limit -> SQL parser limits (DataFusion \
+               parses the SELECTs it plans again, with its own fixed limit of 50)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::Retune,
-        description: "SQL parser recursion depth.",
+        description: "SQL parser recursion depth; SELECTs that DataFusion plans stay capped at \
+                      DataFusion's own limit of 50.",
     },
     KnobDefinition {
         path: "limits.max_value_bytes",
@@ -347,7 +350,8 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         sink: "LimitPolicy.max_value_bytes (no user write path checks it yet)",
         enforcement: PLANNED_WRITE_PIPELINE,
         after_creation: ChangePolicy::Provisioning,
-        description: "Largest accepted user value; only unlimited is accepted until #11.",
+        description: "Largest accepted user value; only unlimited is accepted until the single \
+                      write pipeline lands.",
     },
     KnobDefinition {
         path: "limits.max_batch_ops",
@@ -359,7 +363,8 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         sink: "LimitPolicy.max_batch_ops (no user write path checks it yet)",
         enforcement: PLANNED_WRITE_PIPELINE,
         after_creation: ChangePolicy::Provisioning,
-        description: "Largest accepted write batch; only unlimited is accepted until #11.",
+        description: "Largest accepted write batch; only unlimited is accepted until the single \
+                      write pipeline lands.",
     },
     KnobDefinition {
         path: "history.system_versioning",
@@ -418,10 +423,15 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         path: "floors.audit",
         value_type: KnobType::Bool,
         timing: KnobTiming::Validation,
-        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR (guarantees.audit.enabled)",
+        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR (guarantees.audit.enabled); at \
+               runtime, db::create_database_with_profile refuses audit off \
+               (ProfileFloorNotMet), Database::set_audit_enabled_as keeps audit on, and restore \
+               refuses a backup with audit off unless RestoreConfig.allow_unmet_profile_floors \
+               (multidb restore --allow-unmet-floors)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::NotApplicable,
-        description: "Requires guarantees.audit.enabled; may only be raised.",
+        description: "Requires guarantees.audit.enabled, and keeps audit on in a database \
+                      created with the profile; may only be raised.",
     },
     KnobDefinition {
         path: "floors.backup",
@@ -446,10 +456,17 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         path: "floors.encryption_at_rest",
         value_type: KnobType::Bool,
         timing: KnobTiming::Validation,
-        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR (guarantees.encryption.at_rest)",
+        sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR \
+               (guarantees.encryption.at_rest); at runtime, db::create_database_with_profile \
+               refuses a database without OperationalConfig.encryption (ProfileFloorNotMet), and \
+               restore, whose target is never encrypted, refuses unless \
+               RestoreConfig.allow_unmet_profile_floors (multidb restore --allow-unmet-floors)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::NotApplicable,
-        description: "Requires guarantees.encryption.at_rest; may only be raised.",
+        description: "Requires guarantees.encryption.at_rest, and an encryption config for a \
+                      database created with the profile; covers the database file and is never \
+                      checked on backup, whose files backup encryption encrypts (by default the \
+                      database's own encryption config); may only be raised.",
     },
     KnobDefinition {
         path: "compatible_roles",
@@ -465,7 +482,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
 pub const RESERVED_KNOBS: &[ReservedKnob] = &[
     ReservedKnob {
         path: "history.mvcc_retention_millis",
-        reason: "waits for MVCC and commit-log GC (#12)",
+        reason: "waits for MVCC and commit-log GC",
     },
     ReservedKnob {
         path: "cache.ttl_millis",
@@ -713,8 +730,14 @@ mod tests {
                 "duplicate {}",
                 definition.path
             );
-            assert!(!definition.sink.trim().is_empty());
-            assert!(!definition.description.trim().is_empty());
+            assert!(
+                !definition.sink.trim().is_empty(),
+                "expected a non-empty value"
+            );
+            assert!(
+                !definition.description.trim().is_empty(),
+                "expected a non-empty value"
+            );
             let section = definition
                 .path
                 .split_once('.')
@@ -733,10 +756,26 @@ mod tests {
                 assert_eq!(definition.timing, KnobTiming::Provisioning);
                 assert_eq!(definition.enforcement, KnobEnforcement::Enforced);
             }
+            // The runtime checks these floors at creation and on restore, not only validation.
+            if matches!(
+                definition.path,
+                "floors.audit" | "floors.encryption_at_rest"
+            ) {
+                for check in [
+                    "GUARANTEE_BELOW_PROFILE_FLOOR",
+                    "db::create_database_with_profile",
+                    "RestoreConfig.allow_unmet_profile_floors",
+                ] {
+                    assert!(definition.sink.contains(check), "{}", definition.path);
+                }
+            }
         }
         for reserved in RESERVED_KNOBS {
             assert!(knob_definition(reserved.path).is_none());
-            assert!(!reserved.reason.trim().is_empty());
+            assert!(
+                !reserved.reason.trim().is_empty(),
+                "expected a non-empty value"
+            );
         }
     }
 

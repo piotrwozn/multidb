@@ -944,7 +944,11 @@ mod tests {
         let second = RuntimeAdvisor::advise_at(&repl, &current, &BTreeMap::new(), 30)?;
 
         assert_eq!(second.suppressed_recommendations, 1);
-        assert!(second.recommendations.is_empty());
+        assert!(
+            second.recommendations.is_empty(),
+            "expected an empty value, got {:?}",
+            second.recommendations
+        );
         Ok(())
     }
 

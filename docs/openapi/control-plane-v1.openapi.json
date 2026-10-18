@@ -97,7 +97,15 @@
         },
         "responses": {
           "200": { "$ref": "#/components/responses/LoginEnvelope" },
-          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Invalid JSON (`invalid_json`), or a username over 256 bytes or password over 1024 bytes (`invalid_value`)."
+          },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" },
+          "503": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Too many concurrent password checks (`auth_busy`). The response carries `Retry-After: 1` and the attempt is not counted as a failure."
+          }
         }
       }
     },
@@ -131,7 +139,15 @@
         },
         "responses": {
           "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
-          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Invalid JSON (`invalid_json`), an empty new password, or a password over 1024 bytes (`invalid_value`)."
+          },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" },
+          "503": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Too many concurrent password checks (`auth_busy`). The response carries `Retry-After: 1`."
+          }
         }
       }
     },
@@ -421,8 +437,8 @@
         "type": "object",
         "required": ["username", "password"],
         "properties": {
-          "username": { "type": "string" },
-          "password": { "type": "string", "format": "password" }
+          "username": { "type": "string", "description": "At most 256 UTF-8 bytes." },
+          "password": { "type": "string", "format": "password", "description": "At most 1024 UTF-8 bytes." }
         }
       },
       "LoginResponse": {
@@ -451,8 +467,8 @@
         "type": "object",
         "required": ["current_password", "new_password"],
         "properties": {
-          "current_password": { "type": "string", "format": "password" },
-          "new_password": { "type": "string", "format": "password" }
+          "current_password": { "type": "string", "format": "password", "description": "At most 1024 UTF-8 bytes." },
+          "new_password": { "type": "string", "format": "password", "description": "At most 1024 UTF-8 bytes." }
         }
       },
       "ErrorEnvelopeWithData": {

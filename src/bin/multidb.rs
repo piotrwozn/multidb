@@ -10,8 +10,8 @@ use serde_json::json;
 
 use multidb::{
     backup::{
-        BackupConfig, BackupError, RestoreTarget, full_backup, incremental_backup, list_backups,
-        restore_backup, verify_backup,
+        BackupConfig, BackupError, RestoreConfig, RestoreTarget, full_backup, incremental_backup,
+        list_backups, restore_backup_with_config, verify_backup,
     },
     cdc::{
         ChangefeedFilter, ChangefeedOptions, ChangefeedTarget, MaterializedViewSpec, ResumeToken,
@@ -374,7 +374,9 @@ fn run_config_apply(args: &[String]) -> Result<CliRun, CliError> {
 
 /// `config upgrade`: converts a spec to version 2 (see `upgrade_spec`) and validates it. A valid
 /// result goes to `--out`, in the format its extension names, or to stdout in the input's
-/// format. An invalid result exits 2 and is never written to `--out`.
+/// format. An invalid result exits 2 and is never written to `--out`. A result over
+/// `spec_io::MAX_SPEC_BYTES`, which multidb could not read back, exits 2 with `SPEC_TOO_LARGE`
+/// and is written nowhere, not even to stdout.
 fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
@@ -396,6 +398,19 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
             SpecFormat::Json => "json",
         };
     let content = serialize_spec(&upgraded, format)?;
+    // Re-serializing can grow a compact spec past the size limit, and with `--force` the
+    // result would replace an input that multidb can read with one it refuses.
+    if content.len() > spec_io::MAX_SPEC_BYTES {
+        let too_large = SpecIoError::TooLarge {
+            limit: spec_io::MAX_SPEC_BYTES,
+            found: u64::try_from(content.len()).unwrap_or(u64::MAX),
+        };
+        let report = too_large
+            .validation_report()
+            .ok_or_else(|| CliError::Runtime(too_large.to_string()))?;
+        let source = out_path.as_deref().map(|out_path| ("--out", out_path));
+        return spec_report_run(&report, &output, source);
+    }
     // An invalid result is not written: with `--force` it could replace a valid input.
     let written = match &out_path {
         Some(out_path) if report.valid => {
@@ -2937,12 +2952,30 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
         ),
         None => RestoreTarget::Latest,
     };
+    let allow_unmet_floors = has_flag(args, "--allow-unmet-floors");
 
-    let report = restore_backup(&backup, DbConfig::on_disk(profile, dest_db), target)?;
-    Ok(format!(
+    let report = restore_backup_with_config(
+        &backup,
+        DbConfig::on_disk(profile, &dest_db),
+        target,
+        &RestoreConfig::default().with_unmet_profile_floors_allowed(allow_unmet_floors),
+    )?;
+    let mut lines = vec![format!(
         "restored timeline={} lsn={} applied_commits={}",
         report.timeline_id, report.restored_lsn, report.applied_commits
-    ))
+    )];
+    // Without the flag, a restore that would miss a floor is refused.
+    if allow_unmet_floors
+        && let MetadataProbe::Initialized(metadata) = inspect_database_metadata(&dest_db)
+    {
+        lines.extend(
+            metadata
+                .unmet_floors
+                .iter()
+                .map(|floor| unmet_floor_warning(floor)),
+        );
+    }
+    Ok(lines.join("\n"))
 }
 
 fn run_verify(args: &[String]) -> Result<String, CliError> {
@@ -3189,9 +3222,12 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         let pg_database = Arc::clone(&database);
 
         let admin_task = tokio::spawn(async move {
-            axum::serve(admin_listener, admin_router)
-                .await
-                .map_err(CliError::Io)
+            axum::serve(
+                admin_listener,
+                admin_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(CliError::Io)
         });
         let pg_task = tokio::spawn(async move {
             PgServer::serve_shared(pg_listener, pg_database, pg_config)
@@ -3586,7 +3622,12 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     ));
                 }
                 let listener = tokio::net::TcpListener::bind(bind).await?;
-                axum::serve(listener, multidb::admin::router(state)).await?;
+                axum::serve(
+                    listener,
+                    multidb::admin::router(state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await?;
                 Ok::<(), std::io::Error>(())
             })?;
             Ok(format!("admin server stopped on {bind}"))
@@ -3646,6 +3687,22 @@ fn format_resolution(resolution: &ProfileResolution) -> Result<String, CliError>
     Ok(lines.join("\n"))
 }
 
+/// The warning `profile show --db` and `restore --allow-unmet-floors` print for a manifest floor
+/// the database does not meet (`ProbedMetadata.unmet_floors`).
+fn unmet_floor_warning(floor: &str) -> String {
+    let reason = match floor {
+        "floors.encryption_at_rest" => {
+            "the metadata is readable without a key, so this file is not encrypted at rest (a \
+             restore target never is)"
+        }
+        "floors.audit" => {
+            "audit is switched off in this database (a restore keeps the backed-up audit flag)"
+        }
+        _ => "the database does not meet it",
+    };
+    format!("warning: {floor} is not met: {reason}; see docs/profiles.md, \"Backup and restore\"")
+}
+
 /// The text form of `profile show --db`.
 fn format_metadata_probe(path: &Path, probe: &MetadataProbe) -> Result<String, CliError> {
     Ok(match probe {
@@ -3664,14 +3721,12 @@ fn format_metadata_probe(path: &Path, probe: &MetadataProbe) -> Result<String, C
                     metadata.storage_profile
                 ),
             }];
-            // The probe reports only floors.encryption_at_rest as visibly unmet.
-            lines.extend(metadata.unmet_floors.iter().map(|floor| {
-                format!(
-                    "warning: {floor} is not met: the metadata is readable without a key, so \
-                     this file is not encrypted at rest (a restore target never is; see \
-                     docs/profiles.md, \"Backup and restore\")"
-                )
-            }));
+            lines.extend(
+                metadata
+                    .unmet_floors
+                    .iter()
+                    .map(|floor| unmet_floor_warning(floor)),
+            );
             lines.join("\n")
         }
         MetadataProbe::NotFound => format!("no database at {}", path.display()),
@@ -4974,7 +5029,7 @@ fn usage() -> CliError {
          multidb advice plan --db <path> --profile <profile> --advice-id <id> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb advice reject --db <path> --profile <profile> --advice-id <id> --reason <reason> [--output text|json] [--json]\n\
          multidb backup incr --db <path> --profile <profile> --dest <dir> --parent <backup-dir>\n\
-         multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>]\n\
+         multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>] [--allow-unmet-floors]\n\
          multidb verify --backup <backup-dir>\n\
          multidb list --backup-root <dir>\n\
          multidb cdc poll --db <path> --profile <profile> [--lsn <lsn>] [--table <name>] [--include-system]\n\
@@ -5007,15 +5062,20 @@ mod tests {
         serve_database, values,
     };
     use multidb::{
+        backup::{
+            BackupConfig, BackupError, RestoreConfig, RestoreTarget, full_backup,
+            restore_backup_with_config,
+        },
         config_spec::{
             CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, DeploymentMode,
-            GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, ProfileResolution, RESERVED_KNOBS,
-            WriteAck, resolve_named_profile,
+            GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, PolicyCompiler, ProfileResolution,
+            RESERVED_KNOBS, WriteAck, resolve_named_profile,
+            spec_io::{MAX_SPEC_BYTES, SpecFormat, decode_spec_bytes},
         },
         db::{
-            ConfigError, DbConfig, MetadataProbe, OperationalConfig, Profile, ReplicationKind,
-            create_database, create_database_with_profile, inspect_database_metadata,
-            open_database,
+            ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
+            ReplicationKind, create_database, create_database_with_profile,
+            inspect_database_metadata, open_database,
         },
         tuning::WorkloadSample,
     };
@@ -6200,6 +6260,9 @@ mod tests {
     /// `serve` stops only when it is killed, so the file it leaves behind needs crash recovery.
     /// `profile show --db` still never writes it, while `--profile auto` and
     /// `MULTIDB_PROFILE=auto` recover it, as every opener would, before reading its profile.
+    /// Unix only: the crash is simulated by copying the file while the database holds it open,
+    /// and Windows refuses to read a file that redb has locked.
+    #[cfg(unix)]
     #[test]
     fn profile_auto_recovers_a_database_that_was_not_closed_cleanly()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -6375,6 +6438,112 @@ mod tests {
         Ok(())
     }
 
+    /// A restore target is never encrypted, so `restore` refuses a backup whose manifest sets
+    /// `floors.encryption_at_rest` unless `--allow-unmet-floors` is given, and then warns.
+    #[test]
+    fn restore_refuses_unmet_profile_floors_without_allow_unmet_floors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut spec = decode_spec_bytes(
+            include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+            SpecFormat::Yaml,
+        )?;
+        spec.custom_profile
+            .as_mut()
+            .ok_or("the example sets custom_profile")?
+            .floors
+            .encryption_at_rest = Some(true);
+        spec.guarantees.encryption.at_rest = true;
+        let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+        let source = temp.path().join("source.redb");
+        let binding = compiled.binding(&spec.deployment, Some(source.clone()))?;
+        let key_path = temp.path().join("key.bin");
+        std::fs::write(&key_path, [3_u8; 32])?;
+        let encryption = EncryptionConfig::file_key(&key_path);
+        let database = create_database_with_profile(
+            &binding,
+            OperationalConfig::new().with_encryption(encryption.clone()),
+        )?;
+        let encrypted_backup = full_backup(
+            &database,
+            temp.path().join("encrypted-backups"),
+            &BackupConfig::default(),
+        )?;
+        drop(database);
+        // The library restore with the opt-in gives an unencrypted database whose manifest
+        // still sets the floor; the CLI backs it up without encryption.
+        let restored = temp.path().join("restored.redb");
+        restore_backup_with_config(
+            &encrypted_backup.path,
+            DbConfig::on_disk(Profile::HighDurability, &restored),
+            RestoreTarget::Latest,
+            &RestoreConfig::default()
+                .with_encryption(encryption)
+                .with_unmet_profile_floors_allowed(true),
+        )?;
+        let backup = run(strings(&[
+            "backup",
+            "full",
+            "--db",
+            &path_arg(&restored),
+            "--profile",
+            "auto",
+            "--dest",
+            &path_arg(&temp.path().join("backups")),
+        ]))?;
+        assert_eq!(backup.exit_code, 0, "{}", backup.message);
+        let backup_dir = backup
+            .message
+            .split("path=")
+            .nth(1)
+            .ok_or("missing backup path")?
+            .trim()
+            .to_owned();
+
+        let target = temp.path().join("target.redb");
+        let restore_args = [
+            "restore",
+            "--backup",
+            &backup_dir,
+            "--dest-db",
+            &path_arg(&target),
+            "--profile",
+            "high_durability",
+        ];
+        let refused = run(strings(&restore_args));
+        assert!(
+            matches!(
+                &refused,
+                Err(CliError::Backup(BackupError::ProfileFloorsNotMet { floors }))
+                    if floors == &["floors.encryption_at_rest"]
+            ),
+            "unexpected result: {refused:?}"
+        );
+        assert!(!target.exists(), "a refused restore creates nothing");
+
+        let mut allowed_args = restore_args.to_vec();
+        allowed_args.push("--allow-unmet-floors");
+        let allowed = run(strings(&allowed_args))?;
+        assert_eq!(allowed.exit_code, 0, "{}", allowed.message);
+        assert!(
+            allowed.message.starts_with("restored timeline=")
+                && allowed
+                    .message
+                    .contains("\nwarning: floors.encryption_at_rest is not met"),
+            "{}",
+            allowed.message
+        );
+        let shown = run(strings(&["profile", "show", "--db", &path_arg(&target)]))?;
+        assert!(
+            shown
+                .message
+                .contains("\nwarning: floors.encryption_at_rest is not met"),
+            "{}",
+            shown.message
+        );
+        Ok(())
+    }
+
     #[test]
     fn serve_config_accepts_product_slugs_aliases_and_auto()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -6468,7 +6637,7 @@ mod tests {
         assert_eq!(commit["timing"], "creation");
         assert_eq!(
             knob_row(&report, "limits.max_value_bytes")?["enforcement"]["planned"]["tracking"],
-            "#11 single write pipeline"
+            "single write pipeline"
         );
 
         let text = run(strings(&["profile", "show", "high_durability"]))?;
@@ -6653,16 +6822,17 @@ mod tests {
         assert!(text.message.contains("HighDurability"), "{}", text.message);
         assert_eq!(report["unmet_floors"], json!([]));
         assert!(!text.message.contains("warning:"), "{}", text.message);
-        // A floor the probe sees unmet (a restore target of a floors.encryption_at_rest
-        // database, covered in the db tests) is printed as a warning.
+        // Every floor the probe sees unmet (a restore that was allowed to miss a floor, covered
+        // in the backup tests) is printed as a warning.
         let MetadataProbe::Initialized(mut probed) = inspect_database_metadata(&manifest_path)
         else {
             return Err("the manifest database is not initialized".into());
         };
-        probed.unmet_floors = vec!["floors.encryption_at_rest"];
+        probed.unmet_floors = vec!["floors.audit", "floors.encryption_at_rest"];
         let warned = format_metadata_probe(&manifest_path, &MetadataProbe::Initialized(probed))?;
         assert!(
-            warned.contains("\nwarning: floors.encryption_at_rest is not met"),
+            warned.contains("\nwarning: floors.audit is not met: audit is switched off")
+                && warned.contains("\nwarning: floors.encryption_at_rest is not met"),
             "{warned}"
         );
         assert_eq!(
@@ -6979,6 +7149,47 @@ mod tests {
         Ok(())
     }
 
+    /// Pretty-printing can grow a compact spec past `MAX_SPEC_BYTES`. Such a result is written
+    /// nowhere, so `--force` never replaces an input multidb reads with one it refuses.
+    #[test]
+    fn config_upgrade_refuses_results_over_the_spec_size_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("compact.json");
+        let mut spec = studio_style_spec();
+        spec.operation_hints
+            .extend((0..70_000).map(|index| (format!("h{index}"), String::new())));
+        let compact = serde_json::to_string(&spec)?;
+        assert!(compact.len() < MAX_SPEC_BYTES, "{}", compact.len());
+        assert!(serde_json::to_string_pretty(&spec)?.len() > MAX_SPEC_BYTES);
+        std::fs::write(&input, &compact)?;
+        let out = temp.path().join("upgraded.json");
+        let (input_arg, out_arg) = (path_arg(&input), path_arg(&out));
+
+        for extra in [
+            vec![],
+            vec!["--json"],
+            vec!["--out", out_arg.as_str()],
+            vec!["--out", out_arg.as_str(), "--json"],
+            vec!["--out", input_arg.as_str(), "--force"],
+        ] {
+            let mut args = vec!["config", "upgrade", "--spec", input_arg.as_str()];
+            args.extend(extra);
+            let outcome = run(strings(&args))?;
+            assert_eq!(outcome.exit_code, 2, "{args:?}: {}", outcome.message);
+            assert!(
+                outcome.message.contains("SPEC_TOO_LARGE")
+                    && !outcome.message.contains("operation_hints"),
+                "{args:?}: {}",
+                outcome.message
+            );
+        }
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(&input)?, compact);
+        assert_eq!(upgrade_temp_files(temp.path())?, Vec::<String>::new());
+        Ok(())
+    }
+
     /// The names of `config upgrade` temporary files left in `dir`.
     fn upgrade_temp_files(dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
         let mut names = Vec::new();
@@ -7082,16 +7293,15 @@ mod tests {
             ],
         ] {
             let outcome = run(strings(&args));
-            match outcome {
-                Err(CliError::Io(error)) => {
-                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{args:?}");
-                    assert_eq!(
-                        CliError::Io(error).to_string(),
-                        "io: stream did not contain valid UTF-8"
-                    );
-                }
-                other => panic!("{args:?}: expected an I/O error, got {other:?}"),
-            }
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(error @ CliError::Io(io))
+                        if io.kind() == std::io::ErrorKind::InvalidData
+                            && error.to_string() == "io: stream did not contain valid UTF-8"
+                ),
+                "{args:?}: unexpected result: {outcome:?}"
+            );
         }
         Ok(())
     }

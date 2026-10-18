@@ -10,11 +10,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ConfigError, Database, DbConfig, KEY_LAYOUT, KEY_PROFILE, KEY_PROFILE_MANIFEST,
-    KEY_REPLICATION, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME, META_TABLE, OperationalConfig,
-    Profile, ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED, decode_metadata, engine_for,
-    engine_for_operational, layout_for, read_catalog, read_metadata, validate,
-    validate_operational, write_json, write_metadata, write_security_to_repl,
+    AUTHZ_TABLE, ConfigError, Database, DbConfig, KEY_AUDIT_ENABLED, KEY_LAYOUT, KEY_PROFILE,
+    KEY_PROFILE_MANIFEST, KEY_REPLICATION, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME, META_TABLE,
+    OperationalConfig, Profile, ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED,
+    decode_meta_value, decode_metadata, engine_for, engine_for_operational, layout_for,
+    read_catalog, read_metadata, validate, validate_operational, write_json, write_metadata,
+    write_security_to_repl,
 };
 use crate::config_spec::{
     CompiledPolicy, CompressionKnob, DeploymentMode, DeploymentSpec, GuaranteeFloors, ProfileKnobs,
@@ -24,8 +25,8 @@ use crate::config_spec::{
 use crate::performance::{CompressionConfig, PerformanceConfig};
 use crate::query::TableLayout;
 use crate::storage::{
-    AnyEngine, ExistingRedbOpen, ReadTransaction, RedbEngine, RedbReadOnly, StorageEngine,
-    StorageError, WriteTransaction,
+    AnyEngine, Bytes, EngineKind, ExistingRedbOpen, ReadTransaction, RedbEngine, RedbReadOnly,
+    StorageEngine, StorageError, WriteTransaction,
 };
 
 /// The only `PersistedProfileManifest.manifest_version` this build reads and writes.
@@ -111,10 +112,11 @@ pub struct ProbedMetadata {
     pub manifest: Option<PersistedProfileManifest>,
     /// `__meta` values are compression-framed.
     pub values_framed: bool,
-    /// Manifest floors the file visibly does not meet. The probe reads `__meta` without a key,
-    /// and an encrypted engine encrypts `__meta` too, so a readable manifest that sets
-    /// `floors.encryption_at_rest` belongs to an unencrypted file, such as a restore target
-    /// (docs/profiles.md, "Backup and restore"). Empty without a manifest.
+    /// Manifest floors the file visibly does not meet, in registry order. The probe reads
+    /// `__meta` without a key, and an encrypted engine encrypts `__meta` too, so a readable
+    /// manifest that sets `floors.encryption_at_rest` belongs to an unencrypted file, such as a
+    /// restore that was allowed to miss the floor (docs/profiles.md, "Backup and restore");
+    /// `floors.audit` is listed when the stored audit flag is off. Empty without a manifest.
     pub unmet_floors: Vec<&'static str>,
 }
 
@@ -293,6 +295,66 @@ fn check_profile_floors(
     Ok(())
 }
 
+/// The manifest floors a database does not meet, in registry order: `floors.audit` when audit
+/// is off, and `floors.encryption_at_rest` when its values are not encrypted at rest. `backup`
+/// and `pitr` are operator-managed, so no database state meets or misses them.
+pub(crate) fn unmet_profile_floors(
+    floors: GuaranteeFloors,
+    audit_enabled: bool,
+    encrypted_at_rest: bool,
+) -> Vec<&'static str> {
+    [
+        (floors.audit && !audit_enabled, "floors.audit"),
+        (
+            floors.encryption_at_rest && !encrypted_at_rest,
+            "floors.encryption_at_rest",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(unmet, floor)| unmet.then_some(floor))
+    .collect()
+}
+
+/// Logs a warning for every floor of `manifest` that the database a single-node opener just
+/// opened does not meet: its engine does not encrypt values, such as a restore that was allowed
+/// to miss `floors.encryption_at_rest`, or audit is off. Opening still succeeds; `profile show
+/// --db` lists the same floors (`ProbedMetadata.unmet_floors`).
+pub(crate) fn warn_unmet_profile_floors(
+    manifest: Option<&PersistedProfileManifest>,
+    database: &Database,
+) {
+    let Some(manifest) = manifest else {
+        return;
+    };
+    let encrypted_at_rest = matches!(
+        database.engine_kind(),
+        EngineKind::EncryptedMemory
+            | EngineKind::EncryptedRedb
+            | EngineKind::CompressedEncryptedMemory
+            | EngineKind::CompressedEncryptedRedb
+    );
+    for floor in unmet_profile_floors(
+        manifest.knobs.floors,
+        database.audit_enabled(),
+        encrypted_at_rest,
+    ) {
+        tracing::warn!(
+            profile = %manifest.profile,
+            floor,
+            "the database does not meet profile floor {floor} of its manifest; see \
+             docs/profiles.md, \"Backup and restore\""
+        );
+    }
+}
+
+/// Reads a stored `__authz_policy.audit_enabled` flag, which every opener reads as on when it
+/// is missing.
+fn stored_audit_enabled(raw: Option<Bytes>) -> Result<bool, ConfigError> {
+    raw.map_or(Ok(true), |raw| {
+        decode_meta_value(&raw, "__authz_policy.audit_enabled", &mut false)
+    })
+}
+
 /// Creates the empty target database of a restore, framed the way the backed-up profile
 /// manifest says.
 ///
@@ -302,8 +364,9 @@ fn check_profile_floors(
 /// transaction. Without one, it is what `create_database` creates on an empty target. The
 /// restored `__meta` records overwrite this metadata afterwards. Unlike
 /// `create_database_with_profile`, it does not check the manifest floors: like every restore
-/// target, the engine is not encrypted, also when the manifest sets `floors.encryption_at_rest`
-/// (docs/profiles.md, "Backup and restore").
+/// target, the engine is not encrypted, also when the manifest sets `floors.encryption_at_rest`,
+/// so restore checks the floors before it calls this and refuses unless the caller allows
+/// unmet floors (docs/profiles.md, "Backup and restore").
 /// # Errors
 /// Fails with `ProfileManifestInvalid` when the manifest does not describe `config.profile`,
 /// with `AlreadyInitialized` when the target already holds database metadata, and as
@@ -345,9 +408,10 @@ pub(crate) fn create_restore_target(
 /// A missing path is `NotFound`, a path that is not a regular file (a directory, for example)
 /// `Unreadable` and an empty file `Uninitialized`, all without opening it.
 /// Otherwise the existing redb file is opened read-only (`redb::ReadOnlyDatabase`, a shared
-/// lock and no write access), `__meta` is read through the frame-tolerant reader and the handle
-/// is dropped before returning. A file that was not closed cleanly is `NeedsRecovery`: redb
-/// recovers it only on a read-write open, which the probe never does.
+/// lock and no write access), `__meta` is read through the frame-tolerant reader, as is the
+/// stored audit flag when the manifest sets `floors.audit`, and the handle is dropped before
+/// returning. A file that was not closed cleanly is `NeedsRecovery`: redb recovers it only on a
+/// read-write open, which the probe never does.
 #[must_use]
 pub fn inspect_database_metadata(path: &Path) -> MetadataProbe {
     let length = match std::fs::metadata(path) {
@@ -382,26 +446,30 @@ pub fn inspect_database_metadata(path: &Path) -> MetadataProbe {
     let read = database
         .begin_read()
         .map_err(ConfigError::from)
-        .and_then(|txn| decode_metadata(|key| Ok(txn.get(META_TABLE, key)?)));
+        .and_then(|txn| {
+            let read = decode_metadata(|key| Ok(txn.get(META_TABLE, key)?))?;
+            let unmet_floors = match &read.manifest {
+                // `__meta` was read without a key, so the file is not encrypted at rest.
+                Some(manifest) => unmet_profile_floors(
+                    manifest.knobs.floors,
+                    !manifest.knobs.floors.audit
+                        || stored_audit_enabled(txn.get(AUTHZ_TABLE, KEY_AUDIT_ENABLED)?)?,
+                    false,
+                ),
+                None => Vec::new(),
+            };
+            Ok((read, unmet_floors))
+        });
     let probe = match read {
-        Ok(read) => {
-            // `__meta` was read without a key, so the file is not encrypted at rest.
-            let unmet_floors = read
-                .manifest
-                .as_ref()
-                .filter(|manifest| manifest.knobs.floors.encryption_at_rest)
-                .map(|_| vec!["floors.encryption_at_rest"])
-                .unwrap_or_default();
-            MetadataProbe::Initialized(Box::new(ProbedMetadata {
-                schema_version: read.metadata.schema_version,
-                storage_profile: read.metadata.profile,
-                replication: read.metadata.replication,
-                layout: read.metadata.layout,
-                manifest: read.manifest,
-                values_framed: read.values_framed,
-                unmet_floors,
-            }))
-        }
+        Ok((read, unmet_floors)) => MetadataProbe::Initialized(Box::new(ProbedMetadata {
+            schema_version: read.metadata.schema_version,
+            storage_profile: read.metadata.profile,
+            replication: read.metadata.replication,
+            layout: read.metadata.layout,
+            manifest: read.manifest,
+            values_framed: read.values_framed,
+            unmet_floors,
+        })),
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             MetadataProbe::Uninitialized
         }
