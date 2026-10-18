@@ -143,6 +143,27 @@ const ADMIN_AUTH_TABLE: &str = "__admin_auth";
 /// The system table of spec provisioning: the provision record (key `record`) and its history
 /// (keys `history/{seq:020}`). Backup and restore carry it like every registered keyspace.
 pub(crate) const PROVISION_TABLE: &str = "__provision";
+/// The characters of a config apply plan id its audit detail keeps; real `plan_` ids have 37.
+const CONFIG_APPLY_DETAIL_PLAN_ID_CHARS: usize = 48;
+
+/// Where the plan a config apply confirms comes from, recorded as `plan_source` in its audit
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigPlanSource {
+    /// The caller sent the plan: `POST /config/apply` with `plan`, or the Rust API.
+    Client,
+    /// The Control Plane recomputed the plan from the `current` and `desired` specs it was sent.
+    Recomputed,
+}
+
+impl ConfigPlanSource {
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Recomputed => "recomputed",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Profile {
@@ -1309,7 +1330,8 @@ impl Database {
     /// Confirms a configuration apply plan after checking system admin permission.
     ///
     /// This is an audited control-plane confirmation only. It never mutates user
-    /// data, catalog state, indexes, extensions, or runtime configuration.
+    /// data, catalog state, indexes, extensions, or runtime configuration. The audit
+    /// event records `plan_source: client`: the caller supplied the plan.
     /// # Errors
     /// Fails when authorization fails, audit is disabled, or the audit write fails.
     pub fn confirm_config_apply_as(
@@ -1317,6 +1339,20 @@ impl Database {
         principal: &Principal,
         plan: &MigrationPlan,
         confirm: &str,
+    ) -> Result<ApplyCheckReport, DbError> {
+        self.confirm_config_apply_with_source_as(principal, plan, confirm, ConfigPlanSource::Client)
+    }
+
+    /// [`Database::confirm_config_apply_as`], recording where the plan comes from: a plan the
+    /// client sent, or one the Control Plane recomputed from `current` and `desired` specs.
+    /// # Errors
+    /// Fails when authorization fails, audit is disabled, or the audit write fails.
+    pub(crate) fn confirm_config_apply_with_source_as(
+        &self,
+        principal: &Principal,
+        plan: &MigrationPlan,
+        confirm: &str,
+        source: ConfigPlanSource,
     ) -> Result<ApplyCheckReport, DbError> {
         self.authorize_or_audit(
             principal,
@@ -1336,9 +1372,19 @@ impl Database {
         } else {
             AuditOutcome::Failed
         };
+        // A client plan id is not checked, so only its start is recorded: the detail is cut at
+        // 160 characters, and `plan_source` must survive a forged, overlong id.
+        let plan_id = report
+            .plan_id
+            .chars()
+            .take(CONFIG_APPLY_DETAIL_PLAN_ID_CHARS)
+            .collect::<String>();
         let detail = format!(
-            "plan_id: {}; status: {:?}; confirmation_matched: {}; data_mutated: false",
-            report.plan_id, report.status, report.confirmation_matched
+            "plan_id: {plan_id}; status: {:?}; confirmation_matched: {}; data_mutated: false; \
+             plan_source: {}",
+            report.status,
+            report.confirmation_matched,
+            source.slug()
         );
         self.record_audit(&AuditEvent::new(
             Some(principal),

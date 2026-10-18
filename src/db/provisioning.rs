@@ -332,6 +332,19 @@ impl Database {
         )
     }
 
+    /// Checks that `principal` may read provisioning plans, drift, state or the live spec:
+    /// `System:Admin`, audited as `action` when denied. A plan shows the live catalog, RBAC and
+    /// guarantees, so it needs the permission the security endpoints need.
+    /// # Errors
+    /// Fails with `AuthzDenied` when the permission is missing.
+    pub(crate) fn authorize_provision_read(
+        &self,
+        principal: &Principal,
+        action: &str,
+    ) -> Result<(), DbError> {
+        self.authorize_or_audit(principal, &Resource::System, Permission::Admin, action)
+    }
+
     /// Creates a document collection with the next available collection id after checking
     /// `Admin` on the database, audited like [`Database::create_collection_as`]. Returns the
     /// allocated id.

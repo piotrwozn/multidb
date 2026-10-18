@@ -50,6 +50,54 @@ class ClientTests(unittest.TestCase):
             client.status()
         self.assertEqual(raised.exception.code, "invalid_envelope")
 
+    def test_provisioning_methods_send_documented_paths_and_bodies(self) -> None:
+        calls = []
+
+        def transport(method, url, headers, body):
+            calls.append((method, url, None if body is None else json.loads(body.decode())))
+            return 200, {}, json.dumps({"ok": True, "data": {}}).encode()
+
+        client = ControlPlaneClient(base_url="http://unit.test/api", token="secret", transport=transport)
+        spec = {"version": 2, "name": "shop"}
+        options = {"allow_destructive": ["collections.orders"]}
+        client.provision_state()
+        client.provision_plan(spec)
+        client.provision_apply(spec, "prov_0123", options)
+        client.provision_drift(spec, {"unmanaged": "fail"})
+        client.live_config()
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "http://unit.test/api/provision/state", None),
+                ("POST", "http://unit.test/api/provision/plan", {"spec": spec}),
+                (
+                    "POST",
+                    "http://unit.test/api/provision/apply",
+                    {"spec": spec, "options": options, "confirm": "prov_0123"},
+                ),
+                (
+                    "POST",
+                    "http://unit.test/api/provision/drift",
+                    {"spec": spec, "options": {"unmanaged": "fail"}},
+                ),
+                ("GET", "http://unit.test/api/config/live", None),
+            ],
+        )
+
+    def test_blocked_provision_plan_keeps_the_plan_in_the_error(self) -> None:
+        plan = {"plan_id": "prov_0123", "outcome": "blocked"}
+
+        def transport(method, url, headers, body):
+            payload = {"ok": False, "error": {"code": "provision_blocked", "message": "blocked"}, "data": plan}
+            return 422, {}, json.dumps(payload).encode()
+
+        client = ControlPlaneClient(transport=transport)
+        with self.assertRaises(ControlPlaneError) as raised:
+            client.provision_plan({"version": 2})
+        self.assertEqual(raised.exception.status, 422)
+        self.assertEqual(raised.exception.code, "provision_blocked")
+        self.assertEqual(raised.exception.body["data"], plan)
+
 
 if __name__ == "__main__":
     unittest.main()

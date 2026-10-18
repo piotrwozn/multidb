@@ -72,7 +72,12 @@ document index path, a vector dimension), so their plan is blocked with
 `multidb serve` starts from a spec too: with `MULTIDB_SPEC_PATH` it checks the
 database against the spec at every start, refuses to start when they differ
 (`MULTIDB_SPEC_APPLY=verify`, the default) and creates or extends it with
-`create` or `additive` (see [docker.md](docker.md#spec-mode)).
+`create` or `additive` (see [docker.md](docker.md#spec-mode)). A running server
+provisions the database it serves through the preview Control Plane endpoints
+`POST /provision/plan`, `POST /provision/apply` (confirmed with the plan's
+`prov_` id), `POST /provision/drift`, `GET /provision/state` and
+`GET /config/live`, which the SDKs wrap (see
+[provisioning.md](provisioning.md#control-plane)).
 
 For a repository smoke test, run:
 
@@ -197,8 +202,9 @@ Consistency status:
 - The local/process CP smoke contract is covered; the preview still does not
   claim Kubernetes automation, multi-region placement or enterprise SLA.
 - `config apply --plan` is confirm/audit-only and does not perform physical
-  data migrations. Provisioning (`config apply --spec`, `init --apply`) is a
-  preview for embedded and single-node CP databases: it creates and adopts
+  data migrations. Provisioning (`config apply --spec`, `init --apply`,
+  `multidb serve` spec mode and the `/provision/*` Control Plane endpoints) is
+  a preview for embedded and single-node CP databases: it creates and adopts
   objects, roles and the profile, never drops or alters them, and refuses
   encryption at rest outside the Rust API.
 - Studio v1 is read-only plus validation, catalog, advice and migration dry-run.

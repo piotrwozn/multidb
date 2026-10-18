@@ -103,7 +103,9 @@ multidb config export --db .\shop.redb --out .\exported.yaml
 ```
 
 See `docs/provisioning.md` for the spec fields, the plan, the flags and the
-exit codes.
+exit codes. A running `multidb serve` provisions the database it serves
+through the preview Control Plane endpoints `/provision/plan`,
+`/provision/apply`, `/provision/drift`, `/provision/state` and `/config/live`.
 
 Checked-in examples are under `examples/`, with SDK examples under
 `examples/sdk/`.
@@ -143,12 +145,14 @@ Release-sensitive gate:
   SLA.
 - `config apply --plan` (the version 1 migration plan) stays
   confirmation/audit-only. Provisioning (`config plan|apply --spec`,
-  `init --apply`) is a preview for embedded and single-node CP databases: it
+  `init --apply`, `multidb serve` spec mode and `POST /provision/apply`) is a
+  preview for embedded and single-node CP databases: it
   creates and adopts objects, roles and the profile, but never drops or alters
   an object, switches a profile or storage class, or re-encrypts; encryption
   at rest is provisioned through the Rust API only, so a spec with
-  `encryption.at_rest: true` is blocked on the CLI and refused by `multidb
-  serve` in spec mode (`MULTIDB_SPEC_PATH`, see `docs/docker.md`).
+  `encryption.at_rest: true` is blocked on the CLI and the Control Plane and
+  refused by `multidb serve` in spec mode (`MULTIDB_SPEC_PATH`, see
+  `docs/docker.md`).
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
   migration dry-run workflows.
 - Full PostgreSQL compatibility, Mongo wire protocol, public extension

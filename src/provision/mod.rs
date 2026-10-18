@@ -9,8 +9,9 @@
 //!   and format-upgrade steps need, how each guarantee is enforced on the calling surface, the
 //!   drift of the live database and a `prov_` id that changes whenever the spec, the live state,
 //!   the options, the surface, the target or the binary changes.
-//! - [`drift`] reports how a live database differs from a spec, and [`export_spec`] describes a
-//!   live database as a spec.
+//! - [`drift`] reports how a live database differs from a spec, [`export_spec`] describes a
+//!   live database as a spec, and [`live_fingerprint`] is the fingerprint of the live state a
+//!   plan was computed from.
 //! - [`apply_provision`] applies a confirmed plan to an open database, and
 //!   [`provision_new_database`] creates a database from a spec at an absent target. Audit comes
 //!   first, progress is journaled in the provision record after every step, and applying again
@@ -42,6 +43,7 @@ pub use execute::{
 pub(crate) use execute::{fail_provision_step_for_tests, perturb_new_database_for_tests};
 pub use export::{ExportSource, ExportedSpec, export_spec};
 pub use guarantees::{EnforcementStatus, GuaranteeEnforcement};
+pub use live::live_fingerprint;
 pub use plan::{
     DriftItem, DriftKind, DriftReport, DriftResolution, FieldDiff, ObjectState, PLAN_FORMAT,
     PlanOutcome, PlannedObject, PlannedTarget, ProvisionEnvironment, ProvisionOptions,

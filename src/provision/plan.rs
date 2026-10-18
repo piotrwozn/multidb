@@ -775,10 +775,22 @@ impl PlanBuilder<'_> {
     }
 
     /// Volatile (in-memory) profiles are built on the Rust API only, at a `Volatile` target;
-    /// durable ones need a path.
+    /// durable ones need a path. The Control Plane provisions the database it serves, so a spec
+    /// `storage_path` is only advice there.
     fn check_medium(&mut self, resolved: &ResolvedProfile) {
         let volatile = resolved.knobs.storage.medium == StorageMedium::Volatile;
         let surface = self.env.surface;
+        if surface == ProvisionSurface::ControlPlane && self.spec.deployment.storage_path.is_some()
+        {
+            self.issues.push(issue(
+                "PROVISION_STORAGE_PATH_IGNORED",
+                ValidationSeverity::Advice,
+                "deployment.storage_path",
+                "the Control Plane provisions the database it serves and never opens a path \
+                 from a request, so deployment.storage_path is not used",
+                "Keep deployment.storage_path for the CLI and multidb serve, or remove it.",
+            ));
+        }
         let new_path = match &self.target {
             Target::New { path } => Some(path.is_some()),
             Target::Existing { .. } => None,

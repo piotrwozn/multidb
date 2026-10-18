@@ -30,6 +30,7 @@ use multidb::{
         built_in_profile_normalized, built_in_profiles, collection_role_definition,
         collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
         parse_knob_assignment, profile_variants, resolve_named_profile, resolve_profile,
+        spec_digest,
         spec_io::{self, SpecFormat, SpecIoError},
         suggest_profile_name,
     },
@@ -2991,13 +2992,16 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     }
 
     let config = serve_config_from_env()?;
-    let database = serve_database(&config)?;
+    let (database, spec_mode) = serve_database_with_spec_mode(&config)?;
     let database = Arc::new(tokio::sync::Mutex::new(database));
 
     let mut admin_state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
         .with_admin_session_ttl_seconds(config.admin_session_ttl_seconds)
         .with_admin_login_rate_limit(config.admin_login_rate_limit)
         .with_studio_assets_dir(config.studio_dir.clone());
+    if let Some(spec_mode) = spec_mode {
+        admin_state = admin_state.with_spec_mode(spec_mode.spec_digest, spec_mode.apply_mode);
+    }
     if let Some(token) = &config.admin_token {
         admin_state = admin_state.with_admin_token(token.clone());
     }
@@ -3059,12 +3063,26 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     Ok("serve stopped".to_owned())
 }
 
+/// [`serve_database_with_spec_mode`] without the spec mode.
+#[cfg(test)]
+fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliError> {
+    serve_database_with_spec_mode(config).map(|(database, _)| database)
+}
+
 /// Creates or opens the single-node CP database `serve` runs on. With `MULTIDB_PROFILE=auto`
 /// the database must already exist (see `cli_db_config`). In spec mode the spec decides, see
-/// `serve_spec_database`.
-fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliError> {
+/// `serve_spec_database`, and the spec digest and `MULTIDB_SPEC_APPLY` mode are returned for
+/// `GET /provision/state`.
+fn serve_database_with_spec_mode(
+    config: &ServeConfig,
+) -> Result<(multidb::db::Database, Option<multidb::admin::ServeSpecMode>), CliError> {
     if let Some(serve_spec) = &config.spec {
-        return serve_spec_database(config, serve_spec);
+        let (database, spec_digest) = serve_spec_database(config, serve_spec)?;
+        let spec_mode = multidb::admin::ServeSpecMode {
+            spec_digest,
+            apply_mode: serve_spec.mode,
+        };
+        return Ok((database, Some(spec_mode)));
     }
     // Resolved first, so `auto` on a missing path fails before any directory is created.
     let db_config = cli_db_config(config.profile, config.db_path.clone())?;
@@ -3073,7 +3091,7 @@ fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliErro
     {
         std::fs::create_dir_all(parent)?;
     }
-    Ok(create_database(db_config)?)
+    Ok((create_database(db_config)?, None))
 }
 
 /// `serve` in spec mode (`MULTIDB_SPEC_PATH`). The spec is read through `spec_io`, validated
@@ -3085,11 +3103,12 @@ fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliErro
 /// serve surface then starts, applies an auto-approvable plan as `local:serve` when
 /// `MULTIDB_SPEC_APPLY` allows it, or refuses: a refusal prints the plan and the exact `multidb
 /// config apply ... --confirm prov_...` command that confirms it, or the `config plan` command
-/// that reviews a blocked plan. Every refusal comes before any port is bound.
+/// that reviews a blocked plan. Every refusal comes before any port is bound. Returns the
+/// database and the `spec_digest` of the spec it started from.
 fn serve_spec_database(
     config: &ServeConfig,
     serve_spec: &ServeSpecConfig,
-) -> Result<multidb::db::Database, CliError> {
+) -> Result<(multidb::db::Database, String), CliError> {
     let spec = match read_spec_file(&serve_spec.path) {
         Ok(Ok(spec)) => spec,
         Ok(Err(report)) => {
@@ -3141,7 +3160,7 @@ fn serve_spec_database(
                 "{}",
                 format_startup_report(serve_spec, &db_path, &report, &notes)
             );
-            Ok(database)
+            Ok((database, spec_digest(&spec)))
         }
         Err(ProvisionError::StartupRefused(refusal)) => Err(serve_refusal(
             serve_spec,
@@ -8430,6 +8449,42 @@ mod tests {
         )?;
         drop(serve_database(&explicit)?);
         assert!(other.exists());
+        Ok(())
+    }
+
+    /// In spec mode serve hands the spec digest and the apply mode to the Control Plane, which
+    /// reports them in `GET /provision/state`; without a spec there is no spec mode.
+    #[test]
+    fn serve_spec_mode_reports_the_spec_digest_and_mode() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let orders = provision_spec(&json!([document_collection("orders")]))?;
+        write_yaml_spec(&spec_path, &orders)?;
+        let config = spec_serve_config(&spec_path, &[("MULTIDB_SPEC_APPLY", "create")])?;
+        let (database, spec_mode) = super::serve_database_with_spec_mode(&config)?;
+        drop(database);
+        let spec_mode = spec_mode.ok_or("spec mode reports the spec")?;
+        assert_eq!(
+            spec_mode.spec_digest,
+            multidb::config_spec::spec_digest(&orders)
+        );
+        assert_eq!(
+            spec_mode.apply_mode,
+            multidb::provision::StartupMode::Create
+        );
+
+        let plain_path = temp.path().join("plain.redb");
+        let env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+            ("MULTIDB_DB_PATH", &path_arg(&plain_path)),
+        ]);
+        let plain = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let (database, spec_mode) = super::serve_database_with_spec_mode(&plain)?;
+        drop(database);
+        assert_eq!(spec_mode, None);
         Ok(())
     }
 }

@@ -263,6 +263,43 @@ func (client *Client) Apply(ctx context.Context, plan JSONObject, confirm string
 	return request[JSONObject](client, ctx, http.MethodPost, "/config/apply", JSONObject{"plan": plan, "confirm": confirm}, true)
 }
 
+// ProvisionState returns what provisioning manages in the served database (preview).
+func (client *Client) ProvisionState(ctx context.Context) (JSONObject, error) {
+	return request[JSONObject](client, ctx, http.MethodGet, "/provision/state", nil, true)
+}
+
+// ProvisionPlan plans spec against the served database (preview, a dry run). A blocked plan
+// is HTTP 422: the returned APIError carries the plan in Body. options may be nil.
+func (client *Client) ProvisionPlan(ctx context.Context, spec, options JSONObject) (JSONObject, error) {
+	return request[JSONObject](client, ctx, http.MethodPost, "/provision/plan", provisionBody(spec, options), true)
+}
+
+// ProvisionApply applies spec when confirm is the prov_ id of its current plan (preview). The
+// server recomputes the plan; pass the options the plan was computed with (or nil).
+func (client *Client) ProvisionApply(ctx context.Context, spec JSONObject, confirm string, options JSONObject) (JSONObject, error) {
+	body := provisionBody(spec, options)
+	body["confirm"] = confirm
+	return request[JSONObject](client, ctx, http.MethodPost, "/provision/apply", body, true)
+}
+
+// ProvisionDrift reports how the served database differs from spec (preview). options may be nil.
+func (client *Client) ProvisionDrift(ctx context.Context, spec, options JSONObject) (JSONObject, error) {
+	return request[JSONObject](client, ctx, http.MethodPost, "/provision/drift", provisionBody(spec, options), true)
+}
+
+// LiveConfig returns the served database described as a spec (preview).
+func (client *Client) LiveConfig(ctx context.Context) (JSONObject, error) {
+	return request[JSONObject](client, ctx, http.MethodGet, "/config/live", nil, true)
+}
+
+func provisionBody(spec, options JSONObject) JSONObject {
+	body := JSONObject{"spec": spec}
+	if options != nil {
+		body["options"] = options
+	}
+	return body
+}
+
 func (client *Client) Profiles(ctx context.Context) ([]any, error) {
 	return request[[]any](client, ctx, http.MethodGet, "/profiles", nil, true)
 }

@@ -11,9 +11,10 @@ provision_new_database}`, see [Applying plans](#applying-plans)) and the CLI
 commands `config plan|apply|drift --spec`, `config status`, `config export`
 and `init --apply` (see [CLI](#cli)), and starting from a spec: `multidb
 serve` in spec mode and `multidb::provision::open_from_spec` for embedded
-apps (see [Serve](#serve)). The Control Plane entry points come in a later
-change; until then the Control Plane never creates or changes a database from
-a spec. `config apply --plan` stays audit-only.
+apps (see [Serve](#serve)), and the Control Plane endpoints `/provision/*` and
+`GET /config/live`, which plan, apply and check the database a running server
+serves (see [Control Plane](#control-plane)). `config apply --plan` and
+`POST /config/apply` stay audit-only.
 
 ## Spec version 2 provisioning fields
 
@@ -662,9 +663,11 @@ converted version 1 spec says what to add before `config apply --spec`.
 ### Troubleshooting
 
 - **"database is in use (is multidb serve running?)"** (exit 1): another
-  process, usually `multidb serve`, holds the redb lock. Stop it, then plan
-  and apply with the CLI; in spec mode, `MULTIDB_SPEC_APPLY=additive` applies
-  additive changes at the next start (see [Serve](#serve)).
+  process, usually `multidb serve`, holds the redb lock. Plan and apply
+  through that server's Control Plane (`POST /provision/plan`, then `POST
+  /provision/apply`, see [Control Plane](#control-plane)), or stop it and use
+  the CLI; in spec mode, `MULTIDB_SPEC_APPLY=additive` applies additive
+  changes at the next start (see [Serve](#serve)).
 - **"the plan changed since it was confirmed"** (exit 4): the database, the
   spec, the flags, the target or the binary changed after the plan was
   reviewed, for example an object created outside provisioning. Nothing was
@@ -763,6 +766,91 @@ a startup apply that failed part-way); a start returns the database and a
 `StartupReport` (`mode`, `decision`, `plan_id`, the `applied` report,
 `warnings`).
 
+## Control Plane
+
+A running `multidb serve` (or any server built on `multidb::admin`)
+provisions the database it serves through five preview endpoints, mounted at
+`/` and `/api` behind the admin token or session like every other operation:
+
+| endpoint | what it does |
+| --- | --- |
+| `POST /provision/plan` | `{spec, options?}`: the plan of the spec against the served database, on the `control_plane` surface. A dry run: nothing is written, not even an audit event (only a denied request is audited) |
+| `POST /provision/apply` | `{spec, confirm, options?}`: recomputes the plan and applies it when `confirm` is its current `prov_` id |
+| `POST /provision/drift` | `{spec, options?}`: the `DriftReport` of the plan |
+| `GET /provision/state` | `{provisioned, record, history, manifest, live_fingerprint, spec_mode}`: the provision record and its history, the profile manifest, the live fingerprint plans are computed against now, and, in spec mode, the `spec_digest` and `MULTIDB_SPEC_APPLY` mode `serve` started with |
+| `GET /config/live` | `{spec, source, notes, live_fingerprint}`: `export_spec` of the served database (`source` is `applied_record` or `inferred`). It replaces the legacy `GET /config`, which only describes the database configuration |
+
+`spec` is decoded through `spec_io` as on `/config/validate` (a body that is
+not a spec is 400 `invalid_json`, a missing or unsupported version 422
+`invalid_spec_version`), `options` is a `ProvisionOptions` (an unknown field
+is 400), and any other key is 400: there is no client plan, the server always
+recomputes it. Bodies keep the 1 MiB limit (larger ones are 400
+`invalid_json`, as on the config routes).
+
+**Who may provision.** Every endpoint needs `System:Admin` for the calling
+principal (403 `forbidden`, audited as denied); applying also needs
+`Database:Admin`. The apply runs as that principal: objects are created
+through the audited `*_as` APIs, the record names it in `applied_by`, and
+`RBAC_SELF_LOCKOUT` is checked against it, already at plan time. A grant on
+the whole database includes system administration in this build. A password
+session acts as the bootstrap `admin`. A request with the admin token
+(`MULTIDB_ADMIN_TOKEN`) acts as the principal its `x-multidb-principal`
+header names, looked up in the database's principal registry, so that
+principal needs the permissions: `serve` grants them only to the `admin` of
+the admin password bootstrap, or a spec grants them to a principal of its
+own.
+
+**The flow** is plan, review, confirm:
+
+1. `POST /provision/plan` returns the plan with 200 when it is `ready`, a
+   `noop` or `needs_flags`, and with 422 when it is blocked (codes
+   `invalid_spec`, `provision_blocked`, `audit_required`, `rbac_self_lockout`)
+   in an error envelope whose `data` is the plan.
+2. Review the steps, flags and guarantees. A plan that needs flags is planned
+   again with them in `options`.
+3. `POST /provision/apply` with the same `spec` and `options` and `confirm`
+   set to the plan's `prov_` id. The id hashes the live state, the options and
+   the `control_plane` surface, so an id from the CLI never confirms here, and
+   anything that changed the database since the plan (for example a
+   `/builder/*` call) is 409 `plan_changed`: plan again.
+
+The apply holds the server's database lock from the recomputed plan through
+the last step, so nothing changes in between (pgwire waits meanwhile). Its
+answers:
+
+| status | code | when |
+| --- | --- | --- |
+| 200 | | `applied`, or a `noop` (which needs no `confirm`) |
+| 409 | `plan_changed` | `confirm` is a `prov_` id, but not the current plan's; `data` has both ids |
+| 409 | `object_conflict` | a create failed because the object exists; `data` is the partial apply report |
+| 422 | `confirmation_required` | no `confirm` (`data` is the plan), or one that is not a `prov_` id (`data` is the `rejected` report) |
+| 422 | `flags_required` | the plan needs flags the options do not give |
+| 422 | `invalid_spec`, `provision_blocked`, `audit_required`, `rbac_self_lockout` | the plan is blocked; `data` is the plan, except for `audit_required` on a confirmed apply |
+| 403 | `forbidden` | the principal lacks `System:Admin` or `Database:Admin` |
+| 500 | `provision_partially_applied` | a step failed; `data` is the report. The steps before it stay applied and the record says `failed`: plan again to see what remains |
+
+Retunes and the storage format upgrade are written to the profile manifest
+and take effect when `serve` restarts (`session_pending_restart` in the
+report). The Control Plane never creates a database and never opens a path
+from a request: a spec `deployment.storage_path` is reported as the Advice
+`PROVISION_STORAGE_PATH_IGNORED`. Encryption at rest is not enforceable here
+(`GUARANTEE_NOT_ENFORCEABLE`), and audit is chained with the development key
+(`enforced_with_development_key`).
+
+**Known limits:**
+
+- A served database whose in-memory RBAC differs from its persisted RBAC is
+  refused with `PROVISION_SECURITY_STATE_STALE`: for example under `multidb
+  admin serve --insecure-local-admin`, which grants its local administrator in
+  memory only, or under a `multidb serve` without spec mode that has only the
+  admin token, on a database whose RBAC was persisted before: plain openers
+  do not load persisted RBAC in this build. Spec mode loads it, and the admin
+  password bootstrap persists the state it sets.
+- RBAC applied through the Control Plane survives a restart of `serve` in spec
+  mode only; see the known limits of [Serve](#serve).
+- Studio has no provisioning flow yet; `StudioManifest.provisioning_supported`
+  and the capability `provision_apply` announce the endpoints.
+
 ## The provision record
 
 Provisioning keeps what it owns in the system table `__provision`: the
@@ -807,6 +895,7 @@ Plans add their own issues, whatever the spec version:
 | `DRIFT_ORPHAN`, `DRIFT_INTERRUPTED_APPLY` | Warning | a managed object is missing; the last apply did not finish |
 | `STEP_REQUIRES_FLAG` | Error | a step needs a flag the options do not give |
 | `PROVISION_FAILURE_NOT_RECORDED` | Warning | in an apply report: a failed apply could not write its `failed` record or audit event |
+| `PROVISION_STORAGE_PATH_IGNORED` | Advice | on the Control Plane: the spec `deployment.storage_path` is not used, since the served database is provisioned |
 
 Version 1 issues keep their order: the new version 1 Warnings come after every
 existing issue. The physical checks of version 2 validation run only on
@@ -860,7 +949,12 @@ they are applied by provisioning, not by `config apply`.
   the RBAC policy and the principal registry in one persisted batch after
   checking `System:Admin`, audited as `set_security_state`.
 - `config_spec::canonical_spec_json` and `config_spec::spec_digest` give the
-  canonical form and digest of a spec.
+  canonical form and digest of a spec, and `provision::live_fingerprint(db)`
+  the fingerprint of the live state plans are computed against
+  (`ProvisionPlan.live_fingerprint`).
+- `admin::AdminState::with_spec_mode(spec_digest, apply_mode)` makes
+  `GET /provision/state` report the spec a server started from; `multidb
+  serve` sets it in spec mode.
 - The spec types live in `multidb::config_spec`: `PhysicalObjectSpec`,
   `PhysicalKind`, `SecuritySpec`, `RoleSpec`, `GrantSpec`, `PrincipalSpec`,
   `ProvisioningPolicySpec`, `UnmanagedPolicy`, the pinned `DEFAULT_*`

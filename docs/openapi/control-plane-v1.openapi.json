@@ -21,6 +21,7 @@
     { "name": "Builder" },
     { "name": "Admin" },
     { "name": "Advice" },
+    { "name": "Provisioning" },
     { "name": "Contract" }
   ],
   "paths": {
@@ -357,6 +358,11 @@
     "/config/validate": { "post": { "$ref": "#/components/pathItems/validateConfig" } },
     "/config/plan": { "post": { "$ref": "#/components/pathItems/planConfig" } },
     "/config/apply": { "post": { "$ref": "#/components/pathItems/applyConfig" } },
+    "/config/live": { "get": { "$ref": "#/components/pathItems/getLiveConfig" } },
+    "/provision/state": { "get": { "$ref": "#/components/pathItems/getProvisionState" } },
+    "/provision/plan": { "post": { "$ref": "#/components/pathItems/planProvision" } },
+    "/provision/apply": { "post": { "$ref": "#/components/pathItems/applyProvision" } },
+    "/provision/drift": { "post": { "$ref": "#/components/pathItems/checkProvisionDrift" } },
     "/profiles": { "get": { "$ref": "#/components/pathItems/getProfiles" } },
     "/roles": { "get": { "$ref": "#/components/pathItems/getRoles" } },
     "/domains": { "get": { "$ref": "#/components/pathItems/getDomains" } },
@@ -448,6 +454,150 @@
           "current_password": { "type": "string", "format": "password" },
           "new_password": { "type": "string", "format": "password" }
         }
+      },
+      "ErrorEnvelopeWithData": {
+        "type": "object",
+        "description": "Enveloped error. For provisioning errors `data` carries the plan, the apply report, the validation report or the confirmed and current plan ids, when there is one.",
+        "required": ["ok", "error"],
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": { "$ref": "#/components/schemas/ApiError" },
+          "data": { "$ref": "#/components/schemas/JsonValue" }
+        }
+      },
+      "ProvisionOptions": {
+        "type": "object",
+        "description": "Per-run provisioning options; part of the prov_ plan id, so an apply must repeat the options of the plan it confirms.",
+        "additionalProperties": false,
+        "properties": {
+          "allow_weakening": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+          "allow_destructive": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+          "allow_format_upgrade": { "type": "boolean" },
+          "unmanaged": { "type": "string", "enum": ["ignore", "report", "fail"] }
+        }
+      },
+      "ProvisionRequest": {
+        "type": "object",
+        "required": ["spec"],
+        "additionalProperties": false,
+        "properties": {
+          "spec": {
+            "$ref": "#/components/schemas/JsonObject",
+            "description": "A DatabaseSpec, version 1 or 2.",
+            "x-multidb-json-schema": "https://multidb.dev/schemas/database-spec-v2.schema.json"
+          },
+          "options": { "$ref": "#/components/schemas/ProvisionOptions" }
+        }
+      },
+      "ProvisionApplyRequest": {
+        "type": "object",
+        "required": ["spec"],
+        "additionalProperties": false,
+        "properties": {
+          "spec": {
+            "$ref": "#/components/schemas/JsonObject",
+            "description": "A DatabaseSpec, version 1 or 2.",
+            "x-multidb-json-schema": "https://multidb.dev/schemas/database-spec-v2.schema.json"
+          },
+          "options": { "$ref": "#/components/schemas/ProvisionOptions" },
+          "confirm": {
+            "type": "string",
+            "description": "The prov_ id of the reviewed plan. The server recomputes the plan and applies it only when the id is still current; without it the plan is returned with 422 confirmation_required (a noop needs no confirmation)."
+          }
+        }
+      },
+      "ProvisionPlan": {
+        "type": "object",
+        "description": "A provisioning plan of the served database (see docs/provisioning.md).",
+        "required": ["plan_format", "plan_id", "surface", "target", "spec_digest", "live_fingerprint", "resolved_profile", "validation", "issues", "objects", "guarantees", "drift", "steps", "spec_migration", "outcome", "required_flags", "auto_approvable", "impact", "rollback", "required_confirmation"],
+        "properties": {
+          "plan_format": { "type": "integer" },
+          "plan_id": { "type": "string" },
+          "surface": { "type": "string" },
+          "outcome": { "type": "string", "enum": ["noop", "ready", "needs_flags", "blocked"] },
+          "required_flags": { "type": "array", "items": { "type": "string" } },
+          "auto_approvable": { "type": "boolean" },
+          "required_confirmation": { "type": ["string", "null"] }
+        }
+      },
+      "ProvisionApplyReport": {
+        "type": "object",
+        "description": "What an apply did.",
+        "required": ["status", "check", "plan_id", "applied_steps", "failed_step", "record", "warnings", "session_pending_restart"],
+        "properties": {
+          "status": { "type": "string", "enum": ["applied", "noop", "rejected", "blocked", "plan_changed", "partially_applied"] },
+          "plan_id": { "type": "string" },
+          "failed_step": { "type": ["string", "null"] },
+          "session_pending_restart": { "type": "boolean" }
+        }
+      },
+      "DriftReport": {
+        "type": "object",
+        "description": "How the served database differs from a spec.",
+        "required": ["in_sync", "items"],
+        "properties": {
+          "in_sync": { "type": "boolean" },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/JsonObject" } }
+        }
+      },
+      "ProvisionState": {
+        "type": "object",
+        "required": ["provisioned", "record", "history", "manifest", "live_fingerprint", "spec_mode"],
+        "properties": {
+          "provisioned": { "type": "boolean" },
+          "history": { "type": "array", "items": { "$ref": "#/components/schemas/JsonObject" } },
+          "live_fingerprint": { "type": "string" }
+        }
+      },
+      "LiveConfig": {
+        "type": "object",
+        "required": ["spec", "source", "notes", "live_fingerprint"],
+        "properties": {
+          "spec": { "$ref": "#/components/schemas/JsonObject" },
+          "source": { "type": "string", "enum": ["applied_record", "inferred"] },
+          "notes": { "type": "array", "items": { "type": "string" } },
+          "live_fingerprint": { "type": "string" }
+        }
+      },
+      "ProvisionPlanEnvelope": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": { "$ref": "#/components/schemas/ProvisionPlan" }
+        }
+      },
+      "ProvisionApplyReportEnvelope": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": { "$ref": "#/components/schemas/ProvisionApplyReport" }
+        }
+      },
+      "DriftReportEnvelope": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": { "$ref": "#/components/schemas/DriftReport" }
+        }
+      },
+      "ProvisionStateEnvelope": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": { "$ref": "#/components/schemas/ProvisionState" }
+        }
+      },
+      "LiveConfigEnvelope": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": { "$ref": "#/components/schemas/LiveConfig" }
+        }
       }
     },
     "examples": {
@@ -482,6 +632,14 @@
             }
           }
         }
+      },
+      "ProvisionRequest": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionRequest" } } }
+      },
+      "ProvisionApplyRequest": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionApplyRequest" } } }
       }
     },
     "responses": {
@@ -551,6 +709,35 @@
             "examples": { "error": { "$ref": "#/components/examples/ErrorEnvelope" } }
           }
         }
+      },
+      "ProvisionErrorEnvelope": {
+        "description": "Enveloped error response; data carries the plan, the apply report, the validation report or the plan ids, when there is one",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelopeWithData" },
+            "examples": { "error": { "$ref": "#/components/examples/ErrorEnvelope" } }
+          }
+        }
+      },
+      "ProvisionPlanEnvelope": {
+        "description": "Enveloped provisioning plan",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionPlanEnvelope" } } }
+      },
+      "ProvisionApplyReportEnvelope": {
+        "description": "Enveloped apply report",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionApplyReportEnvelope" } } }
+      },
+      "DriftReportEnvelope": {
+        "description": "Enveloped drift report",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriftReportEnvelope" } } }
+      },
+      "ProvisionStateEnvelope": {
+        "description": "Enveloped provisioning state",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProvisionStateEnvelope" } } }
+      },
+      "LiveConfigEnvelope": {
+        "description": "Enveloped live spec",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LiveConfigEnvelope" } } }
       }
     },
     "pathItems": {
@@ -565,10 +752,15 @@
       "createGeoIndex": { "operationId": "createGeoIndex", "tags": ["Builder"], "summary": "Create a geo index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "createGraph": { "operationId": "createGraph", "tags": ["Builder"], "summary": "Create a graph.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getAudit": { "operationId": "getAudit", "tags": ["Admin"], "summary": "Read audit events.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "getConfig": { "operationId": "getConfig", "tags": ["Admin"], "summary": "Return current DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getConfig": { "operationId": "getConfig", "tags": ["Admin"], "summary": "Return current DatabaseSpec.", "description": "Legacy: a version 1 spec built from the database configuration only (no collections). GET /config/live describes the served database as a spec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "validateConfig": { "operationId": "validateConfig", "tags": ["Admin"], "summary": "Validate a DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "planConfig": { "operationId": "planConfig", "tags": ["Admin"], "summary": "Plan a DatabaseSpec change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectOrErrorEnvelope" } } },
-      "applyConfig": { "operationId": "applyConfig", "tags": ["Admin"], "summary": "Confirm and audit a planned config change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "applyConfig": { "operationId": "applyConfig", "tags": ["Admin"], "summary": "Confirm and audit a planned config change.", "description": "Audit-only (data_mutated: false). The body is {plan, confirm}, a plan the client computed (audited as plan_source: client), or {current, desired, confirm}, from which the server recomputes the plan as POST /config/plan does (audited as plan_source: recomputed). Provisioning is POST /provision/apply.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectOrErrorEnvelope" } } },
+      "getLiveConfig": { "operationId": "getLiveConfig", "tags": ["Provisioning"], "summary": "Return the served database as a DatabaseSpec.", "description": "The spec the last provisioning apply recorded (source applied_record), or a version 2 spec inferred from the catalog, profile manifest, RBAC and audit state (source inferred), with notes and the live fingerprint. Requires System:Admin.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "responses": { "200": { "$ref": "#/components/responses/LiveConfigEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "500": { "$ref": "#/components/responses/ProvisionErrorEnvelope" } } },
+      "getProvisionState": { "operationId": "getProvisionState", "tags": ["Provisioning"], "summary": "Return what provisioning manages in the served database.", "description": "The provision record, its history, the profile manifest, the live fingerprint and, when multidb serve runs in spec mode, the spec digest and MULTIDB_SPEC_APPLY mode. Requires System:Admin.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "responses": { "200": { "$ref": "#/components/responses/ProvisionStateEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "500": { "$ref": "#/components/responses/ProvisionErrorEnvelope" } } },
+      "planProvision": { "operationId": "planProvision", "tags": ["Provisioning"], "summary": "Plan a spec against the served database.", "description": "A dry run on the control_plane surface; nothing is written. Ready, noop and needs_flags plans are 200; a blocked plan or an invalid spec is 422 with the plan in data (codes invalid_spec, provision_blocked, audit_required, rbac_self_lockout); an unsupported spec version is 422 invalid_spec_version. Requires System:Admin.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "requestBody": { "$ref": "#/components/requestBodies/ProvisionRequest" }, "responses": { "200": { "$ref": "#/components/responses/ProvisionPlanEnvelope" }, "400": { "$ref": "#/components/responses/ErrorEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" } } },
+      "applyProvision": { "operationId": "applyProvision", "tags": ["Provisioning"], "summary": "Apply a spec to the served database.", "description": "Recomputes the plan and applies it as the calling principal (System:Admin and Database:Admin) when confirm is its current prov_ id; there is no client plan. 409 plan_changed when the id is no longer current, or object_conflict when a create met an existing object; 422 confirmation_required, flags_required, provision_blocked, invalid_spec, audit_required or rbac_self_lockout, with the plan or report in data; 500 provision_partially_applied with the report. Retunes and the storage format upgrade take effect at the next restart (session_pending_restart).", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "requestBody": { "$ref": "#/components/requestBodies/ProvisionApplyRequest" }, "responses": { "200": { "$ref": "#/components/responses/ProvisionApplyReportEnvelope" }, "400": { "$ref": "#/components/responses/ErrorEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "409": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "500": { "$ref": "#/components/responses/ProvisionErrorEnvelope" } } },
+      "checkProvisionDrift": { "operationId": "checkProvisionDrift", "tags": ["Provisioning"], "summary": "Report how the served database differs from a spec.", "description": "The drift of the control_plane plan of the spec; 422 invalid_spec with the validation report in data for an invalid spec. Requires System:Admin.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "requestBody": { "$ref": "#/components/requestBodies/ProvisionRequest" }, "responses": { "200": { "$ref": "#/components/responses/DriftReportEnvelope" }, "400": { "$ref": "#/components/responses/ErrorEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" } } },
       "getProfiles": { "operationId": "getProfiles", "tags": ["Admin"], "summary": "List built-in profiles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getRoles": { "operationId": "getRoles", "tags": ["Admin"], "summary": "List collection roles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getDomains": { "operationId": "getDomains", "tags": ["Admin"], "summary": "List consistency domains.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
@@ -576,7 +768,7 @@
       "getAdvice": { "operationId": "getAdvice", "tags": ["Advice"], "summary": "Return runtime advice.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "planAdvice": { "operationId": "planAdvice", "tags": ["Advice"], "summary": "Return the dry-run plan for an advice item.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "recordAdviceDecision": { "operationId": "recordAdviceDecision", "tags": ["Advice"], "summary": "Record an advice decision.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "getStudioManifest": { "operationId": "getStudioManifest", "tags": ["Contract"], "summary": "Return Studio and client capability metadata.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } }
+      "getStudioManifest": { "operationId": "getStudioManifest", "tags": ["Contract"], "summary": "Return Studio and client capability metadata.", "description": "provisioning_supported is true when the /provision/* endpoints are served (capability provision_apply).", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } }
     }
   }
 }

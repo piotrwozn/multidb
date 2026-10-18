@@ -46,6 +46,8 @@ export type StudioManifest = {
   openapi_endpoint: string;
   physical_migration_supported: boolean;
   config_apply_data_mutated: boolean;
+  /** True when the server provisions specs (`/provision/*`, preview). */
+  provisioning_supported?: boolean;
   endpoints: string[];
   operations: ControlPlaneOperation[];
   capabilities: string[];
@@ -78,7 +80,9 @@ export type CollectionIndexKind =
   | "graph"
   | "full_text"
   | "columnar"
-  | "time_series";
+  | "time_series"
+  /** Spec version 2 only; needs `physical.geo`. */
+  | "geo";
 
 /**
  * `DatabaseSpec.custom_profile` (spec version 2): a profile that extends one built-in
@@ -102,8 +106,75 @@ export type CustomProfileSpec = JsonObject & {
   };
 };
 
+export type PhysicalKind = "document" | "table" | "vector" | "time_series" | "graph";
+export type PhysicalColumnType = "int" | "float" | "str" | "bool" | "bytes";
+
+/**
+ * `collections[].physical` (spec version 2): the parameters provisioning needs to build a
+ * collection. One flat object for every kind; `docs/provisioning.md` lists which fields apply
+ * to which kind and their defaults.
+ */
+export type PhysicalObjectSpec = JsonObject & {
+  kind?: PhysicalKind;
+  collection_id?: number;
+  graph_id?: number;
+  fields?: (JsonObject & { name: string; path: string; type: PhysicalColumnType })[];
+  document_indexes?: (JsonObject & { path: string; id?: number })[];
+  full_text?: (JsonObject & {
+    path: string;
+    name?: string;
+    language?: string;
+    refresh_lag_target?: number;
+  })[];
+  geo?: (JsonObject & { path: string; name?: string; precision?: number })[];
+  layout?: "row" | "columnar";
+  columns?: (JsonObject & { name: string; type: PhysicalColumnType; nullable?: boolean })[];
+  primary_key?: string;
+  table_indexes?: (JsonObject & {
+    column: string;
+    expression?: "column" | "lower_ascii";
+    include?: string[];
+    id?: number;
+  })[];
+  system_versioning?: boolean;
+  keep_history?: boolean;
+  dim?: number;
+  metric?: "cosine" | "l2";
+  hnsw?: JsonObject & { m?: number; ef_construction?: number; ef_search?: number };
+  chunk_millis?: number;
+  retention_millis?: number | null;
+  max_future_skew_millis?: number;
+};
+
+export type PermissionSpec = "read" | "write" | "admin";
+
+/**
+ * `security` (spec version 2): managed roles and principals. A grant names one spec object
+ * (`object`) or the whole database (`resource: "database"`); there are no secrets and no
+ * system scope.
+ */
+export type SecuritySpec = JsonObject & {
+  roles?: (JsonObject & {
+    name: string;
+    grants: (JsonObject & {
+      object?: string;
+      resource?: "database";
+      permissions: PermissionSpec[];
+    })[];
+  })[];
+  principals?: (JsonObject & { user: string; principal?: string; roles: string[] })[];
+};
+
+export type UnmanagedPolicy = "ignore" | "report" | "fail";
+
+/** `provisioning` (spec version 2): how a plan treats live objects the spec does not declare. */
+export type ProvisioningPolicySpec = JsonObject & {
+  unmanaged?: UnmanagedPolicy;
+};
+
 export type DatabaseSpec = JsonObject & {
-  /** Spec version: 1, or 2 for specs that use `custom_profile`. */
+  /** Spec version: 1, or 2 for specs that use `custom_profile`, `security`, `provisioning`,
+   * `collections[].physical` or the `geo` index kind. */
   version: number;
   name: string;
   profile: string;
@@ -135,6 +206,8 @@ export type DatabaseSpec = JsonObject & {
       role: CollectionRole;
       domain: string;
       indexes: CollectionIndexKind[];
+      /** Version 2 only. */
+      physical?: PhysicalObjectSpec;
     }
   )[];
   extensions: JsonValue[];
@@ -142,6 +215,10 @@ export type DatabaseSpec = JsonObject & {
   operation_hints: JsonObject;
   /** Version 2 only. */
   custom_profile?: CustomProfileSpec;
+  /** Version 2 only. */
+  security?: SecuritySpec;
+  /** Version 2 only. */
+  provisioning?: ProvisioningPolicySpec;
 };
 
 export type AuthMe = {
@@ -487,6 +564,199 @@ export type ExtensionSummary = {
   manifest: ExtensionManifest;
 };
 
+export type ApplyCheckReport = {
+  plan_id: string;
+  status: "confirmed" | "rejected" | "unsupported";
+  valid: boolean;
+  confirmation_matched: boolean;
+  audit_recorded: boolean;
+  data_mutated: boolean;
+  message: string;
+};
+
+/** Per-run provisioning options; part of the `prov_` id, so an apply repeats the plan's. */
+export type ProvisionOptions = {
+  allow_weakening?: string[];
+  allow_destructive?: string[];
+  allow_format_upgrade?: boolean;
+  unmanaged?: UnmanagedPolicy;
+};
+
+export type ProvisionSurface = "rust_api" | "cli" | "serve" | "control_plane";
+
+export type StepSafety =
+  | "additive"
+  | "metadata"
+  | "retune"
+  | "strengthening"
+  | "weakening"
+  | "destructive"
+  | "format_upgrade"
+  | "unsupported";
+
+export type ProvisionStepKind =
+  | "create_database"
+  | "adopt_profile"
+  | "retune_profile"
+  | "upgrade_storage_format"
+  | "enable_audit"
+  | "disable_audit"
+  | "create_collection"
+  | "create_vector_collection"
+  | "create_table"
+  | "create_time_series"
+  | "create_graph"
+  | "adopt_object"
+  | "create_full_text_index"
+  | "create_geo_index"
+  | "enable_system_versioning"
+  | "apply_security"
+  | "release_object"
+  | "record_guarantees"
+  | "record_metadata"
+  | "record_applied_spec"
+  | "noop";
+
+export type ProvisionStep = {
+  /** `pstep-001`, `pstep-002`, ... in execution order. */
+  step_id: string;
+  kind: ProvisionStepKind;
+  path: string;
+  object?: string | null;
+  action: string;
+  safety: StepSafety;
+  impact: PlanImpact;
+  supported: boolean;
+  /** `allow_weakening:<path>`, `allow_destructive:<path>` or `allow_format_upgrade`. */
+  requires_flag?: string | null;
+};
+
+export type PlanOutcome = "noop" | "ready" | "needs_flags" | "blocked";
+
+export type EnforcementStatus =
+  | "enforced"
+  | "enforced_with_development_key"
+  | "trivially_satisfied"
+  | "operator_managed"
+  | "not_enforced"
+  | "not_enforceable"
+  | "not_requested";
+
+/** How one guarantee of a spec is enforced on the surface that provisions it. */
+export type GuaranteeEnforcement = {
+  path: string;
+  requested: string;
+  status: EnforcementStatus;
+  detail: string;
+  remediation: string;
+};
+
+export type DriftItem = {
+  path: string;
+  kind: string;
+  expected: string;
+  actual: string;
+  blocking: boolean;
+  resolution: string;
+};
+
+export type DriftReport = {
+  /** Not blocked, and every item is information only. */
+  in_sync: boolean;
+  items: DriftItem[];
+};
+
+export type PlannedObject = {
+  name: string;
+  spec_collection?: string | null;
+  kind: string;
+  state: "create" | "satisfied" | "adopt" | "conflict" | "release" | "unmanaged";
+  params: JsonValue;
+  diff: (JsonObject & { field: string })[];
+};
+
+/** A provisioning plan (`POST /provision/plan`); see `docs/provisioning.md`. */
+export type ProvisionPlan = {
+  plan_format: number;
+  /** `prov_` and 32 hex characters. */
+  plan_id: string;
+  surface: ProvisionSurface;
+  target: JsonObject & { kind: "new_database" | "existing_database" };
+  spec_digest: string;
+  live_fingerprint?: string | null;
+  resolved_profile?: JsonObject | null;
+  validation: ValidationReport;
+  issues: ValidationIssue[];
+  objects: PlannedObject[];
+  guarantees: GuaranteeEnforcement[];
+  drift: DriftReport;
+  steps: ProvisionStep[];
+  spec_migration?: MigrationPlan | null;
+  outcome: PlanOutcome;
+  required_flags: string[];
+  auto_approvable: boolean;
+  impact: PlanImpact;
+  rollback: RollbackPlan;
+  /** The `plan_id` an apply must confirm; `null` for a noop. */
+  required_confirmation?: string | null;
+};
+
+export type ProvisionOutcome =
+  | "applied"
+  | "noop"
+  | "rejected"
+  | "blocked"
+  | "plan_changed"
+  | "partially_applied";
+
+export type AppliedStep = {
+  step_id: string;
+  kind: ProvisionStepKind;
+  object?: string | null;
+  outcome: "applied" | "already_satisfied" | "failed";
+  detail: string;
+  error_kind?: string;
+};
+
+/** What an apply did (`POST /provision/apply`). */
+export type ProvisionApplyReport = {
+  status: ProvisionOutcome;
+  check: ApplyCheckReport;
+  plan_id: string;
+  applied_steps: AppliedStep[];
+  failed_step?: string | null;
+  record?: JsonObject | null;
+  warnings: ValidationIssue[];
+  /** A retune or the storage format upgrade takes effect at the next restart. */
+  session_pending_restart: boolean;
+};
+
+export type ProvisionRecord = JsonObject & {
+  record_version: number;
+  status: "in_progress" | "applied" | "failed";
+  plan_id: string;
+  spec_digest: string;
+};
+
+/** `GET /provision/state`. */
+export type ProvisionState = {
+  provisioned: boolean;
+  record: ProvisionRecord | null;
+  history: JsonObject[];
+  manifest: JsonObject | null;
+  live_fingerprint: string;
+  /** The spec `multidb serve` started from in spec mode. */
+  spec_mode: { spec_digest: string; apply_mode: "verify" | "create" | "additive" } | null;
+};
+
+/** `GET /config/live`: the served database described as a spec. */
+export type LiveConfig = {
+  spec: DatabaseSpec;
+  source: "applied_record" | "inferred";
+  notes: string[];
+  live_fingerprint: string;
+};
+
 export type LoadedStudioData = {
   health: HealthResponse;
   readiness: HealthResponse;
@@ -548,6 +818,12 @@ const isEnvelope = <T>(value: unknown): value is ApiEnvelope<T> =>
   isObject(value) && typeof value.ok === "boolean";
 
 export const defaultApiBase = (): string => DEFAULT_BASE_URL;
+
+const provisionBody = (
+  spec: JsonObject,
+  options: ProvisionOptions | undefined,
+): { spec: JsonObject; options?: ProvisionOptions } =>
+  options === undefined ? { spec } : { spec, options };
 
 export class ControlPlaneClient {
   private readonly baseUrl: string;
@@ -830,6 +1106,50 @@ export class ControlPlaneClient {
       method: "POST",
       body: { plan, confirm },
     });
+  }
+
+  /** What provisioning manages in the served database (preview). */
+  provisionState(): Promise<ProvisionState> {
+    return this.request<ProvisionState>("/provision/state");
+  }
+
+  /**
+   * Plans `spec` against the served database (preview, a dry run). A blocked plan is HTTP 422:
+   * the thrown `ControlPlaneError` carries the plan as `body.data`.
+   */
+  provisionPlan(spec: JsonObject, options?: ProvisionOptions): Promise<ProvisionPlan> {
+    return this.request<ProvisionPlan>("/provision/plan", {
+      method: "POST",
+      body: provisionBody(spec, options),
+    });
+  }
+
+  /**
+   * Applies `spec` when `confirm` is the `prov_` id of its current plan (preview). The server
+   * recomputes the plan; pass the options the plan was computed with.
+   */
+  provisionApply(
+    spec: JsonObject,
+    confirm: string,
+    options?: ProvisionOptions,
+  ): Promise<ProvisionApplyReport> {
+    return this.request<ProvisionApplyReport>("/provision/apply", {
+      method: "POST",
+      body: { ...provisionBody(spec, options), confirm },
+    });
+  }
+
+  /** How the served database differs from `spec` (preview). */
+  provisionDrift(spec: JsonObject, options?: ProvisionOptions): Promise<DriftReport> {
+    return this.request<DriftReport>("/provision/drift", {
+      method: "POST",
+      body: provisionBody(spec, options),
+    });
+  }
+
+  /** The served database described as a spec (preview). */
+  liveConfig(): Promise<LiveConfig> {
+    return this.request<LiveConfig>("/config/live");
   }
 
   async loadStudioData(): Promise<LoadedStudioData> {

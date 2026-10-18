@@ -20,6 +20,17 @@ use crate::performance::PerformanceConfig;
 use crate::query::TableSchema;
 use crate::security::{AuthzPolicy, Permission, PrincipalRegistry, Resource};
 
+/// The fingerprint of the live state of `db` that `ProvisionPlan.live_fingerprint` reports:
+/// `live_` and 32 hex characters. It changes whenever anything a plan depends on changes (the
+/// catalog, table schemas, RBAC state, audit flag and key, encryption, extension policies,
+/// session performance, profile manifest or provision record), but not when data is written.
+/// Never writes.
+/// # Errors
+/// Fails for CP, AP and sharded databases, and when the live state cannot be read.
+pub fn live_fingerprint(db: &Database) -> Result<String, ProvisionError> {
+    Ok(LiveState::capture(db)?.fingerprint())
+}
+
 /// What a plan knows about an existing database.
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]

@@ -37,6 +37,8 @@ export type StudioManifest = {
   api_version: number;
   physical_migration_supported: boolean;
   config_apply_data_mutated: boolean;
+  /** True when the server provisions specs (`/provision/*`, preview). */
+  provisioning_supported?: boolean;
   endpoints: string[];
   capabilities: string[];
 };
@@ -68,7 +70,9 @@ export type CollectionIndexKind =
   | "graph"
   | "full_text"
   | "columnar"
-  | "time_series";
+  | "time_series"
+  /** Spec version 2 only; needs `physical.geo`. */
+  | "geo";
 
 /**
  * `DatabaseSpec.custom_profile` (spec version 2): a profile that extends one built-in
@@ -90,8 +94,75 @@ export type CustomProfileSpec = JsonObject & {
   };
 };
 
+export type PhysicalKind = "document" | "table" | "vector" | "time_series" | "graph";
+export type PhysicalColumnType = "int" | "float" | "str" | "bool" | "bytes";
+
+/**
+ * `collections[].physical` (spec version 2): the parameters provisioning needs to build a
+ * collection. One flat object for every kind; `docs/provisioning.md` lists which fields apply
+ * to which kind and their defaults.
+ */
+export type PhysicalObjectSpec = JsonObject & {
+  kind?: PhysicalKind;
+  collection_id?: number;
+  graph_id?: number;
+  fields?: (JsonObject & { name: string; path: string; type: PhysicalColumnType })[];
+  document_indexes?: (JsonObject & { path: string; id?: number })[];
+  full_text?: (JsonObject & {
+    path: string;
+    name?: string;
+    language?: string;
+    refresh_lag_target?: number;
+  })[];
+  geo?: (JsonObject & { path: string; name?: string; precision?: number })[];
+  layout?: "row" | "columnar";
+  columns?: (JsonObject & { name: string; type: PhysicalColumnType; nullable?: boolean })[];
+  primary_key?: string;
+  table_indexes?: (JsonObject & {
+    column: string;
+    expression?: "column" | "lower_ascii";
+    include?: string[];
+    id?: number;
+  })[];
+  system_versioning?: boolean;
+  keep_history?: boolean;
+  dim?: number;
+  metric?: "cosine" | "l2";
+  hnsw?: JsonObject & { m?: number; ef_construction?: number; ef_search?: number };
+  chunk_millis?: number;
+  retention_millis?: number | null;
+  max_future_skew_millis?: number;
+};
+
+export type PermissionSpec = "read" | "write" | "admin";
+
+/**
+ * `security` (spec version 2): managed roles and principals. A grant names one spec object
+ * (`object`) or the whole database (`resource: "database"`); there are no secrets and no
+ * system scope.
+ */
+export type SecuritySpec = JsonObject & {
+  roles?: (JsonObject & {
+    name: string;
+    grants: (JsonObject & {
+      object?: string;
+      resource?: "database";
+      permissions: PermissionSpec[];
+    })[];
+  })[];
+  principals?: (JsonObject & { user: string; principal?: string; roles: string[] })[];
+};
+
+export type UnmanagedPolicy = "ignore" | "report" | "fail";
+
+/** `provisioning` (spec version 2): how a plan treats live objects the spec does not declare. */
+export type ProvisioningPolicySpec = JsonObject & {
+  unmanaged?: UnmanagedPolicy;
+};
+
 export type DatabaseSpec = JsonObject & {
-  /** Spec version: 1, or 2 for specs that use `custom_profile`. */
+  /** Spec version: 1, or 2 for specs that use `custom_profile`, `security`, `provisioning`,
+   * `collections[].physical` or the `geo` index kind. */
   version: number;
   name: string;
   profile: string;
@@ -123,6 +194,8 @@ export type DatabaseSpec = JsonObject & {
       role: CollectionRole;
       domain: string;
       indexes: CollectionIndexKind[];
+      /** Version 2 only. */
+      physical?: PhysicalObjectSpec;
     }
   )[];
   extensions: JsonValue[];
@@ -130,6 +203,10 @@ export type DatabaseSpec = JsonObject & {
   operation_hints: JsonObject;
   /** Version 2 only. */
   custom_profile?: CustomProfileSpec;
+  /** Version 2 only. */
+  security?: SecuritySpec;
+  /** Version 2 only. */
+  provisioning?: ProvisioningPolicySpec;
 };
 
 export type AuthMe = {

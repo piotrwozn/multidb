@@ -432,6 +432,58 @@ impl ControlPlaneClient {
         )
     }
 
+    /// What provisioning manages in the served database (preview).
+    pub fn provision_state(&self) -> Result<Value, ControlPlaneError> {
+        self.request("GET", "/provision/state", None, true)
+    }
+
+    /// Plans `spec` against the served database (preview, a dry run). A blocked plan is HTTP
+    /// 422: the error body carries the plan as `data`.
+    pub fn provision_plan(
+        &self,
+        spec: Value,
+        options: Option<Value>,
+    ) -> Result<Value, ControlPlaneError> {
+        self.request(
+            "POST",
+            "/provision/plan",
+            Some(provision_body(spec, options)),
+            true,
+        )
+    }
+
+    /// Applies `spec` when `confirm` is the `prov_` id of its current plan (preview). The server
+    /// recomputes the plan; pass the options the plan was computed with.
+    pub fn provision_apply(
+        &self,
+        spec: Value,
+        confirm: impl Into<String>,
+        options: Option<Value>,
+    ) -> Result<Value, ControlPlaneError> {
+        let mut body = provision_body(spec, options);
+        body["confirm"] = Value::String(confirm.into());
+        self.request("POST", "/provision/apply", Some(body), true)
+    }
+
+    /// How the served database differs from `spec` (preview).
+    pub fn provision_drift(
+        &self,
+        spec: Value,
+        options: Option<Value>,
+    ) -> Result<Value, ControlPlaneError> {
+        self.request(
+            "POST",
+            "/provision/drift",
+            Some(provision_body(spec, options)),
+            true,
+        )
+    }
+
+    /// The served database described as a spec (preview).
+    pub fn live_config(&self) -> Result<Value, ControlPlaneError> {
+        self.request("GET", "/config/live", None, true)
+    }
+
     pub fn profiles(&self) -> Result<Value, ControlPlaneError> {
         self.request("GET", "/profiles", None, true)
     }
@@ -716,6 +768,15 @@ impl ParsedHttpUrl {
     }
 }
 
+/// The body of a provisioning request: the spec and, when given, the options.
+fn provision_body(spec: Value, options: Option<Value>) -> Value {
+    let mut body = json!({ "spec": spec });
+    if let Some(options) = options {
+        body["options"] = options;
+    }
+    body
+}
+
 fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_owned()
 }
@@ -799,6 +860,80 @@ mod tests {
                 .headers
                 .iter()
                 .any(|(name, value)| name == "Authorization" && value == "Bearer secret")
+        );
+    }
+
+    #[test]
+    fn provisioning_methods_send_documented_paths_and_bodies() {
+        #[derive(Default)]
+        struct RecordingTransport {
+            calls: Mutex<Vec<HttpRequest>>,
+        }
+        impl Transport for RecordingTransport {
+            fn send(&self, request: HttpRequest) -> Result<HttpResponse, ControlPlaneError> {
+                self.calls.lock().expect("calls lock").push(request);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: br#"{"ok":true,"data":{}}"#.to_vec(),
+                })
+            }
+        }
+        let transport = Arc::new(RecordingTransport::default());
+        let client = ControlPlaneClient::with_transport("http://unit.test/api", transport.clone())
+            .with_token("secret");
+        let spec = json!({ "version": 2, "name": "shop" });
+        let options = json!({ "allow_destructive": ["collections.orders"] });
+        client.provision_state().unwrap();
+        client.provision_plan(spec.clone(), None).unwrap();
+        client
+            .provision_apply(spec.clone(), "prov_0123", Some(options.clone()))
+            .unwrap();
+        client
+            .provision_drift(spec.clone(), Some(options.clone()))
+            .unwrap();
+        client.live_config().unwrap();
+
+        let calls = transport.calls.lock().expect("calls lock");
+        let seen = calls
+            .iter()
+            .map(|call| {
+                let body = if call.body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&call.body).unwrap()
+                };
+                (call.method.clone(), call.url.clone(), body)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "GET".to_owned(),
+                    "http://unit.test/api/provision/state".to_owned(),
+                    Value::Null
+                ),
+                (
+                    "POST".to_owned(),
+                    "http://unit.test/api/provision/plan".to_owned(),
+                    json!({ "spec": spec })
+                ),
+                (
+                    "POST".to_owned(),
+                    "http://unit.test/api/provision/apply".to_owned(),
+                    json!({ "spec": spec, "options": options, "confirm": "prov_0123" })
+                ),
+                (
+                    "POST".to_owned(),
+                    "http://unit.test/api/provision/drift".to_owned(),
+                    json!({ "spec": spec, "options": options })
+                ),
+                (
+                    "GET".to_owned(),
+                    "http://unit.test/api/config/live".to_owned(),
+                    Value::Null
+                ),
+            ]
         );
     }
 

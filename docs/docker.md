@@ -118,9 +118,13 @@ start (see [provisioning.md](provisioning.md#serve)). Without
 `verify` is the safe default for production: a fresh volume needs
 `MULTIDB_SPEC_APPLY=create` for its first start (or `multidb init --apply` /
 `config apply --spec` before it), and changes to the spec are applied with
-`additive` or a reviewed `config apply`. After provisioning, the admin
-password bootstrap runs as before; its `admin` and `root` names are reserved,
-so provisioning never touches them.
+`additive` or a reviewed `config apply`. A running server can also plan and
+apply a reviewed spec itself through the preview Control Plane endpoints
+`POST /provision/plan` and `POST /provision/apply` (see
+[provisioning.md](provisioning.md#control-plane)); keep the mounted spec in
+step with what you apply, or the next `verify` start refuses. After
+provisioning, the admin password bootstrap runs as before; its `admin` and
+`root` names are reserved, so provisioning never touches them.
 
 Known limits in this build:
 

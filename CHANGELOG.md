@@ -292,9 +292,53 @@ All notable public changes will be recorded here.
   the spec read-only and set `MULTIDB_SPEC_PATH` and `MULTIDB_SPEC_APPLY`
   instead of `MULTIDB_PROFILE` and `MULTIDB_REPLICATION`;
   `docker-compose.yml` has a commented example.
+- Control Plane provisioning (preview) of the served database, as the calling
+  principal: `POST /provision/plan` (`{spec, options?}`; a dry run on the
+  `control_plane` surface, 200 for ready, noop and needs-flags plans, 422 with
+  the plan in `data` when blocked), `POST /provision/apply` (`{spec, confirm,
+  options?}`; the server recomputes the plan and applies it only when
+  `confirm` is its current `prov_` id: 409 `plan_changed` or
+  `object_conflict`, 422 `confirmation_required`, `flags_required`,
+  `provision_blocked`, `invalid_spec`, `audit_required` or
+  `rbac_self_lockout`, 500 `provision_partially_applied` with the report),
+  `POST /provision/drift`, `GET /provision/state` (the provision record,
+  history, profile manifest, live fingerprint and the spec mode of `serve`)
+  and `GET /config/live` (the served database as a spec, from its record or
+  inferred). Every endpoint needs `System:Admin`, and applying also
+  `Database:Admin`; a spec `storage_path` is the Advice
+  `PROVISION_STORAGE_PATH_IGNORED`, since the Control Plane never creates
+  databases or opens paths. The `OpenAPI` snapshot documents the five
+  operations (`x-multidb-stability: preview`, request bodies pointing at the
+  version 2 spec schema, error envelopes that carry `data`), and
+  `StudioManifest` gains `provisioning_supported: true` and the capability
+  `provision_apply`. See `docs/provisioning.md`.
+- SDK provisioning methods: TypeScript `provisionState`, `provisionPlan`,
+  `provisionApply`, `provisionDrift` and `liveConfig` with the types
+  `ProvisionPlan`, `ProvisionStep`, `ProvisionApplyReport`, `DriftReport`,
+  `GuaranteeEnforcement`, `ProvisionState`, `ProvisionOptions` and
+  `LiveConfig`; Go `ProvisionState`, `ProvisionPlan`, `ProvisionApply`,
+  `ProvisionDrift` and `LiveConfig`; Python and Rust `provision_state`,
+  `provision_plan`, `provision_apply`, `provision_drift` and `live_config`.
+  The TypeScript and Studio `DatabaseSpec` types gain the optional `security`,
+  `provisioning` and `collections[].physical` fields and the `geo` index kind,
+  and `StudioManifest` the optional `provisioning_supported`.
+- `provision::live_fingerprint`, the fingerprint of the live state plans are
+  computed against, and `admin::AdminState::with_spec_mode`, which `multidb
+  serve` uses in spec mode so `GET /provision/state` reports the spec digest
+  and `MULTIDB_SPEC_APPLY` mode it started with.
 
 ### Changed
 
+- `POST /config/apply` also accepts `{current, desired, confirm}`: the server
+  recomputes the plan with `MigrationPlanner::plan`, decoding each side as
+  `/config/plan` does. The `config_apply` audit detail ends with
+  `plan_source: recomputed`, or `plan_source: client` for the `{plan,
+  confirm}` body (and for `Database::confirm_config_apply_as`), and keeps at
+  most 48 characters of a client plan id. The endpoint stays audit-only
+  (`data_mutated: false`), and its `OpenAPI` 422 response is documented as a
+  success or an error envelope, since a version error in a recomputed side is
+  `invalid_spec_version`. `GET /config` is documented as legacy, replaced by
+  `GET /config/live`.
 - `multidb config upgrade` adds a note for every physical parameter
   provisioning still needs (`PHYSICAL_PARAMETER_REQUIRED`), so an upgraded
   version 1 spec lists what to add before `config apply --spec`.
@@ -383,6 +427,8 @@ All notable public changes will be recorded here.
   new `physical` field; `None` keeps today's behaviour.
 - `CollectionIndexKind` gains `Geo`; exhaustive matches outside the crate must
   handle it.
+- `admin::StudioManifest` struct literals must set the new
+  `provisioning_supported` field.
 - `ConfigSpecError::UnsupportedVersion` gains a `supported` range field.
 - `CompiledPolicy` struct literals must set the new `resolved_profile` field.
 - `ConfigError` gains `AlreadyInitialized`, `StorageFormatMismatch`,
