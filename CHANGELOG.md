@@ -8,6 +8,10 @@ All notable public changes will be recorded here.
 - Added public repository hygiene files, security policy, contribution guide,
   issue templates and release notes.
 - Kept local planning history out of the public source baseline.
+- Fixed `multidb serve` / `multidb admin serve` starting with an empty RBAC
+  policy after a restart, and admin bootstrap/login overwriting stored roles,
+  PG-user mappings and the audit flag; plain database openers now reload
+  persisted security state and fail closed if it is corrupt.
 - All user writes now run one write pipeline (before triggers, before-commit
   hooks, tenant quota, commit, after-commit hooks and after triggers). SQL and
   pgwire `INSERT`, `RelTable` handles and stored procedures (`CALL`) now run
