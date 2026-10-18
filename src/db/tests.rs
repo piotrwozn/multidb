@@ -1960,10 +1960,11 @@ fn provisioning_views_match_the_file_and_refuse_replicated_backends()
         return Err("the closed database is initialized".into());
     };
 
+    // Plain openers reload the persisted RBAC state, so the handle enforces what is persisted.
     let plain = open_database(config.clone())?;
     assert_eq!(plain.probed_metadata()?, *probe);
     assert_eq!(plain.persisted_security_state()?, security);
-    assert_eq!(*plain.authz_policy(), AuthzPolicy::default());
+    assert_eq!(*plain.authz_policy(), security.authz_policy);
     assert!(!plain.encryption_configured());
     assert!(!plain.audit_key_configured());
     assert_eq!(*plain.audit_config(), super::AuditConfig::default());

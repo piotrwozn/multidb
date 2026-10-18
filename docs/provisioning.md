@@ -417,10 +417,13 @@ all count; when several users map to it, losing administration through any
 of them blocks.
 
 A handle whose RBAC state or audit flag differs from what is persisted in the
-database is `PROVISION_SECURITY_STATE_STALE` (blocks): the plain openers
-(`create_database`, `open_database`) do not load persisted RBAC in this
-build, and `set_authz_policy` and `set_principal_registry` do not persist.
-Open the database with `open_database_with_ops` to plan it.
+database is `PROVISION_SECURITY_STATE_STALE` (blocks). Every opener loads the
+persisted RBAC state, so this happens only after an in-memory change:
+`set_authz_policy` and `set_principal_registry` do not persist (`multidb admin
+serve --insecure-local-admin` grants its local administrator that way). An
+apply would otherwise persist state the database never had. Persist the change
+(`set_authz_policy_as`, `set_principal_registry_as`, `POST /security`) or
+reopen the database, and plan again.
 
 ### Guarantees
 
@@ -789,14 +792,10 @@ reserved, so provisioning never touches them.
   refused with `PROVISION_AUDIT_KEY_MISMATCH` whenever a start would change
   it, and `serve` itself appends its admin events with the development key,
   so serve such a database only after deciding to give up its keyed chain.
-- A restart of `serve` *without* spec mode re-bootstraps RBAC until plain
-  openers load the persisted RBAC state: plain `serve` opens the database
-  with `create_database`, which does not load persisted roles, and the admin
-  password bootstrap then persists the in-memory state, so the roles and
-  principals provisioning applied are replaced by the bootstrap
-  administrator. `config drift` then reports them missing, and applying them
-  again needs a confirmed plan. Spec mode opens with `open_database_with_ops`
-  and is not affected, so keep a provisioned database in spec mode.
+- The roles and principals provisioning applied survive any restart, with or
+  without spec mode: every opener loads the persisted RBAC state, and the
+  admin password bootstrap only adds the reserved `admin` role and principal
+  when they are missing.
 
 **Embedded apps** use `open_from_spec(spec, path, mode, options, environment)`
 with the same decision table on the `rust_api` surface, as `local:embedded`.
@@ -891,12 +890,9 @@ from a request: a spec `deployment.storage_path` is reported as the Advice
 - A served database whose in-memory RBAC differs from its persisted RBAC is
   refused with `PROVISION_SECURITY_STATE_STALE`: for example under `multidb
   admin serve --insecure-local-admin`, which grants its local administrator in
-  memory only, or under a `multidb serve` without spec mode that has only the
-  admin token, on a database whose RBAC was persisted before: plain openers
-  do not load persisted RBAC in this build. Spec mode loads it, and the admin
-  password bootstrap persists the state it sets.
-- RBAC applied through the Control Plane survives a restart of `serve` in spec
-  mode only; see the known limits of [Serve](#serve).
+  memory only. `multidb serve` loads the persisted RBAC state at every start,
+  with or without spec mode, and the admin password bootstrap persists the
+  state it sets, so RBAC applied through the Control Plane survives a restart.
 - Studio has no provisioning flow yet; `StudioManifest.provisioning_supported`
   and the capability `provision_apply` announce the endpoints.
 

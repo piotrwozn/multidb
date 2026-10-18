@@ -45,8 +45,8 @@ pub(crate) struct LiveState {
     pub audit_enabled: bool,
     pub audit_key_configured: bool,
     pub encryption_configured: bool,
-    /// The RBAC state and audit flag persisted in `__authz_policy`; what the next
-    /// `open_database_with_ops` loads.
+    /// The RBAC state and audit flag persisted in `__authz_policy`; what the next open loads
+    /// (every opener does).
     pub persisted_authz: AuthzPolicy,
     pub persisted_principals: PrincipalRegistry,
     pub persisted_audit_enabled: bool,

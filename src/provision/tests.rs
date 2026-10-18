@@ -1290,7 +1290,13 @@ fn live_state_problems_block_the_plan() -> TestResult {
         DbConfig::on_disk(Profile::Balanced, &stale_path),
         OperationalConfig::new().with_security(security),
     )?);
-    let plainly_opened = open_database(DbConfig::on_disk(Profile::Balanced, &stale_path))?;
+    // Plain openers reload the persisted RBAC state, so a plainly opened handle is not stale;
+    // an RBAC change held only in memory (set_authz_policy does not persist) makes it stale.
+    let mut plainly_opened = open_database(DbConfig::on_disk(Profile::Balanced, &stale_path))?;
+    let plan = plan_open(&empty, &plainly_opened)?;
+    assert!(!issue_codes(&plan).contains(&"PROVISION_SECURITY_STATE_STALE"));
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    plainly_opened.set_authz_policy(AuthzPolicy::default());
     assert_blocked(
         &plan_open(&empty, &plainly_opened)?,
         "PROVISION_SECURITY_STATE_STALE",
@@ -3909,6 +3915,41 @@ fn rbac_changes_only_managed_names_in_one_batch() -> TestResult {
     assert!(db.authz_policy().roles().contains_key("auditor"));
     assert_eq!(db.principal_for_user("admin"), admin);
     assert_eq!(plan_open(&base, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+/// Plain openers reload the persisted RBAC state and the admin bootstrap merges into it, so
+/// the roles and principals provisioning applied survive what a `multidb serve` without spec
+/// mode does at every start.
+#[test]
+fn provisioned_rbac_survives_a_plain_reopen_and_the_admin_bootstrap() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("plain.redb");
+    let spec = with_security(
+        orders_spec()?,
+        &json!({
+            "roles": [{
+                "name": "order_reader",
+                "grants": [{ "object": "orders", "permissions": ["read"] }]
+            }],
+            "principals": [{ "user": "orders_svc", "roles": ["order_reader"] }]
+        }),
+    )?;
+    let mut db = create_with_profile(&path, &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    drop(db);
+
+    let mut db = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    db.ensure_bootstrap_admin_principal()?;
+    assert!(db.authz_policy().roles().contains_key("order_reader"));
+    assert!(db.authz_policy().roles().contains_key("admin"));
+    assert_eq!(
+        db.principal_for_user("orders_svc"),
+        Principal::new("orders_svc").with_role("order_reader")
+    );
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.steps);
+    assert!(plan.drift.in_sync, "{:#?}", plan.drift);
     Ok(())
 }
 

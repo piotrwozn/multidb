@@ -139,16 +139,12 @@ step with what you apply, or the next `verify` start refuses. After
 provisioning, the admin password bootstrap runs as before; its `admin` and
 `root` names are reserved, so provisioning never touches them.
 
-Known limits in this build:
+Roles and principals that provisioning applied are stored in the database
+file like any other RBAC state, so they survive a restart with or without spec
+mode (see the RBAC note above).
 
-- Audit is chained with the development key (`enforced_with_development_key`);
-  `serve` has no audit key setting.
-- Without spec mode, a restart re-bootstraps RBAC: plain `serve` opens the
-  database without loading its persisted roles, and the admin password
-  bootstrap then persists the in-memory state, so roles and principals that
-  provisioning applied are replaced by the bootstrap administrator. Spec mode
-  loads the persisted RBAC state at every start, so keep a provisioned
-  database in spec mode.
+Known limit in this build: audit is chained with the development key
+(`enforced_with_development_key`); `serve` has no audit key setting.
 
 ## Helm Chart Variables
 

@@ -154,9 +154,8 @@ impl Database {
         Ok(Some(verifies))
     }
 
-    /// The RBAC policy, principals and audit flag persisted in `__authz_policy`, which the next
-    /// `open_database_with_ops` loads. A database that never persisted them reads as
-    /// `SecurityConfig::default()`.
+    /// The RBAC policy, principals and audit flag persisted in `__authz_policy`, which every
+    /// opener loads. A database that never persisted them reads as `SecurityConfig::default()`.
     pub(crate) fn persisted_security_state(&self) -> Result<SecurityConfig, DbError> {
         Ok(read_security_from_repl(self.replication_ref())?.unwrap_or_default())
     }

@@ -1441,13 +1441,14 @@ impl PlanBuilder<'_> {
                 "PROVISION_SECURITY_STATE_STALE",
                 "security",
                 "the RBAC policy, principals or audit flag this handle enforces differ from \
-                 the ones persisted in the database: it was opened with a plain opener (such \
-                 as open_database), which does not load persisted RBAC in this build, or RBAC \
-                 was changed with set_authz_policy or set_principal_registry, which do not \
-                 persist"
+                 the ones persisted in the database: they were changed in memory only, with \
+                 set_authz_policy or set_principal_registry (as multidb admin serve \
+                 --insecure-local-admin does for its local administrator), which do not \
+                 persist, so an apply would persist state the database never had"
                     .to_owned(),
-                "Open the database with open_database_with_ops (the CLI and multidb serve in \
-                 spec mode do) and plan again.",
+                "Persist the change (set_authz_policy_as, set_principal_registry_as or POST \
+                 /security) or reopen the database, whose openers load the persisted RBAC \
+                 state, and plan again.",
             );
             self.drift.push(drift_item(
                 "security",
