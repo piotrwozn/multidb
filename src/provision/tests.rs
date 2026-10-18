@@ -855,6 +855,94 @@ fn matching_builder_objects_are_adopted_and_unmanaged_ones_follow_the_policy() -
 }
 
 #[test]
+fn system_versioning_of_an_adopted_table_needs_a_typed_confirmation() -> TestResult {
+    let ledger = |versioned: bool| -> Result<DatabaseSpec, Error> {
+        Ok(in_memory(spec(
+            "in_memory",
+            &json!([{
+                "name": "ledger", "role": "event_log", "domain": "primary", "indexes": ["primary"],
+                "physical": {
+                    "kind": "table",
+                    "columns": [
+                        { "name": "entry_id", "type": "int" },
+                        { "name": "amount", "type": "float" }
+                    ],
+                    "primary_key": "entry_id",
+                    "system_versioning": versioned
+                }
+            }]),
+        )?))
+    };
+    let mut db = create_database(DbConfig::new(Profile::InMemory))?;
+    db.create_table(
+        "ledger",
+        Some(TableSchema::new(
+            vec![
+                ColumnDef::new("entry_id", ColumnType::Int, false),
+                ColumnDef::new("amount", ColumnType::Float, false),
+            ],
+            0,
+        )),
+        Vec::new(),
+    )?;
+
+    // Adopting the table as it is stays auto-approvable.
+    let adoption = plan_rust_api(&ledger(false)?, &db)?;
+    assert_eq!(
+        adoption.outcome,
+        PlanOutcome::Ready,
+        "{:#?}",
+        adoption.issues
+    );
+    assert!(adoption.auto_approvable, "{:#?}", adoption.steps);
+
+    // Turning versioning on alters the unmanaged table: additive, but never auto-approved.
+    let spec = ledger(true)?;
+    let plan = plan_rust_api(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    assert!(!plan.auto_approvable);
+    let versioning = plan
+        .steps
+        .iter()
+        .find(|step| step.kind == ProvisionStepKind::EnableSystemVersioning)
+        .ok_or("versioning is planned")?;
+    assert_eq!(versioning.safety, StepSafety::Additive);
+    assert!(
+        versioning.action.contains("typed confirmation"),
+        "{}",
+        versioning.action
+    );
+    let operator = ProvisionActor::local_operator("local:embedded");
+    let rust_api = env(ProvisionSurface::RustApi);
+    assert!(matches!(
+        apply_provision(
+            &mut db,
+            &operator,
+            &spec,
+            &Confirmation::AutoApproveAdditive,
+            &ProvisionOptions::default(),
+            &rust_api,
+        ),
+        Err(ProvisionError::ConfirmationRequired(_))
+    ));
+    assert!(!db.catalog().contains_key("ledger_history"));
+    assert!(matches!(
+        serve_startup_decision(&plan, StartupMode::Additive),
+        StartupDecision::Refuse(_)
+    ));
+    let report = apply_as(
+        &mut db,
+        &operator,
+        &spec,
+        &ProvisionOptions::default(),
+        &rust_api,
+    )?;
+    assert_applied(&report);
+    assert!(db.catalog().contains_key("ledger_history"));
+    Ok(())
+}
+
+#[test]
 fn differing_live_objects_are_conflicts_with_a_field_diff() -> TestResult {
     let mut db = create_database(DbConfig::new(Profile::InMemory))?;
     db.create_vector_collection("dims", VectorCollectionConfig::new(CollectionId::new(1), 4))?;
@@ -1772,6 +1860,62 @@ fn rbac_changes_are_classified_and_reserved_names_refused() -> TestResult {
 }
 
 #[test]
+fn a_role_that_unmanaged_users_already_hold_is_named_in_its_step() -> TestResult {
+    let mut db = create_database(DbConfig::new(Profile::InMemory))?;
+    // A user still assigned a role name the policy no longer defines, and one the spec manages.
+    db.set_security_state(
+        AuthzPolicy::default(),
+        PrincipalRegistry::new()
+            .with_principal(
+                "legacy_svc",
+                Principal::new("legacy").with_role("order_writer"),
+            )
+            .with_principal(
+                "orders_svc",
+                Principal::new("orders_svc").with_role("order_writer"),
+            ),
+    )?;
+    let spec = security(
+        in_memory(orders_spec()?),
+        &json!([{ "object": "orders", "permissions": ["read"] }]),
+    )?;
+    let plan = plan_rust_api(&spec, &db)?;
+    assert!(has_issue(
+        &plan,
+        "SECURITY_ROLE_ALREADY_ASSIGNED",
+        ValidationSeverity::Warning
+    ));
+    let warning = plan
+        .issues
+        .iter()
+        .find(|found| found.code == "SECURITY_ROLE_ALREADY_ASSIGNED")
+        .ok_or("the warning")?;
+    assert_eq!(warning.path, "security.roles.order_writer");
+    assert!(
+        warning.message.contains("legacy_svc"),
+        "{}",
+        warning.message
+    );
+    assert!(
+        !warning.message.contains("orders_svc"),
+        "{}",
+        warning.message
+    );
+    let created = plan
+        .steps
+        .iter()
+        .find(|step| step.path == "security.roles.order_writer")
+        .ok_or("the role step")?;
+    assert!(created.action.contains("legacy_svc"), "{}", created.action);
+
+    // Without a stray holder there is no warning.
+    db.set_security_state(AuthzPolicy::default(), PrincipalRegistry::new())?;
+    let plan = plan_rust_api(&spec, &db)?;
+    assert!(!issue_codes(&plan).contains(&"SECURITY_ROLE_ALREADY_ASSIGNED"));
+    Ok(())
+}
+
+#[test]
 fn audit_must_be_on_for_every_apply() -> TestResult {
     let mut db = create_database(DbConfig::new(Profile::InMemory))?;
     let admin = Principal::new("root").with_role("admin");
@@ -2305,6 +2449,23 @@ fn drift_is_in_sync_for_a_matching_database_and_reports_differences() -> TestRes
         ..ProvisionOptions::default()
     };
     assert!(!drift(&db, &spec, &fail)?.in_sync);
+
+    // The storage path is a default location, not identity: moving it changes nothing.
+    let mut moved = spec.clone();
+    moved.deployment.storage_path = Some("/srv/multidb/elsewhere.redb".to_owned());
+    let report = drift(&db, &moved, &ProvisionOptions::default())?;
+    assert!(report.in_sync, "{:#?}", report.items);
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|item| item.kind != DriftKind::SpecChanged)
+    );
+    let plan = plan_open(&moved, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.steps);
+    assert_ne!(plan.spec_digest, spec_digest(&spec));
+    moved.deployment.storage_path = None;
+    assert_eq!(plan_open(&moved, &db)?.outcome, PlanOutcome::Noop);
 
     let mut changed = spec.clone();
     changed.name = "renamed".to_owned();
@@ -3500,9 +3661,103 @@ fn rust_api_provisions_an_encrypted_database_with_a_local_envelope() -> TestResu
     ));
     let db = open_database_with_ops(
         config,
-        &OperationalConfig::new().with_encryption(encryption),
+        &OperationalConfig::new().with_encryption(encryption.clone()),
     )?;
     assert!(db.catalog().contains_key("orders"));
+
+    // Reopened with its key, the database is in sync and at rest stays enforced.
+    let reopened = plan_provision(
+        &spec,
+        ProvisionTargetRef::Open(&db),
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_eq!(reopened.outcome, PlanOutcome::Noop, "{:#?}", reopened.steps);
+    assert!(reopened.guarantees.iter().any(|entry| {
+        entry.path == "guarantees.encryption.at_rest" && entry.status == EnforcementStatus::Enforced
+    }));
+
+    // A spec that says at_rest: false cannot decrypt it.
+    let mut plaintext = spec.clone();
+    plaintext.guarantees.encryption.at_rest = false;
+    let mismatch = plan_provision(
+        &plaintext,
+        ProvisionTargetRef::Open(&db),
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_blocked(&mismatch, "PROVISION_ENCRYPTION_MISMATCH");
+    assert!(
+        mismatch
+            .drift
+            .items
+            .iter()
+            .any(|item| item.kind == DriftKind::EncryptionMismatch && item.blocking)
+    );
+
+    // An encryption config other than the one the database was opened with is refused.
+    let other = ProvisionEnvironment {
+        encryption: Some(EncryptionConfig::local_envelope(
+            temp_dir.path().join("other-keyring.json"),
+            &kek_path,
+        )),
+        ..env(ProvisionSurface::RustApi)
+    };
+    assert!(matches!(
+        plan_provision(
+            &spec,
+            ProvisionTargetRef::Open(&db),
+            &ProvisionOptions::default(),
+            &other,
+        ),
+        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
+    ));
+    drop(db);
+
+    // open_from_spec opens it with the key and starts it unchanged.
+    let (db, report) = open_from_spec(
+        &spec,
+        Some(&path),
+        StartupMode::Verify,
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_eq!(report.decision, StartupDecision::Start);
+    assert!(report.applied.is_none());
+    assert!(db.catalog().contains_key("orders"));
+    Ok(())
+}
+
+#[test]
+fn an_unencrypted_database_cannot_be_planned_as_encrypted_at_rest() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("plain.redb");
+    let spec = orders_spec()?;
+    let rust_api = env(ProvisionSurface::RustApi);
+    let (db, report) = provision_new_database(
+        &spec,
+        Some(&path),
+        &Confirmation::AutoApproveAdditive,
+        &ProvisionOptions::default(),
+        &rust_api,
+    )?;
+    assert_applied(&report);
+    let mut encrypted = spec.clone();
+    encrypted.guarantees.encryption.at_rest = true;
+    let plan = plan_rust_api(&encrypted, &db)?;
+    assert_blocked(&plan, "PROVISION_ENCRYPTION_MISMATCH");
+    assert!(plan.guarantees.iter().any(|entry| {
+        entry.path == "guarantees.encryption.at_rest"
+            && entry.status == EnforcementStatus::NotEnforceable
+    }));
+    assert!(
+        plan.drift
+            .items
+            .iter()
+            .any(|item| item.kind == DriftKind::EncryptionMismatch && item.blocking)
+    );
+    let report = drift(&db, &encrypted, &ProvisionOptions::default())?;
+    assert!(!report.in_sync);
     Ok(())
 }
 
@@ -4454,7 +4709,22 @@ fn open_from_spec_keeps_the_audit_chain_on_the_callers_key() -> TestResult {
         plain.verify_audit_chain(),
         Err(DbError::AuditIntegrity(_))
     ));
+    db_with_development_key_plans_only_noops(&plain, &spec)?;
     drop(plain);
+
+    // With the chain's key the same change applies, and the chain keeps verifying.
+    let extended = with_notes(spec.clone())?;
+    let (db, report) = open_from_spec(
+        &extended,
+        Some(&path),
+        StartupMode::Additive,
+        &defaults,
+        &keyed,
+    )?;
+    assert_eq!(report.decision, StartupDecision::ApplyThenStart);
+    assert!(db.catalog().contains_key("notes"));
+    db.verify_audit_chain()?;
+    drop(db);
 
     // An unusable key is refused when it is applied, before anything is planned or written.
     std::fs::write(&key_path, "not a key")?;
@@ -4462,6 +4732,64 @@ fn open_from_spec_keeps_the_audit_chain_on_the_callers_key() -> TestResult {
         open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed),
         Err(ProvisionError::Db(DbError::AuditIntegrity(_)))
     ));
+    Ok(())
+}
+
+/// A handle that chains with the development key, on a chain written with a configured key:
+/// a noop plan writes nothing and is not blocked, but any plan with steps would append events
+/// the chain cannot verify, on every surface.
+fn db_with_development_key_plans_only_noops(db: &Database, spec: &DatabaseSpec) -> TestResult {
+    assert_eq!(db.audit_tail_matches_key()?, Some(false));
+    assert_eq!(plan_open(spec, db)?.outcome, PlanOutcome::Noop);
+    let extended = with_notes(spec.clone())?;
+    for surface in [ProvisionSurface::Cli, ProvisionSurface::RustApi] {
+        let plan = plan_provision(
+            &extended,
+            ProvisionTargetRef::Open(db),
+            &ProvisionOptions::default(),
+            &env(surface),
+        )?;
+        assert_blocked(&plan, "PROVISION_AUDIT_KEY_MISMATCH");
+        let Some(found) = plan
+            .issues
+            .iter()
+            .find(|found| found.code == "PROVISION_AUDIT_KEY_MISMATCH")
+        else {
+            return Err("missing PROVISION_AUDIT_KEY_MISMATCH".into());
+        };
+        assert_eq!(found.path, "guarantees.audit.enabled");
+        assert!(
+            found.message.contains("development key"),
+            "{}",
+            found.message
+        );
+        assert!(
+            found.suggestion.contains("open_from_spec"),
+            "{}",
+            found.suggestion
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_audit_chain_on_the_handles_key_does_not_block_a_plan() -> TestResult {
+    let spec = in_memory(orders_spec()?);
+    let db = create_in_memory(&spec)?;
+    let expected = if db.audit_events()?.is_empty() {
+        None
+    } else {
+        Some(true)
+    };
+    assert_eq!(db.audit_tail_matches_key()?, expected);
+    db.record_admin_auth_event(None, "check", AuditOutcome::Succeeded, None)?;
+    assert_eq!(db.audit_tail_matches_key()?, Some(true));
+    let plan = plan_rust_api(&with_notes(spec)?, &db)?;
+    assert!(
+        !issue_codes(&plan).contains(&"PROVISION_AUDIT_KEY_MISMATCH"),
+        "{:#?}",
+        plan.issues
+    );
     Ok(())
 }
 

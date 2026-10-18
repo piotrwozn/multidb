@@ -359,7 +359,8 @@ pub struct ProvisionPlan {
     /// Every flag a step of the plan needs, given or not.
     pub required_flags: Vec<String>,
     /// The plan is ready and only creates, adopts, records or strengthens, without RBAC changes
-    /// on an existing database: `--auto-approve` and `init --apply` accept it.
+    /// on an existing database and without enabling system versioning on a table it adopts:
+    /// `--auto-approve` and `init --apply` accept it.
     pub auto_approvable: bool,
     pub impact: PlanImpact,
     pub rollback: RollbackPlan,
@@ -401,6 +402,7 @@ pub fn plan_provision(
         drift: Vec::new(),
         guarantees: Vec::new(),
         audit_required: false,
+        confirm_only: BTreeSet::new(),
     };
     if let Some(compiled) = compiled {
         builder.build(compiled.resolved_profile)?;
@@ -616,6 +618,9 @@ struct PlanBuilder<'a> {
     guarantees: Vec<GuaranteeEnforcement>,
     /// Audit is off and stays off: any step blocks the plan with `AUDIT_REQUIRED_FOR_APPLY`.
     audit_required: bool,
+    /// Paths of steps that change an existing object provisioning does not manage yet (system
+    /// versioning of an adopted table): they need a typed confirmation, never auto-approval.
+    confirm_only: BTreeSet<String>,
 }
 
 impl PlanBuilder<'_> {
@@ -666,7 +671,48 @@ impl PlanBuilder<'_> {
         }
         self.plan_guarantees();
         self.plan_metadata();
+        if !self.steps.is_empty() {
+            self.check_audit_chain()?;
+        }
         self.resolved = Some(resolved);
+        Ok(())
+    }
+
+    /// An apply appends audit events chained with the key of this handle. When the newest event
+    /// of an existing database does not verify under that key, the appended events would break
+    /// `verify_audit_chain`: `PROVISION_AUDIT_KEY_MISMATCH` blocks the plan. Only plans with
+    /// steps are checked, since a noop writes nothing; the check reads the whole audit log.
+    fn check_audit_chain(&mut self) -> Result<(), ProvisionError> {
+        let Target::Existing { db, live } = &self.target else {
+            return Ok(());
+        };
+        if db.audit_tail_matches_key()? != Some(false) {
+            return Ok(());
+        }
+        let message = if live.audit_key_configured {
+            "the newest audit event does not verify under the audit key this handle was given: \
+             the chain was written with another key, or its head event is missing, so the \
+             events an apply appends would break verify_audit_chain"
+        } else {
+            "the newest audit event does not verify under the built-in development key this \
+             handle chains audit events with: the chain was written with a configured audit \
+             key, or its head event is missing, so the events an apply appends would break \
+             verify_audit_chain"
+        };
+        let suggestion = if self.env.surface == ProvisionSurface::RustApi {
+            "Open the database with provision::open_from_spec and set \
+             ProvisionEnvironment.audit to the AuditConfig whose key the chain was written with."
+        } else {
+            "Apply the spec on the Rust API with provision::open_from_spec and the chain's audit \
+             key in ProvisionEnvironment.audit; the CLI, serve and the Control Plane have no \
+             audit key setting in this build."
+        };
+        self.error(
+            "PROVISION_AUDIT_KEY_MISMATCH",
+            "guarantees.audit.enabled",
+            message.to_owned(),
+            suggestion,
+        );
         Ok(())
     }
 
@@ -1116,7 +1162,7 @@ impl PlanBuilder<'_> {
             Target::New { .. } => (None, None),
         };
         let managed = record.and_then(|record| record.objects.get(&object.name));
-        let outcome =
+        let mut outcome =
             match live.and_then(|live| live.catalog.get(&object.name).map(|entry| (live, entry))) {
                 Some((live, entry)) => {
                     let diff = object_diff(
@@ -1130,6 +1176,22 @@ impl PlanBuilder<'_> {
                 }
                 None => missing_object_outcome(object, &path, live, managed.is_some(), counts),
             };
+        if let DesiredKind::History { base_table, .. } = &object.kind
+            && outcome.state == ObjectState::Create
+            && self
+                .objects
+                .iter()
+                .any(|planned| planned.name == *base_table && planned.state == ObjectState::Adopt)
+            && let Some(planned_step) = &mut outcome.step
+        {
+            planned_step.action = format!(
+                "{}; {base_table} is an existing table this plan adopts, and versioning \
+                 changes how it records writes, so the step needs a typed confirmation and is \
+                 never auto-approved",
+                planned_step.action
+            );
+            self.confirm_only.insert(planned_step.path.clone());
+        }
         self.issues.extend(outcome.issues);
         self.drift.extend(outcome.drift);
         self.objects.push(PlannedObject {
@@ -1403,6 +1465,7 @@ impl PlanBuilder<'_> {
         let (principal_changes, post_principals) =
             plan_principals(&security, &live_registry, &managed_users);
         planned.extend(principal_changes);
+        self.flag_unmanaged_holders(&security, &post_principals, &mut planned);
 
         let env = self.env;
         if let Some(actor) = &env.principal
@@ -1435,6 +1498,53 @@ impl PlanBuilder<'_> {
         }
 
         self.queue_security_changes(planned);
+    }
+
+    /// A role that is created or gains permissions also authorizes every principal that already
+    /// lists its name, since authorization resolves roles by name: principals the spec does not
+    /// manage (left over from a removed role, or assigned through the admin API) are named in the
+    /// step and get the Warning `SECURITY_ROLE_ALREADY_ASSIGNED`.
+    fn flag_unmanaged_holders(
+        &mut self,
+        security: &SecuritySpec,
+        post_principals: &BTreeMap<String, Principal>,
+        planned: &mut [SecurityChange],
+    ) {
+        let declared = security
+            .principals
+            .iter()
+            .map(|principal| principal.user.as_str())
+            .collect::<BTreeSet<_>>();
+        for change in planned.iter_mut().filter(|change| change.widens) {
+            let holders = post_principals
+                .iter()
+                .filter(|(user, principal)| {
+                    !declared.contains(user.as_str()) && principal.roles().contains(&change.object)
+                })
+                .map(|(user, _)| user.as_str())
+                .collect::<Vec<_>>();
+            if holders.is_empty() {
+                continue;
+            }
+            let holders = holders.join(", ");
+            change.action = format!(
+                "{}; users the spec does not manage already hold the role and gain its \
+                 permissions: {holders}",
+                change.action
+            );
+            self.issues.push(issue(
+                "SECURITY_ROLE_ALREADY_ASSIGNED",
+                ValidationSeverity::Warning,
+                change.path.clone(),
+                format!(
+                    "role {} gains permissions, and users the spec does not manage already hold \
+                     it, so they gain them too: {holders}",
+                    change.object
+                ),
+                "Check that these users should get the role's permissions, or give the role \
+                 another name in the spec.",
+            ));
+        }
     }
 
     fn queue_security_changes(&mut self, planned: Vec<SecurityChange>) {
@@ -1648,7 +1758,8 @@ impl PlanBuilder<'_> {
         ];
         let digest = spec_digest(spec);
         let applied_current = record.is_some_and(|record| {
-            record.status == ProvisionRecordStatus::Applied && record.spec_digest == digest
+            record.status == ProvisionRecordStatus::Applied
+                && identity_digest(&record.applied_spec) == identity_digest(spec)
         });
         let existing = self.live().is_some();
         let had_record = record.is_some();
@@ -1757,6 +1868,7 @@ impl PlanBuilder<'_> {
                     planned.safety,
                     StepSafety::Additive | StepSafety::Metadata | StepSafety::Strengthening
                 ) && !(existing && planned.kind == ProvisionStepKind::ApplySecurity)
+                    && !self.confirm_only.contains(&planned.path)
             });
 
         let impact = steps.iter().fold(impact_none(), |mut impact, planned| {
@@ -2068,6 +2180,18 @@ fn rollback_text(planned: &ProvisionStep) -> String {
         | ProvisionStepKind::RecordAppliedSpec
         | ProvisionStepKind::Noop => "apply the previous spec again".to_owned(),
     }
+}
+
+/// `spec_digest` of `spec` without `deployment.storage_path`: the storage path is a default
+/// location, not identity, so a spec that only moves it is still the applied spec. The record
+/// and the plan keep the full `spec_digest`.
+fn identity_digest(spec: &DatabaseSpec) -> String {
+    if spec.deployment.storage_path.is_none() {
+        return spec_digest(spec);
+    }
+    let mut spec = spec.clone();
+    spec.deployment.storage_path = None;
+    spec_digest(&spec)
 }
 
 /// The step kind that creates `kind`.
@@ -2830,6 +2954,7 @@ fn plan_roles(
                 safety: StepSafety::Destructive,
                 flag: Some(format!("allow_destructive:{path}")),
                 conflict: false,
+                widens: false,
             });
         }
     }
@@ -2872,6 +2997,7 @@ fn plan_principals(
                 safety: StepSafety::Destructive,
                 flag: Some(format!("allow_destructive:{path}")),
                 conflict: false,
+                widens: false,
             });
         }
     }
@@ -2985,6 +3111,8 @@ struct SecurityChange {
     flag: Option<String>,
     /// The spec names an unmanaged role or principal that differs from the live one.
     conflict: bool,
+    /// A role is created or gains permissions.
+    widens: bool,
 }
 
 fn grant_pairs(role: &Role) -> BTreeSet<(Resource, Permission)> {
@@ -3013,10 +3141,17 @@ fn role_change(
             safety,
             flag,
             conflict,
+            widens: false,
+        })
+    };
+    let widening = |change: Option<SecurityChange>| {
+        change.map(|change| SecurityChange {
+            widens: true,
+            ..change
         })
     };
     let Some(live) = live else {
-        return change(
+        return widening(change(
             format!(
                 "create the role {name} with {} grants",
                 grant_pairs(desired).len()
@@ -3024,7 +3159,7 @@ fn role_change(
             StepSafety::Additive,
             None,
             false,
-        );
+        ));
     };
     let have = grant_pairs(live);
     let want = grant_pairs(desired);
@@ -3053,7 +3188,7 @@ fn role_change(
     }
     let revoked = have.difference(&want).count();
     let added = want.difference(&have).count();
-    if revoked > 0 {
+    let planned = if revoked > 0 {
         change(
             format!("change the role {name}: revoke {revoked} and add {added} permissions"),
             StepSafety::Weakening,
@@ -3067,6 +3202,11 @@ fn role_change(
             None,
             false,
         )
+    };
+    if added > 0 {
+        widening(planned)
+    } else {
+        planned
     }
 }
 
@@ -3085,6 +3225,7 @@ fn principal_change(
             safety,
             flag,
             conflict,
+            widens: false,
         })
     };
     let Some(live) = live else {

@@ -128,6 +128,8 @@ All notable public changes will be recorded here.
   refresh lag 1, geo precision 6, index ids at position + 1, chunk and
   retention from the profile knobs), as are the derived names
   `<collection>_<path>_fts`, `<collection>_<path>_geo` and `<table>_history`.
+  An explicit `physical.retention_millis: null` is refused when the spec is
+  decoded, since it could mean the profile knob or no retention.
   See `docs/provisioning.md`.
 - `CollectionIndexKind::Geo` (`geo`), a version 2 index kind that needs
   `physical.geo` and no extension.
@@ -145,7 +147,8 @@ All notable public changes will be recorded here.
   `SECURITY_RESERVED_NAME`, `SECURITY_SYSTEM_GRANT_FORBIDDEN`,
   `SECURITY_GRANT_TARGET_INVALID`, `SECURITY_GRANT_UNKNOWN_OBJECT`,
   `SECURITY_PRINCIPAL_UNKNOWN_ROLE` and `SECURITY_DUPLICATE`; and the version
-  2 Warnings `SECURITY_BROAD_GRANT` and
+  2 Warnings `SECURITY_BROAD_GRANT` (every grant on the whole database,
+  which in this build also covers system reads, writes or administration) and
   `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
   `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME` also covers
   `physical.max_future_skew_millis` and full-text languages other than
@@ -184,12 +187,17 @@ All notable public changes will be recorded here.
   Objects that already match are adopted; differing ones are conflicts,
   since there is no alter API; managed objects the spec drops are released
   with their data kept; RBAC is managed-only and never touches the bootstrap
-  administrator. Planning never creates a file or writes a database. New
-  plan issue codes include `PROVISION_ENGINE_MISMATCH`,
+  administrator. Enabling system versioning on a table the plan adopts is
+  never auto-approvable, and `deployment.storage_path` is not part of what
+  counts as the applied spec. Planning never creates a file or writes a
+  database. New plan issue codes include `PROVISION_ENGINE_MISMATCH`,
   `PROVISION_FORMAT_MISMATCH`, `PROVISION_OBJECT_CONFLICT`,
   `PROVISION_SECURITY_STATE_STALE`, `RBAC_SELF_LOCKOUT`,
-  `AUDIT_REQUIRED_FOR_APPLY`, `GUARANTEE_NOT_ENFORCEABLE` and
-  `STEP_REQUIRES_FLAG`. See `docs/provisioning.md`.
+  `AUDIT_REQUIRED_FOR_APPLY`, `PROVISION_AUDIT_KEY_MISMATCH` (a plan with
+  steps whose appended audit events would not verify against the existing
+  chain), `GUARANTEE_NOT_ENFORCEABLE` and `STEP_REQUIRES_FLAG`, and the
+  Warning `SECURITY_ROLE_ALREADY_ASSIGNED` (a created or widened role that
+  users the spec does not manage already hold). See `docs/provisioning.md`.
 - `provision::drift`, which reports how an open database differs from a spec
   (`DriftReport` with `in_sync` and typed items), and `provision::export_spec`,
   which describes an open database as a version 2 spec: the applied spec of
@@ -247,7 +255,10 @@ All notable public changes will be recorded here.
   `config status --db <path>` (the provision record with its guarantee
   statuses, the last 20 history entries, the profile manifest and the drift
   against the applied spec) and
-  `config export --db <path> [--format yaml|json] [--out <file>] [--force]`.
+  `config export --db <path> [--format yaml|json] [--out <file>] [--force]`
+  (the exported `deployment.storage_path` points at the database relative to
+  the directory of `--out`, or is its absolute path on stdout; `--out` never
+  names the database or another multidb database, even with `--force`).
   `--allow-weakening` and `--allow-destructive` (repeatable or
   comma-separated), `--allow-format-upgrade` and `--unmanaged
   ignore|report|fail` are part of the `prov_` id. The target is `--db`, else
@@ -287,8 +298,10 @@ All notable public changes will be recorded here.
 - `multidb::provision::open_from_spec`, which opens or creates the database of
   a spec at startup on the Rust API or serve surface: it probes the target
   (with crash recovery), opens an existing database with
-  `open_database_with_ops` (re-applying `ProvisionEnvironment.audit`, so the
-  audit chain stays on the caller's key) and applies an auto-approvable plan
+  `open_database_with_ops` (with `ProvisionEnvironment.encryption`, also for
+  an encrypted database whose metadata cannot be probed without the key, and
+  re-applying `ProvisionEnvironment.audit`, so the audit chain stays on the
+  caller's key) and applies an auto-approvable plan
   as `local:embedded` or `local:serve` when the `StartupMode` allows it. The
   pure `serve_startup_decision(plan, mode)` returns the `StartupDecision`
   (`start`, `apply_then_start` or `refuse` with the reason); a refusal is

@@ -29,7 +29,7 @@ use super::{
     ProvisionStepKind, ProvisionSurface, ProvisionTargetRef, StepSafety, TargetKind,
     apply_provision, issue_summary, plan_provision, provision_new_database,
 };
-use crate::config_spec::{DatabaseSpec, ValidationIssue};
+use crate::config_spec::{DatabaseSpec, ValidationIssue, resolve_profile};
 use crate::db::{
     ConfigError, Database, DbConfig, MetadataProbe, OperationalConfig, ReplicationKind,
     inspect_database_metadata, open_database_with_ops, recover_database_file,
@@ -150,9 +150,11 @@ pub fn serve_startup_decision(plan: &ProvisionPlan, mode: StartupMode) -> Startu
 /// else a new in-memory database (Rust API only). A file that was not closed cleanly first gets
 /// redb's crash recovery, as with every opener. An existing single-node CP database is opened
 /// with `open_database_with_ops`, which loads its persisted RBAC state, with
-/// `ProvisionEnvironment.encryption` (Rust API only); then `ProvisionEnvironment.audit` is
-/// applied to the handle, since `open_database_with_ops` does not apply an audit config, so the
-/// audit chain stays on the caller's key. The plan of `spec` against the database, or against
+/// `ProvisionEnvironment.encryption` (Rust API only); an encrypted database, whose metadata the
+/// probe cannot read without the key, is opened with that config and the storage profile of the
+/// spec, which the open checks against the decrypted metadata. Then `ProvisionEnvironment.audit`
+/// is applied to the handle, since `open_database_with_ops` does not apply an audit config, so
+/// the audit chain stays on the caller's key. The plan of `spec` against the database, or against
 /// the absent target, goes to [`serve_startup_decision`]: `Start` returns the database as it
 /// is, and `ApplyThenStart` applies the plan with `Confirmation::AutoApproveAdditive` as the
 /// local operator of the surface (`local:serve` or `local:embedded`), creating a missing
@@ -192,7 +194,7 @@ pub fn open_from_spec(
         .map(Path::to_path_buf)
         .or_else(|| spec.deployment.storage_path.as_deref().map(PathBuf::from));
     let existing = match &path {
-        Some(path) => open_existing(path, env)?,
+        Some(path) => open_existing(spec, path, env)?,
         None => None,
     };
     let plan = match (&existing, &path) {
@@ -245,8 +247,13 @@ pub fn open_from_spec(
 }
 
 /// Probes `path` and opens an initialized single-node CP database; `None` when nothing exists
-/// at the path yet or the file is empty.
+/// at the path yet or the file is empty. The probe reads `__meta` without a key, so the
+/// metadata of an encrypted database is unreadable to it: with an encryption config, such a
+/// file is opened with that config and the storage profile of the spec, and the open checks
+/// both against the metadata it then decrypts (a wrong key or another storage profile or
+/// replication fails it).
 fn open_existing(
+    spec: &DatabaseSpec,
     path: &Path,
     env: &ProvisionEnvironment,
 ) -> Result<Option<Database>, ProvisionError> {
@@ -273,10 +280,19 @@ fn open_existing(
             )));
         }
         MetadataProbe::Unreadable { reason } => {
-            return Err(ProvisionError::Io(format!(
-                "{} cannot be probed: {reason}",
-                path.display()
-            )));
+            let storage_profile = resolve_profile(spec)
+                .resolved()
+                .map(|resolved| resolved.storage_profile);
+            let regular_file = std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
+            return match (&env.encryption, storage_profile) {
+                (Some(_), Some(storage_profile)) if regular_file => {
+                    open_with_environment(DbConfig::on_disk(storage_profile, path), env).map(Some)
+                }
+                _ => Err(ProvisionError::Io(format!(
+                    "{} cannot be probed: {reason}",
+                    path.display()
+                ))),
+            };
         }
     };
     if metadata.replication != ReplicationKind::Cp {
@@ -286,18 +302,24 @@ fn open_existing(
         }
         .into());
     }
+    open_with_environment(DbConfig::on_disk(metadata.storage_profile, path), env).map(Some)
+}
+
+/// Opens an existing database with `open_database_with_ops` and the encryption config of the
+/// environment, then applies its audit config to the handle.
+fn open_with_environment(
+    config: DbConfig,
+    env: &ProvisionEnvironment,
+) -> Result<Database, ProvisionError> {
     let mut operational = OperationalConfig::new();
     if let Some(encryption) = &env.encryption {
         operational = operational.with_encryption(encryption.clone());
     }
-    let mut db = open_database_with_ops(
-        DbConfig::on_disk(metadata.storage_profile, path),
-        &operational,
-    )?;
+    let mut db = open_database_with_ops(config, &operational)?;
     if let Some(audit) = &env.audit {
         db.apply_audit_config(audit.clone())?;
     }
-    Ok(Some(db))
+    Ok(db)
 }
 
 /// The database after a startup apply, or the refusal of an apply that failed part-way.

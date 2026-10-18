@@ -851,9 +851,9 @@ mod tests {
     };
     use crate::db::EncryptionConfig;
     use crate::provision::{
-        Confirmation, PlanOutcome, ProvisionEnvironment, ProvisionOptions, ProvisionOutcome,
-        ProvisionPlan, ProvisionSurface, ProvisionTargetRef, physical::project, plan_provision,
-        provision_new_database,
+        Confirmation, EnforcementStatus, PlanOutcome, ProvisionEnvironment, ProvisionOptions,
+        ProvisionOutcome, ProvisionPlan, ProvisionSurface, ProvisionTargetRef, StartupDecision,
+        StartupMode, open_from_spec, physical::project, plan_provision, provision_new_database,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1172,14 +1172,38 @@ mod tests {
             )),
             ..ProvisionEnvironment::new(ProvisionSurface::RustApi)
         };
+        let secure_path = temp_dir.path().join("secure.redb");
         let (db, report) = provision_new_database(
             &secure.spec,
-            Some(&temp_dir.path().join("secure.redb")),
+            Some(&secure_path),
             &Confirmation::AutoApproveAdditive,
             &ProvisionOptions::default(),
             &rust_api,
         )?;
         assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+        assert!(db.catalog().contains_key("tenants"));
+        let again = plan_provision(
+            &secure.spec,
+            ProvisionTargetRef::Open(&db),
+            &ProvisionOptions::default(),
+            &rust_api,
+        )?;
+        assert_eq!(again.outcome, PlanOutcome::Noop, "{:#?}", again.steps);
+        assert!(again.guarantees.iter().any(|entry| {
+            entry.path == "guarantees.encryption.at_rest"
+                && entry.status == EnforcementStatus::Enforced
+        }));
+        drop(db);
+
+        // The documented embedded route: open_from_spec opens it with the key and starts it.
+        let (db, started) = open_from_spec(
+            &secure.spec,
+            Some(&secure_path),
+            StartupMode::Verify,
+            &ProvisionOptions::default(),
+            &rust_api,
+        )?;
+        assert_eq!(started.decision, StartupDecision::Start);
         assert!(db.catalog().contains_key("tenants"));
         Ok(())
     }

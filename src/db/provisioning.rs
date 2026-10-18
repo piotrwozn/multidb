@@ -23,7 +23,8 @@ use crate::provision::{
 use crate::query::{DocField, RelIndexSpec, RelTable, TableLayout, TableSchema, schema_put_op};
 use crate::repl::{Op, ReadConsistency, Replication, propose_system_batch};
 use crate::security::{
-    AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource,
+    AUDIT_TABLE, AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry,
+    Resource,
 };
 use crate::storage::StorageError;
 use crate::vector::{HnswParams, VectorCollectionConfig, VectorMetric};
@@ -96,6 +97,61 @@ impl Database {
         }
         self.audit_config = audit;
         Ok(())
+    }
+
+    /// Whether the newest audit event verifies under the key this handle chains audit events
+    /// with, so the events an apply appends keep `verify_audit_chain` green. `None` for an empty
+    /// chain; `Some(false)` when the chain was written with another key (a configured key read
+    /// by a handle that falls back to the development key, or the reverse) or its head event is
+    /// missing. Reads every audit row once and decodes only the newest, unless the clock went
+    /// backwards and the head event is not the last row.
+    /// # Errors
+    /// Fails when storage or the audit key file cannot be read, or an audit row cannot be
+    /// decoded.
+    pub(crate) fn audit_tail_matches_key(&self) -> Result<Option<bool>, DbError> {
+        let head = self.audit_head()?;
+        if head.sequence == 0 {
+            return Ok(None);
+        }
+        let key = self.audit_key()?;
+        let mut newest = None;
+        self.repl.scan_range_batches(
+            AUDIT_TABLE,
+            &[],
+            &[0xFF],
+            ReadConsistency::Strong,
+            COUNT_BATCH_ROWS,
+            &|| false,
+            &mut |batch| {
+                if let Some((_, value)) = batch.last() {
+                    newest = Some(value.clone());
+                }
+                Ok(true)
+            },
+        )?;
+        let is_head = |event: &AuditEvent| {
+            event
+                .integrity
+                .as_ref()
+                .is_some_and(|integrity| integrity.sequence == head.sequence)
+        };
+        let mut tail = newest
+            .and_then(|bytes| serde_json::from_slice::<AuditEvent>(&bytes).ok())
+            .filter(is_head);
+        if tail.is_none() {
+            // Events are keyed by time, so after a clock step back the head is an earlier row.
+            tail = self.audit_events()?.into_iter().find(is_head);
+        }
+        let Some(integrity) = tail.as_ref().and_then(|event| event.integrity.as_ref()) else {
+            return Ok(Some(false));
+        };
+        let verifies = head.hash.as_deref() == Some(integrity.hash.as_str())
+            && tail.as_ref().is_some_and(|event| {
+                event
+                    .verify_integrity_link(integrity.previous_hash.as_deref(), head.sequence, &key)
+                    .is_ok()
+            });
+        Ok(Some(verifies))
     }
 
     /// The RBAC policy, principals and audit flag persisted in `__authz_policy`, which the next

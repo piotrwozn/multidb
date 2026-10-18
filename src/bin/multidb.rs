@@ -45,7 +45,7 @@ use multidb::{
     },
     network::{AuthConfig, NetworkConfig, PgServer, ScramCredential, TlsConfig, TlsMode},
     provision::{
-        self, Confirmation, PlanOutcome, ProvisionActor, ProvisionApplyReport,
+        self, Confirmation, ExportedSpec, PlanOutcome, ProvisionActor, ProvisionApplyReport,
         ProvisionEnvironment, ProvisionError, ProvisionOptions, ProvisionOutcome, ProvisionPlan,
         ProvisionSurface, ProvisionTargetRef, StartupMode, StartupRefusal, StartupReport,
     },
@@ -1898,14 +1898,8 @@ fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
             Some(SpecFormat::Yaml) | None => "yaml".to_owned(),
         },
     };
-    if let Some(out_path) = &out_path
-        && !has_flag(args, "--force")
-        && std::fs::symlink_metadata(out_path).is_ok()
-    {
-        return Err(CliError::Usage(format!(
-            "refusing to overwrite {}; pass --force to replace it",
-            out_path.display()
-        )));
+    if let Some(out_path) = &out_path {
+        ensure_export_out_target(out_path, &path, has_flag(args, "--force"))?;
     }
     let (db, _) = match open_existing_target(&path, false)? {
         Ok(opened) => opened,
@@ -1913,7 +1907,7 @@ fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
     };
     let exported = provision::export_spec(&db);
     drop(db);
-    let exported = match exported {
+    let mut exported = match exported {
         Ok(exported) => exported,
         Err(error) => {
             return Ok(CliRun::exit(
@@ -1922,6 +1916,7 @@ fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
             ));
         }
     };
+    point_storage_path_at(&mut exported, &path, out_path.as_deref());
     let content = serialize_spec(&exported.spec, &format)?;
     let Some(out_path) = out_path else {
         // stdout carries only the spec, so it can be redirected into a file.
@@ -1940,6 +1935,103 @@ fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
     )];
     lines.extend(exported.notes.iter().map(|note| format!("note: {note}")));
     Ok(CliRun::success(lines.join("\n")))
+}
+
+/// Refuses an export `--out` that names the database being exported or any other multidb
+/// database, even with `--force`, and any other existing file without `--force`.
+fn ensure_export_out_target(out_path: &Path, db_path: &Path, force: bool) -> Result<(), CliError> {
+    if same_file_path(db_path, out_path) {
+        return Err(CliError::Usage(format!(
+            "refusing to write the spec over the database {}; choose another --out",
+            out_path.display()
+        )));
+    }
+    if matches!(
+        inspect_database_metadata(out_path),
+        MetadataProbe::Initialized(_) | MetadataProbe::Locked | MetadataProbe::NeedsRecovery
+    ) {
+        return Err(CliError::Usage(format!(
+            "refusing to write the spec over {}, which holds a multidb database; choose another \
+             --out",
+            out_path.display()
+        )));
+    }
+    if !force && std::fs::symlink_metadata(out_path).is_ok() {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite {}; pass --force to replace it",
+            out_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Points `deployment.storage_path` of an exported spec at the exported database the way `config
+/// plan|apply --spec` and `serve` resolve it: relative to the directory of `--out`, or the
+/// canonical absolute path of the database for stdout (or when no relative path exists, as
+/// across Windows drives). `export_spec` returns the path the database was opened with, or the
+/// one the applied spec named relative to its own file, so neither would find the database
+/// from the exported file.
+fn point_storage_path_at(exported: &mut ExportedSpec, db_path: &Path, out_path: Option<&Path>) {
+    let database = absolute_path(db_path);
+    let relative = out_path.and_then(|out| {
+        let dir = std::fs::canonicalize(parent_dir(out)).ok()?;
+        relative_path(&dir, &database)
+    });
+    let storage_path = relative
+        .as_deref()
+        .unwrap_or(&database)
+        .to_string_lossy()
+        .into_owned();
+    if exported.spec.deployment.storage_path.as_deref() == Some(storage_path.as_str()) {
+        return;
+    }
+    exported.notes.push(if relative.is_some() {
+        format!(
+            "deployment.storage_path is {storage_path}: the database relative to the directory \
+             of the exported spec, which config plan|apply --spec and multidb serve resolve it \
+             against"
+        )
+    } else {
+        format!(
+            "deployment.storage_path is the absolute path of the database ({storage_path}), so \
+             the spec finds it from any directory"
+        )
+    });
+    exported.spec.deployment.storage_path = Some(storage_path);
+}
+
+/// `target` relative to the directory `base`; both are canonical. `None` when they share no
+/// root, as paths on two Windows drives do.
+fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+    let base = base.components().collect::<Vec<_>>();
+    let target = target.components().collect::<Vec<_>>();
+    let common = base
+        .iter()
+        .zip(&target)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let rooted = |components: &[std::path::Component<'_>]| {
+        components
+            .iter()
+            .take_while(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
+            .count()
+    };
+    if common == 0 || common < rooted(&base) || common < rooted(&target) {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..base.len() {
+        relative.push("..");
+    }
+    for component in &target[common..] {
+        relative.push(component);
+    }
+    Some(relative)
 }
 
 /// `init --apply [--db <path>] [--confirm <prov_id>]`.
@@ -7704,11 +7796,16 @@ mod tests {
             serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&out)?)?,
             spec
         );
+        // stdout has no file to be relative to: the storage path is the database's absolute
+        // path.
         let stdout = run(strings(&["config", "export", "--db", &db_arg]))?;
         assert_eq!(stdout.exit_code, 0);
+        let mut absolute = spec.clone();
+        absolute.deployment.storage_path =
+            Some(std::fs::canonicalize(&db_path)?.display().to_string());
         assert_eq!(
             serde_norway::from_str::<DatabaseSpec>(&stdout.message)?,
-            spec
+            absolute
         );
 
         // A database built outside provisioning exports an inferred spec that plans as
@@ -7770,6 +7867,165 @@ mod tests {
                 ["additive", "metadata"].contains(&step["safety"].as_str().unwrap_or_default()),
                 "{step}"
             );
+        }
+        Ok(())
+    }
+
+    /// `path` relative to the working directory of the test process, so a command gets the
+    /// relative `--db` spelling a user would type.
+    fn relative_to_cwd(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+        let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+        let relative = super::relative_path(&cwd, &std::fs::canonicalize(path)?)
+            .ok_or("no relative path from the working directory")?;
+        Ok(relative.display().to_string())
+    }
+
+    fn exported_storage_path(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(path)?)?;
+        Ok(spec
+            .deployment
+            .storage_path
+            .ok_or("the export has no storage_path")?)
+    }
+
+    #[test]
+    fn config_export_points_storage_path_at_the_database_from_the_exported_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(data.join("sub"))?;
+        let db_path = data.join("l3.redb");
+        let mut builder = create_balanced_database(&db_path)?;
+        builder.create_graph_auto_id("social")?;
+        drop(builder);
+        // The relative spelling a user types, relative to the working directory.
+        let db_arg = relative_to_cwd(&db_path)?;
+
+        let inferred = data.join("sub").join("l3.yaml");
+        let exported = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &db_arg,
+            "--out",
+            &path_arg(&inferred),
+        ]))?;
+        assert_eq!(exported.exit_code, 0, "{}", exported.message);
+        assert!(
+            exported.message.contains("deployment.storage_path is"),
+            "{}",
+            exported.message
+        );
+        assert_eq!(
+            exported_storage_path(&inferred)?,
+            std::path::Path::new("..")
+                .join("l3.redb")
+                .display()
+                .to_string()
+        );
+
+        // Without --db the spec finds the exported database and only adopts and records.
+        let plan = run(strings(&[
+            "config",
+            "plan",
+            "--spec",
+            &path_arg(&inferred),
+            "--json",
+        ]))?;
+        assert_eq!(plan.exit_code, 0, "{}", plan.message);
+        let plan = json_message(&plan)?;
+        assert_eq!(plan["target"]["kind"], "existing_database", "{plan}");
+        let steps = plan["steps"].as_array().ok_or("missing steps")?;
+        assert!(!steps.is_empty());
+        for step in steps {
+            assert!(
+                [
+                    "adopt_object",
+                    "adopt_profile",
+                    "record_guarantees",
+                    "record_metadata",
+                    "record_applied_spec"
+                ]
+                .contains(&step["kind"].as_str().unwrap_or_default()),
+                "{step}"
+            );
+        }
+        let applied = run(strings(&[
+            "config",
+            "apply",
+            "--spec",
+            &path_arg(&inferred),
+            "--auto-approve",
+        ]))?;
+        assert_eq!(applied.exit_code, 0, "{}", applied.message);
+
+        // The applied record exports with a storage path relative to the new file, and that
+        // spec is the applied one: a different storage path is not a change.
+        let moved = temp.path().join("l3.yaml");
+        let exported = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &db_arg,
+            "--out",
+            &path_arg(&moved),
+        ]))?;
+        assert_eq!(exported.exit_code, 0, "{}", exported.message);
+        assert!(
+            exported.message.contains("source=applied_record"),
+            "{}",
+            exported.message
+        );
+        assert_eq!(
+            exported_storage_path(&moved)?,
+            std::path::Path::new("data")
+                .join("l3.redb")
+                .display()
+                .to_string()
+        );
+        let noop = run(strings(&[
+            "config",
+            "plan",
+            "--spec",
+            &path_arg(&moved),
+            "--json",
+        ]))?;
+        assert_eq!(noop.exit_code, 0, "{}", noop.message);
+        let noop = json_message(&noop)?;
+        assert_eq!(noop["outcome"], "noop", "{noop}");
+        let drift = run(strings(&["config", "drift", "--spec", &path_arg(&moved)]))?;
+        assert_eq!(drift.exit_code, 0, "{}", drift.message);
+
+        // --out never names the database itself or another database, even with --force.
+        for out in [db_arg.clone(), path_arg(&db_path)] {
+            let refused = run(strings(&[
+                "config", "export", "--db", &db_arg, "--out", &out, "--force",
+            ]));
+            assert!(
+                matches!(refused, Err(CliError::Usage(ref message)) if message.contains("over the database")),
+                "unexpected result: {refused:?}"
+            );
+        }
+        let other_path = temp.path().join("other.redb");
+        drop(create_balanced_database(&other_path)?);
+        let refused = run(strings(&[
+            "config",
+            "export",
+            "--db",
+            &db_arg,
+            "--out",
+            &path_arg(&other_path),
+            "--force",
+        ]));
+        assert!(
+            matches!(refused, Err(CliError::Usage(ref message)) if message.contains("holds a multidb database")),
+            "unexpected result: {refused:?}"
+        );
+        for path in [&db_path, &other_path] {
+            assert!(matches!(
+                inspect_database_metadata(path),
+                MetadataProbe::Initialized(_)
+            ));
         }
         Ok(())
     }

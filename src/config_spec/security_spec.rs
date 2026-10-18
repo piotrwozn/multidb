@@ -316,23 +316,48 @@ fn check_grants(
                 }
             },
             None => {
-                if permissions.contains(&PermissionSpec::Admin) {
-                    issues.push(validation_issue(
-                        "SECURITY_BROAD_GRANT",
-                        ValidationSeverity::Warning,
-                        grant_path,
-                        format!(
-                            "role {} gets admin on the whole database, which in this build also \
-                             includes system administration: provisioning, RBAC and audit",
-                            role.name
-                        ),
-                        "Grant admin on the objects the role needs instead.",
-                        CertificationImpact::None,
-                    ));
+                if !permissions.is_empty() {
+                    issues.push(broad_grant(role, grant_path, &permissions));
                 }
             }
         }
     }
+}
+
+/// A grant on the whole database also covers the system resource in this build
+/// (`Role::allows` falls back to the database grant for every resource): read covers SQL system
+/// views and workload reports, admin covers provisioning, RBAC and audit administration.
+fn broad_grant(
+    role: &RoleSpec,
+    grant_path: String,
+    permissions: &BTreeSet<PermissionSpec>,
+) -> ValidationIssue {
+    let granted = permissions
+        .iter()
+        .map(|permission| permission_slug(*permission))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let covers = permissions
+        .iter()
+        .map(|permission| match permission {
+            PermissionSpec::Read => "system reads (SQL system views and workload reports)",
+            PermissionSpec::Write => "system writes",
+            PermissionSpec::Admin => "system administration (provisioning, RBAC and audit)",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    validation_issue(
+        "SECURITY_BROAD_GRANT",
+        ValidationSeverity::Warning,
+        grant_path,
+        format!(
+            "role {} gets {granted} on the whole database, which in this build also covers the \
+             system resource: {covers}",
+            role.name
+        ),
+        format!("Grant {granted} on the objects the role needs instead."),
+        CertificationImpact::None,
+    )
 }
 
 /// Searching a full-text or geo index needs Read on its source collection too.

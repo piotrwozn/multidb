@@ -6458,6 +6458,50 @@ mod tests {
     }
 
     #[test]
+    fn a_null_retention_is_refused_instead_of_inheriting_the_knob()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metrics = |physical: serde_json::Value| {
+            v2_spec_with(json!([{
+                "name": "metrics",
+                "role": "time_series",
+                "domain": "primary",
+                "indexes": ["time_series"],
+                "physical": physical
+            }]))
+        };
+        assert_eq!(
+            metrics(json!({ "retention_millis": 86_400_000 }))?.collections[0]
+                .physical
+                .as_ref()
+                .and_then(|physical| physical.retention_millis),
+            Some(86_400_000)
+        );
+        // Left out, the field takes the profile knob.
+        assert_eq!(
+            metrics(json!({ "chunk_millis": 3_600_000 }))?.collections[0]
+                .physical
+                .as_ref()
+                .and_then(|physical| physical.retention_millis),
+            None
+        );
+
+        let Err(error) = metrics(json!({ "retention_millis": null })) else {
+            return Err("a null retention_millis was accepted".into());
+        };
+        assert!(error.to_string().contains("cannot be null"), "{error}");
+        let mut value = serde_json::to_value(metrics(json!({}))?)?;
+        value["collections"][0]["physical"] = json!({ "retention_millis": null });
+        assert!(super::spec_io::decode_spec_value(value.clone()).is_err());
+        let yaml = serde_norway::to_string(&value)?;
+        assert!(yaml.contains("retention_millis: null"), "{yaml}");
+        assert!(
+            super::spec_io::decode_spec_bytes(yaml.as_bytes(), super::spec_io::SpecFormat::Yaml)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn collection_names_warn_in_v1_and_fail_in_v2() -> Result<(), Box<dyn std::error::Error>> {
         let mut spec = catalog_spec("balanced", ConsistencyMode::StrongCp);
         spec.collections = vec![
@@ -6960,7 +7004,21 @@ mod tests {
                 "SECURITY_BROAD_GRANT",
                 "security.roles[0].grants[0]",
                 ValidationSeverity::Warning,
-                None,
+                Some("Grant admin on the objects the role needs instead."),
+            ),
+            (
+                role(json!([{ "resource": "database", "permissions": ["read"] }])),
+                "SECURITY_BROAD_GRANT",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Warning,
+                Some("Grant read on the objects the role needs instead."),
+            ),
+            (
+                role(json!([{ "resource": "database", "permissions": ["read", "write"] }])),
+                "SECURITY_BROAD_GRANT",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Warning,
+                Some("Grant read, write on the objects the role needs instead."),
             ),
             (
                 role(json!([{ "object": "orders_notes_fts", "permissions": ["read"] }])),

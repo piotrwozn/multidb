@@ -99,7 +99,7 @@ Every collection becomes exactly one container object. Its kind is
 | `document` | `create_collection`, or `create_collection_auto_id` without a pinned id | `collection_id`; `fields` (`{name, path, type}`, empty means one field `id` holding the document id); `document_indexes` (`{path, id}`) |
 | `table` | `Database::create_table_with_layout` | `layout` (analytics: columnar; otherwise the database layout); `columns` (`{name, type, nullable: false}`; empty means a schemaless row table); `primary_key`; `table_indexes` (`{column, expression: column \| lower_ascii, include, id}`); `system_versioning`, `keep_history` |
 | `vector` | `create_vector_collection`, or `_auto_id` | `collection_id`; `dim` (1..=65536, required); `metric` (`cosine` \| `l2`, cosine); `hnsw` (`m` 1..=255, `ef_construction` >= m, `ef_search` >= 1; 16/200/48) |
-| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; unset or `null` takes the knob, so a series cannot ask for no retention when its profile sets a default retention) |
+| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; left out it takes the knob, and an explicit `null` is refused when the spec is decoded, since it could mean either the knob or no retention, so a series cannot ask for no retention when its profile sets a default retention) |
 | `graph` | `create_graph`, or `create_graph_auto_id` | `graph_id` |
 
 A document collection also derives:
@@ -218,9 +218,11 @@ principals the spec does not name are left alone.
   `admin` and `root`, cannot be managed or assigned (`SECURITY_RESERVED_NAME`).
 - **No system grants.** There is no `system` scope, and objects starting with
   `__` cannot be granted (`SECURITY_SYSTEM_GRANT_FORBIDDEN`). Note that in this
-  build a grant on the whole database also covers system administration
-  (provisioning, RBAC and audit), so `resource: database` with `admin` is the
-  Warning `SECURITY_BROAD_GRANT`.
+  build a grant on the whole database also covers the system resource: `read`
+  covers system reads (SQL system views and workload reports), `write` system
+  writes and `admin` system administration (provisioning, RBAC and audit). So
+  every `resource: database` grant is the Warning `SECURITY_BROAD_GRANT`,
+  which names what it covers.
 - **Index grants.** Searching a full-text or geo index also needs `read` on
   its source collection; a role that can read the index but not the source
   gets the Warning `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
@@ -333,7 +335,8 @@ not give is a `STEP_REQUIRES_FLAG` issue. The outcome is:
 - otherwise `noop` when there is no step, and `ready` when there is.
 
 `auto_approvable` is true for a ready plan whose steps are all additive,
-metadata or strengthening, without RBAC steps on an existing database;
+metadata or strengthening, without RBAC steps on an existing database and
+without enabling system versioning on a table the plan adopts;
 `Confirmation::AutoApproveAdditive` accepts only such plans, and so do the
 CLI `--auto-approve` and `init --apply`. Creating
 a full-text or geo index on a collection that already holds documents is
@@ -355,6 +358,7 @@ not backfill into the new index (see the known limit above).
 | `history.*`, `time_series.*`, `limits.*`, `consistency.default_domain`, `compatible_roles`, raised floors, profile identity (slug, kind, variant, `extends`) | `adopt_profile`, `metadata`; existing objects keep their parameters, so a new time-series default shows up as an object conflict |
 | a lowered floor | `adopt_profile`, `weakening`, flag `custom_profile.floors.<name>` |
 | a missing object | `create_*`, `additive` |
+| system versioning of an existing table the plan adopts (an unmanaged or released table) | `enable_system_versioning`, `additive`, but the plan is never `auto_approvable`: it changes how a table provisioning did not create records writes, so it needs a typed confirmation (`--auto-approve`, `init --apply` and `MULTIDB_SPEC_APPLY=additive` refuse it) |
 | an object that matches the spec and is not managed yet | `adopt_object`, `additive` |
 | an object that differs, or has another kind | `unsupported`, `PROVISION_OBJECT_CONFLICT` with a field diff |
 | a managed object the spec no longer declares | `release_object`, `destructive`, flag `collections.<name>` (`collections.<collection>.<index or history name>` for derived objects); the object and its data stay |
@@ -376,7 +380,11 @@ and index set, vector dimension, metric and HNSW parameters, time-series
 chunk and retention, full-text and geo source, path, language, lag and
 precision, history base table and `keep_history`, and collection and graph
 ids when the spec pins them or the record allocated them.
-`deployment.storage_path` is never compared.
+`deployment.storage_path` is never compared: it is a default location, not
+identity, so a spec that differs from the last applied one only in its
+storage path is still the applied spec (no `record_applied_spec` step and no
+`spec_changed` drift). The record keeps the storage path it was applied with,
+and `spec_digest` still covers the whole spec.
 
 Live objects the spec does not declare follow `provisioning.unmanaged`
 (`ProvisionOptions.unmanaged` overrides it): `ignore` leaves them out,
@@ -395,9 +403,14 @@ role and principal, including the bootstrap administrator (role `admin`,
 principals `admin` and `root`), is left alone. Grants are resolved to the
 resource of their object (`Collection`, `VectorCollection`, `Table` for
 tables and `<table>_history`, `TimeSeries`, `Graph`, `FullTextIndex`,
-`GeoIndex`, or `Database`). A plan that would take system administration away
-from `ProvisionEnvironment.principal` is `RBAC_SELF_LOCKOUT`. The check
-resolves the principal the way authorization will after the apply: through
+`GeoIndex`, or `Database`). Authorization resolves roles by name, so a role
+the plan creates or widens also authorizes every principal that already lists
+its name: users the spec does not manage that hold it (left over from a
+removed role, or assigned through the admin API) are named in the step and get
+the Warning `SECURITY_ROLE_ALREADY_ASSIGNED`. A plan that would take system
+administration away from `ProvisionEnvironment.principal` is
+`RBAC_SELF_LOCKOUT`. The check resolves the principal the way authorization
+will after the apply: through
 the login users that map to it (a user may map to a principal of another
 name), so narrowing its roles, removing its principal or remapping its user
 all count; when several users map to it, losing administration through any
@@ -417,7 +430,7 @@ Open the database with `open_database_with_ops` to plan it.
 | `backup.enabled`, `backup.pitr` | `operator_managed` with the `multidb backup`, `verify` and `restore` runbook and the Warning `GUARANTEE_OPERATOR_MANAGED`, when requested; there is no scheduler |
 | `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): there is no re-encryption. So is a `ProvisionEnvironment.encryption` for a new database whose spec says `at_rest: false`, refused before anything is created |
 | `sensitive_data` | follows `encryption.at_rest`; the development audit key warns but never blocks it |
-| `audit.enabled` | `enforced` with a configured audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one, which is always the case on the CLI and `serve` |
+| `audit.enabled` | `enforced` with a configured audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one, which is always the case on the CLI and `serve`. A plan with steps against an existing database whose newest audit event does not verify under the handle's key (a chain written with a configured key, planned through a handle that falls back to the development key, or the reverse) is `PROVISION_AUDIT_KEY_MISMATCH` (blocks), since the events the apply appends would break `verify_audit_chain`; a noop is not blocked, since it writes nothing. The check reads the whole audit log |
 | `cache` TTL and eviction, `event_log` append-only | `not_enforced`, the Warning `ROLE_CONSTRAINT_NOT_ENFORCED` |
 
 A guarantee the spec does not ask for is `not_requested`.
@@ -488,6 +501,15 @@ resolves it.
 Planning the exported spec against the same database only adopts objects,
 the profile and RBAC and records metadata. An unreadable record makes export
 fail with `RecordUnreadable`.
+
+`export_spec` returns `deployment.storage_path` as it is: the path the
+database was opened with for an inferred spec, and the path the applied spec
+named, relative to its own file, for a record. `multidb config export` points
+it at the exported database instead, relative to the directory of `--out`
+(the canonical absolute path for stdout), because `config plan|apply --spec`
+and `serve` resolve it against the directory of the spec file; a caller of the
+Rust API that saves the spec should do the same. `GET /config/live` returns it
+as the database was opened, since the Control Plane ignores it.
 
 ## Applying plans
 
@@ -628,7 +650,7 @@ exclusive file lock: a database another process holds open is refused.
 | `multidb config apply --spec <file> [--db <path>] (--confirm <prov_id> \| --auto-approve) [flags] [--json]` | Recomputes the plan and applies it: a missing or empty file is created with `provision_new_database`, an existing database is opened and converged with `apply_provision`. Without `--confirm` or `--auto-approve` a noop exits 0 and any other plan is printed with exit 2 |
 | `multidb config drift --spec <file> [--db <path>] [--unmanaged ignore\|report\|fail] [--json]` | How the database differs from the spec, for CI |
 | `multidb config status --db <path> [--json]` | The provision record with its guarantee statuses, the last 20 history entries, the profile manifest and the drift of the database against the spec the record applied |
-| `multidb config export --db <path> [--format yaml\|json] [--out <file>] [--force]` | `export_spec`: the applied spec, or an inferred version 2 spec. Without `--out` the spec goes to stdout and the notes to stderr; `--out` never replaces a file without `--force` |
+| `multidb config export --db <path> [--format yaml\|json] [--out <file>] [--force]` | `export_spec`: the applied spec, or an inferred version 2 spec, with `deployment.storage_path` pointing at the database relative to the directory of `--out` (the canonical absolute path on stdout), so `config plan --spec <file>` without `--db` plans the exported database. Without `--out` the spec goes to stdout and the notes to stderr; `--out` never replaces a file without `--force`, and never the database or another multidb database |
 | `multidb init --guided (--profile <p> \| --template <t>) --name <n> ... --apply [--db <path>] [--confirm <prov_id>]` | Writes the files as `init` always does, then provisions a new database from the spec |
 
 The flags of `config plan` and `config apply` are `--allow-weakening
@@ -762,7 +784,11 @@ reserved, so provisioning never touches them.
 **Known limits:**
 
 - Audit is chained with the development key (`enforced_with_development_key`
-  and `AUDIT_DEVELOPMENT_KEY`): `serve` has no audit key setting.
+  and `AUDIT_DEVELOPMENT_KEY`): `serve` has no audit key setting. A database
+  whose audit chain was written with a configured key (on the Rust API) is
+  refused with `PROVISION_AUDIT_KEY_MISMATCH` whenever a start would change
+  it, and `serve` itself appends its admin events with the development key,
+  so serve such a database only after deciding to give up its keyed chain.
 - A restart of `serve` *without* spec mode re-bootstraps RBAC until plain
   openers load the persisted RBAC state: plain `serve` opens the database
   with `create_database`, which does not load persisted roles, and the admin
@@ -777,10 +803,12 @@ with the same decision table on the `rust_api` surface, as `local:embedded`.
 The target is `path`, else `deployment.storage_path` (relative to the working
 directory), else a new in-memory database, which is new at every open, so
 only `create` and `additive` build it. An existing database is opened with
-`ProvisionEnvironment.encryption` (a `LocalEnvelope` config), and
-`ProvisionEnvironment.audit` is applied to the handle afterwards, because
-`open_database_with_ops` does not apply an audit config: the audit chain then
-stays on the caller's key across opens. An audit key file that cannot be read
+`ProvisionEnvironment.encryption` (a `LocalEnvelope` config); an encrypted
+one, whose metadata cannot be probed without the key, is opened with that
+config and the storage profile of the spec, and the open checks both against
+the decrypted metadata. `ProvisionEnvironment.audit` is applied to the handle
+afterwards, because `open_database_with_ops` does not apply an audit config:
+the audit chain then stays on the caller's key across opens. An audit key file that cannot be read
 or parsed fails the open. A refusal is `ProvisionError::StartupRefused` with
 a `StartupRefusal` (`mode`, `reason`, the `plan`, and the `applied` report of
 a startup apply that failed part-way); a start returns the database and a
@@ -935,7 +963,8 @@ Plans add their own issues, whatever the spec version:
 | `PROVISION_ENGINE_MISMATCH`, `PROVISION_FORMAT_MISMATCH`, `PROVISION_ENCRYPTION_MISMATCH` | Error | the database cannot be changed to the spec |
 | `PROVISION_OBJECT_CONFLICT` | Error | a live object, role or principal differs and cannot be altered |
 | `ID_CONFLICT` | Error | a pinned id is used by another live object |
-| `PROVISION_RECORD_UNREADABLE`, `PROVISION_SECURITY_STATE_STALE`, `RBAC_SELF_LOCKOUT`, `AUDIT_REQUIRED_FOR_APPLY` | Error | see above |
+| `PROVISION_RECORD_UNREADABLE`, `PROVISION_SECURITY_STATE_STALE`, `RBAC_SELF_LOCKOUT`, `AUDIT_REQUIRED_FOR_APPLY`, `PROVISION_AUDIT_KEY_MISMATCH` | Error | see above |
+| `SECURITY_ROLE_ALREADY_ASSIGNED` | Warning | a role the plan creates or widens is already held by users the spec does not manage |
 | `GUARANTEE_NOT_ENFORCEABLE` | Error | a guarantee this surface or database cannot enforce |
 | `GUARANTEE_OPERATOR_MANAGED`, `AUDIT_DEVELOPMENT_KEY`, `ROLE_CONSTRAINT_NOT_ENFORCED` | Warning | how a guarantee is enforced |
 | `DRIFT_UNMANAGED` | Warning, Error under `unmanaged: fail` | an undeclared, unmanaged live object |

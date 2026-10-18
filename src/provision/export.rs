@@ -58,6 +58,13 @@ pub struct ExportedSpec {
 
 /// Exports `db` as a spec: the applied spec of its provision record when it has one, otherwise
 /// a version 2 spec inferred from the live database. Never writes.
+///
+/// `deployment.storage_path` is returned as it is: the path the database was opened with
+/// (`DbConfig.path`, often relative to the working directory) for an inferred spec, and the
+/// path the applied spec named (relative to the directory of its file) for a record. A caller
+/// that saves the spec to a file should point it at the database relative to that file, as
+/// `multidb config export` does, since `config plan|apply --spec` and `multidb serve` resolve it
+/// against the directory of the spec file.
 /// # Errors
 /// Fails with `RecordUnreadable` when the provision record cannot be read (a newer build wrote
 /// it, or it is corrupt), and as `plan_provision` when the live state cannot be read.

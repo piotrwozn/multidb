@@ -136,8 +136,14 @@ pub struct PhysicalObjectSpec {
     /// Time series: the chunk width. Defaults to `time_series.default_chunk_millis`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_millis: Option<i64>,
-    /// Time series: the retention. Defaults to `time_series.default_retention_millis`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Time series: the retention. Defaults to `time_series.default_retention_millis` when the
+    /// field is left out; an explicit `null` is refused, since it could mean either that default
+    /// or no retention.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "retention_not_null"
+    )]
     pub retention_millis: Option<i64>,
     /// Time series: reserved; this build's runtime has no future-skew bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +151,23 @@ pub struct PhysicalObjectSpec {
     /// Graph: a pinned graph id. Unpinned ids are allocated at apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_id: Option<u32>,
+}
+
+/// `physical.retention_millis` when it is present: a number. `null` is refused instead of
+/// falling back to the profile knob, which could set a retention a spec author who wrote `null`
+/// for "keep forever" does not expect. A field that is left out never reaches this function.
+fn retention_not_null<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<i64>::deserialize(deserializer)? {
+        Some(retention) => Ok(Some(retention)),
+        None => Err(serde::de::Error::custom(
+            "physical.retention_millis cannot be null: leave it out to use the profile knob \
+             time_series.default_retention_millis (a profile whose knob is null keeps data \
+             without retention), or give the retention in milliseconds",
+        )),
+    }
 }
 
 /// A SQL-visible document field: a dotted `path` into the document, or `$id`.

@@ -88,8 +88,12 @@ start (see [provisioning.md](provisioning.md#serve)). Without
 2. The database path is an explicit `MULTIDB_DB_PATH`, else the spec
    `deployment.storage_path` resolved against the directory of the spec file,
    else the default `/var/lib/multidb/multidb.redb`. A variable counts as
-   explicit when it is set and not blank. Missing parent directories are
-   created, as without a spec.
+   explicit when it is set and not blank. The image sets
+   `MULTIDB_DB_PATH=/var/lib/multidb/multidb.redb`, and so do
+   `docker-compose.yml` and the Helm chart, so in a container the variable is
+   explicit and the spec `storage_path` is ignored (`serve` prints a note
+   saying so) unless `MULTIDB_DB_PATH` is set to an empty value. Missing
+   parent directories are created, as without a spec.
 3. Before anything is opened, `serve` refuses an explicit `MULTIDB_PROFILE`
    that selects another storage profile than the spec profile (`auto` never
    conflicts), an explicit `MULTIDB_REPLICATION` other than the spec
