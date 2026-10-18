@@ -23,10 +23,10 @@ use multidb::{
         CustomProfileSpec, DATABASE_SPEC_VERSION_V2, DatabaseDefaults, DatabaseSpec,
         DeploymentMode, DeploymentSpec, ExplainConfigReport, FloorOverrides, GuaranteeSpec,
         GuaranteeValidator, KNOB_REGISTRY, KnobDefinition, KnobEnforcement, KnobSource, KnobTiming,
-        LayoutKnob, MigrationPlan, MigrationPlanner, ProfileKnobOverrides, ProfileKnobs,
-        ProfileResolution, ProfileSpec, ProfileVariant, RESERVED_KNOBS, ReplicationMode,
-        ResolvedProfile, ResolvedProfileKind, RoleSetDelta, StorageMedium, TopologySpec,
-        UnmanagedPolicy, ValidationIssue, ValidationReport, ValidationSeverity,
+        LayoutKnob, MigrationPlan, MigrationPlanner, PolicyCompiler, ProfileKnobOverrides,
+        ProfileKnobs, ProfileResolution, ProfileSpec, ProfileVariant, RESERVED_KNOBS,
+        ReplicationMode, ResolvedProfile, ResolvedProfileKind, RoleSetDelta, StorageMedium,
+        TopologySpec, UnmanagedPolicy, ValidationIssue, ValidationReport, ValidationSeverity,
         built_in_profile_normalized, built_in_profiles, collection_role_definition,
         collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
         parse_knob_assignment, profile_variants, resolve_named_profile, resolve_profile,
@@ -46,7 +46,7 @@ use multidb::{
     provision::{
         self, Confirmation, PlanOutcome, ProvisionActor, ProvisionApplyReport,
         ProvisionEnvironment, ProvisionError, ProvisionOptions, ProvisionOutcome, ProvisionPlan,
-        ProvisionSurface, ProvisionTargetRef,
+        ProvisionSurface, ProvisionTargetRef, StartupMode, StartupRefusal, StartupReport,
     },
     runtime_advisor::{RuntimeAdviceDecisionRequest, RuntimeAdviceReport, RuntimeAdviceStatus},
     templates::{
@@ -124,6 +124,24 @@ struct ServeConfig {
     pg_password: String,
     pg_tls: ServePgTls,
     studio_dir: PathBuf,
+    /// Spec mode, when `MULTIDB_SPEC_PATH` is set.
+    spec: Option<ServeSpecConfig>,
+}
+
+/// `serve` in spec mode: the database is built from, and checked against, the spec at
+/// `MULTIDB_SPEC_PATH` at every start (see `serve_spec_database`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServeSpecConfig {
+    path: PathBuf,
+    /// `MULTIDB_SPEC_APPLY`: `verify` (the default), `create` or `additive`.
+    mode: StartupMode,
+    /// `MULTIDB_DB_PATH` is set (present and not blank), so it wins over the spec
+    /// `deployment.storage_path`.
+    explicit_db_path: bool,
+    /// `MULTIDB_PROFILE` is set, so it must not select another storage profile than the spec.
+    explicit_profile: bool,
+    /// `MULTIDB_REPLICATION`, read in spec mode only; it must equal the spec's replication.
+    explicit_replication: Option<ReplicationMode>,
 }
 
 /// What a `--profile` flag or `MULTIDB_PROFILE` selects: a storage profile, or `auto`, which
@@ -911,6 +929,13 @@ fn provision_exit_code(end: ProvisionEnd<'_>) -> u8 {
             | ProvisionError::AlreadyInitialized
             | ProvisionError::AuditRequired
             | ProvisionError::PermissionMissing(_) => 2,
+            ProvisionError::StartupRefused(refusal) => {
+                if refusal.applied.is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             ProvisionError::Locked(_)
             | ProvisionError::RecordUnreadable(_)
             | ProvisionError::Db(_)
@@ -933,6 +958,7 @@ const fn provision_error_status(error: &ProvisionError) -> &'static str {
         ProvisionError::PermissionMissing(_) => "permission_missing",
         ProvisionError::Locked(_) => "in_use",
         ProvisionError::RecordUnreadable(_) => "record_unreadable",
+        ProvisionError::StartupRefused(_) => "startup_refused",
         ProvisionError::Db(_) => "database_error",
         ProvisionError::Config(_) => "config_error",
         ProvisionError::Io(_) => "io_error",
@@ -1375,6 +1401,7 @@ fn provision_error_text(error: &ProvisionError, command: &SpecCommand) -> String
         ProvisionError::Locked(_) => in_use_message(command.db_path.as_deref()),
         ProvisionError::PermissionMissing(_)
         | ProvisionError::RecordUnreadable(_)
+        | ProvisionError::StartupRefused(_)
         | ProvisionError::Db(_)
         | ProvisionError::Config(_)
         | ProvisionError::Io(_) => error.to_string(),
@@ -3033,8 +3060,12 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
 }
 
 /// Creates or opens the single-node CP database `serve` runs on. With `MULTIDB_PROFILE=auto`
-/// the database must already exist (see `cli_db_config`).
+/// the database must already exist (see `cli_db_config`). In spec mode the spec decides, see
+/// `serve_spec_database`.
 fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliError> {
+    if let Some(serve_spec) = &config.spec {
+        return serve_spec_database(config, serve_spec);
+    }
     // Resolved first, so `auto` on a missing path fails before any directory is created.
     let db_config = cli_db_config(config.profile, config.db_path.clone())?;
     if let Some(parent) = config.db_path.parent()
@@ -3043,6 +3074,271 @@ fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliErro
         std::fs::create_dir_all(parent)?;
     }
     Ok(create_database(db_config)?)
+}
+
+/// `serve` in spec mode (`MULTIDB_SPEC_PATH`). The spec is read through `spec_io`, validated
+/// and compiled; then, before anything is opened, serve refuses an explicit `MULTIDB_PROFILE`
+/// that selects another storage profile, an explicit `MULTIDB_REPLICATION` that contradicts the
+/// spec, `encryption.at_rest` (serve cannot open encrypted databases) and a volatile profile.
+/// The database path is an explicit `MULTIDB_DB_PATH`, else the spec `storage_path` resolved
+/// against the directory of the spec file, else serve's default path. `open_from_spec` on the
+/// serve surface then starts, applies an auto-approvable plan as `local:serve` when
+/// `MULTIDB_SPEC_APPLY` allows it, or refuses: a refusal prints the plan and the exact `multidb
+/// config apply ... --confirm prov_...` command that confirms it, or the `config plan` command
+/// that reviews a blocked plan. Every refusal comes before any port is bound.
+fn serve_spec_database(
+    config: &ServeConfig,
+    serve_spec: &ServeSpecConfig,
+) -> Result<multidb::db::Database, CliError> {
+    let spec = match read_spec_file(&serve_spec.path) {
+        Ok(Ok(spec)) => spec,
+        Ok(Err(report)) => {
+            return Err(serve_refusal(
+                serve_spec,
+                &format!(
+                    "the spec cannot be decoded\n{}",
+                    format_validation_report(&report)
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(serve_refusal(
+                serve_spec,
+                &format!("the spec cannot be read: {error}"),
+            ));
+        }
+    };
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| {
+        serve_refusal(
+            serve_spec,
+            &format!("the spec is invalid\n{}", format_validation_report(&report)),
+        )
+    })?;
+    if let Some(reason) = serve_spec_conflict(
+        config,
+        serve_spec,
+        &spec,
+        compiled.resolved_profile.as_ref(),
+    ) {
+        return Err(serve_refusal(serve_spec, &reason));
+    }
+    let (db_path, notes) = serve_spec_db_path(config, serve_spec, &spec);
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let opened = provision::open_from_spec(
+        &spec,
+        Some(&db_path),
+        serve_spec.mode,
+        &ProvisionOptions::default(),
+        &ProvisionEnvironment::new(ProvisionSurface::Serve),
+    );
+    match opened {
+        Ok((database, report)) => {
+            eprintln!(
+                "{}",
+                format_startup_report(serve_spec, &db_path, &report, &notes)
+            );
+            Ok(database)
+        }
+        Err(ProvisionError::StartupRefused(refusal)) => Err(serve_refusal(
+            serve_spec,
+            &serve_refusal_details(serve_spec, &spec, &db_path, &refusal, &notes),
+        )),
+        Err(ProvisionError::Config(error)) => Err(CliError::Config(error)),
+        Err(ProvisionError::Db(error)) => Err(CliError::Db(error)),
+        Err(error) => Err(serve_refusal(serve_spec, &error.to_string())),
+    }
+}
+
+/// A refused start in spec mode, as a usage error.
+fn serve_refusal(serve_spec: &ServeSpecConfig, reason: &str) -> CliError {
+    CliError::Usage(format!(
+        "multidb serve refused to start before binding any port (MULTIDB_SPEC_PATH={}, \
+         MULTIDB_SPEC_APPLY={}): {reason}",
+        serve_spec.path.display(),
+        serve_spec.mode.slug()
+    ))
+}
+
+/// What in serve's own configuration contradicts the spec: an explicit `MULTIDB_PROFILE` that
+/// selects another storage profile (`auto` never does), an explicit `MULTIDB_REPLICATION` other
+/// than the spec's, encryption at rest and a volatile profile.
+fn serve_spec_conflict(
+    config: &ServeConfig,
+    serve_spec: &ServeSpecConfig,
+    spec: &DatabaseSpec,
+    resolved: Option<&ResolvedProfile>,
+) -> Option<String> {
+    if let (true, ProfileSelection::Fixed(selected), Some(resolved)) =
+        (serve_spec.explicit_profile, config.profile, resolved)
+        && selected != resolved.storage_profile
+    {
+        return Some(format!(
+            "MULTIDB_PROFILE selects the storage profile {selected:?}, but the spec profile {} \
+             uses {:?}; in spec mode the spec decides the profile, so unset MULTIDB_PROFILE or \
+             make it agree",
+            resolved.slug, resolved.storage_profile
+        ));
+    }
+    if let Some(replication) = serve_spec.explicit_replication
+        && replication != spec.defaults.replication
+    {
+        return Some(format!(
+            "MULTIDB_REPLICATION is {}, but the spec defaults.replication is {}; unset \
+             MULTIDB_REPLICATION or make it agree",
+            slug(&replication),
+            slug(&spec.defaults.replication)
+        ));
+    }
+    if spec.guarantees.encryption.at_rest {
+        return Some(
+            "the spec sets guarantees.encryption.at_rest, but multidb serve cannot open \
+             encrypted databases in this build: encryption at rest is provisioned through the \
+             Rust API only (GUARANTEE_NOT_ENFORCEABLE)"
+                .to_owned(),
+        );
+    }
+    if let Some(resolved) = resolved
+        && resolved.knobs.storage.medium == StorageMedium::Volatile
+    {
+        return Some(format!(
+            "the spec profile {} is volatile (in memory), and multidb serve serves durable \
+             databases only (PROVISION_VOLATILE_ON_SURFACE); use a durable profile",
+            resolved.slug
+        ));
+    }
+    None
+}
+
+/// The database path of spec mode, and a note when an explicit `MULTIDB_DB_PATH` wins over the
+/// spec `deployment.storage_path`. Without either, serve's default path.
+fn serve_spec_db_path(
+    config: &ServeConfig,
+    serve_spec: &ServeSpecConfig,
+    spec: &DatabaseSpec,
+) -> (PathBuf, Vec<String>) {
+    match spec.deployment.storage_path.as_deref() {
+        Some(storage_path) if serve_spec.explicit_db_path => (
+            config.db_path.clone(),
+            vec![format!(
+                "MULTIDB_DB_PATH {} wins over the spec deployment.storage_path {storage_path}",
+                config.db_path.display()
+            )],
+        ),
+        Some(storage_path) => (
+            resolve_against(parent_dir(&serve_spec.path), storage_path),
+            Vec::new(),
+        ),
+        None => (config.db_path.clone(), Vec::new()),
+    }
+}
+
+/// `path` canonicalized when it exists, else made absolute: commands printed to run later work
+/// from any directory.
+fn absolute_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The reason of a refused start, the plan it was refused on and what to run next.
+fn serve_refusal_details(
+    serve_spec: &ServeSpecConfig,
+    spec: &DatabaseSpec,
+    db_path: &Path,
+    refusal: &StartupRefusal,
+    notes: &[String],
+) -> String {
+    let mut command = SpecCommand {
+        spec_path: absolute_path(&serve_spec.path),
+        spec: spec.clone(),
+        db_path: Some(
+            refusal
+                .plan
+                .target
+                .path
+                .as_deref()
+                .map_or_else(|| absolute_path(db_path), PathBuf::from),
+        ),
+        options: ProvisionOptions::default(),
+        output: "text".to_owned(),
+    };
+    let mut lines = vec![refusal.reason.clone()];
+    lines.extend(notes.iter().map(|note| format!("note: {note}")));
+    if let Some(applied) = &refusal.applied {
+        lines.push(format_provision_report(applied, &command));
+    }
+    lines.push(format_provision_plan(&refusal.plan, &command.options));
+    lines.push(serve_next_step(&mut command, refusal));
+    lines.join("\n")
+}
+
+/// The command that resolves a refused start. For a ready plan, or one that needs flags, it is
+/// `multidb config apply --spec <abs spec> --db <canonical db> [exactly the flags the plan
+/// needs] --confirm <prov_id>`, with the id of a plan on the CLI surface against the same
+/// canonical target with those flags, so running it confirms that plan. For a blocked plan, or
+/// what remains of a failed startup apply, it is the `config plan` command that reviews it.
+fn serve_next_step(command: &mut SpecCommand, refusal: &StartupRefusal) -> String {
+    let review = |command: &SpecCommand| {
+        format!(
+            "review the plan with: {}",
+            plan_command(command, &command.options, None)
+        )
+    };
+    if refusal.applied.is_some()
+        || matches!(
+            refusal.plan.outcome,
+            PlanOutcome::Blocked | PlanOutcome::Noop
+        )
+    {
+        return review(command);
+    }
+    command.options = options_with_flags(&command.options, &refusal.plan.required_flags);
+    let cli_plan = open_spec_target(command.db_path.as_deref())
+        .ok()
+        .and_then(|target| plan_spec_target(command, &target).ok());
+    match cli_plan {
+        Some(plan) if plan.outcome == PlanOutcome::Ready => format!(
+            "apply it with: {}\nthen start multidb serve again (prov_ ids are per surface: this \
+             is the id of the plan on the CLI surface, not of the serve plan above)",
+            apply_command(command, &plan)
+        ),
+        _ => review(command),
+    }
+}
+
+/// What a start in spec mode did, for stderr: whether the database matched or which plan was
+/// applied, the notes and the Warnings of the plan.
+fn format_startup_report(
+    serve_spec: &ServeSpecConfig,
+    db_path: &Path,
+    report: &StartupReport,
+    notes: &[String],
+) -> String {
+    let headline = match &report.applied {
+        Some(applied) => format!(
+            "applied plan {} to {} ({} steps) as local:serve",
+            report.plan_id,
+            db_path.display(),
+            applied.applied_steps.len()
+        ),
+        None => format!(
+            "the database at {} matches the spec (plan {})",
+            db_path.display(),
+            report.plan_id
+        ),
+    };
+    let mut lines = vec![format!(
+        "multidb serve: spec {} (MULTIDB_SPEC_APPLY={}): {headline}",
+        serve_spec.path.display(),
+        serve_spec.mode.slug()
+    )];
+    lines.extend(notes.iter().map(|note| format!("note: {note}")));
+    lines.extend(report.warnings.iter().map(format_issue));
+    lines.join("\n")
 }
 
 fn run_admin(args: &[String]) -> Result<String, CliError> {
@@ -3988,6 +4284,7 @@ where
         "/usr/share/multidb/studio",
     ));
     let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
+    let spec = serve_spec_from_sources(&get_env)?;
 
     Ok(ServeConfig {
         admin_bind,
@@ -4003,7 +4300,54 @@ where
         pg_password,
         pg_tls,
         studio_dir,
+        spec,
     })
+}
+
+/// Spec mode: `MULTIDB_SPEC_PATH`, `MULTIDB_SPEC_APPLY` (`verify` by default, `create` or
+/// `additive`) and which of `MULTIDB_DB_PATH`, `MULTIDB_PROFILE` and `MULTIDB_REPLICATION` are
+/// set explicitly, which means present and not blank, as `env_or_default` reads them.
+/// `MULTIDB_REPLICATION` (`cp` or `ap`) is read in spec mode only; without a spec, `serve`
+/// ignores it as before. `MULTIDB_SPEC_APPLY` without `MULTIDB_SPEC_PATH` is a usage error.
+fn serve_spec_from_sources<F>(get_env: &F) -> Result<Option<ServeSpecConfig>, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let explicit = |name: &str| get_env(name).filter(|value| !value.trim().is_empty());
+    let apply = explicit("MULTIDB_SPEC_APPLY");
+    let Some(path) = explicit("MULTIDB_SPEC_PATH") else {
+        return match apply {
+            Some(_) => Err(CliError::Usage(
+                "MULTIDB_SPEC_APPLY needs MULTIDB_SPEC_PATH, the spec multidb serve starts from"
+                    .to_owned(),
+            )),
+            None => Ok(None),
+        };
+    };
+    let mode = match apply {
+        None => StartupMode::Verify,
+        Some(value) => StartupMode::from_slug(&value).ok_or_else(|| {
+            CliError::Usage(format!(
+                "unsupported MULTIDB_SPEC_APPLY {value}; expected verify, create or additive"
+            ))
+        })?,
+    };
+    let explicit_replication = explicit("MULTIDB_REPLICATION")
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "cp" => Ok(ReplicationMode::Cp),
+            "ap" => Ok(ReplicationMode::Ap),
+            _ => Err(CliError::Usage(format!(
+                "unsupported MULTIDB_REPLICATION {value}; expected cp or ap"
+            ))),
+        })
+        .transpose()?;
+    Ok(Some(ServeSpecConfig {
+        path: PathBuf::from(path),
+        mode,
+        explicit_db_path: explicit("MULTIDB_DB_PATH").is_some(),
+        explicit_profile: explicit("MULTIDB_PROFILE").is_some(),
+        explicit_replication,
+    }))
 }
 
 fn env_or_default<F>(get_env: &F, name: &str, default: &str) -> String
@@ -4436,7 +4780,7 @@ fn parse_knob_overrides(
 
 fn usage() -> CliError {
     CliError::Usage(
-        "multidb serve\n\
+        "multidb serve (configured through MULTIDB_* environment variables; MULTIDB_SPEC_PATH=<spec> [MULTIDB_SPEC_APPLY=verify|create|additive] builds and checks the database from a spec)\n\
          multidb backup full --db <path> --profile <profile> --dest <dir>\n\
          multidb init --guided --profile <profile> --name <name> [--override <knob>=<value>]... [--profile-name <slug>] [--out <path>] [--format yaml|json] [--force] [--apply [--db <path>] [--confirm <prov_id>]] [--json]\n\
          multidb init --guided --template <template> --name <name> [--out <dir>] [--format yaml|json] [--force] [--apply [--db <path>] [--confirm <prov_id>]] [--json]\n\
@@ -4492,8 +4836,9 @@ mod tests {
     #[cfg(unix)]
     use super::write_through_temp_file;
     use super::{
-        CliError, ProfileSelection, ServePgTls, cli_db_config, format_metadata_probe,
-        parse_profile_selection, run, serve_config_from_sources, serve_database, values,
+        CliError, ProfileSelection, ServePgTls, ServeSpecConfig, cli_db_config,
+        format_metadata_probe, parse_profile_selection, run, serve_config_from_sources,
+        serve_database, values,
     };
     use multidb::{
         config_spec::{
@@ -7625,8 +7970,8 @@ mod tests {
         use multidb::config_spec::{ApplyCheckReport, ApplyStatus};
         use multidb::provision::{
             PlanOutcome, ProvisionApplyReport, ProvisionEnvironment, ProvisionError,
-            ProvisionOptions, ProvisionOutcome, ProvisionSurface, ProvisionTargetRef,
-            plan_provision,
+            ProvisionOptions, ProvisionOutcome, ProvisionSurface, ProvisionTargetRef, StartupMode,
+            StartupRefusal, plan_provision,
         };
 
         let temp = tempdir()?;
@@ -7662,6 +8007,7 @@ mod tests {
         invalid.validation.valid = false;
         assert_eq!(provision_exit_code(ProvisionEnd::Drifted(&invalid)), 2);
 
+        let mut partial = None;
         for (status, code) in [
             (ProvisionOutcome::Applied, 0),
             (ProvisionOutcome::Noop, 0),
@@ -7693,9 +8039,20 @@ mod tests {
                 code,
                 "{status:?}"
             );
+            if status == ProvisionOutcome::PartiallyApplied {
+                partial = Some(report);
+            }
         }
 
         let unsupported = || ConfigError::Unsupported("unsupported".to_owned());
+        let startup_refused = |applied: Option<ProvisionApplyReport>| {
+            ProvisionError::StartupRefused(Box::new(StartupRefusal {
+                mode: StartupMode::Verify,
+                reason: "database missing".to_owned(),
+                plan: plan.clone(),
+                applied,
+            }))
+        };
         for (error, code) in [
             (
                 ProvisionError::InvalidSpec(Box::new(plan.validation.clone())),
@@ -7725,6 +8082,8 @@ mod tests {
             ),
             (ProvisionError::Config(unsupported()), 1),
             (ProvisionError::Io("disk".to_owned()), 1),
+            (startup_refused(None), 2),
+            (startup_refused(partial.clone()), 1),
         ] {
             assert_eq!(
                 provision_exit_code(ProvisionEnd::Failed(&error)),
@@ -7732,6 +8091,345 @@ mod tests {
                 "{error:?}"
             );
         }
+        Ok(())
+    }
+
+    /// The environment of a local-dev `serve` in spec mode with `spec_path`, plus `extra`.
+    fn spec_serve_config(
+        spec_path: &std::path::Path,
+        extra: &[(&str, &str)],
+    ) -> Result<super::ServeConfig, CliError> {
+        let spec_arg = path_arg(spec_path);
+        let mut values = vec![
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+            ("MULTIDB_SPEC_PATH", spec_arg.as_str()),
+        ];
+        values.extend_from_slice(extra);
+        let env = env_map(&values);
+        serve_config_from_sources(|name| env.get(name).cloned())
+    }
+
+    /// The message of a start that `serve` refused.
+    fn serve_refusal(
+        result: Result<multidb::db::Database, CliError>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        match result {
+            Err(CliError::Usage(message)) => Ok(message),
+            Err(other) => Err(format!("expected a refused start, got {other}").into()),
+            Ok(_) => Err("expected a refused start, but serve opened the database".into()),
+        }
+    }
+
+    /// The `multidb config apply ...` command a refused start prints, as CLI arguments.
+    fn printed_apply_command(message: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let command = message
+            .lines()
+            .find_map(|line| line.strip_prefix("apply it with: multidb "))
+            .ok_or_else(|| format!("no apply command in: {message}"))?;
+        Ok(command.split_whitespace().map(str::to_owned).collect())
+    }
+
+    #[test]
+    fn serve_config_parses_spec_mode() -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::{config_spec::ReplicationMode, provision::StartupMode};
+
+        let base = [
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+        ];
+        let parse = |extra: &[(&str, &str)]| {
+            let mut values = base.to_vec();
+            values.extend_from_slice(extra);
+            let env = env_map(&values);
+            serve_config_from_sources(|name| env.get(name).cloned())
+        };
+
+        // Without a spec path, serve is unchanged and MULTIDB_REPLICATION is not read.
+        assert_eq!(parse(&[("MULTIDB_REPLICATION", "raft")])?.spec, None);
+        assert_eq!(parse(&[("MULTIDB_SPEC_PATH", "  ")])?.spec, None);
+        let apply_alone = parse(&[("MULTIDB_SPEC_APPLY", "create")]);
+        assert!(
+            matches!(apply_alone, Err(CliError::Usage(ref message)) if message.contains("needs MULTIDB_SPEC_PATH")),
+            "unexpected result: {apply_alone:?}"
+        );
+
+        let spec_path = "/etc/multidb/multidb.yaml";
+        let default = parse(&[("MULTIDB_SPEC_PATH", spec_path)])?;
+        assert_eq!(
+            default.spec,
+            Some(ServeSpecConfig {
+                path: std::path::PathBuf::from(spec_path),
+                mode: StartupMode::Verify,
+                explicit_db_path: false,
+                explicit_profile: false,
+                explicit_replication: None,
+            })
+        );
+        for (value, mode) in [
+            ("verify", StartupMode::Verify),
+            ("create", StartupMode::Create),
+            ("additive", StartupMode::Additive),
+            (" Additive ", StartupMode::Additive),
+            ("", StartupMode::Verify),
+        ] {
+            let config = parse(&[
+                ("MULTIDB_SPEC_PATH", spec_path),
+                ("MULTIDB_SPEC_APPLY", value),
+            ])?;
+            assert_eq!(config.spec.map(|spec| spec.mode), Some(mode), "{value:?}");
+        }
+        let invalid = parse(&[
+            ("MULTIDB_SPEC_PATH", spec_path),
+            ("MULTIDB_SPEC_APPLY", "apply"),
+        ]);
+        assert!(
+            matches!(invalid, Err(CliError::Usage(ref message)) if message.contains("unsupported MULTIDB_SPEC_APPLY apply")),
+            "unexpected result: {invalid:?}"
+        );
+
+        // Explicit means present and not blank, as env_or_default reads the values.
+        let explicit = parse(&[
+            ("MULTIDB_SPEC_PATH", spec_path),
+            ("MULTIDB_DB_PATH", "/data/shop.redb"),
+            ("MULTIDB_PROFILE", "balanced"),
+            ("MULTIDB_REPLICATION", "CP"),
+        ])?;
+        let spec = explicit.spec.ok_or("spec mode")?;
+        assert!(spec.explicit_db_path && spec.explicit_profile);
+        assert_eq!(spec.explicit_replication, Some(ReplicationMode::Cp));
+        assert_eq!(
+            explicit.db_path,
+            std::path::PathBuf::from("/data/shop.redb")
+        );
+        let blank = parse(&[
+            ("MULTIDB_SPEC_PATH", spec_path),
+            ("MULTIDB_DB_PATH", "   "),
+            ("MULTIDB_PROFILE", ""),
+            ("MULTIDB_REPLICATION", " "),
+        ])?;
+        let spec = blank.spec.ok_or("spec mode")?;
+        assert!(!spec.explicit_db_path && !spec.explicit_profile);
+        assert_eq!(spec.explicit_replication, None);
+        assert_eq!(
+            blank.db_path,
+            std::path::PathBuf::from("/var/lib/multidb/multidb.redb")
+        );
+        let replication = parse(&[
+            ("MULTIDB_SPEC_PATH", spec_path),
+            ("MULTIDB_REPLICATION", "raft"),
+        ]);
+        assert!(
+            matches!(replication, Err(CliError::Usage(ref message)) if message.contains("unsupported MULTIDB_REPLICATION raft")),
+            "unexpected result: {replication:?}"
+        );
+        Ok(())
+    }
+
+    /// Explicit variables that contradict the spec, encryption at rest and volatile profiles
+    /// are refused before anything is opened or created.
+    #[test]
+    fn serve_spec_mode_refuses_conflicts_before_opening() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let mut spec = provision_spec(&json!([document_collection("orders")]))?;
+        spec.deployment.storage_path = Some("data/shop.redb".to_owned());
+        write_yaml_spec(&spec_path, &spec)?;
+        let data_dir = temp.path().join("data");
+
+        for (extra, reason) in [
+            (
+                vec![("MULTIDB_PROFILE", "analytical")],
+                "MULTIDB_PROFILE selects the storage profile Analytical, but the spec profile \
+                 balanced uses Balanced",
+            ),
+            (
+                vec![("MULTIDB_REPLICATION", "ap")],
+                "MULTIDB_REPLICATION is ap, but the spec defaults.replication is cp",
+            ),
+        ] {
+            let message = serve_refusal(serve_database(&spec_serve_config(&spec_path, &extra)?))?;
+            assert!(message.contains(reason), "{message}");
+            assert!(message.contains("before binding any port"), "{message}");
+            assert!(!data_dir.exists(), "nothing is created: {message}");
+        }
+
+        // Agreeing values and auto never conflict: the start goes on to the plan, which verify
+        // refuses for the missing database.
+        for extra in [
+            vec![("MULTIDB_PROFILE", "balanced")],
+            vec![("MULTIDB_PROFILE", "auto")],
+            vec![("MULTIDB_REPLICATION", "cp")],
+        ] {
+            let message = serve_refusal(serve_database(&spec_serve_config(&spec_path, &extra)?))?;
+            assert!(message.contains("database missing at"), "{message}");
+        }
+
+        // Refused specs name another directory, which must not be created either.
+        let mut refused = spec.clone();
+        refused.deployment.storage_path = Some("refused/shop.redb".to_owned());
+        let mut at_rest = refused.clone();
+        at_rest.guarantees.encryption.at_rest = true;
+        let mut volatile = refused.clone();
+        volatile.profile = "in_memory".to_owned();
+        volatile.deployment.mode = DeploymentMode::Embedded;
+        volatile.deployment.storage_path = None;
+        let mut invalid = refused;
+        invalid.collections[0].name = "__orders".to_owned();
+        for (spec, reason) in [
+            (&at_rest, "guarantees.encryption.at_rest"),
+            (&volatile, "PROVISION_VOLATILE_ON_SURFACE"),
+            (&invalid, "the spec is invalid"),
+        ] {
+            let path = temp.path().join("refused.yaml");
+            write_yaml_spec(&path, spec)?;
+            let message = serve_refusal(serve_database(&spec_serve_config(&path, &[])?))?;
+            assert!(message.contains(reason), "{reason}: {message}");
+        }
+        let missing = serve_refusal(serve_database(&spec_serve_config(
+            &temp.path().join("missing.yaml"),
+            &[],
+        )?))?;
+        assert!(missing.contains("the spec cannot be read"), "{missing}");
+        let version = temp.path().join("version.yaml");
+        std::fs::write(&version, "version: 3\nname: shop\n")?;
+        let decode = serve_refusal(serve_database(&spec_serve_config(&version, &[])?))?;
+        assert!(decode.contains("the spec cannot be decoded"), "{decode}");
+        assert!(!temp.path().join("refused").exists());
+        Ok(())
+    }
+
+    /// Verify mode refuses a missing database and prints a `config apply` command whose
+    /// `prov_` id confirms the plan; after running it, verify mode starts.
+    #[test]
+    fn serve_spec_mode_verify_prints_a_command_that_confirms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_dir = temp.path().join("app");
+        std::fs::create_dir(&spec_dir)?;
+        let spec_path = spec_dir.join("multidb.yaml");
+        let mut spec = provision_spec(&json!([document_collection("orders")]))?;
+        spec.deployment.storage_path = Some("data/shop.redb".to_owned());
+        write_yaml_spec(&spec_path, &spec)?;
+        let db_path = spec_dir.join("data").join("shop.redb");
+        let verify = spec_serve_config(&spec_path, &[])?;
+
+        let message = serve_refusal(serve_database(&verify))?;
+        for expected in [
+            "MULTIDB_SPEC_APPLY=verify",
+            "database missing at",
+            "set MULTIDB_SPEC_APPLY=create",
+            "provisioning plan prov_",
+            "apply it with: multidb config apply --spec",
+            "--confirm prov_",
+        ] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        assert!(!db_path.exists(), "verify never creates the database");
+
+        let args = printed_apply_command(&message)?;
+        assert!(args.contains(&std::fs::canonicalize(&spec_path)?.display().to_string()));
+        assert!(
+            args.contains(
+                &std::fs::canonicalize(spec_dir.join("data"))?
+                    .join("shop.redb")
+                    .display()
+                    .to_string()
+            )
+        );
+        let applied = run(args)?;
+        assert_eq!(applied.exit_code, 0, "{}", applied.message);
+        assert!(db_path.exists());
+
+        let database = serve_database(&verify)?;
+        assert!(database.catalog().contains_key("orders"));
+        Ok(())
+    }
+
+    /// Create mode boots a new database; verify then starts it unchanged, refuses pending
+    /// additive changes, which additive mode applies, and prints the exact flags a plan needs.
+    #[test]
+    fn serve_spec_mode_creates_verifies_and_applies_additive_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let orders = provision_spec(&json!([document_collection("orders")]))?;
+        write_yaml_spec(&spec_path, &orders)?;
+        let db_path = temp.path().join("shop.redb");
+        let config = |mode: &str| spec_serve_config(&spec_path, &[("MULTIDB_SPEC_APPLY", mode)]);
+
+        let mut database = serve_database(&config("create")?)?;
+        assert!(database.catalog().contains_key("orders"));
+        let record = database.provision_state()?.ok_or("a provision record")?;
+        assert_eq!(record.applied_by, "local:serve");
+        // serve bootstraps the admin principal after provisioning; its names are reserved.
+        database.ensure_bootstrap_admin_principal()?;
+        drop(database);
+        assert!(db_path.exists());
+
+        drop(serve_database(&config("verify")?)?);
+        drop(serve_database(&config("create")?)?);
+
+        let both = provision_spec(&json!([
+            document_collection("orders"),
+            document_collection("notes")
+        ]))?;
+        write_yaml_spec(&spec_path, &both)?;
+        for mode in ["verify", "create"] {
+            let message = serve_refusal(serve_database(&config(mode)?))?;
+            for expected in [
+                "differs from the spec by",
+                "set MULTIDB_SPEC_APPLY=additive",
+                "--confirm prov_",
+            ] {
+                assert!(message.contains(expected), "{mode}: {expected}: {message}");
+            }
+        }
+        let database = serve_database(&config("additive")?)?;
+        assert!(database.catalog().contains_key("notes"));
+        drop(database);
+        drop(serve_database(&config("verify")?)?);
+
+        // Releasing notes is destructive: no mode applies it, and the printed command carries
+        // exactly the flag the plan needs.
+        write_yaml_spec(&spec_path, &orders)?;
+        let message = serve_refusal(serve_database(&config("additive")?))?;
+        assert!(
+            message.contains("needs flags a start never gives"),
+            "{message}"
+        );
+        let args = printed_apply_command(&message)?;
+        let flag = args
+            .iter()
+            .position(|arg| arg == "--allow-destructive")
+            .ok_or_else(|| format!("no --allow-destructive in {args:?}"))?;
+        assert_eq!(
+            args.get(flag + 1).map(String::as_str),
+            Some("collections.notes")
+        );
+        let applied = run(args)?;
+        assert_eq!(applied.exit_code, 0, "{}", applied.message);
+        let database = serve_database(&config("verify")?)?;
+        assert!(
+            database.catalog().contains_key("notes"),
+            "release keeps the data"
+        );
+        drop(database);
+
+        // An explicit MULTIDB_DB_PATH wins over the spec storage path.
+        let other = temp.path().join("other").join("explicit.redb");
+        let explicit = spec_serve_config(
+            &spec_path,
+            &[
+                ("MULTIDB_SPEC_APPLY", "create"),
+                ("MULTIDB_DB_PATH", &path_arg(&other)),
+            ],
+        )?;
+        drop(serve_database(&explicit)?);
+        assert!(other.exists());
         Ok(())
     }
 }

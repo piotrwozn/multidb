@@ -19,8 +19,10 @@ Spec provisioning (`provision::provision_new_database` and
 `provision::apply_provision`, see [provisioning.md](provisioning.md)) creates
 databases this way and writes the manifest of an adopted, retuned or
 format-upgraded database. The CLI provisions through it (`config apply
---spec`, `init --apply`, see [provisioning.md](provisioning.md#cli)); `serve`
-and the Control Plane do not create databases from specs yet. The CLI inspects profiles and specs
+--spec`, `init --apply`, see [provisioning.md](provisioning.md#cli)), and so
+does `serve` in spec mode (`MULTIDB_SPEC_PATH`, see
+[provisioning.md](provisioning.md#serve)); the Control Plane does not create
+databases from specs yet. The CLI inspects profiles and specs
 (`multidb profile show`, `profile explain`, `profile knobs`), writes version 2
 specs (`init --override`, `config upgrade`) and reads a database's own profile
 with `--profile auto` (see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and

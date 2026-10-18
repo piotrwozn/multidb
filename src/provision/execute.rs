@@ -365,7 +365,7 @@ pub fn provision_new_database(
 
 /// The local operator label of a surface; `None` for the Control Plane, which applies as a
 /// principal.
-const fn local_operator_label(surface: ProvisionSurface) -> Option<&'static str> {
+pub(super) const fn local_operator_label(surface: ProvisionSurface) -> Option<&'static str> {
     match surface {
         ProvisionSurface::RustApi => Some("local:embedded"),
         ProvisionSurface::Cli => Some("local:cli"),
@@ -545,7 +545,8 @@ fn noop_report(
     Ok(report)
 }
 
-fn plan_warnings(plan: &ProvisionPlan) -> Vec<ValidationIssue> {
+/// The Warnings of a plan, which every report of it carries.
+pub(super) fn plan_warnings(plan: &ProvisionPlan) -> Vec<ValidationIssue> {
     plan.issues
         .iter()
         .filter(|found| found.severity == ValidationSeverity::Warning)

@@ -21,21 +21,21 @@ foreach ($Relative in $Required) {
 }
 
 $Deployment = Get-Content (Join-Path $Root "ops/helm/multidb/templates/deployment.yaml") -Raw
-foreach ($Token in @("readinessProbe:", "livenessProbe:", "RollingUpdate", "downgrade-policy", "secretKeyRef:", "persistentVolumeClaim:", "MULTIDB_ADMIN_PASSWORD", "MULTIDB_ADMIN_TOKEN", "MULTIDB_PG_PASSWORD", "MULTIDB_PG_TLS_CERT")) {
+foreach ($Token in @("readinessProbe:", "livenessProbe:", "RollingUpdate", "downgrade-policy", "secretKeyRef:", "persistentVolumeClaim:", "MULTIDB_ADMIN_PASSWORD", "MULTIDB_ADMIN_TOKEN", "MULTIDB_PG_PASSWORD", "MULTIDB_PG_TLS_CERT", "configMap:", ".Values.spec.enabled")) {
     if (-not $Deployment.Contains($Token)) {
         throw "deployment template missing required token: $Token"
     }
 }
 
 $Values = Get-Content (Join-Path $Root "ops/helm/multidb/values.yaml") -Raw
-foreach ($Token in @("vaultAddress", "minioEndpoint", "auditJsonlPath", "backupTarget", "runtime:", "persistence:", "adminPassword:", "adminToken:", "pgPassword:", "pgTls:")) {
+foreach ($Token in @("vaultAddress", "minioEndpoint", "auditJsonlPath", "backupTarget", "runtime:", "persistence:", "adminPassword:", "adminToken:", "pgPassword:", "pgTls:", "spec:", "configMap:", "apply: verify")) {
     if (-not $Values.Contains($Token)) {
         throw "values.yaml missing required token: $Token"
     }
 }
 
 $ConfigMap = Get-Content (Join-Path $Root "ops/helm/multidb/templates/configmap.yaml") -Raw
-foreach ($Token in @("MULTIDB_RUNTIME_MODE", "MULTIDB_DB_PATH", "MULTIDB_BIND", "MULTIDB_PG_BIND", "MULTIDB_STUDIO_DIR")) {
+foreach ($Token in @("MULTIDB_RUNTIME_MODE", "MULTIDB_DB_PATH", "MULTIDB_BIND", "MULTIDB_PG_BIND", "MULTIDB_STUDIO_DIR", "MULTIDB_SPEC_PATH", "MULTIDB_SPEC_APPLY")) {
     if (-not $ConfigMap.Contains($Token)) {
         throw "configmap template missing required token: $Token"
     }

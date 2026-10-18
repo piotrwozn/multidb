@@ -3,13 +3,14 @@
 //! inside a row-class database; the read-only views of the live database a provisioning plan is
 //! computed from; and the writes an apply makes: the RBAC state in one batch, the audit flag for
 //! local operators, creates that allocate ids, the provision record and its history, the
-//! profile manifest and provisioning audit events.
+//! profile manifest and provisioning audit events; and re-applying the caller's audit key to a
+//! handle opened from a spec.
 
 use super::{
     AuditConfig, CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, KEY_PROFILE_MANIFEST,
     KEY_SCHEMA_VERSION, PROVISION_TABLE, PersistedProfileManifest, ProbedMetadata, SCHEMA_VERSION,
-    SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op, meta_put_op, read_metadata_from_repl,
-    read_security_from_repl, validate_manifest,
+    SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op, meta_put_op, parse_audit_key_file,
+    read_metadata_from_repl, read_security_from_repl, validate_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{
@@ -24,6 +25,7 @@ use crate::repl::{Op, ReadConsistency, Replication, propose_system_batch};
 use crate::security::{
     AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource,
 };
+use crate::storage::StorageError;
 use crate::vector::{HnswParams, VectorCollectionConfig, VectorMetric};
 
 /// Documents read per batch by `Database::document_count`.
@@ -76,6 +78,24 @@ impl Database {
     /// The audit key and anchor this handle records with.
     pub(crate) const fn audit_config(&self) -> &AuditConfig {
         &self.audit_config
+    }
+
+    /// Makes this handle chain audit events with the key and anchor of `audit`. The audit
+    /// config is not persisted, and `open_database_with_ops` does not apply
+    /// `OperationalConfig.security.audit`, so `provision::open_from_spec` re-applies the
+    /// caller's config to the handle it opened; without it the handle falls back to the
+    /// development key, and the chain no longer verifies. The key file is read and parsed first,
+    /// so an unusable key fails here rather than at the next audit event.
+    /// # Errors
+    /// Fails with `Storage` when the key file cannot be read and with `AuditIntegrity` when it
+    /// holds neither 32 raw bytes nor 64 hex characters.
+    pub(crate) fn apply_audit_config(&mut self, audit: AuditConfig) -> Result<(), DbError> {
+        if let Some(path) = &audit.key_path {
+            let bytes = std::fs::read(path).map_err(StorageError::Io)?;
+            parse_audit_key_file(&bytes).map_err(DbError::AuditIntegrity)?;
+        }
+        self.audit_config = audit;
+        Ok(())
     }
 
     /// The RBAC policy, principals and audit flag persisted in `__authz_policy`, which the next

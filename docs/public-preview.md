@@ -69,6 +69,10 @@ applies it, `config drift` exits 3 when the database no longer matches and
 template specs leave out the physical parameters provisioning needs (a
 document index path, a vector dimension), so their plan is blocked with
 `PHYSICAL_PARAMETER_REQUIRED`; `config upgrade` lists what to add.
+`multidb serve` starts from a spec too: with `MULTIDB_SPEC_PATH` it checks the
+database against the spec at every start, refuses to start when they differ
+(`MULTIDB_SPEC_APPLY=verify`, the default) and creates or extends it with
+`create` or `additive` (see [docker.md](docker.md#spec-mode)).
 
 For a repository smoke test, run:
 

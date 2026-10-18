@@ -1907,7 +1907,7 @@ fn drift_item(
     }
 }
 
-const fn safety_slug(safety: StepSafety) -> &'static str {
+pub(super) const fn safety_slug(safety: StepSafety) -> &'static str {
     match safety {
         StepSafety::Additive => "additive",
         StepSafety::Metadata => "metadata",

@@ -9,9 +9,11 @@ provisioning fields, their validation, the physical projection
 plan through the Rust API (`multidb::provision::{apply_provision,
 provision_new_database}`, see [Applying plans](#applying-plans)) and the CLI
 commands `config plan|apply|drift --spec`, `config status`, `config export`
-and `init --apply` (see [CLI](#cli)). The `serve` and Control Plane entry
-points come in later changes; until then they never create or change a
-database from a spec. `config apply --plan` stays audit-only.
+and `init --apply` (see [CLI](#cli)), and starting from a spec: `multidb
+serve` in spec mode and `multidb::provision::open_from_spec` for embedded
+apps (see [Serve](#serve)). The Control Plane entry points come in a later
+change; until then the Control Plane never creates or changes a database from
+a spec. `config apply --plan` stays audit-only.
 
 ## Spec version 2 provisioning fields
 
@@ -660,8 +662,9 @@ converted version 1 spec says what to add before `config apply --spec`.
 ### Troubleshooting
 
 - **"database is in use (is multidb serve running?)"** (exit 1): another
-  process, usually `multidb serve`, holds the redb lock. Stop it, or plan and
-  apply through the Control Plane.
+  process, usually `multidb serve`, holds the redb lock. Stop it, then plan
+  and apply with the CLI; in spec mode, `MULTIDB_SPEC_APPLY=additive` applies
+  additive changes at the next start (see [Serve](#serve)).
 - **"the plan changed since it was confirmed"** (exit 4): the database, the
   spec, the flags, the target or the binary changed after the plan was
   reviewed, for example an object created outside provisioning. Nothing was
@@ -675,6 +678,90 @@ converted version 1 spec says what to add before `config apply --spec`.
 - **A partial apply** (exit 1) leaves the steps before the failed one
   applied and a `failed` record; `config plan` shows the remaining steps and
   `config status` the record and history.
+
+## Serve
+
+`multidb serve` provisions in spec mode, as the local operator `local:serve`
+on the `serve` surface: `MULTIDB_SPEC_PATH` names the spec, and
+`MULTIDB_SPEC_APPLY` (`verify`, the default, `create` or `additive`) what a
+start may change. Without `MULTIDB_SPEC_PATH`, `serve` is unchanged. The
+container contract (variables, Helm values) is in
+[docker.md](docker.md#spec-mode).
+
+1. The spec is read through `spec_io` (1 MiB, version peek), validated and
+   compiled. A spec that cannot be read, decoded or validated is refused.
+2. The database path is an explicit `MULTIDB_DB_PATH` (set and not blank),
+   else the spec `deployment.storage_path` resolved against the directory of
+   the spec file, else serve's default `/var/lib/multidb/multidb.redb`. An
+   explicit path that wins over a spec `storage_path` is printed as a note.
+3. Before anything is opened, `serve` refuses:
+   - an explicit `MULTIDB_PROFILE` that resolves to another storage profile
+     than the spec profile (`auto` never conflicts);
+   - an explicit `MULTIDB_REPLICATION` (`cp` or `ap`, read in spec mode only)
+     other than the spec `defaults.replication`;
+   - `guarantees.encryption.at_rest: true`: encryption at rest is provisioned
+     through the Rust API only;
+   - a volatile profile.
+4. `open_from_spec` on the `serve` surface probes the database (a file left by
+   a killed `serve` first gets redb's crash recovery, as with every opener),
+   opens an existing one with `open_database_with_ops`, which loads its
+   persisted RBAC state, plans the spec against it or against the absent
+   target and decides with `serve_startup_decision`:
+
+| target | `verify` | `create` | `additive` |
+| --- | --- | --- | --- |
+| absent, plan `auto_approvable` | refuse ("database missing; set MULTIDB_SPEC_APPLY=create or run multidb init --apply") | create it | create it |
+| existing, plan a noop, with no drift or only information drift (unmanaged objects under `report` or `ignore`, `operator_managed`, `enforced_with_development_key`) | start | start | start |
+| existing, plan `auto_approvable` | refuse | refuse | apply it |
+| interrupted apply (`DRIFT_INTERRUPTED_APPLY`), remaining plan `auto_approvable` | refuse | refuse | apply it |
+| anything else: retune, weakening, destructive, format upgrade, RBAC changes on an existing database, missing flags, blocked | refuse | refuse | refuse |
+
+A start applies only `auto_approvable` plans, with
+`Confirmation::AutoApproveAdditive`. Every refusal comes before a port is
+bound: `serve` exits with the reason, the plan and the command that resolves
+it. For a ready plan, or one that needs flags, that is `multidb config apply
+--spec <absolute spec> --db <canonical database path> [exactly the --allow-*
+flags the plan needs] --confirm <prov_id>`, where the id comes from a second
+plan on the `cli` surface against the same canonical target with those flags,
+so running the command (with `serve` stopped, since the database is locked
+while it runs) confirms that plan. `prov_` ids are per surface, so this id
+differs from the serve plan the refusal prints. For a blocked plan, or what
+remains of a startup apply that failed part-way, it is the `multidb config
+plan --spec ... --db ...` command that reviews it.
+
+A startup apply that fails part-way leaves the steps before the failed one
+applied and a `failed` record, and `serve` does not start; the next start sees
+the interrupted apply, which only `additive` resumes. After provisioning, the
+admin password bootstrap runs as before; its `admin` and `root` names are
+reserved, so provisioning never touches them.
+
+**Known limits:**
+
+- Audit is chained with the development key (`enforced_with_development_key`
+  and `AUDIT_DEVELOPMENT_KEY`): `serve` has no audit key setting.
+- A restart of `serve` *without* spec mode re-bootstraps RBAC until plain
+  openers load the persisted RBAC state: plain `serve` opens the database
+  with `create_database`, which does not load persisted roles, and the admin
+  password bootstrap then persists the in-memory state, so the roles and
+  principals provisioning applied are replaced by the bootstrap
+  administrator. `config drift` then reports them missing, and applying them
+  again needs a confirmed plan. Spec mode opens with `open_database_with_ops`
+  and is not affected, so keep a provisioned database in spec mode.
+
+**Embedded apps** use `open_from_spec(spec, path, mode, options, environment)`
+with the same decision table on the `rust_api` surface, as `local:embedded`.
+The target is `path`, else `deployment.storage_path` (relative to the working
+directory), else a new in-memory database, which is new at every open, so
+only `create` and `additive` build it. An existing database is opened with
+`ProvisionEnvironment.encryption` (a `LocalEnvelope` config), and
+`ProvisionEnvironment.audit` is applied to the handle afterwards, because
+`open_database_with_ops` does not apply an audit config: the audit chain then
+stays on the caller's key across opens. An audit key file that cannot be read
+or parsed fails the open. A refusal is `ProvisionError::StartupRefused` with
+a `StartupRefusal` (`mode`, `reason`, the `plan`, and the `applied` report of
+a startup apply that failed part-way); a start returns the database and a
+`StartupReport` (`mode`, `decision`, `plan_id`, the `applied` report,
+`warnings`).
 
 ## The provision record
 
@@ -763,6 +850,12 @@ they are applied by provisioning, not by `config apply`.
   creates one (`Confirmation`, `ProvisionActor`, `ProvisionApplyReport`,
   `ProvisionOutcome`, `AppliedStep`, `StepOutcome`,
   `ProvisionRecordSummary`).
+- `multidb::provision::open_from_spec(spec, path, mode, options,
+  environment)` opens or creates the database of a spec at startup on the
+  `rust_api` or `serve` surface (`StartupMode`, `StartupReport`,
+  `StartupRefusal`, `ProvisionError::StartupRefused`), and the pure
+  `serve_startup_decision(plan, mode)` returns its `StartupDecision`: `start`,
+  `apply_then_start` or `refuse` with the reason (see [Serve](#serve)).
 - `Database::set_security_state_as(principal, policy, principals)` replaces
   the RBAC policy and the principal registry in one persisted batch after
   checking `System:Admin`, audited as `set_security_state`.

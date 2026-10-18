@@ -147,7 +147,8 @@ Release-sensitive gate:
   creates and adopts objects, roles and the profile, but never drops or alters
   an object, switches a profile or storage class, or re-encrypts; encryption
   at rest is provisioned through the Rust API only, so a spec with
-  `encryption.at_rest: true` is blocked on the CLI.
+  `encryption.at_rest: true` is blocked on the CLI and refused by `multidb
+  serve` in spec mode (`MULTIDB_SPEC_PATH`, see `docs/docker.md`).
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
   migration dry-run workflows.
 - Full PostgreSQL compatibility, Mongo wire protocol, public extension

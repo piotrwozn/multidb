@@ -15,6 +15,9 @@
 //!   [`provision_new_database`] creates a database from a spec at an absent target. Audit comes
 //!   first, progress is journaled in the provision record after every step, and applying again
 //!   after a failure converges.
+//! - [`open_from_spec`] opens (or creates) the database of a spec at startup, for `multidb
+//!   serve` in spec mode and embedded apps: [`serve_startup_decision`] decides from the plan and
+//!   the [`StartupMode`] whether to start, to apply an auto-approvable plan first, or to refuse.
 //!
 //! Planning, drift and export are read-only: they never create a file or write a database.
 //! See `docs/provisioning.md`.
@@ -26,6 +29,7 @@ mod live;
 pub mod physical;
 mod plan;
 pub(crate) mod record;
+mod startup;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +51,10 @@ pub use plan::{
 pub use record::{
     ManagedObject, ObjectKind, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus,
     RECORD_VERSION,
+};
+pub use startup::{
+    StartupDecision, StartupMode, StartupRefusal, StartupReport, open_from_spec,
+    serve_startup_decision,
 };
 
 use crate::config_spec::{
@@ -96,6 +104,9 @@ pub enum ProvisionError {
 
     #[error("the provision record is unreadable: {0}")]
     RecordUnreadable(String),
+
+    #[error("startup refused in {} mode: {}", .0.mode.slug(), .0.reason)]
+    StartupRefused(Box<StartupRefusal>),
 
     #[error("database: {0}")]
     Db(#[from] DbError),

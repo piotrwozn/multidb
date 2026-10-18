@@ -14,9 +14,10 @@ use super::{
     ObjectKind, ObjectState, PlanOutcome, ProvisionActor, ProvisionApplyReport,
     ProvisionEnvironment, ProvisionError, ProvisionOptions, ProvisionOutcome, ProvisionPlan,
     ProvisionRecord, ProvisionRecordStatus, ProvisionStep, ProvisionStepKind, ProvisionSurface,
-    ProvisionTargetRef, RECORD_VERSION, StepOutcome, StepSafety, TargetKind, apply_provision,
-    drift, export_spec, fail_provision_step_for_tests, perturb_new_database_for_tests,
-    plan_provision, provision_new_database,
+    ProvisionTargetRef, RECORD_VERSION, StartupDecision, StartupMode, StartupRefusal,
+    StartupReport, StepOutcome, StepSafety, TargetKind, apply_provision, drift, export_spec,
+    fail_provision_step_for_tests, open_from_spec, perturb_new_database_for_tests, plan_provision,
+    provision_new_database, serve_startup_decision,
 };
 use crate::backup::{BackupConfig, RestoreTarget, full_backup, restore_backup, verify_backup};
 use crate::cdc::{AggregateKind, AggregateSpec, MaterializedViewSpec};
@@ -3812,5 +3813,457 @@ fn backup_and_restore_carry_the_record_and_the_manifest() -> TestResult {
     assert_eq!(restored.provision_history()?, history);
     assert_eq!(restored.probed_metadata()?.manifest, manifest);
     assert_eq!(plan_open(&spec, &restored)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Starting from a spec
+// ---------------------------------------------------------------------------------------------
+
+const MODES: [StartupMode; 3] = [
+    StartupMode::Verify,
+    StartupMode::Create,
+    StartupMode::Additive,
+];
+
+/// The decision of `plan` in verify, create and additive mode.
+fn decisions(plan: &ProvisionPlan) -> [StartupDecision; 3] {
+    MODES.map(|mode| serve_startup_decision(plan, mode))
+}
+
+fn refuses(decision: &StartupDecision, reason: &str) -> bool {
+    matches!(decision, StartupDecision::Refuse(found) if found.contains(reason))
+}
+
+/// The refusal of a start, or an error describing what happened instead.
+fn refusal(
+    result: Result<(Database, StartupReport), ProvisionError>,
+) -> Result<StartupRefusal, Error> {
+    match result {
+        Err(ProvisionError::StartupRefused(refusal)) => Ok(*refusal),
+        Err(other) => Err(format!("expected a startup refusal, got {other}").into()),
+        Ok((_, report)) => Err(format!("expected a startup refusal, got {report:?}").into()),
+    }
+}
+
+/// Every row of the startup table in every mode, decided on real plans.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn serve_startup_decision_table() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let serve = env(ProvisionSurface::Serve);
+    let defaults = ProvisionOptions::default();
+    let base = orders_spec()?;
+    let plan_open_on = |spec: &DatabaseSpec, db: &Database, opts: &ProvisionOptions| {
+        plan_provision(spec, ProvisionTargetRef::Open(db), opts, &serve)
+    };
+
+    // Absent and auto-approvable: verify refuses, create and additive apply.
+    let missing = temp_dir.path().join("missing.redb");
+    let absent = plan_path(&base, &missing, ProvisionSurface::Serve)?;
+    assert!(absent.auto_approvable);
+    let [verify, create, additive] = decisions(&absent);
+    assert!(refuses(&verify, "database missing at"), "{verify:?}");
+    assert!(refuses(&verify, "MULTIDB_SPEC_APPLY=create"), "{verify:?}");
+    assert_eq!(create, StartupDecision::ApplyThenStart);
+    assert_eq!(additive, StartupDecision::ApplyThenStart);
+    let volatile = plan_provision(
+        &in_memory(base.clone()),
+        ProvisionTargetRef::Volatile,
+        &defaults,
+        &env(ProvisionSurface::RustApi),
+    )?;
+    assert!(refuses(
+        &serve_startup_decision(&volatile, StartupMode::Verify),
+        "StartupMode::Create"
+    ));
+
+    // Absent but not auto-approvable: refused in every mode.
+    let mut audit_off = base.clone();
+    audit_off.guarantees.audit.enabled = false;
+    let mut at_rest = base.clone();
+    at_rest.guarantees.encryption.at_rest = true;
+    let mut invalid = base.clone();
+    invalid.collections[0].name = "__orders".to_owned();
+    for (name, spec, reason) in [
+        ("needs flags", &audit_off, "needs flags a start never gives"),
+        ("blocked", &at_rest, "GUARANTEE_NOT_ENFORCEABLE"),
+        ("invalid", &invalid, "the spec is invalid"),
+    ] {
+        let plan = plan_path(spec, &missing, ProvisionSurface::Serve)?;
+        assert!(!plan.auto_approvable, "{name}");
+        for decision in decisions(&plan) {
+            assert!(refuses(&decision, reason), "{name}: {decision:?}");
+        }
+    }
+
+    // Existing and a noop: start in every mode, also with information-only drift.
+    let mut db = create_with_profile(&temp_dir.path().join("startup.redb"), &base)?;
+    assert_applied(&apply_cli(&mut db, &base, &defaults)?);
+    let noop = plan_open_on(&base, &db, &defaults)?;
+    assert_eq!(noop.outcome, PlanOutcome::Noop);
+    assert_eq!(decisions(&noop), [const { StartupDecision::Start }; 3]);
+    db.create_collection_auto_id("scratch", orders_fields(), Vec::new())?;
+    let unmanaged = plan_open_on(&base, &db, &defaults)?;
+    assert_eq!(unmanaged.outcome, PlanOutcome::Noop);
+    assert!(unmanaged.drift.in_sync && !unmanaged.drift.items.is_empty());
+    assert_eq!(decisions(&unmanaged), [const { StartupDecision::Start }; 3]);
+
+    // Existing with an auto-approvable additive plan: applied in additive mode only.
+    let additive = plan_open_on(&with_notes(base.clone())?, &db, &defaults)?;
+    assert!(additive.auto_approvable);
+    let [verify, create, apply] = decisions(&additive);
+    for (mode, decision) in [("verify", &verify), ("create", &create)] {
+        assert!(
+            refuses(decision, &format!("the {mode} startup mode never changes")),
+            "{decision:?}"
+        );
+        assert!(
+            refuses(decision, "MULTIDB_SPEC_APPLY=additive"),
+            "{decision:?}"
+        );
+    }
+    assert_eq!(apply, StartupDecision::ApplyThenStart);
+
+    // Anything else is refused in every mode: retune, weakening, destructive, format upgrade,
+    // RBAC on an existing database, missing flags and blocked plans.
+    let retune = with_custom_profile(
+        base.clone(),
+        "orders_custom",
+        &json!({ "extends": "balanced", "knobs": { "cache": { "max_entries": 4096 } } }),
+    )?;
+    let zstd = with_custom_profile(
+        base.clone(),
+        "orders_zstd",
+        &json!({ "extends": "balanced", "knobs": { "compression": { "algorithm": "zstd" } } }),
+    )?;
+    let rbac = with_security(
+        base.clone(),
+        &json!({
+            "roles": [{ "name": "auditor", "grants": [{ "resource": "database", "permissions": ["read"] }] }],
+            "principals": []
+        }),
+    )?;
+    let mut released = base.clone();
+    released.collections.clear();
+    let mut conflict = base.clone();
+    conflict.collections[0].physical = Some(serde_json::from_value(json!({
+        "fields": [{ "name": "customer_id", "path": "customer.id", "type": "int" }],
+        "document_indexes": [{ "path": "customer.id" }]
+    }))?);
+    let format_upgrade = ProvisionOptions {
+        allow_format_upgrade: true,
+        ..ProvisionOptions::default()
+    };
+    for (name, spec, opts, reason) in [
+        ("retune", &retune, defaults.clone(), "has retune steps"),
+        (
+            "weakening",
+            &audit_off,
+            weakening("guarantees.audit.enabled"),
+            "has weakening steps",
+        ),
+        (
+            "weakening without its flag",
+            &audit_off,
+            defaults.clone(),
+            "allow_weakening:guarantees.audit.enabled",
+        ),
+        (
+            "destructive",
+            &released,
+            destructive(&["collections.orders"]),
+            "has destructive steps",
+        ),
+        (
+            "format upgrade",
+            &zstd,
+            format_upgrade,
+            "has format_upgrade steps",
+        ),
+        (
+            "rbac",
+            &rbac,
+            defaults.clone(),
+            "changes RBAC on an existing database",
+        ),
+        (
+            "conflict",
+            &conflict,
+            defaults.clone(),
+            "PROVISION_OBJECT_CONFLICT",
+        ),
+        ("at rest", &at_rest, defaults.clone(), "is blocked"),
+    ] {
+        let plan = plan_open_on(spec, &db, &opts)?;
+        assert!(!plan.auto_approvable, "{name}: {:#?}", plan.steps);
+        for decision in decisions(&plan) {
+            assert!(refuses(&decision, reason), "{name}: {decision:?}");
+        }
+    }
+
+    // An interrupted apply whose remaining steps are auto-approvable: additive mode only.
+    let notes = with_notes(base.clone())?;
+    let mut failed = create_with_profile(&temp_dir.path().join("failed.redb"), &notes)?;
+    let index = plan_open_on(&notes, &failed, &defaults)?
+        .steps
+        .iter()
+        .position(|step| step.object.as_deref() == Some("notes"))
+        .ok_or("notes is created")?;
+    {
+        let _failure = InjectedFailure::at(index);
+        let report = apply_cli(&mut failed, &notes, &defaults)?;
+        assert_eq!(report.status, ProvisionOutcome::PartiallyApplied);
+    }
+    let interrupted = plan_open_on(&notes, &failed, &defaults)?;
+    assert!(interrupted.auto_approvable);
+    let [verify, create, apply] = decisions(&interrupted);
+    for (mode, decision) in [("verify", &verify), ("create", &create)] {
+        assert!(
+            refuses(
+                decision,
+                &format!("the {mode} startup mode never resumes it")
+            ),
+            "{decision:?}"
+        );
+    }
+    assert_eq!(apply, StartupDecision::ApplyThenStart);
+    // ... and one whose remaining plan is not auto-approvable is refused in every mode.
+    let rbac_notes = with_security(
+        notes,
+        &json!({
+            "roles": [{ "name": "auditor", "grants": [{ "resource": "database", "permissions": ["read"] }] }],
+            "principals": []
+        }),
+    )?;
+    let interrupted_rbac = plan_open_on(&rbac_notes, &failed, &defaults)?;
+    for decision in decisions(&interrupted_rbac) {
+        assert!(
+            refuses(&decision, "changes RBAC on an existing database"),
+            "{decision:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn startup_modes_parse_their_slugs() {
+    for mode in MODES {
+        assert_eq!(StartupMode::from_slug(mode.slug()), Some(mode));
+        assert_eq!(
+            StartupMode::from_slug(&format!(" {} ", mode.slug().to_ascii_uppercase())),
+            Some(mode)
+        );
+    }
+    assert_eq!(StartupMode::default(), StartupMode::Verify);
+    assert_eq!(StartupMode::from_slug("apply"), None);
+    assert_eq!(StartupMode::from_slug(""), None);
+}
+
+#[test]
+fn open_from_spec_builds_volatile_databases_on_the_rust_api_only() -> TestResult {
+    let spec = in_memory(orders_spec()?);
+    let rust = env(ProvisionSurface::RustApi);
+    let defaults = ProvisionOptions::default();
+
+    let refused = refusal(open_from_spec(
+        &spec,
+        None,
+        StartupMode::Verify,
+        &defaults,
+        &rust,
+    ))?;
+    assert!(
+        refused.reason.contains("StartupMode::Create"),
+        "{}",
+        refused.reason
+    );
+    assert_eq!(refused.plan.target.kind, TargetKind::NewDatabase);
+    assert!(refused.applied.is_none());
+
+    for mode in [StartupMode::Create, StartupMode::Additive] {
+        let (db, report) = open_from_spec(&spec, None, mode, &defaults, &rust)?;
+        assert_eq!(report.mode, mode);
+        assert_eq!(report.decision, StartupDecision::ApplyThenStart);
+        let applied = report.applied.as_ref().ok_or("the startup apply")?;
+        assert_applied(applied);
+        assert_eq!(report.plan_id, applied.plan_id);
+        assert_eq!(
+            applied
+                .record
+                .as_ref()
+                .map(|record| record.applied_by.as_str()),
+            Some("local:embedded")
+        );
+        assert!(db.config().path.is_none());
+        assert!(db.catalog().contains_key("orders"));
+        assert_eq!(plan_rust_api(&spec, &db)?.outcome, PlanOutcome::Noop);
+    }
+
+    // serve builds durable databases only.
+    let refused = refusal(open_from_spec(
+        &spec,
+        None,
+        StartupMode::Create,
+        &defaults,
+        &env(ProvisionSurface::Serve),
+    ))?;
+    assert!(has_issue(
+        &refused.plan,
+        "PROVISION_VOLATILE_ON_SURFACE",
+        ValidationSeverity::Error
+    ));
+    assert!(refused.reason.contains("is blocked"), "{}", refused.reason);
+
+    // The CLI and the Control Plane do not start from specs, and only the Rust API encrypts.
+    for surface in [ProvisionSurface::Cli, ProvisionSurface::ControlPlane] {
+        assert!(matches!(
+            open_from_spec(&spec, None, StartupMode::Create, &defaults, &env(surface)),
+            Err(ProvisionError::Config(ConfigError::Unsupported(_)))
+        ));
+    }
+    let temp_dir = tempfile::tempdir()?;
+    let encrypted = ProvisionEnvironment {
+        encryption: Some(EncryptionConfig::local_envelope(
+            temp_dir.path().join("keyring.json"),
+            temp_dir.path().join("kek.key"),
+        )),
+        ..env(ProvisionSurface::Serve)
+    };
+    assert!(matches!(
+        open_from_spec(
+            &orders_spec()?,
+            Some(&temp_dir.path().join("encrypted.redb")),
+            StartupMode::Create,
+            &defaults,
+            &encrypted
+        ),
+        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
+    ));
+    assert!(!temp_dir.path().join("encrypted.redb").exists());
+    Ok(())
+}
+
+#[test]
+fn open_from_spec_keeps_the_audit_chain_on_the_callers_key() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let key_path = temp_dir.path().join("audit.key");
+    std::fs::write(&key_path, "5a".repeat(32))?;
+    let path = temp_dir.path().join("keyed.redb");
+    let spec = orders_spec()?;
+    let defaults = ProvisionOptions::default();
+    let keyed = ProvisionEnvironment {
+        audit: Some(AuditConfig {
+            key_path: Some(key_path.clone()),
+            anchor_path: None,
+        }),
+        ..env(ProvisionSurface::RustApi)
+    };
+
+    let (db, report) = open_from_spec(&spec, Some(&path), StartupMode::Create, &defaults, &keyed)?;
+    assert_eq!(report.decision, StartupDecision::ApplyThenStart);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| warning.code != "AUDIT_DEVELOPMENT_KEY")
+    );
+    db.verify_audit_chain()?;
+    drop(db);
+
+    // Every later open chains with the same key, so the chain keeps verifying.
+    for check in ["first_reopen", "second_reopen"] {
+        let (db, report) =
+            open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed)?;
+        assert_eq!(report.decision, StartupDecision::Start);
+        assert!(report.applied.is_none());
+        db.record_admin_auth_event(None, check, AuditOutcome::Succeeded, None)?;
+        db.verify_audit_chain()?;
+    }
+
+    // A handle without the key falls back to the development key: the chain does not verify.
+    let plain = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &path),
+        &OperationalConfig::new(),
+    )?;
+    assert!(matches!(
+        plain.verify_audit_chain(),
+        Err(DbError::AuditIntegrity(_))
+    ));
+    drop(plain);
+
+    // An unusable key is refused when it is applied, before anything is planned or written.
+    std::fs::write(&key_path, "not a key")?;
+    assert!(matches!(
+        open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed),
+        Err(ProvisionError::Db(DbError::AuditIntegrity(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn open_from_spec_resumes_an_interrupted_apply_only_in_additive_mode() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("interrupted.redb");
+    let spec = with_notes(orders_spec()?)?;
+    let serve = env(ProvisionSurface::Serve);
+    let defaults = ProvisionOptions::default();
+    let index = plan_path(&spec, &path, ProvisionSurface::Serve)?
+        .steps
+        .iter()
+        .position(|step| step.object.as_deref() == Some("notes"))
+        .ok_or("notes is created")?;
+
+    let refused = {
+        let _failure = InjectedFailure::at(index);
+        refusal(open_from_spec(
+            &spec,
+            Some(&path),
+            StartupMode::Create,
+            &defaults,
+            &serve,
+        ))?
+    };
+    assert!(
+        refused.reason.contains("did not finish"),
+        "{}",
+        refused.reason
+    );
+    let applied = refused.applied.ok_or("the partial startup apply")?;
+    assert_eq!(applied.status, ProvisionOutcome::PartiallyApplied);
+    assert!(path.exists(), "the new database is kept");
+
+    for mode in [StartupMode::Verify, StartupMode::Create] {
+        let refused = refusal(open_from_spec(&spec, Some(&path), mode, &defaults, &serve))?;
+        assert!(
+            refused.reason.contains("DRIFT_INTERRUPTED_APPLY"),
+            "{}",
+            refused.reason
+        );
+        assert!(refused.plan.auto_approvable);
+        assert!(refused.applied.is_none());
+    }
+
+    let (db, report) =
+        open_from_spec(&spec, Some(&path), StartupMode::Additive, &defaults, &serve)?;
+    assert_eq!(report.decision, StartupDecision::ApplyThenStart);
+    let applied = report.applied.as_ref().ok_or("the startup apply")?;
+    assert_applied(applied);
+    assert_eq!(
+        applied
+            .record
+            .as_ref()
+            .map(|record| record.applied_by.as_str()),
+        Some("local:serve")
+    );
+    assert!(db.catalog().contains_key("notes"));
+    assert_eq!(
+        db.provision_state()?.map(|record| record.status),
+        Some(ProvisionRecordStatus::Applied)
+    );
+    drop(db);
+
+    let (_db, report) = open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &serve)?;
+    assert_eq!(report.decision, StartupDecision::Start);
     Ok(())
 }

@@ -261,6 +261,37 @@ All notable public changes will be recorded here.
   only creates, adopts or records. An existing database is refused, and a
   blocked or not auto-approvable plan keeps the written files and exits 2;
   `--json` adds `database` and `provision` to the summary.
+- `multidb serve` spec mode (preview), as the local operator `local:serve`:
+  `MULTIDB_SPEC_PATH` names the spec the database is built from and checked
+  against at every start, and `MULTIDB_SPEC_APPLY` what a start may change:
+  `verify` (the default; starts only when the database exists and matches),
+  `create` (also creates a missing database from an auto-approvable plan) or
+  `additive` (also applies auto-approvable additive plans, including the rest
+  of an interrupted apply). The database path is an explicit
+  `MULTIDB_DB_PATH`, else the spec `storage_path` relative to the spec file,
+  else the default path. An explicit `MULTIDB_PROFILE` that selects another
+  storage profile, an explicit `MULTIDB_REPLICATION` (read in spec mode only)
+  that contradicts the spec, `encryption.at_rest` and volatile profiles are
+  refused. Every refusal comes before a port is bound and prints the plan and
+  the exact `multidb config apply ... --confirm prov_...` command (with the
+  flags the plan needs) that confirms it, or the `config plan` command for a
+  blocked plan. Without `MULTIDB_SPEC_PATH`, `serve` is unchanged. See
+  `docs/docker.md` and `docs/provisioning.md`.
+- `multidb::provision::open_from_spec`, which opens or creates the database of
+  a spec at startup on the Rust API or serve surface: it probes the target
+  (with crash recovery), opens an existing database with
+  `open_database_with_ops` (re-applying `ProvisionEnvironment.audit`, so the
+  audit chain stays on the caller's key) and applies an auto-approvable plan
+  as `local:embedded` or `local:serve` when the `StartupMode` allows it. The
+  pure `serve_startup_decision(plan, mode)` returns the `StartupDecision`
+  (`start`, `apply_then_start` or `refuse` with the reason); a refusal is
+  `ProvisionError::StartupRefused` (`StartupRefusal`), a start returns a
+  `StartupReport`.
+- Helm chart spec mode: `spec.enabled` (off by default), `spec.configMap`,
+  `spec.key`, `spec.mountPath` and `spec.apply` (`verify` by default) mount
+  the spec read-only and set `MULTIDB_SPEC_PATH` and `MULTIDB_SPEC_APPLY`
+  instead of `MULTIDB_PROFILE` and `MULTIDB_REPLICATION`;
+  `docker-compose.yml` has a commented example.
 
 ### Changed
 

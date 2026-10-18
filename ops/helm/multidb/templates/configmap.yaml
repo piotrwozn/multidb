@@ -11,8 +11,13 @@ data:
   MULTIDB_BIND: {{ .Values.runtime.adminBind | quote }}
   MULTIDB_PG_BIND: {{ .Values.runtime.pgBind | quote }}
   MULTIDB_STUDIO_DIR: {{ .Values.runtime.studioDir | quote }}
+  {{- if .Values.spec.enabled }}
+  MULTIDB_SPEC_PATH: {{ printf "%s/%s" .Values.spec.mountPath .Values.spec.key | quote }}
+  MULTIDB_SPEC_APPLY: {{ .Values.spec.apply | quote }}
+  {{- else }}
   MULTIDB_PROFILE: {{ .Values.config.profile | quote }}
   MULTIDB_REPLICATION: {{ .Values.config.replication | quote }}
+  {{- end }}
   MULTIDB_AUDIT_JSONL_PATH: {{ .Values.config.auditJsonlPath | quote }}
   MULTIDB_BACKUP_TARGET: {{ .Values.config.backupTarget | quote }}
   MULTIDB_MINIO_ENDPOINT: {{ .Values.config.minioEndpoint | quote }}
