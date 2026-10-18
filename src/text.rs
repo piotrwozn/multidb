@@ -76,6 +76,7 @@ pub enum TextError {
 pub struct FullTextIndex<'repl, R: Replication + ?Sized> {
     repl: &'repl R,
     config: FullTextIndexConfig,
+    commit_log_available: bool,
 }
 
 impl FullTextIndexConfig {
@@ -103,7 +104,19 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
     /// Fails when the index name is empty.
     pub fn new(repl: &'repl R, config: FullTextIndexConfig) -> Result<Self, TextError> {
         validate_config(&config)?;
-        Ok(Self { repl, config })
+        Ok(Self {
+            repl,
+            config,
+            commit_log_available: true,
+        })
+    }
+
+    /// Records whether the backing replication writes the commit log that
+    /// incremental refresh replays.
+    #[must_use]
+    pub(crate) const fn with_commit_log(mut self, available: bool) -> Self {
+        self.commit_log_available = available;
+        self
     }
 
     #[must_use]
@@ -169,11 +182,19 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
 
     /// Replays committed changes after the stored LSN and updates the derived index.
     /// # Errors
-    /// Fails when CDC or storage fails.
+    /// Fails when the database uses AP replication (no commit log to replay; use
+    /// `refresh_full`), or CDC or storage fails.
     pub fn refresh_incremental(
         &self,
         catalog: &BTreeMap<String, CatalogEntry>,
     ) -> Result<FullTextIndexState, TextError> {
+        if !self.commit_log_available {
+            return Err(TextError::Repl(ReplError::Unsupported(
+                "AP replication does not support incremental full-text refresh: AP writes are \
+                 not recorded in the commit log; use refresh_full"
+                    .to_owned(),
+            )));
+        }
         let TextSource::Collection {
             collection_id,
             path,
