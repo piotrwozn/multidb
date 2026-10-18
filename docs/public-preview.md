@@ -152,7 +152,7 @@ Profile status:
 | `ai_agent_memory` | Stable | Vector/document/event memory for agents. |
 | `secure_app` | Stable | Audited transactional app state; can use CP semantics without claiming enterprise SLA. |
 | `analytics_columnar` | Stable | Analytics starter path with explicit extension limits. |
-| `production_cp` | Stable | CP OpenRaft cluster profile covered by the local/process smoke gate. |
+| `production_cp` | Stable | CP OpenRaft cluster profile covered by the local/process smoke gate for the live `repl::start_cp_cluster` runtime. |
 
 Collection role status:
 
@@ -173,13 +173,24 @@ Consistency status:
 | Domain | Status | Limit |
 | --- | --- | --- |
 | `local_snapshot` | Certified | Single-process/local semantics only. |
-| `strong_cp` | Stable | CP quorum semantics covered by the local/process smoke gate. |
+| `strong_cp` | Stable | CP quorum semantics covered by the local/process smoke gate for the live `repl::start_cp_cluster` runtime. |
 | `eventual_ap` | Experimental | Conflict policy requires workload review. |
 
 ## Known Limits
 
 - The local/process CP smoke contract is covered; the preview still does not
   claim Kubernetes automation, multi-region placement or enterprise SLA.
+- Multi-node CP replication runs only through the live `repl::start_cp_cluster`
+  OpenRaft runtime. The embedded `Database` cluster constructors
+  (`create_cluster_database`, `open_cluster_database`, their `_with_ops`
+  variants and sharded `Cp` shard backends) fail closed with `Unsupported`; use
+  `create_database`/`open_database` for a single node or `start_cp_cluster`.
+- AP databases do not record writes in the commit log or MVCC history, so they
+  reject incremental backups (so no point-in-time restore beyond a full
+  backup), changefeeds, CDC subscriptions, continuous
+  queries, materialized views, after-commit hooks, system versioning and
+  incremental full-text/geo refresh with `Unsupported`. Full backups and
+  `refresh_full` remain available.
 - `config apply` is confirm/audit-only and does not perform physical data
   migrations.
 - Studio v1 is read-only plus validation, catalog, advice and migration dry-run.
@@ -187,6 +198,11 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- Time-series retention follows the server wall clock and is enforced at chunk
+  granularity only when a series receives a write, so idle series keep expired
+  chunks until their next write. Points more than `max_future_skew_millis`
+  (default 5 minutes for new collections) ahead of the server clock, or older
+  than the retention window, are rejected.
 
 ## Migration Guide
 

@@ -121,7 +121,12 @@ Release-sensitive gate:
 - MultiDB is a public-preview engine, not a mature production database.
 - The CP OpenRaft profile is covered by local/process smoke tests; it does not
   claim managed Kubernetes automation, multi-region placement or an enterprise
-  SLA.
+  SLA. Multi-node CP replication runs through `repl::start_cp_cluster`; the
+  embedded `Database` cluster constructors fail closed with `Unsupported`.
+- AP databases reject commit-log features (incremental backups, so no PITR,
+  changefeeds, subscriptions, continuous queries, materialized views,
+  after-commit hooks, system versioning and incremental full-text/geo refresh)
+  instead of returning empty results.
 - `config apply` is confirmation/audit-only for v1 and does not perform
   physical data migrations.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
