@@ -606,7 +606,7 @@ again. Applying that plan converges, and a further plan is a
 Warning `PROVISION_FAILURE_NOT_RECORDED` and the record still says
 `in_progress`, which the next plan treats the same way. Batching every
 container of a plan into one write is a follow-up of the single write
-pipeline (#11).
+pipeline.
 
 ### Releasing objects
 
