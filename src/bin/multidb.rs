@@ -1193,20 +1193,7 @@ fn format_provision_plan(plan: &ProvisionPlan, options: &ProvisionOptions) -> St
         lines.extend(plan.objects.iter().map(format_planned_object));
     }
     lines.push("guarantees:".to_owned());
-    lines.extend(plan.guarantees.iter().map(|guarantee| {
-        let mut line = format!(
-            "  {}={} {}: {}",
-            guarantee.path,
-            guarantee.requested,
-            slug(&guarantee.status),
-            guarantee.detail
-        );
-        if !guarantee.remediation.is_empty() {
-            line.push_str(" remediation: ");
-            line.push_str(&guarantee.remediation);
-        }
-        line
-    }));
+    lines.extend(plan.guarantees.iter().map(format_guarantee));
     if !plan.issues.is_empty() {
         lines.push("issues:".to_owned());
         lines.extend(
@@ -1450,16 +1437,19 @@ fn provision_error_run(error: &ProvisionError, command: &SpecCommand) -> Result<
     ))
 }
 
-/// `config plan --spec <file> [--db <path>] [--out <plan.json>] [flags] [--json]`: a dry run
-/// against the database at the target, or against an absent target. It never creates the
-/// database file and never writes a database; exit 0 when the plan is ready or a noop, 2 when
-/// it is blocked, the spec is invalid or flags are missing.
+/// `config plan --spec <file> [--db <path>] [--out <plan.json> [--force]] [flags] [--json]`: a
+/// dry run against the database at the target, or against an absent target. It never creates
+/// the database file and never writes a database; exit 0 when the plan is ready or a noop, 2
+/// when it is blocked, the spec is invalid or flags are missing.
 fn run_spec_plan(args: &[String]) -> Result<CliRun, CliError> {
     let command = match SpecCommand::load(args)? {
         Ok(command) => command,
         Err(run) => return Ok(run),
     };
     let out_path = flag_value(args, "--out")?.map(PathBuf::from);
+    if let Some(out_path) = &out_path {
+        ensure_plan_out_target(out_path, &command, has_flag(args, "--force"))?;
+    }
     let target = match open_spec_target(command.db_path.as_deref()) {
         Ok(target) => target,
         Err(refusal) => return refusal_run(&refusal, command.json()),
@@ -1502,6 +1492,48 @@ fn run_spec_plan(args: &[String]) -> Result<CliRun, CliError> {
         message,
         provision_exit_code(ProvisionEnd::Planned(&plan)),
     ))
+}
+
+/// `config plan --spec --out` is a dry run, so it never writes over the spec or the database,
+/// even with `--force`, and it replaces another existing file only with `--force`, like
+/// `config export --out`.
+fn ensure_plan_out_target(
+    out_path: &Path,
+    command: &SpecCommand,
+    force: bool,
+) -> Result<(), CliError> {
+    let inputs = [
+        ("spec", Some(command.spec_path.as_path())),
+        ("database", command.db_path.as_deref()),
+    ];
+    for (what, input) in inputs {
+        if input.is_some_and(|input| same_file_path(input, out_path)) {
+            return Err(CliError::Usage(format!(
+                "refusing to write the plan over the {what} {}; choose another --out",
+                out_path.display()
+            )));
+        }
+    }
+    if !force && std::fs::symlink_metadata(out_path).is_ok() {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite {}; pass --force to replace it",
+            out_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `left` and `right` name the same file: by their canonical paths when both exist,
+/// by their absolute spellings when neither does.
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        (Err(_), Err(_)) => match (std::path::absolute(left), std::path::absolute(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        },
+        _ => false,
+    }
 }
 
 /// `--confirm <prov_id>` or `--auto-approve`, never both; `None` without either.
@@ -1771,6 +1803,23 @@ fn run_config_status(args: &[String]) -> Result<CliRun, CliError> {
     Ok(CliRun::success(message))
 }
 
+/// One guarantee line of a plan or a provision record: the path, what the spec asks for, how
+/// it is enforced and what to do about it.
+fn format_guarantee(guarantee: &provision::GuaranteeEnforcement) -> String {
+    let mut line = format!(
+        "  {}={} {}: {}",
+        guarantee.path,
+        guarantee.requested,
+        slug(&guarantee.status),
+        guarantee.detail
+    );
+    if !guarantee.remediation.is_empty() {
+        line.push_str(" remediation: ");
+        line.push_str(&guarantee.remediation);
+    }
+    line
+}
+
 /// The text form of a provision record for `config status`.
 fn format_provision_record(record: &provision::ProvisionRecord) -> Vec<String> {
     let objects = record
@@ -1784,7 +1833,7 @@ fn format_provision_record(record: &provision::ProvisionRecord) -> Vec<String> {
             )
         })
         .collect::<Vec<_>>();
-    vec![
+    let mut lines = vec![
         format!(
             "provisioned: status={} plan={} spec={} applied_by={} applied_at_millis={} binary={}",
             slug(&record.status),
@@ -1811,7 +1860,10 @@ fn format_provision_record(record: &provision::ProvisionRecord) -> Vec<String> {
             record.failed_step.as_deref().unwrap_or("none"),
             list_or_none(&record.flags)
         ),
-    ]
+    ];
+    lines.push("guarantees:".to_owned());
+    lines.extend(record.guarantees.iter().map(format_guarantee));
+    lines
 }
 
 /// `a, b, c`, or `none`.
@@ -3200,8 +3252,8 @@ fn serve_spec_conflict(
     {
         return Some(format!(
             "MULTIDB_PROFILE selects the storage profile {selected:?}, but the spec profile {} \
-             uses {:?}; in spec mode the spec decides the profile, so unset MULTIDB_PROFILE or \
-             make it agree",
+             uses {:?}; in spec mode the spec decides the profile, so set MULTIDB_PROFILE to an \
+             empty value (unsetting it falls back to the image default) or make it agree",
             resolved.slug, resolved.storage_profile
         ));
     }
@@ -4820,7 +4872,7 @@ fn usage() -> CliError {
          multidb explain config --spec <json|yaml> [--output text|json] [--json]\n\
          multidb config plan --current <json|yaml> --desired <json|yaml> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb config apply --plan <json> --confirm <plan_id> [--output text|json]\n\
-         multidb config plan --spec <json|yaml> [--db <path>] [--out <plan.json>] [--allow-weakening <path>[,<path>]]... [--allow-destructive <path>[,<path>]]... [--allow-format-upgrade] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
+         multidb config plan --spec <json|yaml> [--db <path>] [--out <plan.json> [--force]] [--allow-weakening <path>[,<path>]]... [--allow-destructive <path>[,<path>]]... [--allow-format-upgrade] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
          multidb config apply --spec <json|yaml> [--db <path>] (--confirm <prov_id>|--auto-approve) [--allow-weakening <path>[,<path>]]... [--allow-destructive <path>[,<path>]]... [--allow-format-upgrade] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
          multidb config drift --spec <json|yaml> [--db <path>] [--unmanaged ignore|report|fail] [--output text|json] [--json]\n\
          multidb config status --db <path> [--output text|json] [--json]\n\
@@ -7338,6 +7390,43 @@ mod tests {
             !db_path.exists(),
             "a dry run never creates the database file"
         );
+
+        // --out never replaces an existing file without --force, and never the spec or the
+        // database, even with --force.
+        let plan_out = |out: &std::path::Path, force: bool| {
+            let mut args = strings(&[
+                "config",
+                "plan",
+                "--spec",
+                &spec_arg,
+                "--db",
+                &path_arg(&db_path),
+                "--out",
+                &path_arg(out),
+            ]);
+            if force {
+                args.push("--force".to_owned());
+            }
+            run(args)
+        };
+        match plan_out(&out, false) {
+            Err(CliError::Usage(message)) => {
+                assert!(message.contains("pass --force"), "{message}");
+            }
+            other => return Err(format!("expected a usage error, got {other:?}").into()),
+        }
+        assert_eq!(plan_out(&out, true)?.exit_code, 0);
+        let spec_before = std::fs::read(&spec_path)?;
+        for (target, what) in [(&spec_path, "spec"), (&db_path, "database")] {
+            match plan_out(target, true) {
+                Err(CliError::Usage(message)) => {
+                    assert!(message.contains(&format!("over the {what}")), "{message}");
+                }
+                other => return Err(format!("expected a usage error, got {other:?}").into()),
+            }
+        }
+        assert_eq!(std::fs::read(&spec_path)?, spec_before);
+        assert!(!db_path.exists());
         Ok(())
     }
 
@@ -7550,6 +7639,8 @@ mod tests {
             "applied_by=local:cli",
             "managed objects (1): orders (document)",
             "history (last 1 of 1):",
+            "guarantees:\n",
+            "guarantees.audit.enabled=true enforced_with_development_key",
             "profile manifest: ",
             "drift against the applied spec: in_sync=true",
         ] {
@@ -8397,11 +8488,13 @@ mod tests {
             assert!(!data_dir.exists(), "nothing is created: {message}");
         }
 
-        // Agreeing values and auto never conflict: the start goes on to the plan, which verify
-        // refuses for the missing database.
+        // Agreeing values, auto and blank values (the Helm chart blanks the image's
+        // MULTIDB_PROFILE=transactional in spec mode) never conflict: the start goes on to the
+        // plan, which verify refuses for the missing database.
         for extra in [
             vec![("MULTIDB_PROFILE", "balanced")],
             vec![("MULTIDB_PROFILE", "auto")],
+            vec![("MULTIDB_PROFILE", ""), ("MULTIDB_REPLICATION", "")],
             vec![("MULTIDB_REPLICATION", "cp")],
         ] {
             let message = serve_refusal(serve_database(&spec_serve_config(&spec_path, &extra)?))?;

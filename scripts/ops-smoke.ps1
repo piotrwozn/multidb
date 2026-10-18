@@ -40,6 +40,12 @@ foreach ($Token in @("MULTIDB_RUNTIME_MODE", "MULTIDB_DB_PATH", "MULTIDB_BIND", 
         throw "configmap template missing required token: $Token"
     }
 }
+# Spec mode blanks the image's MULTIDB_PROFILE default instead of leaving it out.
+foreach ($Token in @('MULTIDB_PROFILE: ""', 'MULTIDB_REPLICATION: ""')) {
+    if (-not $ConfigMap.Contains($Token)) {
+        throw "configmap template missing spec-mode token: $Token"
+    }
+}
 
 $Pvc = Get-Content (Join-Path $Root "ops/helm/multidb/templates/pvc.yaml") -Raw
 foreach ($Token in @("PersistentVolumeClaim", "storageClassName", "accessModes")) {

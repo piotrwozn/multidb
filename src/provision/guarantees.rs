@@ -337,11 +337,37 @@ fn at_rest_status(inputs: &GuaranteeInputs<'_>, matrix: &mut Matrix) -> Enforcem
             ));
             EnforcementStatus::NotEnforceable
         }
+        (false, None) if inputs.new_target_encrypted => encrypted_without_at_rest(matrix),
         (false, _) => {
             matrix.not_requested(PATH);
             EnforcementStatus::NotRequested
         }
     }
+}
+
+/// Encrypting a new database whose spec says `at_rest: false` would leave one that every later
+/// plan reports as a mismatch, so it is refused before anything is created.
+fn encrypted_without_at_rest(matrix: &mut Matrix) -> EnforcementStatus {
+    const PATH: &str = "guarantees.encryption.at_rest";
+    let detail = "ProvisionEnvironment.encryption would encrypt the new database, but the spec \
+                  says at_rest: false";
+    let remediation = "Set guarantees.encryption.at_rest to true, or leave \
+                       ProvisionEnvironment.encryption unset.";
+    matrix.push(
+        PATH,
+        "false",
+        EnforcementStatus::NotRequested,
+        detail,
+        remediation,
+    );
+    matrix.issues.push(issue(
+        "PROVISION_ENCRYPTION_MISMATCH",
+        ValidationSeverity::Error,
+        PATH,
+        detail,
+        remediation,
+    ));
+    EnforcementStatus::NotRequested
 }
 
 #[derive(Default)]

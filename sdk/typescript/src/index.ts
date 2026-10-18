@@ -142,7 +142,7 @@ export type PhysicalObjectSpec = JsonObject & {
   metric?: "cosine" | "l2";
   hnsw?: JsonObject & { m?: number; ef_construction?: number; ef_search?: number };
   chunk_millis?: number;
-  retention_millis?: number | null;
+  retention_millis?: number;
   max_future_skew_millis?: number;
 };
 

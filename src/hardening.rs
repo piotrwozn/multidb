@@ -213,6 +213,15 @@ impl FormatRegistry {
                 crate::db::MANIFEST_VERSION,
                 DowngradePolicy::AllowedUntilNewFormatWritten,
             ),
+            // The `__provision` record and history of provisioned databases. Binaries without
+            // provisioning ignore the table; a newer `record_version` blocks every plan.
+            PersistentFormat::new(
+                "provision record",
+                "__provision/record_version",
+                crate::provision::RECORD_VERSION,
+                crate::provision::RECORD_VERSION,
+                DowngradePolicy::AllowedUntilNewFormatWritten,
+            ),
             PersistentFormat::new(
                 "value codec",
                 "MDBV/v1; legacy JSON read-only migration source",
@@ -513,6 +522,7 @@ mod tests {
         let report = registry.check_completeness(&[
             "database metadata",
             "profile manifest",
+            "provision record",
             "value codec",
             "backup manifest",
             "txn versions",
@@ -550,6 +560,16 @@ mod tests {
             (1, 1)
         );
         assert!(manifest.future_version_message(2).is_some());
+
+        let record = registry
+            .find("provision record")
+            .ok_or("provision record is registered")?;
+        assert_eq!(
+            (record.current_version, record.min_read_version),
+            (crate::provision::RECORD_VERSION, 1)
+        );
+        assert!(record.accepts(1) && !record.accepts(2));
+        assert!(record.future_version_message(2).is_some());
         Ok(())
     }
 }

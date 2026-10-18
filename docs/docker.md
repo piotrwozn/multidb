@@ -94,9 +94,11 @@ start (see [provisioning.md](provisioning.md#serve)). Without
    that selects another storage profile than the spec profile (`auto` never
    conflicts), an explicit `MULTIDB_REPLICATION` other than the spec
    `defaults.replication`, `guarantees.encryption.at_rest: true` (serve cannot
-   open encrypted databases in this build) and a volatile profile. Unset
-   `MULTIDB_PROFILE` in spec mode, or make it agree: the spec decides the
-   profile.
+   open encrypted databases in this build) and a volatile profile. The image
+   sets `MULTIDB_PROFILE=transactional`, so unsetting the variable falls back
+   to that default: in spec mode set it to an empty value
+   (`MULTIDB_PROFILE=""`, which is not explicit) or make it agree, since the
+   spec decides the profile.
 4. The database is planned against the spec, and `MULTIDB_SPEC_APPLY`
    decides:
 
@@ -146,9 +148,11 @@ them in this build (`MULTIDB_VAULT_KEK_PATH` is read only by the Rust API's
 Vault key provider). `MULTIDB_REPLICATION` is read only in spec mode. With
 `spec.enabled: true` the chart mounts the ConfigMap `spec.configMap` read-only
 at `spec.mountPath`, sets `MULTIDB_SPEC_PATH` and `MULTIDB_SPEC_APPLY`
-(`spec.apply`, `verify` by default) and leaves out `MULTIDB_PROFILE` and
-`MULTIDB_REPLICATION`; `MULTIDB_DB_PATH` (`runtime.dbPath`) stays explicit, so
-it wins over the spec `storage_path`.
+(`spec.apply`, `verify` by default) and sets `MULTIDB_PROFILE` and
+`MULTIDB_REPLICATION` to empty values, which override the image's
+`MULTIDB_PROFILE=transactional` and are not explicit, so the spec decides
+them; `MULTIDB_DB_PATH` (`runtime.dbPath`) stays explicit, so it wins over the
+spec `storage_path`.
 
 ## API And Studio
 

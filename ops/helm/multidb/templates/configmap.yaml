@@ -14,6 +14,10 @@ data:
   {{- if .Values.spec.enabled }}
   MULTIDB_SPEC_PATH: {{ printf "%s/%s" .Values.spec.mountPath .Values.spec.key | quote }}
   MULTIDB_SPEC_APPLY: {{ .Values.spec.apply | quote }}
+  # Blank, not left out: the image sets MULTIDB_PROFILE=transactional, and a blank value is
+  # not explicit, so the spec decides the profile and replication.
+  MULTIDB_PROFILE: ""
+  MULTIDB_REPLICATION: ""
   {{- else }}
   MULTIDB_PROFILE: {{ .Values.config.profile | quote }}
   MULTIDB_REPLICATION: {{ .Values.config.replication | quote }}

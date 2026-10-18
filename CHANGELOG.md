@@ -189,8 +189,7 @@ All notable public changes will be recorded here.
   `PROVISION_FORMAT_MISMATCH`, `PROVISION_OBJECT_CONFLICT`,
   `PROVISION_SECURITY_STATE_STALE`, `RBAC_SELF_LOCKOUT`,
   `AUDIT_REQUIRED_FOR_APPLY`, `GUARANTEE_NOT_ENFORCEABLE` and
-  `STEP_REQUIRES_FLAG`. Nothing applies a plan yet. See
-  `docs/provisioning.md`.
+  `STEP_REQUIRES_FLAG`. See `docs/provisioning.md`.
 - `provision::drift`, which reports how an open database differs from a spec
   (`DriftReport` with `in_sync` and typed items), and `provision::export_spec`,
   which describes an open database as a version 2 spec: the applied spec of
@@ -199,7 +198,8 @@ All notable public changes will be recorded here.
   listed in `operation_hints["export.unsupported_objects"]`.
 - `Database::provision_state`, which reads the provision record
   (`ProvisionRecord`) from the new system table `__provision`; a record of a
-  newer `record_version` or a corrupt one is refused.
+  newer `record_version` or a corrupt one is refused. The persistent format
+  registry lists it as `provision record` (`__provision/record_version` 1).
 - `config_spec::canonical_spec_json` and `config_spec::spec_digest` (`spec_`
   and 32 hex characters of blake3 over the canonical JSON).
 - `multidb::provision::apply_provision`, which applies a spec to an open
@@ -217,29 +217,36 @@ All notable public changes will be recorded here.
   provision record is journaled after every step and gets a history entry
   (`Database::provision_history`, at most 100); a failed step gives a
   `partially_applied` report and a `failed` record, and the next plan holds
-  only what remains. Objects are only created or adopted, releases keep the
-  data, RBAC changes touch managed names only and commit in one batch, and
-  the storage format upgrade writes the value-framing manifest and
-  `schema_version` 2 together, taking effect at the next open. See
+  only what remains; its declared guarantees and metadata are compared with
+  the last finished apply (`ProvisionRecord::last_applied`), so a confirmed
+  weakening needs its flag again. Objects are only created or adopted,
+  releases keep the data, RBAC changes touch managed names only and commit in
+  one batch, and the storage format upgrade writes the value-framing manifest
+  and `schema_version` 2 together, taking effect at the next open. See
   `docs/provisioning.md`.
 - `multidb::provision::provision_new_database`, which creates a database from
   a spec at an absent target with `create_database_with_profile` (audit on,
   the environment's audit key and, on the Rust API, a `LocalEnvelope`
   encryption config), checks that the plan recomputed against it equals the
-  confirmed one and applies it under the confirmed plan id.
+  confirmed one and applies it under the confirmed plan id. An encryption
+  config for a spec with `at_rest: false` is refused before anything is
+  created (`PROVISION_ENCRYPTION_MISMATCH`).
 - `Database::set_security_state_as`, which replaces the RBAC policy and the
   principal registry in one persisted batch after checking `System:Admin`,
   audited as `set_security_state`.
 - CLI provisioning (preview), as the local operator `local:cli`:
-  `multidb config plan --spec <file> [--db <path>] [--out <plan.json>]` (a
-  dry run that never creates the database file; text output lists every
-  step with its safety class and flag, every guarantee status and the exact
-  `config apply ... --confirm prov_...` command), `config apply --spec <file>
+  `multidb config plan --spec <file> [--db <path>] [--out <plan.json>
+  [--force]]` (a dry run that never creates the database file; text output
+  lists every step with its safety class and flag, every guarantee status and
+  the exact `config apply ... --confirm prov_...` command; `--out` never
+  replaces an existing file without `--force`, and never the spec or the
+  database), `config apply --spec <file>
   [--db <path>] (--confirm <prov_id> | --auto-approve)` (recomputes the plan,
   creates a missing database with `provision_new_database` or converges an
   existing one with `apply_provision`), `config drift --spec <file>`,
-  `config status --db <path>` (the provision record, the last 20 history
-  entries, the profile manifest and the drift against the applied spec) and
+  `config status --db <path>` (the provision record with its guarantee
+  statuses, the last 20 history entries, the profile manifest and the drift
+  against the applied spec) and
   `config export --db <path> [--format yaml|json] [--out <file>] [--force]`.
   `--allow-weakening` and `--allow-destructive` (repeatable or
   comma-separated), `--allow-format-upgrade` and `--unmanaged
@@ -289,8 +296,10 @@ All notable public changes will be recorded here.
   `StartupReport`.
 - Helm chart spec mode: `spec.enabled` (off by default), `spec.configMap`,
   `spec.key`, `spec.mountPath` and `spec.apply` (`verify` by default) mount
-  the spec read-only and set `MULTIDB_SPEC_PATH` and `MULTIDB_SPEC_APPLY`
-  instead of `MULTIDB_PROFILE` and `MULTIDB_REPLICATION`;
+  the spec read-only, set `MULTIDB_SPEC_PATH` and `MULTIDB_SPEC_APPLY`, and
+  set `MULTIDB_PROFILE` and `MULTIDB_REPLICATION` to empty values, which
+  override the image's `MULTIDB_PROFILE=transactional` and leave the profile to
+  the spec;
   `docker-compose.yml` has a commented example.
 - Control Plane provisioning (preview) of the served database, as the calling
   principal: `POST /provision/plan` (`{spec, options?}`; a dry run on the
@@ -362,7 +371,6 @@ All notable public changes will be recorded here.
   a re-apply (a noop) for every template, with `secure-saas` exiting 2.
   `scripts/preview-smoke.ps1` adds a `config plan --spec --db` dry run of the
   generated ai-memory spec and records its outcome in the summary.
-
 - `POST /config/apply` also accepts `{current, desired, confirm}`: the server
   recomputes the plan with `MigrationPlanner::plan`, decoding each side as
   `/config/plan` does. The `config_apply` audit detail ends with
@@ -391,9 +399,12 @@ All notable public changes will be recorded here.
   labelled advisory catalog guidance that this build does not enforce (its
   values are unchanged).
 - Version 1 specs also gain the Warnings `COLLECTION_NAME_INVALID`,
-  `COLLECTION_NAME_RESERVED` and `SPEC_LIMIT_EXCEEDED` after every existing
-  issue, for collection names the runtime would refuse and for oversized
-  `overrides`, `operation_hints` and collection lists.
+  `COLLECTION_NAME_RESERVED`, `OBJECT_NAME_COLLISION` and
+  `SPEC_LIMIT_EXCEEDED` after every existing issue, for collection names the
+  runtime would refuse, duplicate collection names and oversized `overrides`,
+  `operation_hints` and collection lists.
+- `multidb init` refuses `--db` and `--confirm` without `--apply` as a usage
+  error; they were ignored before.
 - Version 1 specs gain only Advice and Warnings, no new Errors:
   `PROFILE_NOT_PROVISIONABLE` after `CUSTOM_PROFILE` for unknown profiles,
   `OVERRIDE_IS_METADATA_ONLY` for `overrides` keys in a knob namespace

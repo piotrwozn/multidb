@@ -98,6 +98,12 @@ pub struct ProvisionRecord {
     /// The spec the last apply converged to (or, while `in_progress` or `failed`, was
     /// converging to).
     pub applied_spec: DatabaseSpec,
+    /// While the record is `in_progress` or `failed`: the spec the last finished apply converged
+    /// to, which plans compare declared guarantees and metadata against, so a weakening the
+    /// unfinished apply confirmed still needs its flag. `None` when no apply finished; an
+    /// `applied` record leaves it out, since `applied_spec` is that spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied_spec: Option<DatabaseSpec>,
     /// The `prof_` digest of the resolved profile of `applied_spec`.
     pub profile_digest: String,
     /// Managed catalog objects by name.
@@ -132,6 +138,19 @@ pub struct ProvisionRecord {
     pub applied_by: String,
     /// The crate version that wrote the record.
     pub binary_version: String,
+}
+
+impl ProvisionRecord {
+    /// The spec the last finished apply converged to: `applied_spec` once the record is
+    /// `applied`, else `last_applied_spec`.
+    #[must_use]
+    pub fn last_applied(&self) -> Option<&DatabaseSpec> {
+        if self.status == ProvisionRecordStatus::Applied {
+            Some(&self.applied_spec)
+        } else {
+            self.last_applied_spec.as_ref()
+        }
+    }
 }
 
 /// One past apply, kept under `history/{seq:020}`.

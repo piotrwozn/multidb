@@ -99,7 +99,7 @@ Every collection becomes exactly one container object. Its kind is
 | `document` | `create_collection`, or `create_collection_auto_id` without a pinned id | `collection_id`; `fields` (`{name, path, type}`, empty means one field `id` holding the document id); `document_indexes` (`{path, id}`) |
 | `table` | `Database::create_table_with_layout` | `layout` (analytics: columnar; otherwise the database layout); `columns` (`{name, type, nullable: false}`; empty means a schemaless row table); `primary_key`; `table_indexes` (`{column, expression: column \| lower_ascii, include, id}`); `system_versioning`, `keep_history` |
 | `vector` | `create_vector_collection`, or `_auto_id` | `collection_id`; `dim` (1..=65536, required); `metric` (`cosine` \| `l2`, cosine); `hnsw` (`m` 1..=255, `ef_construction` >= m, `ef_search` >= 1; 16/200/48) |
-| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset) |
+| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; unset or `null` takes the knob, so a series cannot ask for no retention when its profile sets a default retention) |
 | `graph` | `create_graph`, or `create_graph_auto_id` | `graph_id` |
 
 A document collection also derives:
@@ -109,6 +109,12 @@ A document collection also derives:
   `create_full_text_index` on the collection;
 - one geo index per `physical.geo` entry (`{path, name, precision: 6}`,
   precision 1..=12), built with `create_geo_index`.
+
+Known limit: in this build full-text and geo indexes are created empty and
+are not maintained on writes. Call `FullTextIndex::refresh_full` /
+`refresh_incremental` (and `GeoIndex::refresh_full` / `refresh_incremental`)
+after loading or changing documents, until index backfill and write
+maintenance land.
 
 A typed row table with system versioning derives `<table>_history`
 (`enable_system_versioning` with `keep_history`). Versioning comes from
@@ -331,7 +337,8 @@ metadata or strengthening, without RBAC steps on an existing database;
 `Confirmation::AutoApproveAdditive` accepts only such plans, and so do the
 CLI `--auto-approve` and `init --apply`. Creating
 a full-text or geo index on a collection that already holds documents is
-medium impact, and the step names the document count.
+medium impact, and the step names the document count, which this build does
+not backfill into the new index (see the known limit above).
 
 ### What a plan compares
 
@@ -389,7 +396,12 @@ principals `admin` and `root`), is left alone. Grants are resolved to the
 resource of their object (`Collection`, `VectorCollection`, `Table` for
 tables and `<table>_history`, `TimeSeries`, `Graph`, `FullTextIndex`,
 `GeoIndex`, or `Database`). A plan that would take system administration away
-from `ProvisionEnvironment.principal` is `RBAC_SELF_LOCKOUT`.
+from `ProvisionEnvironment.principal` is `RBAC_SELF_LOCKOUT`. The check
+resolves the principal the way authorization will after the apply: through
+the login users that map to it (a user may map to a principal of another
+name), so narrowing its roles, removing its principal or remapping its user
+all count; when several users map to it, losing administration through any
+of them blocks.
 
 A handle whose RBAC state or audit flag differs from what is persisted in the
 database is `PROVISION_SECURITY_STATE_STALE` (blocks): the plain openers
@@ -403,7 +415,7 @@ Open the database with `open_database_with_ops` to plan it.
 | --- | --- |
 | `write_ack`, `conflict_resolution: none`, `strict_cross_domain_transactions`, `local_snapshot` and `strong_cp` domains | `trivially_satisfied`: one replica, redb `Durability::Immediate`, one replication mode |
 | `backup.enabled`, `backup.pitr` | `operator_managed` with the `multidb backup`, `verify` and `restore` runbook and the Warning `GUARANTEE_OPERATOR_MANAGED`, when requested; there is no scheduler |
-| `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): there is no re-encryption |
+| `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): there is no re-encryption. So is a `ProvisionEnvironment.encryption` for a new database whose spec says `at_rest: false`, refused before anything is created |
 | `sensitive_data` | follows `encryption.at_rest`; the development audit key warns but never blocks it |
 | `audit.enabled` | `enforced` with a configured audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one, which is always the case on the CLI and `serve` |
 | `cache` TTL and eviction, `event_log` append-only | `not_enforced`, the Warning `ROLE_CONSTRAINT_NOT_ENFORCED` |
@@ -508,8 +520,9 @@ a spec to an open single-node database under exclusive `&mut Database`:
    the step count and the flags, and this write must succeed before anything
    else changes.
 6. **The record is journaled** as `in_progress`, holding the spec being
-   applied, and rewritten after every step with its completed steps and the
-   objects it owns.
+   applied and the spec the last finished apply converged to
+   (`last_applied_spec`), and rewritten after every step with its completed
+   steps and the objects it owns.
 7. **The steps run in plan order.** Each first checks whether it is already
    satisfied. A principal creates through the audited `*_as` APIs (one
    `create_*` event per object, ids allocated by the `_auto_id_as` variants);
@@ -544,9 +557,12 @@ its `failed_step` and `completed_steps`, a history entry is written,
 `provision_apply_failed` is audited, and the report is `partially_applied`.
 The next plan reports `DRIFT_INTERRUPTED_APPLY` and holds only what remains:
 objects the failed apply created are already managed, so they are satisfied.
-Because the journal already holds the spec being applied, metadata and
-guarantee changes it recorded are not planned again; the applied spec is
-always recorded again. Applying that plan converges, and a further plan is a
+Declared guarantees and metadata count only once an apply finishes: the plan
+compares them with the spec the last finished apply converged to (the
+record's `last_applied_spec`; `ProvisionRecord::last_applied()`), so a
+weakening the failed apply confirmed needs its `--allow-weakening` flag again,
+and `spec_migration` keeps that baseline. The applied spec is always recorded
+again. Applying that plan converges, and a further plan is a
 `noop`. When the failure itself cannot be recorded, the report carries the
 Warning `PROVISION_FAILURE_NOT_RECORDED` and the record still says
 `in_progress`, which the next plan treats the same way. Batching every
@@ -608,10 +624,10 @@ exclusive file lock: a database another process holds open is refused.
 
 | command | what it does |
 | --- | --- |
-| `multidb config plan --spec <file> [--db <path>] [--out <plan.json>] [flags] [--json]` | Dry run against the database at the target, or against an absent target. Prints every step with its safety class and flag, the flags, the objects, every guarantee status, the issues, the drift, the impact and the exact `config apply ... --confirm prov_...` command; `--out` writes the plan JSON |
+| `multidb config plan --spec <file> [--db <path>] [--out <plan.json> [--force]] [flags] [--json]` | Dry run against the database at the target, or against an absent target. Prints every step with its safety class and flag, the flags, the objects, every guarantee status, the issues, the drift, the impact and the exact `config apply ... --confirm prov_...` command; `--out` writes the plan JSON, never over an existing file without `--force` and never over the spec or the database |
 | `multidb config apply --spec <file> [--db <path>] (--confirm <prov_id> \| --auto-approve) [flags] [--json]` | Recomputes the plan and applies it: a missing or empty file is created with `provision_new_database`, an existing database is opened and converged with `apply_provision`. Without `--confirm` or `--auto-approve` a noop exits 0 and any other plan is printed with exit 2 |
 | `multidb config drift --spec <file> [--db <path>] [--unmanaged ignore\|report\|fail] [--json]` | How the database differs from the spec, for CI |
-| `multidb config status --db <path> [--json]` | The provision record, the last 20 history entries, the profile manifest and the drift of the database against the spec the record applied |
+| `multidb config status --db <path> [--json]` | The provision record with its guarantee statuses, the last 20 history entries, the profile manifest and the drift of the database against the spec the record applied |
 | `multidb config export --db <path> [--format yaml\|json] [--out <file>] [--force]` | `export_spec`: the applied spec, or an inferred version 2 spec. Without `--out` the spec goes to stdout and the notes to stderr; `--out` never replaces a file without `--force` |
 | `multidb init --guided (--profile <p> \| --template <t>) --name <n> ... --apply [--db <path>] [--confirm <prov_id>]` | Writes the files as `init` always does, then provisions a new database from the spec |
 
@@ -702,7 +718,9 @@ container contract (variables, Helm values) is in
    explicit path that wins over a spec `storage_path` is printed as a note.
 3. Before anything is opened, `serve` refuses:
    - an explicit `MULTIDB_PROFILE` that resolves to another storage profile
-     than the spec profile (`auto` never conflicts);
+     than the spec profile (`auto` never conflicts). The container image sets
+     `MULTIDB_PROFILE=transactional`, so blank it (`MULTIDB_PROFILE=""`, as
+     the Helm chart does in spec mode) rather than unset it;
    - an explicit `MULTIDB_REPLICATION` (`cp` or `ap`, read in spec mode only)
      other than the spec `defaults.replication`;
    - `guarantees.encryption.at_rest: true`: encryption at rest is provisioned
@@ -883,7 +901,8 @@ checks that `secure-saas` exits 2.
 
 Provisioning keeps what it owns in the system table `__provision`: the
 record (`ProvisionRecord`, key `record`) holds the status of the last apply,
-its plan id, the applied spec and its digest, the managed objects (with the
+its plan id, the applied spec and its digest (while an apply is unfinished,
+also the spec the last finished apply converged to), the managed objects (with the
 collection or graph id each one got), roles and principals, released
 objects, guarantee statuses, completed and failed steps, flags, actor and
 binary version; `history/{seq:020}` keys hold one entry per finished or

@@ -352,8 +352,8 @@ pub struct ProvisionPlan {
     pub guarantees: Vec<GuaranteeEnforcement>,
     pub drift: DriftReport,
     pub steps: Vec<ProvisionStep>,
-    /// `MigrationPlanner::plan(record.applied_spec, spec)`, for the metadata-level diff against
-    /// the last applied spec.
+    /// `MigrationPlanner::plan(last applied spec, spec)`, for the metadata-level diff against
+    /// the spec the last finished apply converged to (`ProvisionRecord::last_applied`).
     pub spec_migration: Option<MigrationPlan>,
     pub outcome: PlanOutcome,
     /// Every flag a step of the plan needs, given or not.
@@ -1409,16 +1409,16 @@ impl PlanBuilder<'_> {
             && !planned.is_empty()
         {
             let post_policy = AuthzPolicy::new(post_roles.into_values());
-            let post_actor = post_principals
-                .get(actor.name())
-                .filter(|principal| principal.name() == actor.name())
-                .unwrap_or(actor);
             let allowed_now = live_policy
                 .authorize(actor, &Resource::System, Permission::Admin)
                 .is_ok();
-            let allowed_after = post_policy
-                .authorize(post_actor, &Resource::System, Permission::Admin)
-                .is_ok();
+            let allowed_after = post_apply_actors(actor, &live_registry, &post_principals)
+                .iter()
+                .all(|post_actor| {
+                    post_policy
+                        .authorize(post_actor, &Resource::System, Permission::Admin)
+                        .is_ok()
+                });
             if allowed_now && !allowed_after {
                 self.error(
                     "RBAC_SELF_LOCKOUT",
@@ -1546,7 +1546,8 @@ impl PlanBuilder<'_> {
     fn plan_recorded_guarantees(&mut self) {
         let Some(applied) = self
             .record()
-            .map(|record| record.applied_spec.guarantees.clone())
+            .and_then(ProvisionRecord::last_applied)
+            .map(|applied| applied.guarantees.clone())
         else {
             return;
         };
@@ -1617,7 +1618,7 @@ impl PlanBuilder<'_> {
     /// the applied spec is recorded last, before audit is disabled.
     fn plan_metadata(&mut self) {
         let record = self.record();
-        let applied = record.map(|record| &record.applied_spec);
+        let applied = record.and_then(ProvisionRecord::last_applied);
         let spec = self.spec;
         let changed = [
             (
@@ -1711,7 +1712,8 @@ impl PlanBuilder<'_> {
         let existing = self.live().is_some();
         let spec_migration = self
             .record()
-            .map(|record| MigrationPlanner::plan(&record.applied_spec, self.spec));
+            .and_then(ProvisionRecord::last_applied)
+            .map(|applied| MigrationPlanner::plan(applied, self.spec));
         let target = self.planned_target(target_path);
         self.check_audit_required();
 
@@ -2175,7 +2177,10 @@ fn create_step(
     };
     match counts.get(source) {
         Some(&rows) if rows > 0 => {
-            let note = format!("the source collection {source} holds {rows} documents to index");
+            let note = format!(
+                "the source collection {source} holds {rows} documents, which this build does \
+                 not backfill into the new index"
+            );
             ProvisionStep {
                 action: format!("{}; {note}", created.action),
                 ..created
@@ -2871,6 +2876,45 @@ fn plan_principals(
         }
     }
     (planned, post_principals)
+}
+
+/// What the applying `actor` resolves to after the apply, the way authorization resolves a
+/// login user (`PrincipalRegistry::principal_for_user`). The registry is keyed by login user,
+/// and a user may map to a principal of another name, so the actor is matched against the live
+/// principals: exactly first, then by principal name. Each matching user maps to its post-apply
+/// principal, or to a principal without roles when the plan removes the user. Every match
+/// counts, so an ambiguous actor fails closed. An actor that no login user maps to (a session,
+/// or a principal the caller built) keeps its roles.
+fn post_apply_actors(
+    actor: &Principal,
+    live_registry: &PrincipalRegistry,
+    post_principals: &BTreeMap<String, Principal>,
+) -> Vec<Principal> {
+    let live = live_registry.principals();
+    let mut users: Vec<&String> = live
+        .iter()
+        .filter(|(_, principal)| *principal == actor)
+        .map(|(user, _)| user)
+        .collect();
+    if users.is_empty() {
+        users = live
+            .iter()
+            .filter(|(_, principal)| principal.name() == actor.name())
+            .map(|(user, _)| user)
+            .collect();
+    }
+    if users.is_empty() {
+        return vec![actor.clone()];
+    }
+    users
+        .into_iter()
+        .map(|user| {
+            post_principals
+                .get(user)
+                .cloned()
+                .unwrap_or_else(|| Principal::new(user.clone()))
+        })
+        .collect()
 }
 
 /// The roles and principals a record manages, without the reserved bootstrap names, which

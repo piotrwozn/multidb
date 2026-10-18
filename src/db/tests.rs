@@ -1787,6 +1787,7 @@ fn provision_record(plan_id: &str) -> ProvisionRecord {
         plan_id: plan_id.to_owned(),
         spec_digest: "spec_test".to_owned(),
         applied_spec: DatabaseSpec::from_db_config("app", &DbConfig::new(Profile::InMemory)),
+        last_applied_spec: None,
         profile_digest: "prof_test".to_owned(),
         objects: BTreeMap::new(),
         managed_roles: BTreeSet::new(),

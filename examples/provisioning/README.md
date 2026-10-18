@@ -79,3 +79,7 @@ Guarantee statuses a CLI plan reports for this spec:
   (`--allow-destructive collections.<name>`), keeping its data.
 - Encryption at rest is not requested here; a spec that requests it is
   provisioned through the Rust API only.
+- In this build the full-text and geo indexes of `orders` are created empty
+  and are not maintained on writes: call `refresh_full` or
+  `refresh_incremental` on them after loading documents, until index
+  backfill lands.

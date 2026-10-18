@@ -313,6 +313,7 @@ fn record_for(spec: &DatabaseSpec, plan: &ProvisionPlan) -> ProvisionRecord {
         plan_id: plan.plan_id.clone(),
         spec_digest: spec_digest(spec),
         applied_spec: spec.clone(),
+        last_applied_spec: None,
         profile_digest: plan
             .resolved_profile
             .as_ref()
@@ -2991,6 +2992,7 @@ fn audit_is_enabled_first_disabled_last_and_required_in_between() -> TestResult 
 type StepSignature = (ProvisionStepKind, Option<String>, String);
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestResult {
     let spec = in_memory(full_spec()?);
     let rust = env(ProvisionSurface::RustApi);
@@ -3022,6 +3024,14 @@ fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestRe
         };
         assert_eq!(report.status, ProvisionOutcome::PartiallyApplied, "{index}");
         assert!(report.check.data_mutated);
+        assert!(
+            report
+                .check
+                .message
+                .ends_with("the steps before it stay applied; plan again to see what remains"),
+            "{}",
+            report.check.message
+        );
         assert_eq!(report.failed_step.as_ref(), Some(&failed_id));
         let failed = report.applied_steps.last().ok_or("the failed step")?;
         assert_eq!(failed.outcome, StepOutcome::Failed);
@@ -3049,7 +3059,8 @@ fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestRe
         assert_eq!(last.outcome, AuditOutcome::Failed);
 
         // The next plan holds only what remains: nothing that completed comes back, and every
-        // object the failed apply did not create is still planned.
+        // object the failed apply did not create is still planned. Recorded metadata counts
+        // only once an apply finishes, so it is planned against the last finished one again.
         let remaining = plan_rust_api(&spec, &db)?;
         assert!(has_issue(
             &remaining,
@@ -3061,7 +3072,10 @@ fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestRe
             .map(signature)
             .collect::<Vec<_>>();
         for step in &remaining.steps {
-            assert!(left.contains(&signature(step)), "{index}: {step:?}");
+            assert!(
+                step.kind == ProvisionStepKind::RecordMetadata || left.contains(&signature(step)),
+                "{index}: {step:?}"
+            );
         }
         for step in &plan.steps[index..] {
             if step.object.is_some() && step.kind != ProvisionStepKind::ApplySecurity {
@@ -3094,6 +3108,81 @@ fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestRe
         assert_eq!(record.objects.len(), 9);
         assert_eq!(db.provision_history()?.len(), 2);
     }
+    Ok(())
+}
+
+#[test]
+fn an_unfinished_apply_does_not_carry_its_weakened_guarantees() -> TestResult {
+    let mut strict = in_memory(orders_spec()?);
+    strict.guarantees.strict_cross_domain_transactions = true;
+    let embedded = ProvisionActor::local_operator("local:embedded");
+    let rust = env(ProvisionSurface::RustApi);
+    let mut db = create_in_memory(&strict)?;
+    assert_applied(&apply_as(
+        &mut db,
+        &embedded,
+        &strict,
+        &ProvisionOptions::default(),
+        &rust,
+    )?);
+
+    let mut relaxed = with_notes(strict.clone())?;
+    relaxed.guarantees.strict_cross_domain_transactions = false;
+    let flag = "guarantees.strict_cross_domain_transactions";
+    let allow = weakening(flag);
+    let plan = plan_provision(&relaxed, ProvisionTargetRef::Open(&db), &allow, &rust)?;
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    let create = plan
+        .steps
+        .iter()
+        .position(|step| step.object.as_deref() == Some("notes"))
+        .ok_or("the notes step")?;
+    let report = {
+        let _failure = InjectedFailure::at(create);
+        apply_provision(
+            &mut db,
+            &embedded,
+            &relaxed,
+            &Confirmation::PlanId(plan.plan_id.clone()),
+            &allow,
+            &rust,
+        )?
+    };
+    assert_eq!(report.status, ProvisionOutcome::PartiallyApplied);
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert_eq!(record.status, ProvisionRecordStatus::Failed);
+    assert_eq!(record.applied_spec, relaxed);
+    assert_eq!(record.last_applied_spec.as_ref(), Some(&strict));
+    assert_eq!(record.last_applied(), Some(&strict));
+
+    // The weakening the failed apply confirmed still needs its flag on the next run.
+    let resumed = plan_rust_api(&relaxed, &db)?;
+    assert_eq!(
+        resumed.outcome,
+        PlanOutcome::NeedsFlags,
+        "{:#?}",
+        resumed.steps
+    );
+    assert!(
+        resumed
+            .required_flags
+            .contains(&format!("allow_weakening:{flag}"))
+    );
+    assert!(
+        resumed
+            .steps
+            .iter()
+            .any(|step| step.kind == ProvisionStepKind::RecordGuarantees && step.path == flag)
+    );
+    let spec_migration = resumed.spec_migration.ok_or("a spec migration")?;
+    assert!(!spec_migration.steps.is_empty());
+
+    assert_applied(&apply_as(&mut db, &embedded, &relaxed, &allow, &rust)?);
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    assert_eq!(record.status, ProvisionRecordStatus::Applied);
+    assert_eq!(record.last_applied_spec, None);
+    assert_eq!(record.last_applied(), Some(&relaxed));
+    assert_eq!(plan_rust_api(&relaxed, &db)?.outcome, PlanOutcome::Noop);
     Ok(())
 }
 
@@ -3418,6 +3507,49 @@ fn rust_api_provisions_an_encrypted_database_with_a_local_envelope() -> TestResu
 }
 
 #[test]
+fn an_encryption_config_with_at_rest_false_is_refused_before_creating_anything() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("encrypted.redb");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [7_u8; 32])?;
+    let spec = orders_spec()?;
+    assert!(!spec.guarantees.encryption.at_rest);
+    let environment = ProvisionEnvironment {
+        encryption: Some(EncryptionConfig::local_envelope(
+            temp_dir.path().join("keyring.json"),
+            &kek_path,
+        )),
+        ..env(ProvisionSurface::RustApi)
+    };
+    let plan = plan_provision(
+        &spec,
+        ProvisionTargetRef::Path(&path),
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_eq!(plan.outcome, PlanOutcome::Blocked);
+    assert!(has_issue(
+        &plan,
+        "PROVISION_ENCRYPTION_MISMATCH",
+        ValidationSeverity::Error
+    ));
+    assert!(!plan.auto_approvable);
+    match provision_new_database(
+        &spec,
+        Some(&path),
+        &Confirmation::PlanId(plan.plan_id.clone()),
+        &ProvisionOptions::default(),
+        &environment,
+    ) {
+        Err(ProvisionError::Blocked(_)) => {}
+        Err(other) => return Err(format!("expected a blocked plan, got {other:?}").into()),
+        Ok(_) => return Err("expected a blocked plan, got a new database".into()),
+    }
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn rbac_changes_only_managed_names_in_one_batch() -> TestResult {
     let temp_dir = tempfile::tempdir()?;
@@ -3571,6 +3703,138 @@ fn a_principal_cannot_apply_a_plan_that_locks_it_out() -> TestResult {
     );
     // A local operator relies on filesystem trust, not on the role.
     assert_applied(&apply_cli(&mut db, &narrowed, &allow)?);
+    Ok(())
+}
+
+fn assert_self_lockout(result: Result<ProvisionApplyReport, ProvisionError>) -> TestResult {
+    match result {
+        Err(ProvisionError::Blocked(plan)) => {
+            assert!(has_issue(
+                &plan,
+                "RBAC_SELF_LOCKOUT",
+                ValidationSeverity::Error
+            ));
+            Ok(())
+        }
+        other => Err(format!("expected a lockout, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn a_principal_cannot_remove_its_own_managed_principal() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let base = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("lockout.redb"), &base)?;
+    let administrators = |users: &[&str]| {
+        let principals: Vec<JsonValue> = users
+            .iter()
+            .map(|user| json!({ "user": user, "roles": ["ops"] }))
+            .collect();
+        with_security(
+            base.clone(),
+            &json!({
+                "roles": [{
+                    "name": "ops",
+                    "grants": [{ "resource": "database", "permissions": ["admin"] }]
+                }],
+                "principals": principals
+            }),
+        )
+    };
+    assert_applied(&apply_cli(
+        &mut db,
+        &administrators(&["ops", "ops2"])?,
+        &ProvisionOptions::default(),
+    )?);
+
+    let without_ops = administrators(&["ops2"])?;
+    let allow = destructive(&["security.principals.ops"]);
+    let ops = ProvisionActor::Principal(db.principal_for_user("ops"));
+    let control_plane = env(ProvisionSurface::ControlPlane);
+    assert_self_lockout(apply_as(
+        &mut db,
+        &ops,
+        &without_ops,
+        &allow,
+        &control_plane,
+    ))?;
+    assert!(db.principal_registry().principals().contains_key("ops"));
+    // The plan is refused at plan time too, for the principal the Control Plane passes.
+    let plan = plan_provision(
+        &without_ops,
+        ProvisionTargetRef::Open(&db),
+        &allow,
+        &ProvisionEnvironment {
+            principal: Some(db.principal_for_user("ops")),
+            ..env(ProvisionSurface::ControlPlane)
+        },
+    )?;
+    assert!(has_issue(
+        &plan,
+        "RBAC_SELF_LOCKOUT",
+        ValidationSeverity::Error
+    ));
+
+    // Another administrator may remove it.
+    let ops2 = ProvisionActor::Principal(db.principal_for_user("ops2"));
+    assert_applied(&apply_as(
+        &mut db,
+        &ops2,
+        &without_ops,
+        &allow,
+        &control_plane,
+    )?);
+    assert!(!db.principal_registry().principals().contains_key("ops"));
+    Ok(())
+}
+
+#[test]
+fn self_lockout_resolves_a_principal_named_differently_from_its_user() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let base = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("lockout.redb"), &base)?;
+    let alice = |principal: &str, roles: &[&str]| {
+        with_security(
+            base.clone(),
+            &json!({
+                "roles": [{
+                    "name": "ops",
+                    "grants": [{ "resource": "database", "permissions": ["admin"] }]
+                }],
+                "principals": [{ "user": "alice", "principal": principal, "roles": roles }]
+            }),
+        )
+    };
+    assert_applied(&apply_cli(
+        &mut db,
+        &alice("alice_p", &["ops"])?,
+        &ProvisionOptions::default(),
+    )?);
+    let actor = db.principal_for_user("alice");
+    assert_eq!(actor.name(), "alice_p");
+    let actor = ProvisionActor::Principal(actor);
+    let allow = weakening("security.principals.alice");
+    let control_plane = env(ProvisionSurface::ControlPlane);
+
+    // Stripping the role from the principal alice maps to locks alice out.
+    assert_self_lockout(apply_as(
+        &mut db,
+        &actor,
+        &alice("alice_p", &[])?,
+        &allow,
+        &control_plane,
+    ))?;
+    assert!(db.principal_for_user("alice").roles().contains("ops"));
+
+    // Renaming the principal keeps alice an administrator, so it is not a lockout.
+    assert_applied(&apply_as(
+        &mut db,
+        &actor,
+        &alice("alice_q", &["ops"])?,
+        &allow,
+        &control_plane,
+    )?);
+    assert_eq!(db.principal_for_user("alice").name(), "alice_q");
     Ok(())
 }
 

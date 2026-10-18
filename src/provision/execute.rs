@@ -622,7 +622,7 @@ fn managed_resource(name: &str, kind: ObjectKind) -> Resource {
 }
 
 /// The record an apply journals before its first step: the target spec, with what the previous
-/// record manages until the steps change it.
+/// record manages until the steps change it, and the spec the last finished apply converged to.
 fn journal_record(
     previous: Option<&ProvisionRecord>,
     plan: &ProvisionPlan,
@@ -637,6 +637,7 @@ fn journal_record(
         plan_id: plan.plan_id.clone(),
         spec_digest: spec_digest(spec),
         applied_spec: spec.clone(),
+        last_applied_spec: previous.and_then(ProvisionRecord::last_applied).cloned(),
         profile_digest: resolved.digest.clone(),
         objects: previous
             .map(|record| record.objects.clone())
@@ -934,7 +935,8 @@ impl Run<'_> {
             )));
         }
         let message = format!(
-            "{failed_step} failed: {error}; the steps before it stay applied; plan again to see              what remains"
+            "{failed_step} failed: {error}; the steps before it stay applied; plan again to see \
+             what remains"
         );
         self.report(ProvisionOutcome::PartiallyApplied, &message)
     }
@@ -956,6 +958,7 @@ impl Run<'_> {
             .released_objects
             .retain(|name| catalog.contains_key(name) && !objects.contains_key(name));
         record.status = ProvisionRecordStatus::Applied;
+        record.last_applied_spec = None;
         record.failed_step = None;
         record.applied_at_millis = now_millis();
         let history = self.history_entry();
