@@ -4090,7 +4090,7 @@ fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult 
         exported
             .notes
             .iter()
-            .any(|note| note.contains("accepts any of them")),
+            .any(|note| note.contains("accepts any future timestamp")),
         "{:#?}",
         exported.notes
     );

@@ -440,9 +440,9 @@ fn container_collection(
             }
             if config.max_future_skew_millis == i64::MAX {
                 findings.notes.push(format!(
-                    "time series {name} was created before time series bounded future \
-                     timestamps, so it accepts any of them; the spec pins \
-                     max_future_skew_millis {}",
+                    "time series {name} accepts any future timestamp (max_future_skew_millis {}, \
+                     as for every series created before the bound existed); the spec pins that \
+                     value, so a new series built from it accepts any future timestamp too",
                     i64::MAX
                 ));
             }
