@@ -3776,10 +3776,9 @@ mod tests {
         }
 
         // Second boot mirrors `multidb serve` with MULTIDB_ADMIN_PASSWORD set.
-        let database = Arc::new(Mutex::new(create_database(DbConfig::on_disk(
-            Profile::Transactional,
-            &db_path,
-        ))?));
+        let database = Arc::new(tokio::sync::RwLock::new(create_database(
+            DbConfig::on_disk(Profile::Transactional, &db_path),
+        )?));
         let state = AdminState::from_database_handle(Arc::clone(&database));
         state
             .bootstrap_admin_password("secret".to_owned(), false)
@@ -3814,7 +3813,7 @@ mod tests {
         })));
         assert_eq!(body["data"]["audit_enabled"], true);
 
-        let database = database.lock().await;
+        let database = database.read().await;
         let principal = database.principal_for_user("multidb");
         assert_eq!(principal, Principal::new("app").with_role("app_rw"));
         assert!(matches!(
