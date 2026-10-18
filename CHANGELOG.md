@@ -179,12 +179,16 @@ All notable public changes will be recorded here.
   (temporal retention), which used sqlparser's defaults (recursion depth 50,
   no size or statement limits): a configured lower limit fails every path
   with the same parser error, `SELECT version()` and the catalog views no
-  longer bypass `max_sql_bytes`, and statements multidb executes itself, such
-  as `INSERT` and indexed equality lookups, may nest to the configured depth
-  through `query` and `query_as`. DataFusion still parses the SELECTs it
-  plans with its own fixed recursion limit of 50. `compat::execute_compat_sql`
-  and `compat::compat_sql_requirements` take the `QueryExecutionConfig` whose
-  limits they apply.
+  longer bypass `max_sql_bytes` (the whole SQL text counts, trailing
+  whitespace and semicolons included), and statements multidb executes
+  itself, such as `INSERT` and indexed equality lookups, may nest to the
+  configured depth through `query` and `query_as`. DataFusion still parses
+  the SELECTs it plans with its own fixed recursion limit of 50; its SQL
+  errors (`DataFusionError::SQL`: its parser errors, that limit included, and
+  the planner errors it builds from them) are now `QueryError::Parse`
+  (SQLSTATE 42601) like the engine's, instead of `QueryError::DataFusion`
+  (XX000). The pgwire
+  extended-protocol Describe still pre-parses with sqlparser's defaults.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
   with `StorageFormatMismatch` (previously an opaque serde error). Every
@@ -249,6 +253,9 @@ All notable public changes will be recorded here.
   `..RestoreConfig::default()`; `RestoreConfig::default()` and the builders
   are unchanged. `BackupError` gains `ProfileFloorsNotMet { floors }` and is
   not `non_exhaustive` either.
+- `compat::execute_compat_sql` and `compat::compat_sql_requirements` take a
+  new `&QueryExecutionConfig` argument, the SQL parser limits they apply
+  (for example the database's `PerformanceConfig.query`).
 
 ## 0.1.0-preview.1
 

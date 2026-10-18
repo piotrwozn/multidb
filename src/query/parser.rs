@@ -15,9 +15,11 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
 }
 
 /// Parses SQL text with the `PostgreSQL` dialect under the configured SQL text size, statement
-/// count, `VALUES` row and parser recursion limits. The engine and every pre-parse of
-/// `Database::query` and its RBAC and temporal checks parse through it, so they agree on what
-/// SQL is accepted.
+/// count, `VALUES` row and parser recursion limits. The engine and the compatibility, RBAC and
+/// `AS OF` retention pre-parses parse through it, so they agree on what SQL is accepted.
+/// `DataFusion` parses the SELECTs it plans again with its own recursion limit of 50; the pgwire
+/// extended-protocol Describe pre-parse and best-effort internal parses that ignore parse errors
+/// keep sqlparser's defaults.
 pub(crate) fn parse_with_limits(
     sql: &str,
     limits: &QueryExecutionConfig,

@@ -289,7 +289,8 @@ fn parse_compat_request(
     {
         return Ok(None);
     }
-    let statements = parse_with_limits(trimmed, limits)?;
+    // The raw text, as the engine parses it, so padding counts toward `max_sql_bytes`.
+    let statements = parse_with_limits(sql, limits)?;
     let [Statement::Query(query)] = statements.as_slice() else {
         return Ok(None);
     };

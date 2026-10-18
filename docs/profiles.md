@@ -154,14 +154,26 @@ benchmark settings are deliberately not knobs, because nothing reads them at
 runtime; they always come from `PerformanceConfig::for_profile`.
 
 The four SQL parser limits (`query.max_sql_bytes`, `max_statements`,
-`max_values_rows`, `parser_recursion_limit`) bind every parse of a query: the
-engine's, the compatibility-query check of `Database::query`, the RBAC check
-of `query_as` and `query_as_of_as` and the retention check of `query_as_of`.
-DataFusion parses the SELECTs it plans (every SELECT except indexed
-single-table equality lookups and the built-in system views and functions,
-and every `AS OF` query) a second time with its own fixed recursion limit of
-50, so a `query.parser_recursion_limit` above 50 deepens only the statements
-multidb executes itself, such as `INSERT` and indexed equality lookups.
+`max_values_rows`, `parser_recursion_limit`) bind the engine's parse and the
+pre-parses in front of it: the compatibility-query check of `Database::query`,
+the RBAC check of `query_as` and `query_as_of_as` and the retention check of
+`query_as_of`. The size limit counts the whole SQL text, trailing whitespace
+and semicolons included; for the inline `... AS OF LSN n` / `AS OF TIMESTAMP n`
+form of `Database::query` it counts the query left after the `AS OF` clause
+is removed. DataFusion parses the SELECTs it plans (every SELECT
+except indexed single-table equality lookups and the built-in system views and
+functions, and every `AS OF` query) a second time with its own fixed recursion
+limit of 50, so a `query.parser_recursion_limit` above 50 deepens only the
+statements multidb executes itself, such as `INSERT` and indexed equality
+lookups; a SELECT that DataFusion plans and that nests deeper than 50 fails
+with a parse error (SQLSTATE 42601). The pgwire extended-protocol Describe
+pre-parse still uses sqlparser's defaults (recursion depth 50, no size or
+statement limits); moving it to these limits is left to the pgwire work.
+Best-effort internal parses also keep sqlparser's defaults: the tuning system
+views, workload sampling and the optimizer fingerprint, which leave the
+statement to the engine when they fail, and the `match`, `time_bucket`,
+`within_radius` and `graph_neighbors` calls, which multidb runs itself when
+they parse and otherwise leave to the engine.
 
 `multidb::config_spec::parse_knob_assignment("cache.max_entries=8192")`
 parses one `path=value` against the registry: enum names, integers, `auto`,

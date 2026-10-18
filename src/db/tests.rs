@@ -2802,11 +2802,12 @@ fn seed_parser_limit_database(
     ))
 }
 
-/// The SQL parser limits (`query.parser_recursion_limit`, `query.max_sql_bytes`, ...) bind every
-/// parse of a query, not only the engine's: the compatibility, RBAC and temporal pre-parses
-/// parse with the configured limits instead of the sqlparser defaults.
+/// The SQL parser limits (`query.parser_recursion_limit`, `query.max_sql_bytes`, ...) bind the
+/// engine's parse and the compatibility, RBAC and temporal pre-parses, which parse with the
+/// configured limits instead of the sqlparser defaults.
 #[tokio::test]
-async fn sql_parser_limits_bind_every_parse_of_a_query() -> Result<(), Box<dyn std::error::Error>> {
+async fn sql_parser_limits_bind_the_engine_and_pre_parses() -> Result<(), Box<dyn std::error::Error>>
+{
     let mut database = create_database(DbConfig::new(Profile::InMemory))?;
     let (reader, lsn) = seed_parser_limit_database(&mut database)?;
     assert_eq!(
@@ -2831,13 +2832,21 @@ async fn sql_parser_limits_bind_every_parse_of_a_query() -> Result<(), Box<dyn s
         database.query_as(&writer, &insert).await?,
         SqlOutput::AffectedRows(1)
     );
-    // An AS OF query always goes to DataFusion, whose parser keeps its own limit of 50.
-    let capped = database.query_as_of(&deep, TemporalPoint::Lsn(lsn)).await;
-    assert!(
-        matches!(&capped, Err(DbError::Query(QueryError::DataFusion(message)))
-            if message.contains("RecursionLimitExceeded")),
-        "{capped:?}"
-    );
+    // An AS OF query and an ordered SELECT go to DataFusion, whose parser keeps its own limit of
+    // 50. Past it they are parse errors (SQLSTATE 42601), not internal errors.
+    for capped in [
+        database.query_as_of(&deep, TemporalPoint::Lsn(lsn)).await,
+        database.query(&format!("{deep} ORDER BY name")).await,
+    ] {
+        match &capped {
+            Err(error @ DbError::Query(QueryError::Parse(message)))
+                if message.contains("RecursionLimitExceeded") =>
+            {
+                assert_eq!(crate::compat::sqlstate_for_db_error(error), "42601");
+            }
+            other => return Err(format!("expected a DataFusion parse error: {other:?}").into()),
+        }
+    }
 
     let mut performance = PerformanceConfig::for_profile(Profile::InMemory);
     performance.query.parser_recursion_limit = 20;
@@ -2861,21 +2870,31 @@ async fn sql_parser_limits_bind_every_parse_of_a_query() -> Result<(), Box<dyn s
             "{result:?}"
         );
     }
-    // The compatibility pre-parse answers `SELECT version()`, but not past max_sql_bytes.
-    let padded = format!("SELECT version() -- {}", "x".repeat(300));
-    for result in [
-        limited.query(&padded).await,
-        limited.query_as(&reader, &padded).await,
+    // The compatibility pre-parse answers `SELECT version()` and the catalog views, but not past
+    // max_sql_bytes, which counts the whole text, trailing whitespace and semicolons included.
+    for padded in [
+        format!("SELECT version() -- {}", "x".repeat(300)),
+        format!("SELECT version(){}", " ".repeat(300)),
+        format!("SELECT version(){}", ";".repeat(300)),
+        format!("SELECT * FROM pg_catalog.pg_type{}", "; \n".repeat(100)),
     ] {
-        assert!(
-            matches!(&result, Err(DbError::Query(QueryError::InputLimit(_)))),
-            "{result:?}"
-        );
+        for result in [
+            limited.query(&padded).await,
+            limited.query_as(&reader, &padded).await,
+        ] {
+            assert!(
+                matches!(&result, Err(DbError::Query(QueryError::InputLimit(_)))),
+                "{result:?}"
+            );
+        }
     }
-    assert!(matches!(
-        limited.query("SELECT version()").await?,
-        SqlOutput::Rows(_)
-    ));
+    for sql in [
+        "SELECT version()",
+        "  SELECT version() ;; ",
+        "SELECT * FROM pg_catalog.pg_type;",
+    ] {
+        assert!(matches!(limited.query(sql).await?, SqlOutput::Rows(_)));
+    }
     Ok(())
 }
 
