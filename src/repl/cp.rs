@@ -483,9 +483,13 @@ pub fn validate_cp_cluster_config(
 }
 
 impl<S: StorageEngine> CpRaft<S> {
-    /// Creates a CP/Raft replication backend.
+    /// Creates the in-process simulated CP adapter for unit tests.
+    ///
+    /// It has no `OpenRaft` runtime or transport; replicated CP storage must use
+    /// `start_cp_cluster`.
     /// # Errors
     /// Fails when the cluster topology is invalid.
+    #[cfg(test)]
     pub fn new(storage: S, cluster: CpClusterConfig) -> Result<Self, ReplError> {
         validate_cp_cluster_config(&cluster, false).map_err(ReplError::Transport)?;
         Ok(Self::with_validated_config(storage, cluster))

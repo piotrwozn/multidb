@@ -33,8 +33,8 @@ which claims are deliberately out of scope.
 | Area | Support Status |
 | --- | --- |
 | Certified local profiles and collection roles | Stable preview inside generated spec and smoke coverage |
-| `strong_cp` local/process cluster contract | Stable preview for local/process smoke semantics |
-| `eventual_ap` conflict policy | Experimental; workload review required |
+| `strong_cp` local/process cluster contract | Stable preview for local/process smoke semantics of the live `repl::start_cp_cluster` OpenRaft runtime (`scripts/cluster-smoke.ps1`); embedded `Database` cluster constructors (`create_cluster_database`, `open_cluster_database`, their `_with_ops` variants and sharded `Cp` shard backends) fail closed with `Unsupported` |
+| `eventual_ap` conflict policy | Experimental; workload review required. AP databases reject commit-log features with `Unsupported`: incremental backups (so no point-in-time restore beyond a full backup), changefeeds, CDC subscriptions, continuous queries, materialized views, after-commit hooks, system versioning and incremental full-text/geo refresh; full backups and `refresh_full` remain available |
 | Graph role | Experimental |
 | Full-text (`match`) and geo (`within_radius`) indexes | Experimental; backfilled on create and maintained synchronously with document writes through collection handles, transactions and Control Plane CRUD; raw key writes need `refresh_full`/`refresh_incremental`; searches need Read on the source collection and are denied under its row or masking policies |
 
