@@ -267,16 +267,30 @@ pub fn full_backup(
     })
 }
 
+/// Rejects incremental backups for databases whose writes are not recorded in the commit log.
+pub(crate) fn ensure_incremental_backup_supported(database: &Database) -> Result<(), BackupError> {
+    if database.uses_ap_replication() {
+        return Err(BackupError::Unsupported(
+            "AP replication does not support incremental backup or point-in-time restore: AP \
+             writes are not recorded in the commit log; take a full backup instead"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Takes an incremental logical backup after `parent_backup_dir`.
 ///
 /// # Errors
-/// Fails when the parent manifest is invalid, commit logs are missing, or files cannot be written.
+/// Fails when the database uses AP replication (its writes are not recorded in the commit log),
+/// the parent manifest is invalid, commit logs are missing, or files cannot be written.
 pub fn incremental_backup(
     database: &Database,
     dest_root: impl AsRef<Path>,
     parent_backup_dir: impl AsRef<Path>,
     config: &BackupConfig,
 ) -> Result<BackupReport, BackupError> {
+    ensure_incremental_backup_supported(database)?;
     let started = Instant::now();
     let parent = read_manifest(parent_backup_dir.as_ref())?;
     let storage = database.local_storage().ok_or_else(|| {
@@ -1082,14 +1096,15 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BackupConfig, RestoreConfig, RestoreTarget, full_backup, incremental_backup, list_backups,
-        restore_backup, restore_backup_with_config, verify_backup, verify_backup_with_config,
+        BackupConfig, BackupError, RestoreConfig, RestoreTarget, full_backup, incremental_backup,
+        list_backups, restore_backup, restore_backup_with_config, verify_backup,
+        verify_backup_with_config,
     };
     use crate::db::{
-        DbConfig, EncryptionConfig, OperationalConfig, Profile, create_database,
-        create_database_with_ops, open_database,
+        DbConfig, EncryptionConfig, OperationalConfig, Profile, ReplicationKind,
+        create_ap_database, create_database, create_database_with_ops, open_database,
     };
-    use crate::repl::{Op, ReadConsistency, Replication};
+    use crate::repl::{ApClusterConfig, Op, ReadConsistency, Replication};
 
     #[test]
     fn full_backup_restore_round_trips_redb() -> Result<(), Box<dyn std::error::Error>> {
@@ -1120,6 +1135,36 @@ mod tests {
             Some(b"v".to_vec())
         );
         assert_eq!(report.restored_lsn, backup.manifest.end_lsn);
+        Ok(())
+    }
+
+    #[test]
+    fn ap_database_rejects_incremental_backup_but_allows_full_backup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("ap.redb");
+        let database = create_ap_database(
+            DbConfig::on_disk(Profile::Balanced, &db_path).with_replication(ReplicationKind::Ap),
+            ApClusterConfig::single_node_for_tests(1),
+        )?;
+        database.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+        })?;
+        let root = temp.path().join("backups");
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        database.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"k2".to_vec(),
+            value: b"v2".to_vec(),
+        })?;
+
+        assert!(matches!(
+            incremental_backup(&database, &root, &full.path, &BackupConfig::default()),
+            Err(BackupError::Unsupported(_))
+        ));
+        assert_eq!(list_backups(&root)?.len(), 1);
         Ok(())
     }
 

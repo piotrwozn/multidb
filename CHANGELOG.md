@@ -33,6 +33,16 @@ All notable public changes will be recorded here.
   validation errors from the Control Plane now return HTTP 400
   `invalid_value` instead of 500, and `time_bucket` and range queries no longer
   overflow near the `i64` bounds.
+- The public CP cluster constructors (`create_cluster_database`,
+  `open_cluster_database`, their `_with_ops` variants) and sharded `Cp` shard
+  backends now fail with `Unsupported` instead of returning a database that
+  acknowledges writes without replication. Use `repl::start_cp_cluster` for
+  replicated CP storage; data written through the old constructors still opens
+  with `open_database`. `CpRaft::new` is now test-only.
+- AP databases now reject commit-log features they cannot provide
+  (incremental backups, changefeeds, CDC subscriptions, continuous queries,
+  materialized views, after-commit hooks, system versioning and incremental
+  full-text/geo refresh) with `Unsupported` instead of returning empty results.
 - Columnar tiering no longer loses or resurrects rows written while a segment is
   being tiered: pointers are installed with a conditional write, and segments
   that changed are left alone and reported in `conflicted_segments`. Tiered
