@@ -8,6 +8,10 @@ All notable public changes will be recorded here.
 - Added public repository hygiene files, security policy, contribution guide,
   issue templates and release notes.
 - Kept local planning history out of the public source baseline.
+- Fixed `multidb serve` / `multidb admin serve` starting with an empty RBAC
+  policy after a restart, and admin bootstrap/login overwriting stored roles,
+  PG-user mappings and the audit flag; plain database openers now reload
+  persisted security state and fail closed if it is corrupt.
 - Changefeed paging and `AS OF TIMESTAMP` resolution now read bounded
   commit-log windows: catch-up is linear and memory is bounded by the page size
   instead of the whole log. The earliest-LSN lookup reads the recorded floor or
