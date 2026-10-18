@@ -30,18 +30,21 @@ use crate::config_spec::{
 };
 use crate::db::{
     AuditConfig, CatalogEntry, ConfigError, Database, DbConfig, DbError, EncryptionConfig,
-    OperationalConfig, PROVISION_TABLE, Profile, ReplicationKind, SecurityConfig, create_database,
-    create_database_with_ops, create_database_with_profile, open_database, open_database_with_ops,
+    OperationalConfig, PROVISION_TABLE, Profile, ReplicationKind, SecurityConfig,
+    create_cluster_database, create_database, create_database_with_ops,
+    create_database_with_profile, create_simulated_cluster_database, open_database,
+    open_database_with_ops,
 };
 use crate::extension::{LimitPolicy, PolicyConfig};
 use crate::geo::{GeoIndexConfig, GeoPoint};
 use crate::graph::GraphId;
 use crate::model::{CollectionId, FieldPath, IndexId, IndexSpec, Value};
+use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
     ColumnDef, ColumnType, DocField, RelIndexExpression, RelIndexSpec, RelPredicate, SqlOutput,
     SqlRows, TableLayout, TableSchema,
 };
-use crate::repl::{Op, ReadConsistency, Replication, propose_system};
+use crate::repl::{CpClusterConfig, Op, RaftNode, ReadConsistency, Replication, propose_system};
 use crate::security::{
     AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role,
 };
@@ -1080,7 +1083,40 @@ fn unsupported_scopes_and_surfaces_block_the_plan() -> TestResult {
     sharded.topology.shard_count = 2;
     let plan = plan_path(&sharded, &path, ProvisionSurface::Cli)?;
     assert_blocked(&plan, "PROVISION_DEPLOYMENT_UNSUPPORTED");
-    assert!(plan.issues.iter().any(|issue| issue.path == "topology"));
+    assert!(plan.issues.iter().any(
+        |issue| issue.path == "topology" && issue.suggestion.contains("repl::start_cp_cluster")
+    ));
+
+    // The public CP cluster constructors fail closed, so no CP handle reaches the planner from
+    // outside the crate; the in-crate simulated one is refused before anything is planned.
+    let cluster_config = || {
+        CpClusterConfig::new(
+            1,
+            "127.0.0.1:7101",
+            vec![
+                RaftNode::new(1, "127.0.0.1:7101"),
+                RaftNode::new(2, "127.0.0.1:7102"),
+                RaftNode::new(3, "127.0.0.1:7103"),
+            ],
+        )
+        .with_transport(InternalTransportConfig::new(
+            "127.0.0.1:7101",
+            InternalTransportSecurity::PlaintextForTests,
+        ))
+    };
+    assert!(matches!(
+        create_cluster_database(DbConfig::new(Profile::InMemory), cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let simulated =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cluster_config())?;
+    assert!(matches!(
+        plan_open(&orders_spec()?, &simulated),
+        Err(ProvisionError::Db(DbError::Config(
+            ConfigError::Unsupported(_)
+        )))
+    ));
+    drop(simulated);
 
     let mut ap = orders_spec()?;
     ap.defaults.replication = ReplicationMode::Ap;

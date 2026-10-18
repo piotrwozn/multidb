@@ -1974,7 +1974,14 @@ fn provisioning_views_match_the_file_and_refuse_replicated_backends()
     assert_eq!(fresh.persisted_security_state()?, SecurityConfig::default());
     assert!(!fresh.probed_metadata()?.values_framed);
 
-    let cp = create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    // The public CP constructors fail closed, so only the in-crate simulated cluster has a CP
+    // backend to refuse.
+    assert!(matches!(
+        create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let cp =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
     assert!(matches!(
         cp.probed_metadata(),
         Err(DbError::Config(ConfigError::Unsupported(_)))

@@ -259,8 +259,9 @@ dry run: it never creates a file and never writes a database.
   `Locked`: an existing database is planned through its open handle,
   `ProvisionTargetRef::Open`, so a dry run never opens a database implicitly.
   `ProvisionTargetRef::Volatile` is a new in-memory database (Rust API only).
-  Only single-node CP databases are planned; CP cluster, AP and sharded
-  handles are refused.
+  Only single-node CP databases are planned: AP and sharded handles are
+  refused, and the embedded CP cluster constructors fail closed with
+  `Unsupported`, so no CP cluster handle reaches provisioning.
 - **Surfaces.** `ProvisionEnvironment.surface` is `rust_api`, `cli`, `serve`
   or `control_plane`. `ProvisionEnvironment.encryption` is accepted on the
   Rust API only, as a `LocalEnvelope` config; with an open database it must
@@ -443,10 +444,15 @@ A guarantee the spec does not ask for is `not_requested`.
 Provisioning builds embedded and single-node CP databases with one replica and
 one shard. Everything else fails closed:
 
-- cluster deployments and other topologies: `PROVISION_DEPLOYMENT_UNSUPPORTED`;
+- cluster deployments and other topologies: `PROVISION_DEPLOYMENT_UNSUPPORTED`.
+  This matches the runtime: the embedded `Database` cluster constructors
+  (`create_cluster_database`, `open_cluster_database` and their `_with_ops`
+  variants) fail closed with `Unsupported`, and multi-node CP replication runs
+  only through `repl::start_cp_cluster`, which provisioning does not drive;
 - AP replication (in the spec or in the database) and conflict policies other
   than `none`: `PROVISION_REPLICATION_UNSUPPORTED`; `eventual_ap` domains:
-  `DOMAIN_MODE_INCOMPATIBLE_WITH_REPLICATION`;
+  `DOMAIN_MODE_INCOMPATIBLE_WITH_REPLICATION`. AP databases also reject
+  commit-log features such as system versioning with `Unsupported`;
 - volatile profiles outside the Rust API: `PROVISION_VOLATILE_ON_SURFACE`; a
   durable profile without a path: `PROVISION_STORAGE_PATH_REQUIRED`; a
   volatile profile at a path: `PROFILE_DEPLOYMENT_MISMATCH`;

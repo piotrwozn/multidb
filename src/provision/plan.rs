@@ -750,9 +750,11 @@ impl PlanBuilder<'_> {
                 "PROVISION_DEPLOYMENT_UNSUPPORTED",
                 "deployment.mode",
                 "provisioning builds embedded and single-node databases only; cluster \
-                 deployments are not supported"
+                 deployments are not supported, and the embedded Database cluster \
+                 constructors fail closed in this build"
                     .to_owned(),
-                "Use deployment.mode embedded or single_node.",
+                "Use deployment.mode embedded or single_node; run a replicated CP cluster with \
+                 repl::start_cp_cluster, outside provisioning.",
             );
         }
         if spec.topology != TopologySpec::default() {
@@ -764,7 +766,8 @@ impl PlanBuilder<'_> {
                      replicas and {} shards",
                     spec.topology.replica_count, spec.topology.shard_count
                 ),
-                "Set topology to 1 replica and 1 shard, or remove it.",
+                "Set topology to 1 replica and 1 shard, or remove it; multi-node CP \
+                 replication runs through repl::start_cp_cluster, outside provisioning.",
             );
         }
         if spec.defaults.replication == ReplicationMode::Ap {
