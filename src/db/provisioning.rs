@@ -10,7 +10,7 @@ use super::{
     AuditConfig, CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, KEY_PROFILE_MANIFEST,
     KEY_SCHEMA_VERSION, PROVISION_TABLE, PersistedProfileManifest, ProbedMetadata, SCHEMA_VERSION,
     SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op, meta_put_op, parse_audit_key_file,
-    read_metadata_from_repl, read_security_from_repl, validate_manifest,
+    read_metadata_from_repl, read_security_from_repl, unmet_profile_floors, validate_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{
@@ -163,8 +163,9 @@ impl Database {
     /// The metadata of this single-node database as `inspect_database_metadata` reports it for
     /// a file: storage profile, replication, layout, schema version, manifest and whether
     /// values are compression-framed (in `__meta`, or by this handle's engine).
-    /// `unmet_floors` lists `floors.encryption_at_rest` when the manifest sets it and this
-    /// handle is not encrypted.
+    /// `unmet_floors` lists the manifest floors this handle does not meet, as the file probe
+    /// does: `floors.audit` when audit is off, and `floors.encryption_at_rest` when the handle is
+    /// not encrypted.
     /// # Errors
     /// Fails with `Unsupported` for CP, AP and sharded replication backends, which provisioning
     /// does not support, and when `__meta` cannot be read.
@@ -178,14 +179,13 @@ impl Database {
             .into());
         };
         let read = read_metadata_from_repl(repl.as_ref())?;
-        let unmet_floors = read
-            .manifest
-            .as_ref()
-            .filter(|manifest| {
-                manifest.knobs.floors.encryption_at_rest && !self.encryption_configured()
-            })
-            .map(|_| vec!["floors.encryption_at_rest"])
-            .unwrap_or_default();
+        let unmet_floors = read.manifest.as_ref().map_or_else(Vec::new, |manifest| {
+            unmet_profile_floors(
+                manifest.knobs.floors,
+                self.audit_enabled(),
+                self.encryption_configured(),
+            )
+        });
         Ok(ProbedMetadata {
             schema_version: read.metadata.schema_version,
             storage_profile: read.metadata.profile,

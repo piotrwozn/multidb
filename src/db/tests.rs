@@ -5536,7 +5536,11 @@ fn single_node_openers_warn_about_unmet_profile_floors() -> Result<(), Box<dyn s
     let audited_config = DbConfig::on_disk(binding.db_config.profile, &audited);
     let (opened, logs) =
         capture_logs(|| open_database_with_ops(audited_config, &OperationalConfig::new()))?;
-    assert!(!opened?.audit_enabled());
+    let opened = opened?;
+    assert!(!opened.audit_enabled());
+    // The handle view that provisioning plans from lists the same floor as the file probe.
+    assert_eq!(opened.probed_metadata()?.unmet_floors, vec!["floors.audit"]);
+    drop(opened);
     assert!(
         logs.contains("WARN") && logs.contains("floors.audit"),
         "{logs}"
