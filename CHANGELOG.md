@@ -8,6 +8,10 @@ All notable public changes will be recorded here.
 - Added public repository hygiene files, security policy, contribution guide,
   issue templates and release notes.
 - Kept local planning history out of the public source baseline.
+- Fixed `multidb serve` / `multidb admin serve` starting with an empty RBAC
+  policy after a restart, and admin bootstrap/login overwriting stored roles,
+  PG-user mappings and the audit flag; plain database openers now reload
+  persisted security state and fail closed if it is corrupt.
 - Incremental and point-in-time restore now replays commit records through the
   same routine as live commits. This rebuilds `__txn_mvcc` history and the HLC
   from each record, so transactional reads, inserts after a delete, document
