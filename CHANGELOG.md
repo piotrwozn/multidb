@@ -74,7 +74,8 @@ All notable public changes will be recorded here.
   with error code `busy` and `Retry-After: 1`, and a write conflict that
   outlasts the internal retries (SQLSTATE 40001) is HTTP 409 with code
   `conflict`; both were HTTP 500 `internal_error`. A `busy` response can be retried as is; a `conflict` on a multi-statement `/sql` body may follow statements that already committed, so retry only single-statement bodies or idempotent work.
-  Other database errors stay HTTP 500.
+  Time-series validation errors are HTTP 400 `invalid_value` (see above);
+  other database errors stay HTTP 500.
   Control Plane authentication no longer depends on lock
   contention: a busy database delays the check instead of returning
   `admin_auth_not_configured` or dropping the roles of `x-multidb-principal`.

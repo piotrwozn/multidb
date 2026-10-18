@@ -144,11 +144,8 @@ Control Plane login limits:
 - Admin login and password change read the stored credential under the
   shared lock and release it before the Argon2id password check, which runs on
   the blocking pool, so a check in progress never delays `/builder/*` or
-  `/security` updates. Password checks have their own limit, separate from the
-  query governor: at most 2 run at once, and further login or password change
-  requests get HTTP 503 with error code `auth_busy` and `Retry-After: 1` and
-  are not counted as failed logins. A client locked out by the login limits
-  above gets a neutral `401` without `Retry-After`.
+  `/security` updates. Password checks have their own concurrency limit,
+  separate from the query governor; see the login limits above.
 - By default at most 4 x available CPUs statements execute at once; a
   container CPU limit lowers that number. `MULTIDB_MAX_CONCURRENT_QUERIES`
   overrides it. PostgreSQL wire admits up to that many statements, and never
