@@ -1253,6 +1253,7 @@ pub fn incremental_backup_to_uri(
     parent_backup_id: &str,
     config: &BackupConfig,
 ) -> Result<BackupReport, CloudError> {
+    crate::backup::ensure_incremental_backup_supported(database)?;
     let parent_temp = tempfile_backup_root().join(parent_backup_id);
     download_directory(parent_uri, parent_backup_id, &parent_temp)?;
     let temp = tempfile_backup_root();
