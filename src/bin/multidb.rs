@@ -51,8 +51,8 @@ use multidb::{
     },
     runtime_advisor::{RuntimeAdviceDecisionRequest, RuntimeAdviceReport, RuntimeAdviceStatus},
     templates::{
-        TemplateMaterialization, TemplateOutputFormat, built_in_template, built_in_templates,
-        materialize_template,
+        TEMPLATE_SPEC_VERSION, TemplateMaterialization, TemplateOutputFormat, built_in_template,
+        built_in_templates, materialize_template,
     },
 };
 
@@ -2584,6 +2584,7 @@ fn run_template_list(args: &[String]) -> Result<CliRun, CliError> {
                     "aliases": template.aliases,
                     "title": template.title,
                     "profile": template.profile,
+                    "spec_version": TEMPLATE_SPEC_VERSION,
                     "description": template.description,
                     "collections": template
                         .collections
@@ -2592,11 +2593,12 @@ fn run_template_list(args: &[String]) -> Result<CliRun, CliError> {
                             json!({
                                 "name": collection.name,
                                 "role": role_slug(collection.role),
-                                    "indexes": collection
-                                        .indexes
-                                        .iter()
-                                        .map(|index| template_index_slug(*index))
-                                        .collect::<Vec<_>>(),
+                                "indexes": collection
+                                    .indexes
+                                    .iter()
+                                    .map(|index| template_index_slug(*index))
+                                    .collect::<Vec<_>>(),
+                                "physical": template.physical(collection.name),
                                 "description": collection.description,
                             })
                         })
@@ -2639,10 +2641,11 @@ fn run_template_explain(args: &[String]) -> Result<CliRun, CliError> {
             )));
         };
         format!(
-            "template={} title={} profile={} valid={} status={:?}\nwhy={}\n{}",
+            "template={} title={} profile={} spec_version={} valid={} status={:?}\nwhy={}\n{}",
             template.slug,
             template.title,
             materialized.spec.profile,
+            materialized.spec.version,
             report.validation.valid,
             report.validation.status,
             template.why_profile,
@@ -5636,6 +5639,26 @@ mod tests {
         let templates = serde_json::from_str::<serde_json::Value>(&json.message)?;
         assert!(templates.as_array().is_some_and(|items| items.len() == 5));
         assert!(json.message.contains("ai-memory"));
+        let templates = templates.as_array().ok_or("template list is an array")?;
+        assert!(
+            templates
+                .iter()
+                .all(|template| template["spec_version"] == 2)
+        );
+        let ai = templates
+            .iter()
+            .find(|template| template["slug"] == "ai-memory")
+            .ok_or("ai-memory is listed")?;
+        assert_eq!(ai["collections"][0]["name"], "memories");
+        assert_eq!(
+            ai["collections"][0]["physical"],
+            json!({ "dim": 1536, "metric": "cosine" })
+        );
+        assert_eq!(
+            ai["collections"][1]["physical"],
+            json!({ "document_indexes": [{ "path": "subject" }] })
+        );
+        assert_eq!(ai["collections"][2]["physical"], Value::Null);
         Ok(())
     }
 
@@ -5654,8 +5677,19 @@ mod tests {
         let report = serde_json::from_str::<serde_json::Value>(&outcome.message)?;
         assert_eq!(report["template"], "ai-memory");
         assert_eq!(report["spec"]["profile"], "ai_agent_memory");
+        assert_eq!(report["spec"]["version"], 2);
+        assert_eq!(report["spec"]["collections"][0]["physical"]["dim"], 1536);
         assert_eq!(report["explain"]["validation"]["valid"], true);
         assert!(outcome.message.contains("vector_hnsw"));
+
+        let text = run(strings(&["template", "explain", "analytics"]))?;
+        assert_eq!(text.exit_code, 0, "{}", text.message);
+        assert!(
+            text.message
+                .starts_with("template=analytics title=Analytics profile=analytics_columnar spec_version=2 valid=true"),
+            "{}",
+            text.message
+        );
         Ok(())
     }
 
@@ -7947,6 +7981,93 @@ mod tests {
             assert!(out_dir.join(file).exists(), "{file}");
         }
         assert!(!out_dir.join("secure_app.redb").exists());
+        // Encryption at rest is the only reason: the CLI cannot enforce it.
+        assert!(
+            outcome.message.contains(
+                "is blocked: GUARANTEE_NOT_ENFORCEABLE at guarantees.encryption.at_rest\n"
+            ),
+            "{}",
+            outcome.message
+        );
+
+        let json = run(strings(&[
+            "init",
+            "--guided",
+            "--template",
+            "secure-saas",
+            "--name",
+            "Secure App",
+            "--out",
+            &path_arg(&out_dir),
+            "--force",
+            "--apply",
+            "--json",
+        ]))?;
+        assert_eq!(json.exit_code, 2, "{}", json.message);
+        let summary = json_message(&json)?;
+        assert_eq!(summary["valid"], true);
+        assert_eq!(summary["provision"]["status"], "blocked");
+        let errors = summary["provision"]["plan"]["issues"]
+            .as_array()
+            .ok_or("plan issues")?
+            .iter()
+            .filter(|issue| issue["severity"] == "error")
+            .map(|issue| issue["code"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(errors, [Some("GUARANTEE_NOT_ENFORCEABLE")], "{summary}");
+        assert!(!out_dir.join("secure_app.redb").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_template_apply_creates_the_default_database_and_stays_in_sync()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let out_dir = temp.path().join("game");
+
+        let outcome = run(strings(&[
+            "init",
+            "--guided",
+            "--template",
+            "game-save",
+            "--name",
+            "Arcade Save",
+            "--out",
+            &path_arg(&out_dir),
+            "--apply",
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        let summary = json_message(&outcome)?;
+        // game-save leaves the path to the app, so init --apply picks <out>/<sanitized name>.redb.
+        let db_path = out_dir.join("arcade_save.redb");
+        assert_eq!(summary["database"], json!(path_arg(&db_path)));
+        assert_eq!(summary["provision"]["status"], "applied");
+        assert!(db_path.exists());
+        let spec_path = out_dir.join("multidb.yaml");
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        assert_eq!(spec.version, 2);
+        assert_eq!(spec.deployment.storage_path, None);
+
+        let spec_db = |command: &str, extra: &[&str]| {
+            let mut args = strings(&[
+                "config",
+                command,
+                "--spec",
+                &path_arg(&spec_path),
+                "--db",
+                &path_arg(&db_path),
+            ]);
+            args.extend(strings(extra));
+            run(args)
+        };
+        let drift = spec_db("drift", &["--json"])?;
+        assert_eq!(drift.exit_code, 0, "{}", drift.message);
+        assert_eq!(json_message(&drift)?["in_sync"], true);
+        let again = spec_db("apply", &["--auto-approve", "--json"])?;
+        assert_eq!(again.exit_code, 0, "{}", again.message);
+        assert_eq!(json_message(&again)?["status"], "noop");
         Ok(())
     }
 

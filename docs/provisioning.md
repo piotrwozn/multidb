@@ -148,8 +148,11 @@ an index kind the object cannot have, is `PHYSICAL_FIELD_NOT_APPLICABLE`.
 
 So a version 1 spec can be provisioned only when everything can be derived
 from it, for example collections with only `primary` indexes. The version 1
-templates are blocked: their `document`, `vector` and `columnar` index kinds
-carry no paths, dimension or columns.
+specs the built-in templates emitted before this release (frozen under
+`tests/fixtures/spec-v1`) are blocked: their `document`, `vector` and
+`columnar` index kinds carry no paths, dimension or columns. The built-in
+templates now emit version 2 specs with those parameters (see
+[Templates](#templates)).
 
 ### Names, paths and ids
 
@@ -850,6 +853,31 @@ from a request: a spec `deployment.storage_path` is reported as the Advice
   mode only; see the known limits of [Serve](#serve).
 - Studio has no provisioning flow yet; `StudioManifest.provisioning_supported`
   and the capability `provision_apply` announce the endpoints.
+
+## Templates
+
+The built-in templates emit spec version 2 with the physical parameters
+provisioning needs, so `multidb init --guided --template <t> --apply` builds
+the database in one step. Everything a template leaves out takes the
+defaults above.
+
+| template | physical parameters | CLI plan for a new database |
+| --- | --- | --- |
+| `game-save` | `saves.document_indexes: [{path: slot}]`; embedded with no `storage_path` (the app chooses; `init --apply` uses `<out dir>/<sanitized name>.redb`) | ready |
+| `desktop-embedded` | `documents.document_indexes: [{path: title}]`; `usage_metrics` `chunk_millis: 3600000`, `retention_millis: 2592000000` | ready |
+| `ai-memory` | `memories: {dim: 1536, metric: cosine}`; `facts.document_indexes: [{path: subject}]` | ready |
+| `secure-saas` | `tenants.document_indexes: [{path: tenant_id}]`; `encryption.at_rest: true` | blocked by `GUARANTEE_NOT_ENFORCEABLE` alone; ready on the Rust API with a `LocalEnvelope` key |
+| `analytics` | `metrics.chunk_millis: 3600000`; `aggregates`: a typed columnar table (`id`, `bucket`, `metric` str, `value` float, primary key `id`) | ready |
+
+A vector `dim` and table columns are fixed at creation: edit them in the spec
+before `--apply`. The version 1 specs the templates emitted before are frozen
+under `tests/fixtures/spec-v1` and still validate. `examples/provisioning` is
+a full version 2 example: a document collection with fields, document
+indexes, a full-text and a geo index, a versioned ledger table, a vector
+collection and a columnar table in a `HighDurability` row-class database,
+with a managed role and principal. `scripts/templates-smoke.ps1` runs `init
+--apply`, `config drift` and a re-apply (a noop) for every template and
+checks that `secure-saas` exits 2.
 
 ## The provision record
 

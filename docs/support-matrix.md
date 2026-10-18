@@ -19,7 +19,7 @@ which claims are deliberately out of scope.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| CLI templates/config | Stable preview | `scripts/preview-smoke.ps1`, template smoke, config tests |
+| CLI templates/config | Stable preview; built-in templates emit spec v2 with the physical parameters provisioning needs, and `init --template <t> --apply` (Preview, see the provisioning row) builds every template except `secure-saas`, whose encryption at rest is Rust API only | `scripts/preview-smoke.ps1`, template smoke (including `init --apply`, `config drift` and a re-apply per template), template plan and provisioning tests, config tests |
 | Control Plane API v1 | Stable preview | OpenAPI v1, operation registry, SDK contract tests |
 | Studio | Stable for documented admin workflows | Vitest, Playwright operator flow, Docker smoke |
 | Docker image | Stable for single-node production-shaped runtime | Docker smoke, GHCR release image, signed digest |

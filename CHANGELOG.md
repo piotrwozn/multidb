@@ -326,8 +326,42 @@ All notable public changes will be recorded here.
   computed against, and `admin::AdminState::with_spec_mode`, which `multidb
   serve` uses in spec mode so `GET /provision/state` reports the spec digest
   and `MULTIDB_SPEC_APPLY` mode it started with.
+- `examples/provisioning`: a full version 2 spec that provisioning builds end
+  to end (a document collection with fields, document, full-text and geo
+  indexes, a system-versioned ledger table, a vector collection, a columnar
+  table in a `HighDurability` row-class database, a managed role and
+  principal), validated, explained and dry-run planned by
+  `scripts/templates-smoke.ps1`.
+- `templates::TemplateSpec::physical(collection)` returns the `physical`
+  parameters a built-in template gives a collection, and
+  `templates::TEMPLATE_SPEC_VERSION` the spec version templates emit.
+  `multidb template list --json` adds `spec_version` and each collection's
+  `physical`, and the `template explain` text header adds `spec_version`.
 
 ### Changed
+
+- Built-in templates emit spec version 2 with the `physical` parameters
+  provisioning needs, so `multidb init --guided --template <t> --apply` builds
+  `game-save` (document index on `slot`), `desktop-embedded` (`title`, and
+  one-hour chunks with 30-day retention for `usage_metrics`), `ai-memory`
+  (1536-dimension cosine `memories`, `subject`) and `analytics` (one-hour
+  `metrics` chunks, a typed columnar `aggregates` table) on the CLI.
+  `secure-saas` (`tenant_id`) keeps `encryption.at_rest: true`, so its plan
+  is blocked on the CLI, `serve` and the Control Plane with
+  `GUARANTEE_NOT_ENFORCEABLE` and is provisioned through the Rust API with a
+  `LocalEnvelope` key. The generated README gains a Provision section with
+  the plan, apply and drift commands and the guarantee statuses a CLI plan
+  reports, and the known limits name the values fixed at creation. The
+  checked-in `examples/<template>/multidb.yaml` and `README.md` are
+  regenerated (`seed.json` and `smoke.ps1` are unchanged); the version 1
+  originals stay frozen under `tests/fixtures/spec-v1`, still validate, and
+  are blocked for provisioning with `PHYSICAL_PARAMETER_REQUIRED`.
+- `scripts/templates-smoke.ps1` also validates and explains the frozen
+  version 1 specs and `examples/provisioning`, dry-runs the provisioning
+  plan of the example, and runs `init --apply`, `config drift` (exit 0) and
+  a re-apply (a noop) for every template, with `secure-saas` exiting 2.
+  `scripts/preview-smoke.ps1` adds a `config plan --spec --db` dry run of the
+  generated ai-memory spec and records its outcome in the summary.
 
 - `POST /config/apply` also accepts `{current, desired, confirm}`: the server
   recomputes the plan with `MigrationPlanner::plan`, decoding each side as

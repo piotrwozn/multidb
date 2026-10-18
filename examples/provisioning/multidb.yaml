@@ -1,0 +1,102 @@
+# A version 2 spec that provisioning builds end to end: see README.md and
+# docs/provisioning.md. Validate it with `multidb config validate --spec`, and
+# dry-run it with `multidb config plan --spec multidb.yaml --db orders.redb`.
+version: 2
+name: orders
+profile: orders_durable
+custom_profile:
+  extends: high_durability
+  description: Durable order store with a ledger table, note search and memories.
+  knobs:
+    cache:
+      max_entries: 8192
+  compatible_roles:
+    add:
+    - vector_memory
+    - analytics
+deployment:
+  mode: single_node
+  storage_path: orders.redb
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: true # operator_managed: the plan prints the backup runbook
+    pitr: true
+  encryption:
+    at_rest: false
+  audit:
+    enabled: true
+  sensitive_data: false
+  strict_cross_domain_transactions: false
+domains:
+- name: primary
+  mode: strong_cp
+collections:
+- name: orders
+  role: document_entity
+  domain: primary
+  indexes: [primary, document, full_text, geo]
+  physical:
+    fields:
+    - { name: customer_id, path: customer.id, type: str }
+    - { name: total, path: total, type: float }
+    document_indexes:
+    - { path: customer.id }
+    - { path: status }
+    full_text:
+    - { path: notes } # -> orders_notes_fts
+    geo:
+    - { path: shipping.location, precision: 7 } # -> orders_shipping_location_geo
+- name: ledger
+  role: event_log
+  domain: primary
+  indexes: [primary, document]
+  physical:
+    kind: table
+    columns:
+    - { name: entry_id, type: int }
+    - { name: order_id, type: str }
+    - { name: amount, type: float }
+    primary_key: entry_id
+    table_indexes:
+    - { column: order_id }
+    system_versioning: true # -> ledger_history
+- name: memories
+  role: vector_memory
+  domain: primary
+  indexes: [vector]
+  physical: { dim: 1536, metric: cosine }
+- name: daily_rollups
+  role: analytics
+  domain: primary
+  indexes: [columnar]
+  physical: # a columnar table in a row-class database
+    columns:
+    - { name: id, type: str }
+    - { name: day, type: str }
+    - { name: revenue, type: float }
+    primary_key: id
+security:
+  roles:
+  - name: order_writer
+    grants:
+    - { object: orders, permissions: [read, write] }
+    - { object: orders_notes_fts, permissions: [read] }
+    - { object: ledger, permissions: [read, write] }
+  principals:
+  - { user: orders_svc, roles: [order_writer] }
+provisioning:
+  unmanaged: report
+extensions:
+- { name: audit, version: 1.0.0, stability: stable }
+- { name: cdc, version: 1.0.0, stability: stable }
+- { name: document_index, version: 1.0.0, stability: stable }
+- { name: full_text, version: 1.0.0, stability: stable }
+- { name: vector_hnsw, version: 1.0.0, stability: stable }
+- { name: columnar_layout, version: 1.0.0, stability: experimental }
+overrides: {}
+operation_hints: {}

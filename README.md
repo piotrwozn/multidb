@@ -69,10 +69,18 @@ GitHub Actions runs the Go checks.
 ```powershell
 multidb template list
 multidb template explain ai-memory --json
-multidb init --guided --template ai-memory --name "Agent Memory" --out .\agent-memory
+multidb init --guided --template ai-memory --name "Agent Memory" --out .\agent-memory --apply
 multidb config validate --spec .\agent-memory\multidb.yaml
 multidb config explain --spec .\agent-memory\multidb.yaml
+multidb config drift --spec .\agent-memory\multidb.yaml
 ```
+
+Built-in templates emit version 2 specs with the physical parameters
+provisioning needs (document index paths, the vector dimension, time-series
+chunks and table columns), so `init --template <t> --apply` writes the files
+and creates the database in one step; `config drift` exits 0 while it matches
+the spec. `secure-saas` asks for encryption at rest, which is provisioned
+through the Rust API only, so its `init --apply` writes the files and exits 2.
 
 Profiles have typed knobs. Inspect them, or write a version 2 spec with a
 custom profile that extends a built-in one:
@@ -108,7 +116,9 @@ through the preview Control Plane endpoints `/provision/plan`,
 `/provision/apply`, `/provision/drift`, `/provision/state` and `/config/live`.
 
 Checked-in examples are under `examples/`, with SDK examples under
-`examples/sdk/`.
+`examples/sdk/`; `examples/provisioning` is a full version 2 spec with
+full-text and geo indexes, a versioned table, a columnar table, roles and
+principals.
 
 ## Repository Gates
 
@@ -150,9 +160,11 @@ Release-sensitive gate:
   creates and adopts objects, roles and the profile, but never drops or alters
   an object, switches a profile or storage class, or re-encrypts; encryption
   at rest is provisioned through the Rust API only, so a spec with
-  `encryption.at_rest: true` is blocked on the CLI and the Control Plane and
-  refused by `multidb serve` in spec mode (`MULTIDB_SPEC_PATH`, see
-  `docs/docker.md`).
+  `encryption.at_rest: true`, such as the `secure-saas` template, is blocked
+  on the CLI and the Control Plane and refused by `multidb serve` in spec
+  mode (`MULTIDB_SPEC_PATH`, see `docs/docker.md`). Values fixed at creation,
+  such as a vector `dim` or table columns, are edited in the spec before the
+  first apply.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
   migration dry-run workflows.
 - Full PostgreSQL compatibility, Mongo wire protocol, public extension

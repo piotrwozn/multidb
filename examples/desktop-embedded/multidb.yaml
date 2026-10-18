@@ -1,9 +1,12 @@
-version: 1
+version: 2
 name: Desk Notes
 profile: desktop_app_embedded
 deployment:
   mode: single_node
   storage_path: desk_notes.redb
+topology:
+  replica_count: 1
+  shard_count: 1
 defaults:
   consistency_domain: primary
   replication: cp
@@ -28,6 +31,9 @@ collections:
   domain: primary
   indexes:
   - document
+  physical:
+    document_indexes:
+    - path: title
 - name: settings
   role: key_value
   domain: primary
@@ -43,6 +49,9 @@ collections:
   domain: primary
   indexes:
   - time_series
+  physical:
+    chunk_millis: 3600000
+    retention_millis: 2592000000
 extensions:
 - name: audit
   version: 1.0.0
