@@ -1269,17 +1269,38 @@ impl Database {
     }
 
     /// Ensures the bootstrap admin identity can use password-backed sessions.
+    ///
+    /// Merges the bootstrap admin role and principal into the loaded security
+    /// state without replacing other roles, mappings or the audit flag; persists
+    /// only when something was missing.
     /// # Errors
     /// Fails when the updated security metadata cannot be persisted.
     pub fn ensure_bootstrap_admin_principal(&mut self) -> Result<(), DbError> {
-        let admin_role = Role::new("admin")
+        let current_role = self.authz.roles().get("admin");
+        let admin_role = current_role
+            .cloned()
+            .unwrap_or_else(|| Role::new("admin"))
             .grant(Resource::System, Permission::Admin)
             .grant(Resource::Database, Permission::Read)
             .grant(Resource::Database, Permission::Write)
             .grant(Resource::Database, Permission::Admin);
-        self.authz = self.authz.clone().allow(admin_role);
-        self.principals
-            .insert("admin", Principal::new("admin").with_role("admin"));
+        let role_changed = current_role != Some(&admin_role);
+        let current_principal = self.principals.principals().get("admin");
+        let admin_principal = current_principal
+            .cloned()
+            .unwrap_or_else(|| Principal::new("admin"))
+            .with_role("admin");
+        let principal_changed = current_principal != Some(&admin_principal);
+        if !role_changed && !principal_changed {
+            return Ok(());
+        }
+
+        if role_changed {
+            self.authz = self.authz.clone().allow(admin_role);
+        }
+        if principal_changed {
+            self.principals.insert("admin", admin_principal);
+        }
         self.persist_security_state()
     }
 
@@ -4249,6 +4270,14 @@ impl Database {
         self.audit_config = security.audit;
     }
 
+    /// Restores the persisted RBAC policy, principal registry, and audit flag when present.
+    fn load_persisted_security(&mut self) -> Result<(), ConfigError> {
+        if let Some(security) = read_security_from_repl(self.replication_ref())? {
+            self.apply_security_config(security);
+        }
+        Ok(())
+    }
+
     fn apply_tenant_config(&mut self, tenant: Option<TenantConfig>) {
         self.tenant = tenant.map(|tenant| {
             let runtime = TenantRuntime::new(tenant);
@@ -5338,7 +5367,8 @@ fn db_hook_to_repl(error: HookError) -> ReplError {
 
 /// Creates a database and initializes metadata when it is missing.
 /// # Errors
-/// Fails when the config is invalid, storage cannot open, or existing metadata conflicts.
+/// Fails when the config is invalid, storage cannot open, existing metadata conflicts, or
+/// persisted security metadata cannot be read or decoded.
 pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
 
@@ -5356,21 +5386,24 @@ pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
 
     let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let database = Database::new_with_performance(config, engine, catalog, performance)?;
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
 /// Opens an existing database and validates its metadata.
 /// # Errors
-/// Fails when the config is invalid, storage cannot open, metadata is missing, or metadata conflicts.
+/// Fails when the config is invalid, storage cannot open, metadata is missing, metadata
+/// conflicts, or persisted security metadata cannot be read or decoded.
 pub fn open_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
     let read = read_metadata(&engine)?;
     ensure_metadata_matches(&config, read.metadata)?;
     let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let database = Database::new_with_performance(config, engine, catalog, performance)?;
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
@@ -5434,7 +5467,8 @@ pub fn open_database_with_ops(
 
 /// Creates a database backed by a CP/Raft replication backend.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn create_cluster_database(
     config: DbConfig,
     cluster: CpClusterConfig,
@@ -5454,12 +5488,15 @@ pub fn create_cluster_database(
     }
 
     let catalog = read_catalog(&engine)?;
-    Database::new_cp(config, engine, catalog, cluster)
+    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Opens a database backed by a CP/Raft replication backend.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn open_cluster_database(
     config: DbConfig,
     cluster: CpClusterConfig,
@@ -5470,7 +5507,9 @@ pub fn open_cluster_database(
     ensure_metadata_matches(&config, read.metadata)?;
     refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_cp(config, engine, catalog, cluster)
+    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Creates a CP/Raft database with operational settings.
@@ -5530,7 +5569,8 @@ pub fn open_cluster_database_with_ops(
 
 /// Creates a database backed by an AP/Dynamo-style replication backend.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn create_ap_database(
     config: DbConfig,
     cluster: ApClusterConfig,
@@ -5550,12 +5590,15 @@ pub fn create_ap_database(
     }
 
     let catalog = read_catalog(&engine)?;
-    Database::new_ap(config, engine, catalog, cluster)
+    let mut database = Database::new_ap(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Opens a database backed by an AP/Dynamo-style replication backend.
 /// # Errors
-/// Fails when config, cluster topology, storage, or metadata validation fails.
+/// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn open_ap_database(
     config: DbConfig,
     cluster: ApClusterConfig,
@@ -5566,7 +5609,9 @@ pub fn open_ap_database(
     ensure_metadata_matches(&config, read.metadata)?;
     refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
-    Database::new_ap(config, engine, catalog, cluster)
+    let mut database = Database::new_ap(config, engine, catalog, cluster)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Creates an AP/Dynamo database with operational settings.
@@ -5626,7 +5671,8 @@ pub fn open_ap_database_with_ops(
 
 /// Creates a sharded database backed by multiple replication groups.
 /// # Errors
-/// Fails when config, shard topology, metadata, or catalog initialization fails.
+/// Fails when config, shard topology, metadata, or catalog initialization fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn create_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
@@ -5646,12 +5692,15 @@ pub fn create_sharded_database(
     }
 
     let catalog = read_catalog_from_repl(repl.as_ref())?;
-    Database::new_sharded(config, repl, catalog)
+    let mut database = Database::new_sharded(config, repl, catalog)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Opens a sharded database backed by multiple replication groups.
 /// # Errors
-/// Fails when config, shard topology, metadata, or catalog validation fails.
+/// Fails when config, shard topology, metadata, or catalog validation fails, or persisted
+/// security metadata cannot be read or decoded.
 pub fn open_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
@@ -5662,7 +5711,9 @@ pub fn open_sharded_database(
     ensure_metadata_matches(&config, read.metadata)?;
     refuse_profile_manifest(&read)?;
     let catalog = read_catalog_from_repl(repl.as_ref())?;
-    Database::new_sharded(config, repl, catalog)
+    let mut database = Database::new_sharded(config, repl, catalog)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 /// Creates a sharded database with operational settings.
@@ -7058,7 +7109,8 @@ fn build_shard_backend(
 
 /// Opens one local shard, initializing its metadata when `create` is set. A local shard is a
 /// plain single-node database, except that a profile manifest on any shard is refused before
-/// the shard database is built.
+/// the shard database is built. Like `open_database`, it restores the shard's persisted security
+/// state.
 fn open_local_shard(config: DbConfig, create: bool) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
 
@@ -7075,7 +7127,9 @@ fn open_local_shard(config: DbConfig, create: bool) -> Result<Database, ConfigEr
 
     let catalog = read_catalog(&engine)?;
     let performance = PerformanceConfig::for_profile(config.profile);
-    Database::new_with_performance(config, engine, catalog, performance)
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
+    Ok(database)
 }
 
 fn ensure_cluster_supported(
