@@ -44,6 +44,14 @@ impl RedbEngine {
             two_phase_commit: true,
         })
     }
+
+    /// Reports whether the database already contains any table.
+    /// # Errors
+    /// Fails if redb cannot open a read snapshot or list its tables.
+    pub(crate) fn has_tables(&self) -> Result<bool, StorageError> {
+        let read = self.db.begin_read().map_err(to_storage_err)?;
+        Ok(read.list_tables().map_err(to_storage_err)?.next().is_some())
+    }
 }
 
 impl StorageEngine for RedbEngine {
