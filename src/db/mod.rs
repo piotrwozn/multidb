@@ -62,8 +62,7 @@ use crate::query::{
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
     SqlEngine, SqlOutput, SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
-    parse_with_limits,
-    schema_put_op,
+    parse_with_limits, schema_put_op,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
