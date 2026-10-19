@@ -5,6 +5,10 @@ use uuid::Uuid;
 use crate::keyenc;
 use crate::repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition};
 use crate::storage::{Bytes, StorageError};
+use crate::{
+    geo::GeoIndexConfig,
+    text::{FullTextIndexConfig, TextSource},
+};
 
 pub const DOCUMENT_TABLE: &str = "documents";
 pub const INDEX_TABLE: &str = "document_indexes";
@@ -91,6 +95,15 @@ pub struct DocumentCollection<'repl, R: Replication + ?Sized> {
     repl: &'repl R,
     collection_id: CollectionId,
     indexes: Vec<IndexSpec>,
+    derived: DerivedIndexes,
+}
+
+/// Full-text and geo indexes whose entries are maintained in the same batch as the
+/// document writes built by a `DocumentCollection` handle.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DerivedIndexes {
+    pub(crate) full_text: Vec<FullTextIndexConfig>,
+    pub(crate) geo: Vec<GeoIndexConfig>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -579,6 +592,10 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
             repl,
             collection_id,
             indexes: Vec::new(),
+            derived: DerivedIndexes {
+                full_text: Vec::new(),
+                geo: Vec::new(),
+            },
         }
     }
 
@@ -592,7 +609,30 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
             repl,
             collection_id,
             indexes,
+            derived: DerivedIndexes {
+                full_text: Vec::new(),
+                geo: Vec::new(),
+            },
         }
+    }
+
+    /// Attaches the full-text and geo indexes that this handle's write operations keep
+    /// current. Configs whose source is another collection are ignored.
+    #[must_use]
+    pub(crate) fn with_derived_indexes(mut self, mut derived: DerivedIndexes) -> Self {
+        let collection_id = self.collection_id;
+        derived.full_text.retain(|config| {
+            let TextSource::Collection {
+                collection_id: source,
+                ..
+            } = &config.source;
+            *source == collection_id
+        });
+        derived
+            .geo
+            .retain(|config| config.collection_id == collection_id);
+        self.derived = derived;
+        self
     }
 
     /// Inserts a document and returns its generated id.
@@ -692,6 +732,7 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
         let mut ops = Vec::new();
         ops.push(put_document_op(self.collection_id, id, doc)?);
         append_new_index_ops(&mut ops, self.collection_id, &self.indexes, id, doc)?;
+        append_derived_index_ops(&mut ops, &self.derived, id, None, Some(doc))?;
         Ok((id, ops))
     }
 
@@ -700,11 +741,13 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
     /// Fails when reads, serialization, or indexed value encoding fails.
     pub fn update_ops(&self, id: DocumentId, doc: &Value) -> Result<Vec<Op>, ModelError> {
         let mut ops = Vec::new();
-        if let Some(old) = self.get(id)? {
-            append_old_index_delete_ops(&mut ops, self.collection_id, &self.indexes, id, &old)?;
+        let old = self.get(id)?;
+        if let Some(old) = &old {
+            append_old_index_delete_ops(&mut ops, self.collection_id, &self.indexes, id, old)?;
         }
         ops.push(put_document_op(self.collection_id, id, doc)?);
         append_new_index_ops(&mut ops, self.collection_id, &self.indexes, id, doc)?;
+        append_derived_index_ops(&mut ops, &self.derived, id, old.as_ref(), Some(doc))?;
         Ok(ops)
     }
 
@@ -716,18 +759,20 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
         if let Some(old) = self.get(id)? {
             append_old_index_delete_ops(&mut ops, self.collection_id, &self.indexes, id, &old)?;
             ops.push(delete_document_op(self.collection_id, id));
+            append_derived_index_ops(&mut ops, &self.derived, id, Some(&old), None)?;
         }
         Ok(ops)
     }
 
     /// Builds put operations for a known document id without reading current storage.
+    ///
+    /// Index entries of a previous version of the document (`document_indexes` and the
+    /// attached full-text/geo indexes) are not removed; use `replace_ops_with_old` when
+    /// the document may already exist.
     /// # Errors
     /// Fails when the document or indexed values cannot be encoded.
     pub fn put_ops_for_id(&self, id: DocumentId, doc: &Value) -> Result<Vec<Op>, ModelError> {
-        let mut ops = Vec::new();
-        ops.push(put_document_op(self.collection_id, id, doc)?);
-        append_new_index_ops(&mut ops, self.collection_id, &self.indexes, id, doc)?;
-        Ok(ops)
+        self.put_ops_with_old(id, None, doc)
     }
 
     /// Builds replacement operations using a caller-provided old snapshot value.
@@ -743,7 +788,7 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
         if let Some(old) = old {
             append_old_index_delete_ops(&mut ops, self.collection_id, &self.indexes, id, old)?;
         }
-        ops.extend(self.put_ops_for_id(id, doc)?);
+        ops.extend(self.put_ops_with_old(id, old, doc)?);
         Ok(ops)
     }
 
@@ -759,7 +804,21 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
         if let Some(old) = old {
             append_old_index_delete_ops(&mut ops, self.collection_id, &self.indexes, id, old)?;
             ops.push(delete_document_op(self.collection_id, id));
+            append_derived_index_ops(&mut ops, &self.derived, id, Some(old), None)?;
         }
+        Ok(ops)
+    }
+
+    fn put_ops_with_old(
+        &self,
+        id: DocumentId,
+        old: Option<&Value>,
+        doc: &Value,
+    ) -> Result<Vec<Op>, ModelError> {
+        let mut ops = Vec::new();
+        ops.push(put_document_op(self.collection_id, id, doc)?);
+        append_new_index_ops(&mut ops, self.collection_id, &self.indexes, id, doc)?;
+        append_derived_index_ops(&mut ops, &self.derived, id, old, Some(doc))?;
         Ok(ops)
     }
 
@@ -1001,6 +1060,26 @@ fn append_new_index_ops(
         }
     }
 
+    Ok(())
+}
+
+/// Appends full-text and geo index writes for one document change, computed as a diff
+/// between the `old` and `new` document values so they commit with the document itself.
+fn append_derived_index_ops(
+    ops: &mut Vec<Op>,
+    derived: &DerivedIndexes,
+    id: DocumentId,
+    old: Option<&Value>,
+    new: Option<&Value>,
+) -> Result<(), ModelError> {
+    for config in &derived.full_text {
+        crate::text::append_document_change_ops(config, id, old, new, ops)
+            .map_err(|error| ModelError::Storage(StorageError::Backend(error.to_string())))?;
+    }
+    for config in &derived.geo {
+        crate::geo::append_document_change_ops(config, id, old, new, ops)
+            .map_err(|error| ModelError::Storage(StorageError::Backend(error.to_string())))?;
+    }
     Ok(())
 }
 

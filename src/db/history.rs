@@ -168,9 +168,11 @@ impl Database {
     }
 
     /// True when history GC truncated the commit log, so a changefeed replay from
-    /// LSN 0 fails with `TokenExpired`.
+    /// LSN 0 fails with `TokenExpired`. Index and view creation backfill from the
+    /// current state, so only tests need to ask.
     /// # Errors
     /// Fails when the commit-log floor cannot be read.
+    #[cfg(test)]
     pub(super) fn commit_log_truncated(&self) -> Result<bool, DbError> {
         Ok(history::earliest_commit_lsn(self.replication_ref())? > 1)
     }
