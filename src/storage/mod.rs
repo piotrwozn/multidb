@@ -19,7 +19,7 @@ pub use compressed::{
 pub use encrypted::{
     ConfiguredKeyProvider, CryptoShredReport, EncryptedEngine, EncryptedReadTxn, EncryptedWriteTxn,
     EnvelopeKeyProvider, FileKeyProvider, KekProvider, KeyProvider, KeyRotationPlan, LocalFileKms,
-    ProtectedKey, StaticKeyProvider, VaultKekProvider,
+    ProtectedKey, ReencryptionReport, StaticKeyProvider, VaultKekProvider,
 };
 pub use error::StorageError;
 pub use memory::MemEngine;
