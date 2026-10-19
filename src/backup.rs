@@ -1894,7 +1894,7 @@ mod tests {
             .range(REL_ROWS_TABLE, &[], &[])?
             .collect::<Result<Vec<_>, _>>()?;
         drop(engine);
-        assert!(!rows.is_empty());
+        assert!(!rows.is_empty(), "the restored database holds no rows");
         assert!(rows.iter().all(|(_, value)| value.starts_with(b"MDBC1")));
 
         let restored = open_database(DbConfig::on_disk(Profile::HighDurability, &restore_path))?;
