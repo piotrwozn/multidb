@@ -256,8 +256,9 @@ All notable public changes will be recorded here.
   counts as the applied spec. Planning never creates a file or writes a
   database. New plan issue codes include `PROVISION_ENGINE_MISMATCH`,
   `PROVISION_FORMAT_MISMATCH`, `PROVISION_OBJECT_CONFLICT`,
-  `PROVISION_SECURITY_STATE_STALE` (RBAC changed in memory only, for example
-  with `set_authz_policy`, which an apply would persist), `RBAC_SELF_LOCKOUT`,
+  `PROVISION_SECURITY_STATE_STALE` (RBAC or the audit flag changed in memory
+  only, with `set_authz_policy` or by a change whose persist failed, which an
+  apply would persist), `RBAC_SELF_LOCKOUT`,
   `AUDIT_REQUIRED_FOR_APPLY`, `PROVISION_AUDIT_KEY_MISMATCH` (a plan with
   steps whose appended audit events would not verify against the existing
   chain), `GUARANTEE_NOT_ENFORCEABLE` and `STEP_REQUIRES_FLAG`, and the

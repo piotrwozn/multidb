@@ -428,10 +428,12 @@ A handle whose RBAC state or audit flag differs from what is persisted in the
 database is `PROVISION_SECURITY_STATE_STALE` (blocks). Every opener loads the
 persisted RBAC state, so this happens only after an in-memory change:
 `set_authz_policy` and `set_principal_registry` do not persist (`multidb admin
-serve --insecure-local-admin` grants its local administrator that way). An
-apply would otherwise persist state the database never had. Persist the change
-(`set_authz_policy_as`, `set_principal_registry_as`, `POST /security`) or
-reopen the database, and plan again.
+serve --insecure-local-admin` grants its local administrator that way), and an
+RBAC or audit change whose persist failed (`set_authz_policy_as`,
+`set_principal_registry_as`, `set_audit_enabled_as`) keeps its in-memory
+state. An apply would otherwise persist state the database never had. Persist
+the change (`set_authz_policy_as`, `set_principal_registry_as`,
+`POST /security`) or reopen the database, and plan again.
 
 ### Guarantees
 

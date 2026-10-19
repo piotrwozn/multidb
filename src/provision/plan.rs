@@ -1447,7 +1447,8 @@ impl PlanBuilder<'_> {
                  the ones persisted in the database: they were changed in memory only, with \
                  set_authz_policy or set_principal_registry (as multidb admin serve \
                  --insecure-local-admin does for its local administrator), which do not \
-                 persist, so an apply would persist state the database never had"
+                 persist, or by an RBAC or audit change whose persist failed, so an apply would \
+                 persist state the database never had"
                     .to_owned(),
                 "Persist the change (set_authz_policy_as, set_principal_registry_as or POST \
                  /security) or reopen the database, whose openers load the persisted RBAC \
