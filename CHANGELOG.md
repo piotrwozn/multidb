@@ -250,15 +250,19 @@ All notable public changes will be recorded here.
   and direct `Database::propose` and `propose_batch` writes check nothing at
   commit: they are last-writer-wins, and under concurrent writes the event and
   `old` value their triggers see are best effort.
-- Breaking for embedders: with a tenant set (`DbConfig::with_tenant`) whose
-  `max_concurrent_writes` or `max_concurrent_queries` is limited, Control Plane
-  requests (including row and document writes) and PostgreSQL wire statements
-  can now exceed those limits, because they run concurrently. Tenant write and
-  query slots are taken without waiting, so the extra requests fail with
-  `ReplError::QuotaExceeded { requested: 1, remaining: 0, .. }`, which the
-  Control Plane returns as HTTP 500 `internal_error` and PostgreSQL wire as
-  SQLSTATE 53100. Size the limits for the concurrent load or retry such
-  failures. `multidb serve` sets no tenant.
+- Breaking for embedders: with a tenant set (`OperationalConfig::with_tenant`)
+  whose `max_concurrent_writes` or `max_concurrent_queries` is limited, Control
+  Plane requests (including row and document writes) and PostgreSQL wire
+  statements can now exceed those limits, because they run concurrently.
+  Tenant write and query slots are taken without waiting, so the extra
+  requests fail. Writes and single-table equality `SELECT`s fail with
+  `ReplError::QuotaExceeded { requested: 1, remaining: 0, .. }`, which
+  PostgreSQL wire reports as SQLSTATE 53100. Other `SELECT`s, which DataFusion
+  executes, can instead fail with a `QueryError::DataFusion` whose message
+  contains the quota error, which PostgreSQL wire reports as SQLSTATE XX000.
+  The Control Plane returns HTTP 500 `internal_error` in both cases. Size the
+  limits for the concurrent load or retry such failures. `multidb serve` sets
+  no tenant.
 
 ## 0.1.0-preview.1
 
