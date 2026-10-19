@@ -236,9 +236,11 @@ All notable public changes will be recorded here.
   Conditional writes (SQL `INSERT`, `RelTable` handles) now take each
   trigger's event and `old` value from the row values their commit checks, and
   `MultiModelTxn` commits (including Control Plane row and document writes)
-  take them from the transaction snapshot, so a lost race ends in the commit's
-  conflict and is retried as before. Stored procedure (`CALL`) writes and
-  direct `Database::propose` and `propose_batch` writes check nothing at
+  take them from the transaction snapshot. At every isolation level, a commit
+  that writes a row another writer changed after the transaction began fails
+  with its conflict before that row's triggers run, so a lost race ends in the
+  commit's conflict and is retried as before. Stored procedure (`CALL`) writes
+  and direct `Database::propose` and `propose_batch` writes check nothing at
   commit: they are last-writer-wins, and under concurrent writes the event and
   `old` value their triggers see are best effort.
 - Breaking for embedders: with a tenant set (`DbConfig::with_tenant`) whose

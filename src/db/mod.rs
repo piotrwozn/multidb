@@ -5017,7 +5017,7 @@ impl MultiModelTxn<'_> {
         let write_set = self.write_set;
         let read_keys = self.read_keys.into_inner();
         let read_ranges = self.read_ranges.into_inner();
-        let snapshot = self.read;
+        let snapshot_read = self.read;
 
         let storage = database.repl.storage().ok_or_else(|| {
             ConfigError::Unsupported("replication backend has no local snapshot storage".to_owned())
@@ -5037,12 +5037,19 @@ impl MultiModelTxn<'_> {
             return Ok(());
         }
 
-        // The commit fails if a written key changed after the snapshot, so triggers
-        // take old values from the snapshot.
+        // The commit fails if a written key changed after the snapshot. A key that
+        // triggers fire for fails with that conflict before they run, and otherwise
+        // takes its old value from the snapshot, which then holds what the
+        // transaction read at every isolation level.
         let batch = ConditionalBatch::new(Vec::new(), ops_from_write_set(&write_set));
+        let snapshot = TxnSnapshot {
+            id: snapshot_id,
+            read: &snapshot_read,
+            storage,
+        };
         database
             .write_pipeline()
-            .execute(batch, Some(&snapshot), |batch| {
+            .execute(batch, Some(snapshot), |batch| {
                 let write_set = txn::ops_to_write_set(batch.ops);
                 let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
                 if isolation == IsolationLevel::Serializable {
@@ -5192,19 +5199,20 @@ struct WasmTriggerInvocation {
 /// and `old` value from here, so they see the row the commit checks.
 ///
 /// A conditional batch asserts the value of each key it has a condition on, and a
-/// snapshot transaction asserts that no key it writes changed after its snapshot.
-/// When another writer changes such a row after the caller read it, the commit
+/// `MultiModelTxn` commit asserts that no key it writes changed after the
+/// transaction's snapshot. When another writer changes such a row after the
+/// caller read it, or before a read-committed transaction read it, the write
 /// fails with a conflict, which callers retry, instead of a before trigger running
 /// for an event the write does not have. A key without an assertion is read when
 /// the pipeline runs, so the events of unconditional writes are best effort under
 /// concurrent writes.
 struct AssertedOldValues<'a> {
     conditions: BTreeMap<(&'a str, &'a [u8]), Option<&'a [u8]>>,
-    snapshot: Option<&'a AnyReadTxn>,
+    snapshot: Option<TxnSnapshot<'a>>,
 }
 
 impl<'a> AssertedOldValues<'a> {
-    fn new(conditions: &'a [WriteCondition], snapshot: Option<&'a AnyReadTxn>) -> Self {
+    fn new(conditions: &'a [WriteCondition], snapshot: Option<TxnSnapshot<'a>>) -> Self {
         let conditions = conditions
             .iter()
             .map(|condition| match condition {
@@ -5222,6 +5230,29 @@ impl<'a> AssertedOldValues<'a> {
             conditions,
             snapshot,
         }
+    }
+}
+
+/// The storage snapshot a `MultiModelTxn` began with. Its commit fails with a
+/// conflict when a key it writes changed after `id`, at every isolation level.
+struct TxnSnapshot<'a> {
+    id: TxnId,
+    read: &'a AnyReadTxn,
+    storage: &'a AnyEngine,
+}
+
+impl TxnSnapshot<'_> {
+    /// The value `key` held at the snapshot. A read-committed transaction reads
+    /// current values, so it may have read a later value of a key that changed
+    /// after the snapshot: such a key fails here with the conflict its commit
+    /// would report, before a trigger sees the snapshot's value. Any other key
+    /// held the snapshot's value at every read the transaction made.
+    fn old_value(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
+        let current = self.storage.begin_read()?;
+        if txn::last_key_version_from(&current, table, key)? > self.id {
+            return Err(StorageError::Conflict.into());
+        }
+        Ok(self.read.get(table, key)?)
     }
 }
 
@@ -5257,12 +5288,12 @@ const AFTER_COMMIT_HOOKS_FAILURE_NAME: &str = "after_commit_hooks";
 impl WritePipeline {
     /// Runs `batch` through every stage; `commit` writes it to the backend. The
     /// before triggers may change `batch.ops`, never its conditions. `snapshot` is
-    /// the storage snapshot of a snapshot transaction, whose commit asserts that no
-    /// written key changed after it.
+    /// the snapshot of a `MultiModelTxn`, whose commit asserts that no written key
+    /// changed after it.
     fn execute<E: PipelineError>(
         &self,
         batch: ConditionalBatch,
-        snapshot: Option<&AnyReadTxn>,
+        snapshot: Option<TxnSnapshot<'_>>,
         commit: impl FnOnce(ConditionalBatch) -> Result<(), E>,
     ) -> Result<(), E> {
         let ConditionalBatch { conditions, ops } = batch;
@@ -5600,8 +5631,8 @@ impl WritePipeline {
         if let Some(value) = asserted.conditions.get(&(table, key)) {
             return Ok(value.map(<[u8]>::to_vec));
         }
-        if let Some(snapshot) = asserted.snapshot {
-            return Ok(snapshot.get(table, key)?);
+        if let Some(snapshot) = &asserted.snapshot {
+            return snapshot.old_value(table, key);
         }
         Ok(self.backend.read(table, key, ReadConsistency::Strong)?)
     }

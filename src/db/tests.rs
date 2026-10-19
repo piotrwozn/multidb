@@ -3920,6 +3920,123 @@ fn transaction_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
     Ok(())
 }
 
+#[test]
+fn read_committed_insert_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_committed = txn::TxnOptions {
+        isolation: txn::IsolationLevel::ReadCommitted,
+        ..txn::TxnOptions::default()
+    };
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    accounts.insert(account_row(1, "Ada", 36))?;
+    accounts.insert(account_row(2, "Grace", 85))?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+
+    // Another writer deletes the row after this transaction's snapshot, before the
+    // transaction reads it as missing and inserts it.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.delete(&Value::Int(1))?;
+        }
+        if txn.get_row("accounts", &Value::Int(1))?.is_some() {
+            return Ok(());
+        }
+        txn.insert_row("accounts", account_row(1, "Mine", 1))
+    })?;
+    // The first commit conflicts before the trigger sees the snapshot's row; the
+    // retry inserts.
+    assert_eq!(attempts, 2);
+
+    // Another writer deletes the row before the transaction reads it and inserts it
+    // again before the commit, so the row holds its snapshot value again.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.delete(&Value::Int(2))?;
+        }
+        if txn.get_row("accounts", &Value::Int(2))?.is_some() {
+            return Ok(());
+        }
+        txn.insert_row("accounts", account_row(2, "Mine", 1))?;
+        if attempts == 1 {
+            accounts.insert(account_row(2, "Grace", 85))?;
+        }
+        Ok(())
+    })?;
+    // The first commit still conflicts; the retry sees the row and writes nothing.
+    assert_eq!(attempts, 2);
+
+    assert_eq!(
+        accounts.scan()?,
+        vec![account_row(1, "Mine", 1), account_row(2, "Grace", 85)]
+    );
+    assert_rejected(
+        "transaction update",
+        database.transaction_with_options(read_committed, |txn| {
+            txn.update_row("accounts", account_row(1, "Mine", 2))
+        }),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn read_committed_update_that_loses_a_race_retries_instead_of_firing_an_insert_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_committed = txn::TxnOptions {
+        isolation: txn::IsolationLevel::ReadCommitted,
+        ..txn::TxnOptions::default()
+    };
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    let reject_insert = wasm_trigger(
+        "reject_accounts_insert",
+        "accounts",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+    );
+
+    // Another writer inserts the row after this transaction's snapshot, and a
+    // trigger that rejects inserts is added after that insert. The transaction
+    // reads the row and updates it.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.insert(account_row(1, "Ada", 36))?;
+            database.register_wasm_trigger(reject_insert.clone(), &wasm)?;
+        }
+        if txn.get_row("accounts", &Value::Int(1))?.is_none() {
+            return Err(DbError::TransactionAborted("row 1 is missing".to_owned()));
+        }
+        txn.update_row("accounts", account_row(1, "Ada", 37))
+    })?;
+
+    // The first commit conflicts before the trigger sees the snapshot's missing
+    // row; the retry updates.
+    assert_eq!(attempts, 2);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 37)]);
+    assert_rejected(
+        "transaction insert",
+        database.transaction_with_options(read_committed, |txn| {
+            txn.insert_row("accounts", account_row(2, "Grace", 85))
+        }),
+        "rejected write",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn query_governor_limits_are_settable_and_a_full_queue_is_busy()
 -> Result<(), Box<dyn std::error::Error>> {
