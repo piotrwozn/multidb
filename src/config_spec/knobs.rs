@@ -482,7 +482,8 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
 pub const RESERVED_KNOBS: &[ReservedKnob] = &[
     ReservedKnob {
         path: "history.mvcc_retention_millis",
-        reason: "waits for MVCC and commit-log GC",
+        reason: "history GC is manual and retains a number of LSNs (multidb maintenance gc \
+                 --history-retain-lsns), not a duration",
     },
     ReservedKnob {
         path: "cache.ttl_millis",

@@ -189,7 +189,7 @@ them and any value is refused with `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME`:
 
 | path | reason |
 | --- | --- |
-| `history.mvcc_retention_millis` | waits for MVCC and commit-log GC |
+| `history.mvcc_retention_millis` | history GC is manual and retains a number of LSNs (`multidb maintenance gc --history-retain-lsns`), not a duration |
 | `cache.ttl_millis` | no runtime implementation |
 
 ## Resolution and status rules
@@ -464,6 +464,16 @@ floors with `profile show --db` and in the output of `restore
 --allow-unmet-floors`. No opener writes security because of a manifest.
 Databases without a manifest open exactly as before; plain `create_database`
 and `serve` never write one.
+
+History GC (`multidb maintenance gc`, `Database::gc_history`) opens the
+database through the same openers, so it reads and rewrites the MVCC
+versions and commit records of a framed database through its value framing,
+and a `--profile` that names another storage class is refused before anything
+is pruned. No profile knob sets its retention: `history.system_versioning` and
+`history.keep_history` describe the typed tables provisioning creates, and
+`history.mvcc_retention_millis` is reserved, so GC keeps only what
+`--history-retain-lsns` (`mvcc_retain_lsns`), `AS OF` pins and the temporal
+`keep_history` retentions of existing tables require.
 
 ### Evolving the manifest
 
