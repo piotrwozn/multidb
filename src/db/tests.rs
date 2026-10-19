@@ -3921,6 +3921,60 @@ fn transaction_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
 }
 
 #[test]
+fn transaction_that_loses_a_race_on_a_later_row_conflicts_before_any_trigger_runs()
+-> Result<(), Box<dyn std::error::Error>> {
+    for isolation in [
+        txn::IsolationLevel::Snapshot,
+        txn::IsolationLevel::ReadCommitted,
+        txn::IsolationLevel::SnapshotIsolation,
+        txn::IsolationLevel::Serializable,
+    ] {
+        let options = txn::TxnOptions {
+            isolation,
+            ..txn::TxnOptions::default()
+        };
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+        accounts.insert(account_row(1, "Ada", 36))?;
+        register_accounts_trigger(
+            &database,
+            "reject_accounts_update",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+            &trigger_response("reject", None),
+        )?;
+
+        // The transaction updates row 1, which no other writer changes, and inserts
+        // row 2, which another writer inserts before the commit. Row 1 is written
+        // first, so its trigger would reject the write before the pipeline reached
+        // row 2.
+        let mut attempts = 0;
+        database.transaction_with_retry_with_options(options, |txn| {
+            attempts += 1;
+            if txn.get_row("accounts", &Value::Int(2))?.is_some() {
+                return Ok(());
+            }
+            txn.update_row("accounts", account_row(1, "Ada", 37))?;
+            txn.insert_row("accounts", account_row(2, "Mine", 1))?;
+            if attempts == 1 {
+                accounts.insert(account_row(2, "Grace", 85))?;
+            }
+            Ok(())
+        })?;
+
+        // The first commit conflicts before any trigger runs; the retry sees row 2
+        // and writes nothing.
+        assert_eq!(attempts, 2, "{isolation:?}");
+        assert_eq!(
+            accounts.scan()?,
+            vec![account_row(1, "Ada", 36), account_row(2, "Grace", 85)],
+            "{isolation:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn read_committed_insert_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
 -> Result<(), Box<dyn std::error::Error>> {
     let read_committed = txn::TxnOptions {

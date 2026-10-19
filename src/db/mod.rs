@@ -5043,9 +5043,9 @@ impl MultiModelTxn<'_> {
             return Ok(());
         }
 
-        // The commit fails if a written key changed after the snapshot. A key that
-        // triggers fire for fails with that conflict before they run, and otherwise
-        // takes its old value from the snapshot, which then holds what the
+        // The commit fails if a written key changed after the snapshot. When
+        // triggers fire, the pipeline checks that before any of them runs, so they
+        // take each key's old value from the snapshot, which then holds what the
         // transaction read at every isolation level.
         let batch = ConditionalBatch::new(Vec::new(), ops_from_write_set(&write_set));
         let snapshot = TxnSnapshot {
@@ -5225,7 +5225,16 @@ struct AssertedOldValues<'a> {
 }
 
 impl<'a> AssertedOldValues<'a> {
-    fn new(conditions: &'a [WriteCondition], snapshot: Option<TxnSnapshot<'a>>) -> Self {
+    /// Fails with the conflict the commit would report when `snapshot` is set and a
+    /// key `ops` writes changed after it, so no trigger runs for such a commit.
+    fn new(
+        conditions: &'a [WriteCondition],
+        snapshot: Option<TxnSnapshot<'a>>,
+        ops: &[Op],
+    ) -> Result<Self, DbError> {
+        if let Some(snapshot) = &snapshot {
+            snapshot.check_unchanged(ops)?;
+        }
         let conditions = conditions
             .iter()
             .map(|condition| match condition {
@@ -5239,10 +5248,10 @@ impl<'a> AssertedOldValues<'a> {
                 } => ((table.as_str(), key.as_slice()), expected.as_deref()),
             })
             .collect();
-        Self {
+        Ok(Self {
             conditions,
             snapshot,
-        }
+        })
     }
 }
 
@@ -5255,16 +5264,25 @@ struct TxnSnapshot<'a> {
 }
 
 impl TxnSnapshot<'_> {
-    /// The value `key` held at the snapshot. A read-committed transaction reads
-    /// current values, so it may have read a later value of a key that changed
-    /// after the snapshot: such a key fails here with the conflict its commit
-    /// would report, before a trigger sees the snapshot's value. Any other key
-    /// held the snapshot's value at every read the transaction made.
-    fn old_value(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
+    /// Fails with the conflict the commit would report when a key `ops` writes
+    /// changed after the snapshot. A read-committed transaction reads current
+    /// values, so it may have read a later value of such a key than the snapshot
+    /// holds.
+    fn check_unchanged(&self, ops: &[Op]) -> Result<(), DbError> {
         let current = self.storage.begin_read()?;
-        if txn::last_key_version_from(&current, table, key)? > self.id {
-            return Err(StorageError::Conflict.into());
+        for op in ops {
+            let (table, key) = op_table_key(op);
+            if txn::last_key_version_from(&current, table, key)? > self.id {
+                return Err(StorageError::Conflict.into());
+            }
         }
+        Ok(())
+    }
+
+    /// The value `key` held at the snapshot. Once `check_unchanged` passed for the
+    /// written keys, each of them held that value at every read the transaction
+    /// made, at every isolation level.
+    fn old_value(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
         Ok(self.read.get(table, key)?)
     }
 }
@@ -5302,7 +5320,8 @@ impl WritePipeline {
     /// Runs `batch` through every stage; `commit` writes it to the backend. The
     /// before triggers may change `batch.ops`, never its conditions. `snapshot` is
     /// the snapshot of a `MultiModelTxn`, whose commit asserts that no written key
-    /// changed after it.
+    /// changed after it; when triggers fire, that is checked before any of them
+    /// runs.
     fn execute<E: PipelineError>(
         &self,
         batch: ConditionalBatch,
@@ -5314,7 +5333,8 @@ impl WritePipeline {
         let (ops, invocations) = if triggers.is_empty() {
             (ops, Vec::new())
         } else {
-            let asserted = AssertedOldValues::new(&conditions, snapshot);
+            let asserted =
+                AssertedOldValues::new(&conditions, snapshot, &ops).map_err(E::trigger)?;
             let ops = self
                 .apply_before_triggers(&triggers.before, ops, &asserted)
                 .map_err(E::trigger)?;
