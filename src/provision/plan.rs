@@ -2307,16 +2307,30 @@ fn create_step(
     match counts.get(source) {
         Some(&rows) if rows > 0 => {
             let note = format!(
-                "the source collection {source} holds {rows} documents, which this build does \
-                 not backfill into the new index"
+                "the source collection {source} holds {rows} documents, which creating the \
+                 index backfills before it is published"
             );
             ProvisionStep {
                 action: format!("{}; {note}", created.action),
                 ..created
             }
-            .with_impact(medium_impact(&note))
+            .with_impact(backfill_impact(&note))
         }
         _ => created,
+    }
+}
+
+/// Creating a full-text or geo index on a populated collection scans and indexes every
+/// document before the index is published, while the apply holds the database. It only adds
+/// derived index entries, so it needs no backup.
+fn backfill_impact(note: &str) -> PlanImpact {
+    PlanImpact {
+        downtime: ImpactLevel::Low,
+        disk: ImpactLevel::Low,
+        cpu: ImpactLevel::Medium,
+        risk: RiskLevel::Low,
+        notes: vec![note.to_owned()],
+        ..impact_none()
     }
 }
 

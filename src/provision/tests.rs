@@ -24,8 +24,8 @@ use crate::cdc::{AggregateKind, AggregateSpec, MaterializedViewSpec};
 use crate::config_spec::{
     ApplyStatus, ConflictResolution, ConsistencyDomainSpec, ConsistencyMode,
     DATABASE_SPEC_VERSION_V2, DatabaseSpec, DeploymentMode, ExtensionManifestRef,
-    ExtensionStability, GuaranteeValidator, ReplicationMode, ResolvedProfile, RiskLevel,
-    UnmanagedPolicy, ValidationSeverity, resolve_profile, spec_digest,
+    ExtensionStability, GuaranteeValidator, ImpactLevel, ReplicationMode, ResolvedProfile,
+    RiskLevel, UnmanagedPolicy, ValidationSeverity, resolve_profile, spec_digest,
     spec_io::{SpecFormat, decode_spec_bytes},
 };
 use crate::db::{
@@ -2213,9 +2213,29 @@ fn full_text_and_geo_on_populated_sources_show_the_document_count() -> TestResul
             .iter()
             .find(|step| step.kind == kind)
             .ok_or("index step")?;
-        assert!(step.action.contains("3 documents"), "{}", step.action);
-        assert_eq!(step.impact.risk, RiskLevel::Medium);
+        assert!(
+            step.action
+                .contains("3 documents, which creating the index backfills"),
+            "{}",
+            step.action
+        );
+        assert_eq!(step.impact.cpu, ImpactLevel::Medium);
+        assert_eq!(step.impact.risk, RiskLevel::Low);
+        assert!(!step.impact.requires_backup);
     }
+
+    // The apply backfills both indexes, so the documents written before it are found.
+    assert_applied(&apply_as(
+        &mut db,
+        &cli_operator(),
+        &spec,
+        &ProvisionOptions::default(),
+        &env(ProvisionSurface::RustApi),
+    )?);
+    let hits = db
+        .full_text_index("orders_notes_fts")?
+        .search("fragile", 10)?;
+    assert_eq!(hits.len(), 3);
     Ok(())
 }
 
@@ -2919,19 +2939,17 @@ async fn executor_builds_every_object_kind() -> TestResult {
             &BTreeSet::from(["order_writer".to_owned()])
         );
 
-        // Documents inserted after provisioning are found once the indexes are refreshed.
+        // Document writes maintain the provisioned indexes, so documents inserted after
+        // provisioning are found.
         let id =
             db.collection("orders")?
                 .insert(&shipped_order("c-1", "fragile glass", 13.4, 52.5))?;
         db.collection("orders")?
             .insert(&shipped_order("c-2", "books", -70.0, -30.0))?;
-        db.full_text_index("orders_notes_fts")?.refresh_full()?;
         let hits = db
             .full_text_index("orders_notes_fts")?
             .search("fragile", 10)?;
         assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![id]);
-        db.geo_index("orders_shipping_location_geo")?
-            .refresh_full()?;
         let near = db
             .geo_index("orders_shipping_location_geo")?
             .within_radius(GeoPoint::new(13.4, 52.5)?, 1_000.0)?;
@@ -4373,6 +4391,67 @@ async fn a_spec_granted_role_runs_sql_and_others_are_denied() -> TestResult {
         db.query_as(&stranger, "SELECT entry_id FROM ledger").await,
         Err(DbError::AuthzDenied(_))
     ));
+    Ok(())
+}
+
+/// `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ` warns about exactly what the runtime refuses:
+/// a role that reads a full-text index but not its source collection cannot search it.
+#[tokio::test]
+async fn an_index_grant_without_source_read_warns_and_cannot_search() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = with_security(
+        full_spec()?,
+        &json!({
+            "roles": [
+                {
+                    "name": "searcher",
+                    "grants": [{ "object": "orders_notes_fts", "permissions": ["read"] }]
+                },
+                {
+                    "name": "reader",
+                    "grants": [
+                        { "object": "orders", "permissions": ["read"] },
+                        { "object": "orders_notes_fts", "permissions": ["read"] }
+                    ]
+                }
+            ],
+            "principals": [
+                { "user": "searcher_svc", "roles": ["searcher"] },
+                { "user": "reader_svc", "roles": ["reader"] }
+            ]
+        }),
+    )?;
+    let mut db = create_with_profile(&temp_dir.path().join("search.redb"), &spec)?;
+    let plan = plan_open(&spec, &db)?;
+    let warned = plan
+        .validation
+        .issues
+        .iter()
+        .filter(|issue| issue.code == "SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ")
+        .map(|issue| issue.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warned,
+        vec!["security.roles[0].grants[0]"],
+        "{:#?}",
+        plan.validation.issues
+    );
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let id = db
+        .collection("orders")?
+        .insert(&shipped_order("c-1", "fragile glass", 13.4, 52.5))?;
+
+    let search = "SELECT * FROM match('orders_notes_fts', 'fragile', 10)";
+    let searcher = db.principal_for_user("searcher_svc");
+    assert!(matches!(
+        db.query_as(&searcher, search).await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    let reader = db.principal_for_user("reader_svc");
+    let SqlOutput::Rows(rows) = db.query_as(&reader, search).await? else {
+        return Err("match() returns rows".into());
+    };
+    assert_eq!(rows.rows.len(), 1, "{rows:?} for {id:?}");
     Ok(())
 }
 

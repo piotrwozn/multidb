@@ -15,7 +15,8 @@ reference, the plan and the flags.
   document indexes on `customer.id` and `status`, the full-text index
   `orders_notes_fts` on `notes` and the geo index
   `orders_shipping_location_geo` on `shipping.location` (precision 7). The
-  index names are derived from the collection and the path.
+  index names are derived from the collection and the path. Both indexes are
+  backfilled when they are created, and document writes keep them current.
 - **ledger** (`event_log`): a typed row table with the primary key
   `entry_id`, a B-tree index on `order_id` and system versioning into
   `ledger_history`.
@@ -79,7 +80,6 @@ Guarantee statuses a CLI plan reports for this spec:
   (`--allow-destructive collections.<name>`), keeping its data.
 - Encryption at rest is not requested here; a spec that requests it is
   provisioned through the Rust API only.
-- In this build the full-text and geo indexes of `orders` are created empty
-  and are not maintained on writes: call `refresh_full` or
-  `refresh_incremental` on them after loading documents, until index
-  backfill lands.
+- Raw key writes that bypass collection handles, transactions and Control
+  Plane document CRUD do not reach the full-text and geo indexes of `orders`:
+  call `refresh_incremental` or `refresh_full` on them after such writes.

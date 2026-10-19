@@ -360,7 +360,8 @@ fn broad_grant(
     )
 }
 
-/// Searching a full-text or geo index needs Read on its source collection too.
+/// `match()` and `within_radius()` return the source documents' text, ids and points, so
+/// searching a full-text or geo index needs Read on its source collection too.
 fn check_index_source_read(
     role: &RoleSpec,
     grant_path: &str,
@@ -385,8 +386,9 @@ fn check_index_source_read(
             ValidationSeverity::Warning,
             grant_path,
             format!(
-                "role {} can read index {} but not its source collection {source}; index \
-                 search also needs read on the source",
+                "role {} can read index {} but not its source collection {source}; match() \
+                 and within_radius() return the source documents' text, ids and points, so \
+                 searching the index also needs read on {source}",
                 role.name, planned.name
             ),
             format!("Grant read on {source} to the role as well."),

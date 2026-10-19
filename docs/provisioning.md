@@ -110,11 +110,12 @@ A document collection also derives:
 - one geo index per `physical.geo` entry (`{path, name, precision: 6}`,
   precision 1..=12), built with `create_geo_index`.
 
-Known limit: in this build full-text and geo indexes are created empty and
-are not maintained on writes. Call `FullTextIndex::refresh_full` /
-`refresh_incremental` (and `GeoIndex::refresh_full` / `refresh_incremental`)
-after loading or changing documents, until index backfill and write
-maintenance land.
+Creating either index backfills the documents its source collection already
+holds, and document writes through collection handles, multi-model
+transactions and Control Plane document CRUD keep it current. Raw key writes
+that bypass those paths need `refresh_incremental` or `refresh_full`. A plan
+adopts a matching index that already exists as it is, so an index created
+empty by a build without backfill needs one `refresh_full()`.
 
 A typed row table with system versioning derives `<table>_history`
 (`enable_system_versioning` with `keep_history`). Versioning comes from
@@ -230,9 +231,12 @@ principals the spec does not name are left alone.
   writes and `admin` system administration (provisioning, RBAC and audit). So
   every `resource: database` grant is the Warning `SECURITY_BROAD_GRANT`,
   which names what it covers.
-- **Index grants.** Searching a full-text or geo index also needs `read` on
-  its source collection; a role that can read the index but not the source
-  gets the Warning `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
+- **Index grants.** `match()` and `within_radius()` return the source
+  documents' text, ids and points, so searching a full-text or geo index
+  through `query_as` also needs `read` on its source collection, and is
+  denied while that collection has row or masking policies. A role that can
+  read the index but not the source gets the Warning
+  `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
 - Duplicate roles, users, grant targets, permissions and role assignments are
   `SECURITY_DUPLICATE`.
 
@@ -347,9 +351,10 @@ metadata or strengthening, without RBAC steps on an existing database and
 without enabling system versioning on a table the plan adopts;
 `Confirmation::AutoApproveAdditive` accepts only such plans, and so do the
 CLI `--auto-approve` and `init --apply`. Creating
-a full-text or geo index on a collection that already holds documents is
-medium impact, and the step names the document count, which this build does
-not backfill into the new index (see the known limit above).
+a full-text or geo index on a collection that already holds documents names
+the document count in its step, which the index backfills before it is
+published: medium CPU and low disk and downtime impact (the apply holds the
+database while it runs), low risk, and no backup required.
 
 ### What a plan compares
 
