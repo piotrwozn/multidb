@@ -5769,4 +5769,81 @@ mod tests {
         }
         Ok(())
     }
+
+    /// `maintenance gc` opens a profile-manifest database like every other opener: a
+    /// `--profile` whose storage profile differs from the database is refused before anything
+    /// is pruned, `auto` and a product slug open it with the persisted manifest, and GC prunes
+    /// the zstd-framed MVCC history it decodes without breaking the framed values.
+    #[test]
+    fn maintenance_gc_opens_profile_manifest_databases_like_every_opener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::repl::{Op, ReadConsistency, Replication};
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("framed.redb");
+        let overrides = serde_json::from_value(
+            json!({ "compression": { "algorithm": "zstd", "min_bytes": 64 } }),
+        )?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with zstd must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(db_path.clone()))?;
+        assert!(binding.manifest.storage_format.value_framing);
+        let value = |version: u8| vec![version; 512];
+        let database = create_database_with_profile(&binding, OperationalConfig::default())?;
+        for version in 0..5_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: value(version),
+            })?;
+        }
+        drop(database);
+        let gc = |profile: &str, extra: &[&str]| {
+            let mut args = strings(&["maintenance", "gc", "--db"]);
+            args.push(path_arg(&db_path));
+            args.extend(strings(&["--profile", profile]));
+            args.extend(strings(extra));
+            run(args)
+        };
+
+        let refused = gc("balanced", &["--history-retain-lsns", "1"]);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::Config(ConfigError::ProfileMismatch {
+                    expected: Profile::Balanced,
+                    found: Profile::HighDurability,
+                }))
+            ),
+            "{refused:?}"
+        );
+        let pending = json_message(&gc("auto", &["--dry-run"])?)?;
+        assert_eq!(pending["history_horizon"], 0);
+        assert!(
+            pending["pending_commits"]
+                .as_u64()
+                .is_some_and(|pending| pending > 0)
+        );
+
+        let pruned = json_message(&gc("high_durability", &["--history-retain-lsns", "1"])?)?;
+        assert!(
+            pruned["mvcc_versions_pruned"]
+                .as_u64()
+                .is_some_and(|count| count >= 4),
+            "{pruned}"
+        );
+        assert_eq!(pruned["complete"], true);
+        assert_eq!(pruned["history_horizon"], pruned["current_lsn"]);
+
+        let reopened = open_database(DbConfig::on_disk(Profile::HighDurability, &db_path))?;
+        assert_eq!(reopened.performance_config(), &binding.performance);
+        assert_eq!(
+            reopened.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(value(4))
+        );
+        Ok(())
+    }
 }

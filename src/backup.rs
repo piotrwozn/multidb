@@ -1818,6 +1818,112 @@ mod tests {
         Ok(())
     }
 
+    /// History GC composes with profile manifests and backups. On a zstd-framed manifest
+    /// database GC prunes the framed MVCC versions and commit records it decodes, an
+    /// incremental backup whose parent predates the truncated commit log fails with
+    /// `CommitLogTruncated`, and a new full backup verifies and restores into a framed manifest
+    /// database that keeps the latest row and the history horizon.
+    #[tokio::test]
+    async fn history_gc_composes_with_profile_manifest_backups() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let binding = profile_binding(
+            "high_durability",
+            json!({ "compression": { "algorithm": "zstd", "min_bytes": 64 } }),
+            &db_path,
+        )?;
+        let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        let schema = TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("note", ColumnType::Str, false),
+            ],
+            0,
+        );
+        let notes = database.create_table("notes", Some(schema), Vec::new())?;
+        let note = |version: i64| {
+            vec![
+                Value::Int(1),
+                Value::Str(format!("{version}:{}", "n".repeat(256))),
+            ]
+        };
+        notes.insert(note(0))?;
+        let root = temp.path().join("backups");
+        let parent = full_backup(&database, &root, &BackupConfig::default())?;
+        for version in 1..=4 {
+            notes.update(note(version))?;
+        }
+
+        let report = database.gc_history(&txn::history::HistoryGcOptions {
+            mvcc_retain_lsns: Some(1),
+            commit_log_retain_lsns: Some(1),
+            ..txn::history::HistoryGcOptions::default()
+        })?;
+        assert!(report.complete, "{report:?}");
+        assert!(report.mvcc_versions_pruned >= 4, "{report:?}");
+        assert!(report.commit_log_records_pruned > 0, "{report:?}");
+        let horizon = report.history_horizon;
+        assert!(horizon > parent.manifest.end_lsn + 1, "{report:?}");
+        let truncated =
+            incremental_backup(&database, &root, &parent.path, &BackupConfig::default());
+        assert!(
+            matches!(
+                truncated,
+                Err(BackupError::CommitLogTruncated { parent_end_lsn, .. })
+                    if parent_end_lsn == parent.manifest.end_lsn
+            ),
+            "{truncated:?}"
+        );
+
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        drop(notes);
+        drop(database);
+        assert_eq!(
+            verify_backup(&full.path)?.restored_lsn,
+            full.manifest.end_lsn
+        );
+        let restore_path = temp.path().join("restored.redb");
+        restore_backup(
+            &full.path,
+            DbConfig::on_disk(Profile::HighDurability, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        let engine = RedbEngine::open(&restore_path)?;
+        let rows = engine
+            .begin_read()?
+            .range(REL_ROWS_TABLE, &[], &[])?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(engine);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|(_, value)| value.starts_with(b"MDBC1")));
+
+        let restored = open_database(DbConfig::on_disk(Profile::HighDurability, &restore_path))?;
+        assert_eq!(restored.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(restored.performance_config(), &binding.performance);
+        assert_eq!(restored.table("notes")?.get(&Value::Int(1))?, Some(note(4)));
+        let sql = "SELECT id, note FROM notes";
+        let below = restored
+            .query_as_of(sql, TemporalPoint::Lsn(horizon - 1))
+            .await;
+        assert!(
+            matches!(
+                below,
+                Err(DbError::Temporal(
+                    crate::temporal::TemporalError::RetentionExpired { .. }
+                ))
+            ),
+            "{below:?}"
+        );
+        let SqlOutput::Rows(at_horizon) = restored
+            .query_as_of(sql, TemporalPoint::Lsn(horizon))
+            .await?
+        else {
+            return Err("AS OF at the history horizon must return rows".into());
+        };
+        assert_eq!(at_horizon.rows, vec![note(4)]);
+        Ok(())
+    }
+
     #[test]
     fn restored_profile_manifest_chain_reopens_with_manifest_performance()
     -> Result<(), Box<dyn std::error::Error>> {

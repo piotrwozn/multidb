@@ -5163,6 +5163,170 @@ fn profile_manifest_framing_without_compression_writes_raw_frames()
     Ok(())
 }
 
+/// A profile-manifest database (the example custom profile: HighDurability, zstd and
+/// `floors.audit`) with a tenant quota runs every user write through the write pipeline. Table
+/// handles, transactions, SQL, `query_as` and before-trigger replacements store compressed
+/// frames and read back decoded, also through the changefeed; after-trigger failures and audit
+/// events are recorded framed; and the tenant quota charges the decoded bytes, also after a
+/// reopen in which the persisted manifest supplies the performance.
+#[tokio::test]
+async fn profile_manifest_database_runs_user_writes_through_the_write_pipeline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("orders.redb");
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let binding = compiled.binding(&spec.deployment, Some(path.clone()))?;
+    assert_eq!(binding.db_config.profile, Profile::HighDurability);
+    assert!(binding.manifest.storage_format.value_framing);
+    assert!(binding.manifest.knobs.floors.audit);
+    let tenant = || {
+        OperationalConfig::new().with_tenant(TenantConfig::new(
+            "tenant-a",
+            TenantQuota::storage_bytes(16_384),
+        ))
+    };
+    let name = "n".repeat(600);
+    let large = "x".repeat(32_768);
+
+    {
+        let mut database = create_database_with_profile(&binding, tenant())?;
+        assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+        database.create_table("accounts", Some(account_schema()), Vec::new())?;
+        database
+            .set_authz_policy(AuthzPolicy::new([Role::new("writer")
+                .grant(Resource::Table("accounts".to_owned()), Permission::Write)]));
+        register_accounts_trigger(
+            &database,
+            "reject_after_accounts_insert",
+            TriggerTiming::After,
+            TriggerEvent::Insert,
+            &trigger_response("reject", None),
+        )?;
+
+        database
+            .table("accounts")?
+            .insert(account_row(1, &name, 1))?;
+        database.transaction(|txn| txn.insert_row("accounts", account_row(2, &name, 2)))?;
+        database
+            .query(&format!(
+                "INSERT INTO accounts (id, name, age) VALUES (3, '{name}', 3)"
+            ))
+            .await?;
+        database
+            .query_as(
+                &Principal::new("writer").with_role("writer"),
+                &format!("INSERT INTO accounts (id, name, age) VALUES (4, '{name}', 4)"),
+            )
+            .await?;
+
+        match database.transaction(|txn| txn.insert_row("accounts", account_row(6, &large, 6))) {
+            Err(DbError::Repl(ReplError::QuotaExceeded { .. })) => {}
+            other => panic!("transactions must charge the tenant quota, got {other:?}"),
+        }
+        assert_rejected(
+            "SQL over the tenant quota",
+            database
+                .query(&format!(
+                    "INSERT INTO accounts (id, name, age) VALUES (7, '{large}', 7)"
+                ))
+                .await,
+            "quota exceeded for tenant",
+        );
+
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            &trigger_response("replace", Some(Value::Array(account_row(5, &name, 55)))),
+        )?;
+        database
+            .query("INSERT INTO accounts (id, name, age) VALUES (5, 'short', 5)")
+            .await?;
+
+        assert_eq!(database.table("accounts")?.scan()?.len(), 5);
+        let failures = database.post_commit_failures()?;
+        assert_eq!(failures.len(), 5, "{failures:?}");
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.stage == PostCommitStage::AfterTrigger)
+        );
+        assert!(
+            database.audit_events()?.iter().any(|event| {
+                event.action == "query" && event.outcome == AuditOutcome::Succeeded
+            })
+        );
+    }
+
+    for table in [
+        REL_ROWS_TABLE,
+        txn::TXN_MVCC_TABLE,
+        txn::COMMIT_LOG_TABLE,
+        crate::cdc::POST_COMMIT_FAILURES_TABLE,
+        AUDIT_TABLE,
+    ] {
+        let rows = raw_rows(&path, table)?;
+        assert!(!rows.is_empty(), "{table} is empty");
+        assert!(
+            rows.iter().all(|(_, value)| value.starts_with(b"MDBC1")),
+            "{table} holds an unframed value"
+        );
+    }
+    for table in [REL_ROWS_TABLE, txn::COMMIT_LOG_TABLE] {
+        assert!(
+            raw_rows(&path, table)?
+                .iter()
+                .all(|(_, value)| !contains_bytes(value, name.as_bytes())),
+            "{table} holds an uncompressed row"
+        );
+    }
+
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::HighDurability, &path), &tenant())?;
+    assert_eq!(reopened.performance_config(), &binding.performance);
+    assert!(reopened.audit_enabled());
+    assert_eq!(
+        reopened.table("accounts")?.get(&Value::Int(5))?,
+        Some(account_row(5, &name, 55))
+    );
+    let (events, _) = reopened.poll_changefeed(
+        &ResumeToken::default(),
+        &ChangefeedFilter {
+            target: ChangefeedTarget::Table("accounts".to_owned()),
+        },
+        &ChangefeedOptions::default(),
+        100,
+    )?;
+    let upserts = events
+        .iter()
+        .filter_map(|event| match &event.op {
+            ChangeOp::Upsert { value_after, .. } => Some(value_after),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 5);
+    assert!(
+        upserts
+            .iter()
+            .all(|value| contains_bytes(value, name.as_bytes()))
+    );
+    assert_eq!(reopened.post_commit_failures()?.len(), 5);
+    assert!(matches!(
+        reopened.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"large".to_vec(),
+            value: large.into_bytes(),
+        }),
+        Err(ReplError::QuotaExceeded { .. })
+    ));
+    Ok(())
+}
+
 #[test]
 fn legacy_framed_database_needs_ops_compression() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

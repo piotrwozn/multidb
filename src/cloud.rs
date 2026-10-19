@@ -1822,7 +1822,7 @@ mod tests {
             resume_database_guarded, tier_columnar_segments, verify_backup_uri,
         },
         config_spec::{
-            PolicyCompiler,
+            PolicyCompiler, ProfileKnobOverrides, resolve_named_profile,
             spec_io::{SpecFormat, decode_spec_bytes},
         },
         db::{
@@ -1834,7 +1834,7 @@ mod tests {
         model::Value,
         query::{ColumnDef, ColumnType, REL_COLUMNAR_SEGMENTS_TABLE, RelTable, TableSchema},
         repl::{ApClusterConfig, Op, ReadConsistency, ReplError, Replication, propose_system},
-        storage::Bytes,
+        storage::{Bytes, EngineKind, ReadTransaction, RedbEngine, StorageEngine},
         txn,
     };
 
@@ -2670,6 +2670,87 @@ mod tests {
         .ok_or("latest segment version is a delete")?;
         assert!(decode_tiered_segment_pointer(&latest)?.is_none());
         assert_eq!(latest, segment);
+        Ok(())
+    }
+
+    /// Tiering composes with profile manifests: on a zstd-framed analytical manifest database
+    /// the pointer is stored framed and reads resolve it, and a full backup inlines the segment,
+    /// so verify and restore succeed without the object store and the restored manifest
+    /// database stores the segment bytes framed again.
+    #[test]
+    fn tiered_segments_of_a_profile_manifest_database_back_up_and_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("framed.redb");
+        let overrides: ProfileKnobOverrides = serde_json::from_value(serde_json::json!({
+            "compression": { "algorithm": "zstd", "min_bytes": 64 }
+        }))?;
+        let resolution = resolve_named_profile("analytical", &overrides);
+        let resolved = resolution
+            .resolved()
+            .ok_or_else(|| format!("analytical did not resolve: {:?}", resolution.issues()))?;
+        let binding = resolved.bind(ReplicationKind::default(), Some(db_path.clone()))?;
+        assert_eq!(binding.db_config.profile, Profile::Analytical);
+        assert!(binding.manifest.storage_format.value_framing);
+        let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        let schema = TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("amount", ColumnType::Int, false),
+            ],
+            0,
+        );
+        let table = database.create_table("sales", Some(schema), Vec::new())?;
+        let rows = vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+        ];
+        for row in &rows {
+            table.insert(row.clone())?;
+        }
+
+        let objects = temp.path().join("objects");
+        let report = tier_columnar_segments(
+            &database,
+            &ObjectStoreConfig::local_dir(&objects),
+            &TieringPolicy::default(),
+        )?;
+        assert_eq!(report.uploaded_segments, 1);
+        let (key, _) = only_segment(&database)?;
+        current_pointer(&database, &key)?;
+        assert_eq!(table.scan()?, rows);
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        drop(table);
+        drop(database);
+        let raw_segment = |path: &Path| -> Result<Bytes, Box<dyn std::error::Error>> {
+            let engine = RedbEngine::open(path)?;
+            let value = engine
+                .begin_read()?
+                .get(REL_COLUMNAR_SEGMENTS_TABLE, &key)?
+                .ok_or("missing raw segment")?;
+            Ok(value)
+        };
+        assert!(raw_segment(&db_path)?.starts_with(b"MDBC1"));
+
+        std::fs::remove_dir_all(&objects)?;
+        verify_backup(&backup.path)?;
+        let restore_path = temp.path().join("framed-restore.redb");
+        restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Analytical, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        assert!(raw_segment(&restore_path)?.starts_with(b"MDBC1"));
+        let restored = open_database(DbConfig::on_disk(Profile::Analytical, &restore_path))?;
+        assert_eq!(restored.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(restored.performance_config(), &binding.performance);
+        assert_eq!(restored.table("sales")?.scan()?, rows);
+        let segment = segment_value(&restored, &key)?.ok_or("missing restored segment")?;
+        assert!(decode_tiered_segment_pointer(&segment)?.is_none());
         Ok(())
     }
 
