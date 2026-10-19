@@ -34,8 +34,8 @@ use crate::performance::{
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, REL_ROWS_TABLE, RelIndexSpec,
-    RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_ROWS_TABLE,
+    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -52,7 +52,7 @@ use crate::text::{FullTextIndexConfig, TextError};
 use crate::timeseries::{TimePoint, TimeSeriesConfig, TimeSeriesError};
 use crate::tuning::{
     ParameterEnvelope, ReprofilePlan, ReprofileStatus, TunableParameter, TuningDecision,
-    TuningPolicy, WorkloadSample,
+    TuningPolicy, WORKLOAD_TABLE, WorkloadEntry, WorkloadSample, WorkloadWindow,
 };
 use crate::txn;
 use crate::vector::{HnswParams, VectorCollectionConfig, VectorMetric};
@@ -292,6 +292,154 @@ async fn phase21_workload_system_view_requires_rbac_and_records_queries()
     };
     assert!(rows.columns.contains(&"fingerprint".to_owned()));
     assert!(!rows.rows.is_empty(), "expected a non-empty value");
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_read_only_selects_do_not_commit_workload_samples()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let mut database = create_database(DbConfig::on_disk(
+        Profile::Balanced,
+        temp_dir.path().join("workload.redb"),
+    ))?;
+    seed_orders(&mut database)?;
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let fingerprint = QueryFingerprint::new(sql).0;
+    let before = latest_lsn(&database)?;
+
+    for _ in 0..16 {
+        database.query(sql).await?;
+    }
+    let SqlOutput::Rows(view) = database.query("SELECT * FROM system.workload").await? else {
+        panic!("system workload should return rows");
+    };
+    assert!(view.rows.iter().any(|row| {
+        row.first() == Some(&Value::Str(fingerprint.clone())) && row.get(1) == Some(&Value::Int(16))
+    }));
+
+    assert_eq!(latest_lsn(&database)?, before);
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        None
+    );
+    assert_eq!(workload_executions(&database, &fingerprint)?, 16);
+
+    database.flush_workload_samples()?;
+    assert_eq!(latest_lsn(&database)?, before + 1);
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        Some(16)
+    );
+    assert_eq!(workload_executions(&database, &fingerprint)?, 16);
+
+    database.flush_workload_samples()?;
+    assert_eq!(latest_lsn(&database)?, before + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_query_as_selects_commit_only_audit_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut database)?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read)
+    ]));
+    let reader = Principal::new("alice").with_role("reader");
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let before = latest_lsn(&database)?;
+    let events_before = database.audit_events()?;
+
+    for _ in 0..16 {
+        database.query_as(&reader, sql).await?;
+    }
+
+    assert_eq!(latest_lsn(&database)? - before, 16);
+    let events = database.audit_events()?;
+    assert_eq!(events.len(), events_before.len() + 16);
+    let query_events = |events: &[crate::security::AuditEvent]| {
+        events
+            .iter()
+            .filter(|event| event.action == "query")
+            .count()
+    };
+    assert_eq!(query_events(&events), query_events(&events_before) + 16);
+    assert_eq!(
+        workload_executions(&database, &QueryFingerprint::new(sql).0)?,
+        16
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_workload_samples_survive_clean_drop_and_merge_with_persisted_counts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("workload.redb");
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let fingerprint = QueryFingerprint::new(sql).0;
+
+    let mut database = create_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    seed_orders(&mut database)?;
+    database.record_workload_sample(&WorkloadSample::new(sql))?;
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        Some(1)
+    );
+    for _ in 0..5 {
+        database.query(sql).await?;
+    }
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        Some(1)
+    );
+    assert_eq!(workload_executions(&database, &fingerprint)?, 6);
+    drop(database);
+
+    let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(
+        persisted_workload_executions(&reopened, &fingerprint)?,
+        Some(6)
+    );
+    assert_eq!(workload_executions(&reopened, &fingerprint)?, 6);
+    let lsn = latest_lsn(&reopened)?;
+    drop(reopened);
+
+    let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(latest_lsn(&reopened)?, lsn);
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_runtime_advice_flushes_buffered_workload_samples()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let fingerprint = QueryFingerprint::new(sql).0;
+
+    let mut runtime = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut runtime)?;
+    for _ in 0..8 {
+        runtime.query(sql).await?;
+    }
+    assert_eq!(persisted_workload_executions(&runtime, &fingerprint)?, None);
+    runtime.runtime_advice()?;
+    assert_eq!(
+        persisted_workload_executions(&runtime, &fingerprint)?,
+        Some(8)
+    );
+
+    let mut index = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut index)?;
+    for _ in 0..8 {
+        index.query(sql).await?;
+    }
+    assert_eq!(persisted_workload_executions(&index, &fingerprint)?, None);
+    index.index_advice()?;
+    assert_eq!(
+        persisted_workload_executions(&index, &fingerprint)?,
+        Some(8)
+    );
     Ok(())
 }
 
@@ -3705,6 +3853,36 @@ fn latest_lsn(database: &Database) -> Result<u64, Box<dyn std::error::Error>> {
         .max()
         .ok_or("missing commit log")?;
     Ok(lsn)
+}
+
+fn workload_executions(
+    database: &Database,
+    fingerprint: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let entry = database
+        .workload_report(WorkloadWindow::All)?
+        .entries
+        .into_iter()
+        .find(|entry| entry.fingerprint.0 == fingerprint)
+        .ok_or("missing workload entry")?;
+    Ok(entry.executions)
+}
+
+fn persisted_workload_executions(
+    database: &Database,
+    fingerprint: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let Some(bytes) = database.read(
+        WORKLOAD_TABLE,
+        fingerprint.as_bytes(),
+        ReadConsistency::Strong,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_json::from_slice::<WorkloadEntry>(&bytes)?.executions,
+    ))
 }
 
 fn seed_orders(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {
