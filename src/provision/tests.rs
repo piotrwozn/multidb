@@ -4716,6 +4716,61 @@ fn backup_and_restore_carry_the_record_and_the_manifest() -> TestResult {
     Ok(())
 }
 
+/// Restoring an incremental chain replays an apply made after the full backup: the restored
+/// database holds its record, history, objects and backfilled index entries, and plans as a
+/// noop.
+#[test]
+fn an_incremental_restore_replays_an_apply_after_the_full_backup() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let first = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("source.redb"), &first)?;
+    assert_applied(&apply_cli(&mut db, &first, &ProvisionOptions::default())?);
+    let early =
+        db.collection("orders")?
+            .insert(&shipped_order("c-1", "fragile glass", 13.4, 52.5))?;
+    let root = temp_dir.path().join("backups");
+    let full = full_backup(&db, &root, &BackupConfig::default())?;
+
+    // The second apply creates and backfills the indexes and builds the other objects.
+    let spec = full_spec()?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let late =
+        db.collection("orders")?
+            .insert(&shipped_order("c-2", "fragile vase", -70.0, -30.0))?;
+    let record = db.provision_state()?;
+    let history = db.provision_history()?;
+    assert_eq!(history.len(), 2);
+    let incremental =
+        crate::backup::incremental_backup(&db, &root, &full.path, &BackupConfig::default())?;
+    verify_backup(&incremental.path)?;
+    drop(db);
+
+    let restored_path = temp_dir.path().join("restored.redb");
+    restore_backup(
+        &incremental.path,
+        DbConfig::on_disk(Profile::Balanced, &restored_path),
+        RestoreTarget::Latest,
+    )?;
+    let restored = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &restored_path),
+        &OperationalConfig::new(),
+    )?;
+    assert_eq!(restored.provision_state()?, record);
+    assert_eq!(restored.provision_history()?, history);
+    assert_eq!(plan_open(&spec, &restored)?.outcome, PlanOutcome::Noop);
+    let mut hits = restored
+        .full_text_index("orders_notes_fts")?
+        .search("fragile", 10)?
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect::<Vec<_>>();
+    hits.sort();
+    let mut expected = vec![early, late];
+    expected.sort();
+    assert_eq!(hits, expected);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Starting from a spec
 // ---------------------------------------------------------------------------------------------
