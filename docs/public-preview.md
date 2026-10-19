@@ -139,6 +139,12 @@ Consistency status:
   chunks until their next write. Points more than `max_future_skew_millis`
   (default 5 minutes for new collections) ahead of the server clock, or older
   than the retention window, are rejected.
+- Workload-profiler statistics (`system.workload`, index advice and the Runtime
+  Advisor) are advisory. They are buffered in memory and flushed in batches;
+  the 10-second age trigger is checked on the next statement, not by a
+  background task. Samples buffered since the last flush are lost on crash or
+  when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
+  AP and sharded databases do not flush on drop.
 - History GC (`multidb maintenance gc`) is manual and offline; `multidb serve`
   does not run it online or in the background yet. Commit-log truncation
   requires a new full backup afterwards.
