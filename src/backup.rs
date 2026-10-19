@@ -15,7 +15,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
-    cloud::{CLOUD_HIBERNATION_TABLE, CLOUD_SEGMENTS_TABLE},
+    cloud::{
+        CLOUD_HIBERNATION_TABLE, CLOUD_SEGMENTS_TABLE, decode_tiered_segment_pointer,
+        resolve_tiered_segment_payload,
+    },
     db::{
         ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode, Profile, create_database,
     },
@@ -35,7 +38,7 @@ use crate::{
         Bytes, ConfiguredKeyProvider, KeyProvider, ReadTransaction, StorageEngine, StorageError,
         WriteTransaction,
     },
-    txn::{self, CommitLogRecord, TxnId},
+    txn::{self, CommitLogRecord, MvccRecord, TxnId},
     vector::VECTOR_TABLE,
 };
 
@@ -203,8 +206,13 @@ struct CommitLogPayload {
 
 /// Takes a consistent full logical backup into a new directory under `dest_root`.
 ///
+/// Tiered columnar segments are fetched from their object store and inlined, so
+/// restoring the backup does not need the object store for current data.
+///
 /// # Errors
-/// Fails when the database has no local storage, storage reads fail, or the backup files cannot be written.
+/// Fails when the database has no local storage, storage reads fail, a tiered
+/// segment object is missing, corrupt, or unreachable, or the backup files cannot
+/// be written.
 pub fn full_backup(
     database: &Database,
     dest_root: impl AsRef<Path>,
@@ -597,19 +605,62 @@ fn default_keyspaces() -> BTreeSet<String> {
     .collect()
 }
 
+/// Reads every keyspace into a full backup payload.
+///
+/// Full backups are self-contained for the current state of tiered columnar
+/// segments: each pointer is resolved (CRC-checked) and its bytes are inlined, and
+/// so are the matching `__txn_mvcc` versions that still hold that pointer. A
+/// missing or corrupt object fails the backup. Commit-log records, other
+/// historical versions, and incremental backups keep referencing the immutable,
+/// retained objects.
 fn read_full_payload(
     txn: &impl ReadTransaction,
     keyspaces: &BTreeSet<String>,
 ) -> Result<BackupDataPayload, BackupError> {
     let mut records = Vec::new();
+    // Segment key -> (encoded MVCC record holding the pointer, encoded MVCC record
+    // holding the resolved bytes).
+    let mut inlined = BTreeMap::<Bytes, (Bytes, Bytes)>::new();
     for table in keyspaces {
         for row in txn.range(table, &[], &[])? {
-            let (key, value) = row?;
+            let (key, mut value) = row?;
+            if table == REL_COLUMNAR_SEGMENTS_TABLE
+                && decode_tiered_segment_pointer(&value)?.is_some()
+            {
+                let resolved = resolve_tiered_segment_payload(&value)?;
+                inlined.insert(
+                    key.clone(),
+                    (
+                        txn::encode_mvcc_record(&MvccRecord { value: Some(value) })?,
+                        txn::encode_mvcc_record(&MvccRecord {
+                            value: Some(resolved.clone()),
+                        })?,
+                    ),
+                );
+                value = resolved;
+            }
             records.push(BackupDataRecord {
                 table: table.clone(),
                 key,
                 value,
             });
+        }
+    }
+    if !inlined.is_empty() {
+        let segment_prefix = txn::version_key(REL_COLUMNAR_SEGMENTS_TABLE, &[])?;
+        for record in &mut records {
+            if record.table != txn::TXN_MVCC_TABLE
+                || record.key.len() < segment_prefix.len() + 8
+                || !record.key.starts_with(&segment_prefix)
+            {
+                continue;
+            }
+            let segment_key = &record.key[segment_prefix.len()..record.key.len() - 8];
+            if let Some((pointer_record, resolved_record)) = inlined.get(segment_key)
+                && record.value == *pointer_record
+            {
+                record.value.clone_from(resolved_record);
+            }
         }
     }
     records.sort_by(|left, right| {
