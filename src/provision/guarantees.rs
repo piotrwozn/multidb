@@ -272,8 +272,8 @@ fn at_rest_status(inputs: &GuaranteeInputs<'_>, matrix: &mut Matrix) -> Enforcem
             let (status, detail) = if requested {
                 (
                     EnforcementStatus::NotEnforceable,
-                    "the database is not encrypted at rest, and provisioning cannot re-encrypt \
-                     an existing database",
+                    "the database is not encrypted at rest, and provisioning cannot encrypt an \
+                     existing database",
                 )
             } else {
                 (

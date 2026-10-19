@@ -446,7 +446,7 @@ the change (`set_authz_policy_as`, `set_principal_registry_as`,
 | --- | --- |
 | `write_ack`, `conflict_resolution: none`, `strict_cross_domain_transactions`, `local_snapshot` and `strong_cp` domains | `trivially_satisfied`: one replica, redb `Durability::Immediate`, one replication mode |
 | `backup.enabled`, `backup.pitr` | `operator_managed` with the `multidb backup`, `verify` and `restore` runbook and the Warning `GUARANTEE_OPERATOR_MANAGED`, when requested; there is no scheduler |
-| `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): there is no re-encryption. So is a `ProvisionEnvironment.encryption` for a new database whose spec says `at_rest: false`, refused before anything is created |
+| `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): provisioning cannot encrypt or decrypt an existing database (`Database::reencrypt_existing_values` only rewrites the values of an encrypted database under its current key). So is a `ProvisionEnvironment.encryption` for a new database whose spec says `at_rest: false`, refused before anything is created |
 | `sensitive_data` | follows `encryption.at_rest`; the development audit key warns but never blocks it |
 | `audit.enabled` | `enforced` with a configured audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one, which is always the case on the CLI and `serve`. A plan with steps against an existing database whose newest audit event does not verify under the handle's key (a chain written with a configured key, planned through a handle that falls back to the development key, or the reverse) is `PROVISION_AUDIT_KEY_MISMATCH` (blocks), since the events the apply appends would break `verify_audit_chain`; a noop is not blocked, since it writes nothing. The check reads the whole audit log |
 | `cache` TTL and eviction, `event_log` append-only | `not_enforced`, the Warning `ROLE_CONSTRAINT_NOT_ENFORCED` |
@@ -651,8 +651,10 @@ in-memory database (Rust API only).
 2. The database is created with `create_database_with_profile`: audit on,
    `ProvisionEnvironment.audit` as its audit key and anchor, and
    `ProvisionEnvironment.encryption` (a `LocalEnvelope` config, Rust API only)
-   as its encryption. `create_*_with_ops` is never used on an existing
-   database, since it would overwrite its security state.
+   as its encryption. The new file holds no tables yet, so its keyring is
+   created at the configured path, or opened when one already exists there
+   (with the configured KEK). `create_*_with_ops` is never used on an
+   existing database, since it would overwrite its security state.
 3. The plan is recomputed against the new database. Its steps must equal the
    confirmed ones minus `create_database` (kinds, paths, objects, safety
    classes and flags), otherwise the apply stops with `PlanChanged` and the
@@ -824,7 +826,10 @@ only `create` and `additive` build it. An existing database is opened with
 `ProvisionEnvironment.encryption` (a `LocalEnvelope` config); an encrypted
 one, whose metadata cannot be probed without the key, is opened with that
 config and the storage profile of the spec, and the open checks both against
-the decrypted metadata. `ProvisionEnvironment.audit` is applied to the handle
+the decrypted metadata. The open never creates a keyring for a file that
+already holds tables: when the keyring is missing (a path typo or an
+unmounted volume), every start mode fails and writes no keyring, since a new
+one could never decrypt the data. `ProvisionEnvironment.audit` is applied to the handle
 afterwards, because `open_database_with_ops` does not apply an audit config:
 the audit chain then stays on the caller's key across opens. An audit key file that cannot be read
 or parsed fails the open. A refusal is `ProvisionError::StartupRefused` with

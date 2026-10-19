@@ -348,7 +348,8 @@ All notable public changes will be recorded here.
 - `multidb::provision::provision_new_database`, which creates a database from
   a spec at an absent target with `create_database_with_profile` (audit on,
   the environment's audit key and, on the Rust API, a `LocalEnvelope`
-  encryption config), checks that the plan recomputed against it equals the
+  encryption config, whose keyring is created with the new file unless one
+  already exists at its path), checks that the plan recomputed against it equals the
   confirmed one and applies it under the confirmed plan id. An encryption
   config for a spec with `at_rest: false` is refused before anything is
   created (`PROVISION_ENCRYPTION_MISMATCH`).
@@ -413,6 +414,7 @@ All notable public changes will be recorded here.
   (with crash recovery), opens an existing database with
   `open_database_with_ops` (with `ProvisionEnvironment.encryption`, also for
   an encrypted database whose metadata cannot be probed without the key, and
+  never creating a keyring for it, so a missing keyring fails the start; and
   re-applying `ProvisionEnvironment.audit`, so the audit chain stays on the
   caller's key) and applies an auto-approvable plan
   as `local:embedded` or `local:serve` when the `StartupMode` allows it. The

@@ -3829,6 +3829,81 @@ fn rust_api_provisions_an_encrypted_database_with_a_local_envelope() -> TestResu
     Ok(())
 }
 
+/// A new encrypted database gets its keyring when it is created, but opening an existing one
+/// never mints a keyring: with the keyring gone, every start mode fails closed and leaves no
+/// keyring behind, and the database opens again once the keyring is back.
+#[test]
+fn an_existing_encrypted_database_never_gets_a_new_keyring() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("encrypted.redb");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [9_u8; 32])?;
+    let keyring = temp_dir.path().join("keyring.json");
+    let mut spec = orders_spec()?;
+    spec.guarantees.encryption.at_rest = true;
+    let environment = ProvisionEnvironment {
+        encryption: Some(EncryptionConfig::local_envelope(&keyring, &kek_path)),
+        ..env(ProvisionSurface::RustApi)
+    };
+    let (db, report) = provision_new_database(
+        &spec,
+        Some(&path),
+        &Confirmation::AutoApproveAdditive,
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_applied(&report);
+    drop(db);
+    assert!(
+        keyring.is_file(),
+        "creating the database creates its keyring"
+    );
+
+    let moved = temp_dir.path().join("keyring.moved");
+    std::fs::rename(&keyring, &moved)?;
+    for mode in [
+        StartupMode::Verify,
+        StartupMode::Create,
+        StartupMode::Additive,
+    ] {
+        let opened = open_from_spec(
+            &spec,
+            Some(&path),
+            mode,
+            &ProvisionOptions::default(),
+            &environment,
+        );
+        let Err(error) = opened else {
+            return Err(format!("{mode:?} opened a database without its keyring").into());
+        };
+        assert!(error.to_string().contains("keyring"), "{mode:?}: {error}");
+        assert!(!keyring.exists(), "{mode:?} minted a keyring");
+    }
+    assert!(matches!(
+        provision_new_database(
+            &spec,
+            Some(&path),
+            &Confirmation::AutoApproveAdditive,
+            &ProvisionOptions::default(),
+            &environment,
+        ),
+        Err(ProvisionError::Io(_))
+    ));
+    assert!(!keyring.exists(), "provision_new_database minted a keyring");
+
+    std::fs::rename(&moved, &keyring)?;
+    let (db, report) = open_from_spec(
+        &spec,
+        Some(&path),
+        StartupMode::Verify,
+        &ProvisionOptions::default(),
+        &environment,
+    )?;
+    assert_eq!(report.decision, StartupDecision::Start);
+    assert!(db.catalog().contains_key("orders"));
+    Ok(())
+}
+
 #[test]
 fn an_unencrypted_database_cannot_be_planned_as_encrypted_at_rest() -> TestResult {
     let temp_dir = tempfile::tempdir()?;
