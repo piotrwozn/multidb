@@ -1554,6 +1554,128 @@ async fn create_database_with_ops_encrypts_and_reopens() -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[tokio::test]
+async fn envelope_rotate_reencrypt_shred_keeps_database_readable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("envelope.redb");
+    let keyring_path = temp_dir.path().join("keyring.json");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [5_u8; 32])?;
+    let ops = || {
+        OperationalConfig::new()
+            .with_encryption(EncryptionConfig::local_envelope(&keyring_path, &kek_path))
+    };
+
+    {
+        let mut database =
+            create_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), ops())?;
+        seed_orders(&mut database)?;
+        assert_eq!(database.rotate_dek()?, 2);
+        database.table("users")?.insert(vec![
+            Value::Int(3),
+            Value::Str("Linus".to_owned()),
+            Value::Int(54),
+        ])?;
+
+        match database.destroy_dek(1) {
+            Err(DbError::Storage(StorageError::Backend(message))) => {
+                assert!(message.contains("still encrypted"), "{message}");
+            }
+            other => panic!("expected in-use key refusal, got {other:?}"),
+        }
+        match database.destroy_dek(2) {
+            Err(DbError::Storage(StorageError::Backend(message))) => {
+                assert!(message.contains("current"), "{message}");
+            }
+            other => panic!("expected current key refusal, got {other:?}"),
+        }
+
+        assert!(database.reencrypt_existing_values(4)?.reencrypted_values > 0);
+        assert_eq!(database.reencrypt_existing_values(4)?.reencrypted_values, 0);
+        database.destroy_dek(1)?;
+        assert_eq!(database.encryption_key_versions()?, vec![2]);
+    }
+
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), &ops())?;
+    let SqlOutput::Rows(rows) = reopened.query("SELECT name FROM users").await? else {
+        panic!("user query should return rows");
+    };
+    assert_eq!(rows.rows.len(), 3);
+
+    let (events, _) = reopened.poll_changefeed(
+        &ResumeToken::default(),
+        &ChangefeedFilter {
+            target: ChangefeedTarget::Table("users".to_owned()),
+        },
+        &ChangefeedOptions::default(),
+        100,
+    )?;
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event.op, ChangeOp::Upsert { .. }))
+            .count()
+            >= 3
+    );
+
+    crate::backup::full_backup(
+        &reopened,
+        temp_dir.path().join("backups"),
+        &crate::backup::BackupConfig::default(),
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn envelope_database_with_missing_keyring_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("envelope.redb");
+    let keyring_path = temp_dir.path().join("keyring.json");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [5_u8; 32])?;
+    let ops = || {
+        OperationalConfig::new()
+            .with_encryption(EncryptionConfig::local_envelope(&keyring_path, &kek_path))
+    };
+
+    {
+        let mut database =
+            create_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), ops())?;
+        seed_orders(&mut database)?;
+    }
+    let keyring = std::fs::read(&keyring_path)?;
+    std::fs::remove_file(&keyring_path)?;
+
+    match open_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), &ops()) {
+        Err(ConfigError::Storage(StorageError::Corruption(message))) => {
+            assert!(message.contains("keyring"), "{message}");
+        }
+        Err(error) => panic!("expected missing keyring corruption, got {error:?}"),
+        Ok(_) => panic!("database opened without its keyring"),
+    }
+    assert!(!keyring_path.exists());
+    match create_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), ops()) {
+        Err(ConfigError::Storage(StorageError::Corruption(message))) => {
+            assert!(message.contains("keyring"), "{message}");
+        }
+        Err(error) => panic!("expected missing keyring corruption, got {error:?}"),
+        Ok(_) => panic!("database was recreated without its keyring"),
+    }
+    assert!(!keyring_path.exists());
+
+    std::fs::write(&keyring_path, keyring)?;
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), &ops())?;
+    let SqlOutput::Rows(rows) = reopened.query("SELECT name FROM users").await? else {
+        panic!("user query should return rows");
+    };
+    assert_eq!(rows.rows.len(), 2);
+    Ok(())
+}
+
 #[test]
 fn engine_for_operational_uses_encrypted_dispatch() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
