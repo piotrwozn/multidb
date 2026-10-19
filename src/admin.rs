@@ -5638,6 +5638,138 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn full_text_and_geo_indexes_follow_document_crud_over_http()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+        let post = |path: &str, body: Value| {
+            authed_request(Method::POST, path, Some(&body))
+                .map(|request| app.clone().oneshot(request))
+        };
+
+        let response = post(
+            "/builder/collection",
+            serde_json::json!({
+                "name": "places",
+                "collection_id": 88,
+                "fields": [{ "name": "id", "source": "DocumentId", "ty": "Bytes" }],
+                "indexes": []
+            }),
+        )?
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // JSON integers become `Value::Int` coordinates.
+        let response = post(
+            "/data/collections/places/documents",
+            serde_json::json!({
+                "document": { "body": "rust database", "location": { "lon": 21, "lat": 52 } }
+            }),
+        )?
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let first = body["data"]["id"]
+            .as_str()
+            .ok_or("missing document id")?
+            .to_owned();
+
+        for (path, body) in [
+            (
+                "/builder/full-text",
+                serde_json::json!({ "name": "places_text", "collection_id": 88, "path": ["body"] }),
+            ),
+            (
+                "/builder/geo",
+                serde_json::json!({ "name": "places_geo", "collection_id": 88, "path": ["location"] }),
+            ),
+        ] {
+            let response = post(path, body)?.await?;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        // Creating the indexes backfilled the existing document.
+        assert_eq!(
+            sql_ids(&app, "SELECT * FROM match('places_text', 'rust', 10)").await?,
+            vec![first.clone()]
+        );
+        assert_eq!(
+            sql_ids(
+                &app,
+                "SELECT * FROM within_radius('places_geo', 21, 52, 1000)"
+            )
+            .await?,
+            vec![first.clone()]
+        );
+
+        let response = post(
+            "/data/collections/places/documents",
+            serde_json::json!({
+                "document": {
+                    "body": "rust tokio",
+                    "location": { "lon": -0.1276, "lat": 51.5072 }
+                }
+            }),
+        )?
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let second = body["data"]["id"]
+            .as_str()
+            .ok_or("missing document id")?
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::PUT,
+                &format!("/data/collections/places/documents/{first}"),
+                Some(&serde_json::json!({
+                    "document": { "body": "zig allocator", "location": { "lon": 2.35, "lat": 48.85 } }
+                })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/data/collections/places/documents/{second}"),
+                Some(&serde_json::json!({ "confirm": second })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for (sql, expected) in [
+            (
+                "SELECT * FROM match('places_text', 'zig', 10)",
+                vec![first.clone()],
+            ),
+            ("SELECT * FROM match('places_text', 'rust', 10)", Vec::new()),
+            (
+                "SELECT * FROM within_radius('places_geo', 2.35, 48.85, 1000)",
+                vec![first.clone()],
+            ),
+            (
+                "SELECT * FROM within_radius('places_geo', 21, 52, 1000)",
+                Vec::new(),
+            ),
+        ] {
+            assert_eq!(sql_ids(&app, sql).await?, expected, "{sql}");
+        }
+
+        let response = post(
+            "/builder/full-text",
+            serde_json::json!({ "name": "orphan_text", "collection_id": 4242, "path": ["body"] }),
+        )?
+        .await?;
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], serde_json::json!(false));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn time_series_http_rejects_invalid_retention_and_future_points()
     -> Result<(), Box<dyn std::error::Error>> {
         let app = super::router(test_state()?);
@@ -5886,6 +6018,31 @@ mod tests {
             .as_str()
             .ok_or("login token must be a string")?
             .to_owned())
+    }
+
+    /// Runs `/sql` and returns the first column of each row as a string.
+    async fn sql_ids(
+        app: &axum::Router,
+        sql: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/sql",
+                Some(&serde_json::json!({ "sql": sql })),
+            )?)
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("{sql} failed with {}", response.status()).into());
+        }
+        let body = json_body(response).await?;
+        Ok(body["data"]["output"]["rows"]
+            .as_array()
+            .ok_or("sql rows must be an array")?
+            .iter()
+            .map(|row| row[0].as_str().unwrap_or_default().to_owned())
+            .collect())
     }
 
     async fn json_body(
