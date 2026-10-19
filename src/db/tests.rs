@@ -41,8 +41,9 @@ use crate::performance::{
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_INDEX_TABLE,
-    REL_ROWS_TABLE, RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint,
+    REL_COLUMNAR_SEGMENT_META_TABLE, REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE,
+    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -3817,6 +3818,190 @@ fn analytical_transaction_rollback_does_not_write_columnar_segment()
     Ok(())
 }
 
+#[test]
+fn analytical_transaction_row_crud_keeps_rows_beyond_first_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-segments.redb"), 2_500)?;
+
+    let txn = database.begin_transaction()?;
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(1_500))?,
+        Some(sales_row(1_500))
+    );
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(2_400))?,
+        Some(sales_row(2_400))
+    );
+    txn.rollback();
+
+    database.transaction(|txn| txn.insert_row("sales", sales_row(2_500)))?;
+    assert_eq!(database.table("sales")?.scan()?.len(), 2_501);
+
+    let updated = vec![
+        Value::Int(1_500),
+        Value::Str("updated".to_owned()),
+        Value::Float(99.0),
+    ];
+    database.transaction(|txn| txn.update_row("sales", updated.clone()))?;
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(2_400)))?;
+    database.transaction_with_options(
+        txn::TxnOptions {
+            isolation: txn::IsolationLevel::Serializable,
+            ..txn::TxnOptions::default()
+        },
+        |txn| {
+            txn.get_row("sales", &Value::Int(2_499))?;
+            txn.update_row("sales", sales_row(2_499))
+        },
+    )?;
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_500);
+    assert_eq!(sales.get(&Value::Int(1_500))?, Some(updated));
+    assert_eq!(sales.get(&Value::Int(2_400))?, None);
+    for id in [1_100, 2_499, 2_500] {
+        assert_eq!(sales.get(&Value::Int(id))?, Some(sales_row(id)));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_rewrites_pending_columnar_segments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-pending.redb"), 2_048)?;
+
+    let mut txn = database.begin_transaction()?;
+    txn.insert_row("sales", sales_row(2_048))?;
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(2_048))?,
+        Some(sales_row(2_048))
+    );
+    assert!(txn.get_row("sales", &Value::Int(1_500))?.is_some());
+    txn.delete_row("sales", &Value::Int(0))?;
+    txn.delete_row("sales", &Value::Int(1))?;
+    txn.commit()?;
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_047);
+    assert_eq!(sales.get(&Value::Int(0))?, None);
+    assert_eq!(sales.get(&Value::Int(1))?, None);
+    for id in [2_047, 2_048] {
+        assert_eq!(sales.get(&Value::Int(id))?, Some(sales_row(id)));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_conflicts_with_concurrent_columnar_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-conflict.redb"), 2_500)?;
+
+    let mut txn = database.begin_transaction()?;
+    assert!(txn.get_row("sales", &Value::Int(2_100))?.is_some());
+    database.table("sales")?.insert(sales_row(5_000))?;
+    txn.update_row(
+        "sales",
+        vec![
+            Value::Int(2_100),
+            Value::Str("changed".to_owned()),
+            Value::Float(1.0),
+        ],
+    )?;
+    assert!(matches!(
+        txn.commit(),
+        Err(DbError::Storage(StorageError::Conflict))
+    ));
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_501);
+    assert!(sales.get(&Value::Int(5_000))?.is_some());
+    assert_eq!(sales.get(&Value::Int(2_100))?, Some(sales_row(2_100)));
+
+    Ok(())
+}
+
+#[test]
+fn analytical_read_committed_transaction_keeps_rows_beyond_first_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = analytical_sales_database(
+        temp_dir.path().join("analytical-read-committed.redb"),
+        2_500,
+    )?;
+    let read_committed = || {
+        database.begin_transaction_with_options(txn::TxnOptions {
+            isolation: txn::IsolationLevel::ReadCommitted,
+            ..txn::TxnOptions::default()
+        })
+    };
+
+    let mut txn = read_committed()?;
+    assert!(txn.get_row("sales", &Value::Int(2_200))?.is_some());
+    txn.insert_row("sales", sales_row(5_001))?;
+    txn.commit()?;
+    assert_eq!(database.table("sales")?.scan()?.len(), 2_501);
+
+    // Read committed sees a concurrent commit in every segment, but rewriting
+    // segments that changed after the transaction began still conflicts.
+    let mut txn = read_committed()?;
+    database.table("sales")?.insert(sales_row(5_000))?;
+    assert!(txn.get_row("sales", &Value::Int(5_000))?.is_some());
+    txn.insert_row("sales", sales_row(5_002))?;
+    assert!(matches!(
+        txn.commit(),
+        Err(DbError::Storage(StorageError::Conflict))
+    ));
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_502);
+    for id in [1_100, 2_200, 2_499, 5_000, 5_001] {
+        assert!(sales.get(&Value::Int(id))?.is_some(), "row {id} is missing");
+    }
+    assert_eq!(sales.get(&Value::Int(5_002))?, None);
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_deletes_committed_segments_it_no_longer_needs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-shrink.redb"), 1_025)?;
+    let (start, end) = database.table("sales")?.columnar_segment_bounds();
+    let stored_keys = |table: &str| -> Result<Vec<Vec<u8>>, ReplError> {
+        Ok(database
+            .range(table, &start, &end, ReadConsistency::Strong)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    };
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?.len(), 2);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?.len(), 2);
+
+    // 1,024 rows fit one segment, so the committed second segment must go.
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(7)))?;
+
+    let expected = (0..1_025)
+        .filter(|id| *id != 7)
+        .map(sales_row)
+        .collect::<Vec<_>>();
+    assert_eq!(database.table("sales")?.scan()?, expected);
+    let segments = stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?, segments);
+
+    Ok(())
+}
+
 async fn run_cross_model_join(mut database: Database) -> Result<(), Box<dyn std::error::Error>> {
     let orders = database.create_table("orders", Some(order_schema()), Vec::new())?;
     let users =
@@ -4776,6 +4961,24 @@ fn sales_schema() -> TableSchema {
         ],
         0,
     )
+}
+
+fn sales_row(id: i64) -> Row {
+    vec![
+        Value::Int(id),
+        Value::Str(format!("cat{}", id % 4)),
+        Value::Float(10.0),
+    ]
+}
+
+fn analytical_sales_database(
+    path: std::path::PathBuf,
+    rows: i64,
+) -> Result<Database, Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, path))?;
+    let sales = database.create_table("sales", Some(sales_schema()), Vec::new())?;
+    database.propose_batch(sales.columnar_replace_ops((0..rows).map(sales_row).collect())?)?;
+    Ok(database)
 }
 
 fn user_doc_fields() -> Vec<DocField> {

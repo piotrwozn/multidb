@@ -77,7 +77,6 @@ pub const REL_INDEX_TABLE: &str = "rel_indexes";
 pub const REL_SCHEMA_TABLE: &str = "__schema__";
 
 const EMPTY_INDEX_VALUE: &[u8] = b"";
-const COLUMNAR_SEGMENT_ID: u64 = 0;
 const COLUMNAR_SEGMENT_ROWS: usize = 1_024;
 /// How many times a write that lost a race re-reads and tries again before it
 /// reports a serialization conflict.
@@ -1244,8 +1243,8 @@ impl RelTable {
         Ok(primary_key_value(self.schema.as_ref(), row)?.clone())
     }
 
-    pub(crate) fn columnar_segment_key(&self) -> Bytes {
-        columnar_segment_key(&self.name, COLUMNAR_SEGMENT_ID)
+    pub(crate) fn columnar_segment_bounds(&self) -> (Bytes, Bytes) {
+        columnar_segment_range_bounds(&self.name)
     }
 
     pub(crate) fn decode_columnar_rows(
@@ -1261,6 +1260,10 @@ impl RelTable {
         parquet_bytes_to_rows(&bytes, schema)
     }
 
+    /// Builds ops that replace every stored row with `rows`, for seeding columnar
+    /// tables in tests. Writers read the segments first and use
+    /// `columnar_rewrite_ops` or `rewrite_columnar_rows`.
+    #[cfg(test)]
     pub(crate) fn columnar_replace_ops(&self, rows: Vec<Row>) -> Result<Vec<Op>, QueryError> {
         self.columnar_replace_ops_from_rows(rows)
     }
@@ -1551,7 +1554,7 @@ impl RelTable {
         self.columnar_rewrite_ops(&segments, rows)
     }
 
-    fn columnar_rewrite_ops(
+    pub(crate) fn columnar_rewrite_ops(
         &self,
         segments: &[(Bytes, Bytes)],
         rows: Vec<Row>,

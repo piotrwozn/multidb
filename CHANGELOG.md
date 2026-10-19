@@ -225,6 +225,13 @@ All notable public changes will be recorded here.
   (previously `ResourceLimit`; both map to SQLSTATE 53200), so exhaustive
   matches need an extra arm. `Database::set_query_governor` sets the
   governor's concurrency and queue timeout.
+- Transactional row writes (`MultiModelTxn::insert_row`, `update_row`,
+  `delete_row`, including Control Plane row CRUD) to columnar tables with more
+  than 1,024 rows no longer drop the rows stored beyond the first segment, and
+  `MultiModelTxn::get_row` now finds them. Transactions read and rewrite every
+  columnar segment of the table: from their snapshot under snapshot and
+  serializable isolation, and from current committed data under read
+  committed.
 
 ## 0.1.0-preview.1
 
