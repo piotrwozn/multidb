@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{Arc, Mutex},
+    thread,
 };
 
 use async_trait::async_trait;
@@ -77,8 +78,14 @@ pub const REL_INDEX_TABLE: &str = "rel_indexes";
 pub const REL_SCHEMA_TABLE: &str = "__schema__";
 
 const EMPTY_INDEX_VALUE: &[u8] = b"";
-const COLUMNAR_SEGMENT_ID: u64 = 0;
 const COLUMNAR_SEGMENT_ROWS: usize = 1_024;
+/// How many times a write that lost a race re-reads and tries again before it
+/// reports a serialization conflict.
+const WRITE_CONFLICT_RETRIES: usize = 64;
+/// How many times a pruned columnar scan reads segments and zone maps before it
+/// gives up on pruning because a commit landed between the reads every time.
+/// Any commit counts, so a higher value mostly re-reads every segment again.
+const SEGMENT_PRUNING_READ_ATTEMPTS: usize = 2;
 
 pub type Row = Vec<Value>;
 
@@ -228,6 +235,11 @@ pub enum QueryError {
 
     #[error("query resource limit: {0}")]
     ResourceLimit(String),
+
+    /// The query governor had no free statement slot within its queue timeout.
+    /// Nothing ran, so the statement can be retried.
+    #[error("query governor busy: {0}")]
+    Busy(String),
 
     #[error("query cancelled: {0}")]
     Cancelled(String),
@@ -587,10 +599,17 @@ impl RelTable {
     /// Inserts a new row.
     /// # Errors
     /// Fails if the row is invalid, the primary key exists, or storage fails.
+    /// A columnar table also fails with a conflict when other writers keep changing it.
     pub fn insert(&self, row: Row) -> Result<(), QueryError> {
         if self.layout == TableLayout::Columnar {
-            self.repl.propose_batch(self.insert_ops(row)?)?;
-            return Ok(());
+            let primary_key = self.primary_key_value_for_row(&row)?;
+            return self.rewrite_columnar_rows(|rows| {
+                if row_with_primary_key(self.schema.as_ref(), rows, &primary_key).is_some() {
+                    return Err(QueryError::DuplicatePrimaryKey);
+                }
+                rows.push(row.clone());
+                Ok(true)
+            });
         }
 
         let row_key = self.row_key(&row)?;
@@ -633,10 +652,19 @@ impl RelTable {
     /// Replaces a row or creates it if it does not exist.
     /// # Errors
     /// Fails when row validation, serialization, or storage fails.
+    /// A columnar table also fails with a conflict when other writers keep changing it.
     pub fn update(&self, row: Row) -> Result<(), QueryError> {
         if self.layout == TableLayout::Columnar {
-            self.repl.propose_batch(self.update_ops(row)?)?;
-            return Ok(());
+            let primary_key = self.primary_key_value_for_row(&row)?;
+            return self.rewrite_columnar_rows(|rows| {
+                if let Some(index) = row_with_primary_key(self.schema.as_ref(), rows, &primary_key)
+                {
+                    rows[index].clone_from(&row);
+                } else {
+                    rows.push(row.clone());
+                }
+                Ok(true)
+            });
         }
 
         let row_key = self.row_key(&row)?;
@@ -686,13 +714,14 @@ impl RelTable {
     /// Deletes a row by primary key.
     /// # Errors
     /// Fails when key encoding or storage fails.
+    /// A columnar table also fails with a conflict when other writers keep changing it.
     pub fn delete(&self, primary_key: &Value) -> Result<(), QueryError> {
         if self.layout == TableLayout::Columnar {
-            let ops = self.delete_ops(primary_key)?;
-            if !ops.is_empty() {
-                self.repl.propose_batch(ops)?;
-            }
-            return Ok(());
+            return self.rewrite_columnar_rows(|rows| {
+                let before = rows.len();
+                rows.retain(|row| !row_primary_key_eq(self.schema.as_ref(), row, primary_key));
+                Ok(rows.len() != before)
+            });
         }
 
         let row_key = make_row_key(&self.name, primary_key)?;
@@ -1215,8 +1244,8 @@ impl RelTable {
         Ok(primary_key_value(self.schema.as_ref(), row)?.clone())
     }
 
-    pub(crate) fn columnar_segment_key(&self) -> Bytes {
-        columnar_segment_key(&self.name, COLUMNAR_SEGMENT_ID)
+    pub(crate) fn columnar_segment_bounds(&self) -> (Bytes, Bytes) {
+        columnar_segment_range_bounds(&self.name)
     }
 
     pub(crate) fn decode_columnar_rows(
@@ -1232,6 +1261,10 @@ impl RelTable {
         parquet_bytes_to_rows(&bytes, schema)
     }
 
+    /// Builds ops that replace every stored row with `rows`, for seeding columnar
+    /// tables in tests. Writers read the segments first and use
+    /// `columnar_rewrite_ops` or `rewrite_columnar_rows`.
+    #[cfg(test)]
     pub(crate) fn columnar_replace_ops(&self, rows: Vec<Row>) -> Result<Vec<Op>, QueryError> {
         self.columnar_replace_ops_from_rows(rows)
     }
@@ -1280,18 +1313,114 @@ impl RelTable {
     }
 
     fn columnar_rows(&self) -> Result<Vec<Row>, QueryError> {
+        self.decode_columnar_segments(&self.columnar_segments()?)
+    }
+
+    fn columnar_segments(&self) -> Result<Vec<(Bytes, Bytes)>, QueryError> {
         let (start, end) = columnar_segment_range_bounds(&self.name);
-        let segments = self.repl.range(
+        Ok(self.repl.range(
             REL_COLUMNAR_SEGMENTS_TABLE,
             &start,
             &end,
             ReadConsistency::Strong,
-        )?;
+        )?)
+    }
+
+    fn decode_columnar_segments(
+        &self,
+        segments: &[(Bytes, Bytes)],
+    ) -> Result<Vec<Row>, QueryError> {
         let mut rows = Vec::new();
         for (_, bytes) in segments {
-            rows.extend(self.decode_columnar_rows(Some(&bytes))?);
+            rows.extend(self.decode_columnar_rows(Some(bytes))?);
         }
         Ok(rows)
+    }
+
+    /// Rewrites the columnar rows with `change`, applied to the rows currently stored.
+    ///
+    /// The rewrite commits only if no other writer changed the table's segments
+    /// after they were read; otherwise the rows are read again and `change` runs
+    /// again. `change` returns `false` to leave the table untouched.
+    fn rewrite_columnar_rows(
+        &self,
+        mut change: impl FnMut(&mut Vec<Row>) -> Result<bool, QueryError>,
+    ) -> Result<(), QueryError> {
+        for _ in 0..=WRITE_CONFLICT_RETRIES {
+            let segments = self.columnar_segments()?;
+            let mut rows = self.decode_columnar_segments(&segments)?;
+            if !change(&mut rows)? {
+                return Ok(());
+            }
+
+            let batch = self.columnar_rewrite_batch(&segments, rows)?;
+            match self.repl.propose_conditional_batch(batch) {
+                Ok(()) => return Ok(()),
+                Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
+                    thread::yield_now();
+                }
+                // Without conditional writes, write unconditionally as the row
+                // layout does. The rewrite is rebuilt here rather than copied on
+                // every attempt, since backends that support conditions never
+                // get here.
+                Err(ReplError::Unsupported(_)) => {
+                    let segments = self.columnar_segments()?;
+                    let mut rows = self.decode_columnar_segments(&segments)?;
+                    if change(&mut rows)? {
+                        self.repl
+                            .propose_batch(self.columnar_rewrite_ops(&segments, rows)?)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(QueryError::Repl(ReplError::Conflict))
+    }
+
+    /// Builds a rewrite that commits only while `segments` are still the table's segments.
+    fn columnar_rewrite_batch(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: Vec<Row>,
+    ) -> Result<ConditionalBatch, QueryError> {
+        let ops = self.columnar_rewrite_ops(segments, rows)?;
+        let mut conditions = segments
+            .iter()
+            .map(|(key, bytes)| {
+                let condition = WriteCondition::ValueEquals {
+                    table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                    key: key.clone(),
+                    expected: Some(bytes.clone()),
+                };
+                (key.clone(), condition)
+            })
+            .collect::<BTreeMap<_, _>>();
+        // Segment ids are dense, so a writer that grows the table creates the
+        // segment after the last one read.
+        let next_segment = segments
+            .iter()
+            .filter_map(|(key, _)| columnar_segment_id(&self.name, key))
+            .max()
+            .map_or(0, |id| id.saturating_add(1));
+        let written = ops.iter().filter_map(|op| match op {
+            Op::Put { table, key, .. } if table == REL_COLUMNAR_SEGMENTS_TABLE => Some(key.clone()),
+            _ => None,
+        });
+        for key in written.chain([columnar_segment_key(&self.name, next_segment)]) {
+            conditions
+                .entry(key.clone())
+                .or_insert(WriteCondition::KeyMissing {
+                    table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                    key,
+                });
+        }
+
+        Ok(ConditionalBatch::new(
+            conditions.into_values().collect(),
+            ops,
+        ))
     }
 
     fn columnar_record_batches(
@@ -1327,17 +1456,10 @@ impl RelTable {
         &self,
         filter: &RelPredicate,
     ) -> Result<SegmentSkipReport, QueryError> {
-        let (start, end) = columnar_segment_range_bounds(&self.name);
-        let segments = self.repl.range(
-            REL_COLUMNAR_SEGMENTS_TABLE,
-            &start,
-            &end,
-            ReadConsistency::Strong,
-        )?;
         let mut report = SegmentSkipReport::default();
-        for (key, bytes) in segments {
+        for (_, bytes, meta) in self.columnar_segments_with_meta()? {
             let bytes_len = usize_to_u64(bytes.len());
-            match self.read_columnar_segment_meta(&key)? {
+            match meta {
                 Some(meta) if !segment_may_match_filter(&meta, filter)? => {
                     report.skipped_segments = report.skipped_segments.saturating_add(1);
                     report.skipped_bytes = report.skipped_bytes.saturating_add(bytes_len);
@@ -1355,44 +1477,89 @@ impl RelTable {
         &self,
         filter: &RelPredicate,
     ) -> Result<Vec<(Bytes, Bytes)>, QueryError> {
-        let (start, end) = columnar_segment_range_bounds(&self.name);
-        let segments = self.repl.range(
-            REL_COLUMNAR_SEGMENTS_TABLE,
-            &start,
-            &end,
-            ReadConsistency::Strong,
-        )?;
-        segments
+        self.columnar_segments_with_meta()?
             .into_iter()
-            .filter_map(|(key, bytes)| match self.read_columnar_segment_meta(&key) {
-                Ok(Some(meta)) => match segment_may_match_filter(&meta, filter) {
+            .filter_map(|(key, bytes, meta)| match meta {
+                Some(meta) => match segment_may_match_filter(&meta, filter) {
                     Ok(true) => Some(Ok((key, bytes))),
                     Ok(false) => None,
                     Err(error) => Some(Err(error)),
                 },
-                Ok(None) => Some(Ok((key, bytes))),
-                Err(error) => Some(Err(error)),
+                None => Some(Ok((key, bytes))),
             })
             .collect()
     }
 
-    fn read_columnar_segment_meta(
+    /// Reads the table's segments together with the zone map of each one.
+    ///
+    /// Segments and zone maps come from separate storage reads, and every write
+    /// re-chunks the whole table, so a commit between the reads would pair a
+    /// segment with a zone map that describes other rows. The commit LSN is
+    /// global, so any commit voids an attempt, even one to another table or the
+    /// audit record written after each statement. The reads are repeated up to
+    /// `SEGMENT_PRUNING_READ_ATTEMPTS` times; if the LSN moves under every one,
+    /// the segments the last attempt read are returned without zone maps, so
+    /// nothing is pruned. Under steady commit traffic a filtered scan therefore
+    /// decodes every segment, in exchange for reading the segments at most that
+    /// many times and never pairing them with zone maps from another commit.
+    /// That guarantee relies on every commit to the segment tables moving the
+    /// commit LSN, which holds on single-node and CP backends (the ones
+    /// `multidb serve` uses). On AP and sharded backends the check cannot see
+    /// those commits and always passes.
+    fn columnar_segments_with_meta(
         &self,
-        segment_key: &[u8],
-    ) -> Result<Option<ColumnarSegmentMeta>, QueryError> {
-        self.repl
-            .read(
+    ) -> Result<Vec<(Bytes, Bytes, Option<ColumnarSegmentMeta>)>, QueryError> {
+        let (start, end) = columnar_segment_range_bounds(&self.name);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let before = cdc::current_lsn(self.repl.as_ref())?;
+            let segments = self.columnar_segments()?;
+            let metas = self.repl.range(
                 REL_COLUMNAR_SEGMENT_META_TABLE,
-                segment_key,
+                &start,
+                &end,
                 ReadConsistency::Strong,
-            )?
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| QueryError::Serde(error.to_string()))
-            })
-            .transpose()
+            )?;
+            if cdc::current_lsn(self.repl.as_ref())? != before {
+                if attempts < SEGMENT_PRUNING_READ_ATTEMPTS {
+                    continue;
+                }
+                // One range read of the segments is itself consistent; only its
+                // pairing with the zone maps is in doubt.
+                return Ok(segments
+                    .into_iter()
+                    .map(|(key, bytes)| (key, bytes, None))
+                    .collect());
+            }
+
+            let mut metas = metas.into_iter().collect::<BTreeMap<_, _>>();
+            return segments
+                .into_iter()
+                .map(|(key, bytes)| {
+                    let meta = metas
+                        .remove(&key)
+                        .map(|meta| {
+                            serde_json::from_slice(&meta)
+                                .map_err(|error| QueryError::Serde(error.to_string()))
+                        })
+                        .transpose()?;
+                    Ok((key, bytes, meta))
+                })
+                .collect();
+        }
     }
 
     fn columnar_replace_ops_from_rows(&self, rows: Vec<Row>) -> Result<Vec<Op>, QueryError> {
+        let segments = self.columnar_segments()?;
+        self.columnar_rewrite_ops(&segments, rows)
+    }
+
+    pub(crate) fn columnar_rewrite_ops(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: Vec<Row>,
+    ) -> Result<Vec<Op>, QueryError> {
         for row in &rows {
             validate_row(self.schema.as_ref(), row)?;
         }
@@ -1407,16 +1574,8 @@ impl RelTable {
             .map(|(_, row)| row)
             .collect::<Vec<_>>();
 
-        let (start, end) = columnar_segment_range_bounds(&self.name);
-        let mut ops = self
-            .repl
-            .range(
-                REL_COLUMNAR_SEGMENTS_TABLE,
-                &start,
-                &end,
-                ReadConsistency::Strong,
-            )?
-            .into_iter()
+        let mut ops = segments
+            .iter()
             .flat_map(|(key, _)| {
                 [
                     Op::Delete {
@@ -1425,7 +1584,7 @@ impl RelTable {
                     },
                     Op::Delete {
                         table: REL_COLUMNAR_SEGMENT_META_TABLE.to_owned(),
-                        key,
+                        key: key.clone(),
                     },
                 ]
             })
@@ -1900,7 +2059,7 @@ impl SqlEngine {
             .ok_or_else(|| QueryError::MissingTable(table_name.clone()))?;
 
         let rows = values_from_insert(insert, table)?;
-        let affected_rows = apply_insert_rows_atomic(table, rows, insert)?;
+        let affected_rows = apply_insert_rows_atomic(table, &rows, insert)?;
 
         if let Some(returning) = &insert.returning {
             let (columns, rows) = returning_rows(table.schema.as_ref(), returning, &affected_rows)?;
@@ -3197,6 +3356,11 @@ fn columnar_segment_key(table: &str, segment_id: u64) -> Bytes {
     key
 }
 
+fn columnar_segment_id(table: &str, key: &[u8]) -> Option<u64> {
+    let id = key.strip_prefix(table_prefix(table).as_slice())?;
+    Some(u64::from_be_bytes(id.try_into().ok()?))
+}
+
 fn make_row_key(table: &str, primary_key: &Value) -> Result<Bytes, QueryError> {
     let mut key = table_prefix(table);
     key.extend_from_slice(&encode_rel_key(primary_key)?);
@@ -3892,19 +4056,44 @@ fn values_from_insert(
         .collect()
 }
 
+/// Outcome of one optimistic attempt to apply an INSERT to a row-layout table.
+enum InsertAttempt {
+    Committed(Vec<Row>),
+    /// A row this attempt read or inserted changed before it committed.
+    Conflict,
+}
+
 fn apply_insert_rows_atomic(
     table: &RelTable,
-    rows: Vec<Row>,
+    rows: &[Row],
     insert: &sqlparser::ast::Insert,
 ) -> Result<Vec<Row>, QueryError> {
+    if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
+        validate_conflict_target(table.schema.as_ref(), conflict)?;
+    }
     if table.layout == TableLayout::Columnar {
         return apply_columnar_insert_rows_atomic(table, rows, insert);
     }
 
-    if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
-        validate_conflict_target(table.schema.as_ref(), conflict)?;
+    // A plain INSERT only loses a race to a row with the same primary key.
+    // ON CONFLICT reads the rows again and reapplies its action instead.
+    let retry_conflicts = matches!(insert.on, Some(OnInsert::OnConflict(_)));
+    for _ in 0..=WRITE_CONFLICT_RETRIES {
+        match try_apply_row_insert(table, rows, insert)? {
+            InsertAttempt::Committed(affected) => return Ok(affected),
+            InsertAttempt::Conflict if retry_conflicts => thread::yield_now(),
+            InsertAttempt::Conflict => return Err(QueryError::DuplicatePrimaryKey),
+        }
     }
 
+    Err(QueryError::Repl(ReplError::Conflict))
+}
+
+fn try_apply_row_insert(
+    table: &RelTable,
+    rows: &[Row],
+    insert: &sqlparser::ast::Insert,
+) -> Result<InsertAttempt, QueryError> {
     let mut initial = BTreeMap::<Bytes, Option<(Option<Bytes>, Row)>>::new();
     let mut staged = BTreeMap::<Bytes, Row>::new();
     let mut conditions = BTreeMap::<Bytes, WriteCondition>::new();
@@ -3912,7 +4101,7 @@ fn apply_insert_rows_atomic(
     let mut affected = Vec::new();
 
     for row in rows {
-        let primary_key = table.primary_key_value_for_row(&row)?;
+        let primary_key = table.primary_key_value_for_row(row)?;
         let row_key = table.row_key_for_primary_key(&primary_key)?;
         let existing_row = if let Some(staged_row) = staged.get(&row_key) {
             Some(staged_row.clone())
@@ -3938,7 +4127,7 @@ fn apply_insert_rows_atomic(
                 ensure_insert_condition(&mut conditions, &initial, &row_key);
                 ops.extend(table.put_ops_for_key(row.clone(), &row_key)?);
                 staged.insert(row_key, row.clone());
-                affected.push(row);
+                affected.push(row.clone());
             }
             Some(existing_row) => {
                 let Some(OnInsert::OnConflict(conflict)) = &insert.on else {
@@ -3955,7 +4144,7 @@ fn apply_insert_rows_atomic(
                         let updated = apply_update_assignments(
                             table.schema.as_ref(),
                             existing_row.clone(),
-                            &row,
+                            row,
                             &update.assignments,
                         )?;
                         ensure_insert_condition(&mut conditions, &initial, &row_key);
@@ -3970,10 +4159,12 @@ fn apply_insert_rows_atomic(
     }
 
     if !ops.is_empty() {
-        let batch = ConditionalBatch::new(conditions.into_values().collect(), ops.clone());
+        let batch = ConditionalBatch::new(conditions.into_values().collect(), ops);
         match table.repl.propose_conditional_batch(batch) {
             Ok(()) => {}
-            Err(ReplError::Conflict) => return Err(QueryError::DuplicatePrimaryKey),
+            Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
+                return Ok(InsertAttempt::Conflict);
+            }
             Err(ReplError::Unsupported(error)) => {
                 return Err(QueryError::Unsupported(format!(
                     "atomic INSERT requires conditional batch support: {error}"
@@ -3983,7 +4174,7 @@ fn apply_insert_rows_atomic(
         }
     }
 
-    Ok(affected)
+    Ok(InsertAttempt::Committed(affected))
 }
 
 fn ensure_insert_condition(
@@ -4014,53 +4205,46 @@ fn ensure_insert_condition(
 
 fn apply_columnar_insert_rows_atomic(
     table: &RelTable,
-    rows: Vec<Row>,
+    rows: &[Row],
     insert: &sqlparser::ast::Insert,
 ) -> Result<Vec<Row>, QueryError> {
-    if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
-        validate_conflict_target(table.schema.as_ref(), conflict)?;
-    }
-
-    let mut current = table.columnar_rows()?;
     let mut affected = Vec::new();
-    for row in rows {
-        let primary_key = table.primary_key_value_for_row(&row)?;
-        match row_with_primary_key(table.schema.as_ref(), &current, &primary_key) {
-            None => {
-                current.push(row.clone());
-                affected.push(row);
-            }
-            Some(index) => {
-                let Some(OnInsert::OnConflict(conflict)) = &insert.on else {
-                    return Err(QueryError::DuplicatePrimaryKey);
-                };
-                match &conflict.action {
-                    OnConflictAction::DoNothing => {}
-                    OnConflictAction::DoUpdate(update) => {
-                        if update.selection.is_some() {
-                            return Err(QueryError::Unsupported(
-                                "ON CONFLICT DO UPDATE WHERE is unsupported".to_owned(),
-                            ));
+    table.rewrite_columnar_rows(|current| {
+        affected.clear();
+        for row in rows {
+            let primary_key = table.primary_key_value_for_row(row)?;
+            match row_with_primary_key(table.schema.as_ref(), current, &primary_key) {
+                None => {
+                    current.push(row.clone());
+                    affected.push(row.clone());
+                }
+                Some(index) => {
+                    let Some(OnInsert::OnConflict(conflict)) = &insert.on else {
+                        return Err(QueryError::DuplicatePrimaryKey);
+                    };
+                    match &conflict.action {
+                        OnConflictAction::DoNothing => {}
+                        OnConflictAction::DoUpdate(update) => {
+                            if update.selection.is_some() {
+                                return Err(QueryError::Unsupported(
+                                    "ON CONFLICT DO UPDATE WHERE is unsupported".to_owned(),
+                                ));
+                            }
+                            let updated = apply_update_assignments(
+                                table.schema.as_ref(),
+                                current[index].clone(),
+                                row,
+                                &update.assignments,
+                            )?;
+                            current[index].clone_from(&updated);
+                            affected.push(updated);
                         }
-                        let updated = apply_update_assignments(
-                            table.schema.as_ref(),
-                            current[index].clone(),
-                            &row,
-                            &update.assignments,
-                        )?;
-                        current[index].clone_from(&updated);
-                        affected.push(updated);
                     }
                 }
             }
         }
-    }
-
-    if !affected.is_empty() {
-        table
-            .repl
-            .propose_batch(table.columnar_replace_ops(current)?)?;
-    }
+        Ok(!affected.is_empty())
+    })?;
 
     Ok(affected)
 }

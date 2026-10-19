@@ -231,7 +231,7 @@ pub fn sqlstate_for_query(error: &QueryError) -> &'static str {
     match error {
         QueryError::Parse(_) | QueryError::InputLimit(_) => "42601",
         QueryError::Timeout(_) | QueryError::Cancelled(_) => "57014",
-        QueryError::ResourceLimit(_) => "53200",
+        QueryError::ResourceLimit(_) | QueryError::Busy(_) => "53200",
         QueryError::Unsupported(_) => "0A000",
         QueryError::InvalidSchema(_) | QueryError::InvalidRow(_) | QueryError::InvalidValue(_) => {
             "22023"
@@ -652,6 +652,11 @@ mod tests {
         assert_eq!(
             sqlstate_for_query(&QueryError::MissingTable("users".to_owned())),
             "42P01"
+        );
+        // Governor saturation keeps the SQLSTATE it had as a resource limit.
+        assert_eq!(
+            sqlstate_for_query(&QueryError::Busy("queue".to_owned())),
+            "53200"
         );
     }
 

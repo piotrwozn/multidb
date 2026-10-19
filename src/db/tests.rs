@@ -51,8 +51,9 @@ use crate::performance::{
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_INDEX_TABLE,
-    REL_ROWS_TABLE, RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint,
+    REL_COLUMNAR_SEGMENT_META_TABLE, REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE,
+    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -3472,6 +3473,294 @@ fn transaction_with_retry_does_not_lose_concurrent_increments()
 }
 
 #[test]
+fn concurrent_vector_inserts_stay_in_the_in_memory_index() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_vector_collection(
+        "embeddings",
+        VectorCollectionConfig::new(CollectionId::new(93), 2).with_metric(VectorMetric::L2),
+    )?;
+
+    let database = Arc::new(database);
+    let mut handles = Vec::new();
+    for worker in 0..8_u16 {
+        let database = Arc::clone(&database);
+        handles.push(thread::spawn(move || {
+            let mut ids = Vec::new();
+            for index in 0..32_u16 {
+                // Reopening per insert exercises first-open and resize rebuilds.
+                let vectors = database
+                    .vector_collection("embeddings")
+                    .map_err(|error| error.to_string())?;
+                let id = vectors
+                    .insert_vector(
+                        &Value::Int(i64::from(index)),
+                        vec![f32::from(worker) + 1.0, f32::from(index) + 1.0],
+                    )
+                    .map_err(|error| error.to_string())?;
+                ids.push(id);
+            }
+            Ok::<_, String>(ids)
+        }));
+    }
+
+    let mut inserted = BTreeSet::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => inserted.extend(result.map_err(io::Error::other)?),
+            Err(_) => return Err(io::Error::other("vector insert thread panicked").into()),
+        }
+    }
+    assert_eq!(inserted.len(), 256);
+
+    let hits = database
+        .vector_collection("embeddings")?
+        .knn(&[0.0, 0.0], 256)?;
+    let found = hits.iter().map(|hit| hit.id).collect::<BTreeSet<_>>();
+    assert_eq!(hits.len(), 256);
+    assert_eq!(found, inserted);
+
+    Ok(())
+}
+
+/// Runs `sql` from several threads at once, each on its own runtime, as `PostgreSQL`
+/// wire does. Returns, per thread, the indexes of the statements that completed;
+/// statements that still conflict after every retry are skipped.
+fn run_concurrent_statements(
+    database: &Arc<Database>,
+    workers: i64,
+    statements: i64,
+    sql: impl Fn(i64, i64) -> String + Send + Sync + 'static,
+) -> Result<Vec<Vec<i64>>, Box<dyn std::error::Error>> {
+    let sql = Arc::new(sql);
+    let mut handles = Vec::new();
+    for worker in 0..workers {
+        let database = Arc::clone(database);
+        let sql = Arc::clone(&sql);
+        handles.push(thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let mut completed = Vec::new();
+            for index in 0..statements {
+                let statement = sql(worker, index);
+                match runtime.block_on(database.query(&statement)) {
+                    Ok(_) => completed.push(index),
+                    Err(error) if error.is_conflict() => {}
+                    Err(error) => return Err(format!("{statement}: {error}")),
+                }
+            }
+            Ok::<_, String>(completed)
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => results.push(result.map_err(io::Error::other)?),
+            Err(_) => return Err(io::Error::other("statement thread panicked").into()),
+        }
+    }
+    Ok(results)
+}
+
+#[test]
+fn concurrent_columnar_sql_inserts_keep_every_acknowledged_row()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("analytical-concurrent.redb");
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, path))?;
+    let sales = database.create_table("sales", Some(sales_schema()), Vec::new())?;
+    assert_eq!(sales.layout(), TableLayout::Columnar);
+
+    let database = Arc::new(database);
+    let results = run_concurrent_statements(&database, 4, 16, |worker, index| {
+        let id = worker * 100 + index;
+        format!("INSERT INTO sales VALUES ({id}, 'c{worker}', 1.5)")
+    })?;
+
+    let mut acknowledged = BTreeSet::new();
+    for (worker, completed) in (0_i64..).zip(&results) {
+        acknowledged.extend(completed.iter().map(|index| worker * 100 + index));
+    }
+    let stored = database
+        .table("sales")?
+        .scan()?
+        .into_iter()
+        .filter_map(|row| match row.first() {
+            Some(Value::Int(id)) => Some(*id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    // Every insert commits within its retries, and none is lost.
+    assert_eq!(acknowledged.len(), 64);
+    assert_eq!(stored, acknowledged);
+
+    Ok(())
+}
+
+#[test]
+fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let counters = database.create_table("counters", Some(counter_schema()), Vec::new())?;
+    counters.insert(vec![Value::Int(1), Value::Int(-1)])?;
+
+    let database = Arc::new(database);
+    let results = run_concurrent_statements(&database, 4, 16, |worker, index| {
+        if index % 2 == 0 {
+            format!(
+                "INSERT INTO counters (id, value) VALUES (1, {worker}) \
+                 ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value"
+            )
+        } else {
+            format!(
+                "INSERT INTO counters (id, value) VALUES ({}, {worker}) \
+                 ON CONFLICT (id) DO NOTHING",
+                100 + index
+            )
+        }
+    })?;
+
+    // DO NOTHING succeeds once it sees the row the winning statement inserted.
+    for completed in &results {
+        assert!((1..16).step_by(2).all(|index| completed.contains(&index)));
+    }
+    let rows = database.table("counters")?.scan()?;
+    assert_eq!(rows.len(), 9);
+    assert!(matches!(
+        rows.first().and_then(|row| row.get(1)),
+        Some(Value::Int(0..=3))
+    ));
+
+    // Plain INSERTs of one new key from several threads: all but one report the
+    // duplicate primary key. query::tests covers the lost-race path
+    // deterministically.
+    let results = run_concurrent_statements(&database, 4, 1, |worker, _| {
+        format!("INSERT INTO counters (id, value) VALUES (500, {worker})")
+    });
+    let message = match results {
+        Ok(_) => String::new(),
+        Err(error) => error.to_string(),
+    };
+    assert!(message.contains("duplicate primary key"), "{message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_governor_limits_are_settable_and_a_full_queue_is_busy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("counters", Some(counter_schema()), Vec::new())?;
+    let defaults = database.performance_config().query.clone();
+    assert!(matches!(
+        database.set_query_governor(0, 10),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        database.set_query_governor(1, 0),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert_eq!(database.performance_config().query, defaults);
+
+    database.set_query_governor(1, 10)?;
+    assert_eq!(
+        database.performance_config().query.max_concurrent_queries,
+        1
+    );
+    assert_eq!(database.performance_config().query.queue_timeout_ms, 10);
+
+    // Hold the only slot, as a running statement would.
+    let slot = Arc::clone(&database.query_permits).acquire_owned().await?;
+    let error = match database.query("SELECT id FROM counters").await {
+        Ok(output) => return Err(format!("expected a busy governor, got {output:?}").into()),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, DbError::Query(QueryError::Busy(_))),
+        "{error}"
+    );
+    assert!(!error.is_conflict());
+    assert_eq!(crate::compat::sqlstate_for_db_error(&error), "53200");
+
+    drop(slot);
+    database.query("SELECT id FROM counters").await?;
+    Ok(())
+}
+
+#[test]
+fn bootstrap_admin_check_agrees_with_ensure() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let reader = Role::new("reader").grant(Resource::Database, Permission::Read);
+    database.set_authz_policy(AuthzPolicy::new([reader.clone()]));
+    database.set_principal_registry(
+        PrincipalRegistry::new().with_principal("ada", Principal::new("ada").with_role("reader")),
+    );
+    assert!(!database.has_bootstrap_admin_principal());
+
+    database.ensure_bootstrap_admin_principal()?;
+    assert!(database.has_bootstrap_admin_principal());
+    // Other roles and principals are kept.
+    assert_eq!(database.authz_policy().roles().get("reader"), Some(&reader));
+    assert!(
+        database
+            .principal_registry()
+            .principals()
+            .contains_key("ada")
+    );
+
+    // A narrowed admin role or a changed admin principal is not the bootstrap
+    // definition, and ensure() restores it.
+    let narrowed = Role::new("admin").grant(Resource::System, Permission::Admin);
+    database.set_authz_policy(database.authz_policy().clone().allow(narrowed));
+    assert!(!database.has_bootstrap_admin_principal());
+    database.ensure_bootstrap_admin_principal()?;
+    assert!(database.has_bootstrap_admin_principal());
+
+    let mut principals = database.principal_registry().clone();
+    principals.insert("admin", Principal::new("admin").with_role("reader"));
+    database.set_principal_registry(principals);
+    assert!(!database.has_bootstrap_admin_principal());
+    database.ensure_bootstrap_admin_principal()?;
+    assert!(database.has_bootstrap_admin_principal());
+
+    let (role, principal) = super::bootstrap_admin_identity();
+    assert!(
+        database
+            .authz_policy()
+            .authorize(&principal, &Resource::System, Permission::Admin)
+            .is_ok()
+    );
+    assert_eq!(
+        principal.roles().iter().collect::<Vec<_>>(),
+        vec![role.name()]
+    );
+    Ok(())
+}
+
+#[test]
+fn bootstrap_admin_principal_is_recognized_after_reopen() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = DbConfig::on_disk(
+        Profile::Transactional,
+        temp_dir.path().join("bootstrap-admin.redb"),
+    );
+    {
+        let mut database = create_database(config.clone())?;
+        database.ensure_bootstrap_admin_principal()?;
+    }
+    // The stored definition reads back equal, so once stored security state is
+    // loaded, login and change-password keep to the read guard instead of
+    // rewriting it.
+    let database = open_database_with_ops(config, &OperationalConfig::default())?;
+    assert!(database.has_bootstrap_admin_principal());
+    Ok(())
+}
+
+#[test]
 fn redb_committed_transaction_survives_reopen_and_rollback_does_not()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -3536,6 +3825,190 @@ fn analytical_transaction_rollback_does_not_write_columnar_segment()
     txn.rollback();
 
     assert_eq!(database.table("sales")?.scan()?, Vec::<Row>::new());
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_row_crud_keeps_rows_beyond_first_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-segments.redb"), 2_500)?;
+
+    let txn = database.begin_transaction()?;
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(1_500))?,
+        Some(sales_row(1_500))
+    );
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(2_400))?,
+        Some(sales_row(2_400))
+    );
+    txn.rollback();
+
+    database.transaction(|txn| txn.insert_row("sales", sales_row(2_500)))?;
+    assert_eq!(database.table("sales")?.scan()?.len(), 2_501);
+
+    let updated = vec![
+        Value::Int(1_500),
+        Value::Str("updated".to_owned()),
+        Value::Float(99.0),
+    ];
+    database.transaction(|txn| txn.update_row("sales", updated.clone()))?;
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(2_400)))?;
+    database.transaction_with_options(
+        txn::TxnOptions {
+            isolation: txn::IsolationLevel::Serializable,
+            ..txn::TxnOptions::default()
+        },
+        |txn| {
+            txn.get_row("sales", &Value::Int(2_499))?;
+            txn.update_row("sales", sales_row(2_499))
+        },
+    )?;
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_500);
+    assert_eq!(sales.get(&Value::Int(1_500))?, Some(updated));
+    assert_eq!(sales.get(&Value::Int(2_400))?, None);
+    for id in [1_100, 2_499, 2_500] {
+        assert_eq!(sales.get(&Value::Int(id))?, Some(sales_row(id)));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_rewrites_pending_columnar_segments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-pending.redb"), 2_048)?;
+
+    let mut txn = database.begin_transaction()?;
+    txn.insert_row("sales", sales_row(2_048))?;
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(2_048))?,
+        Some(sales_row(2_048))
+    );
+    assert!(txn.get_row("sales", &Value::Int(1_500))?.is_some());
+    txn.delete_row("sales", &Value::Int(0))?;
+    txn.delete_row("sales", &Value::Int(1))?;
+    txn.commit()?;
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_047);
+    assert_eq!(sales.get(&Value::Int(0))?, None);
+    assert_eq!(sales.get(&Value::Int(1))?, None);
+    for id in [2_047, 2_048] {
+        assert_eq!(sales.get(&Value::Int(id))?, Some(sales_row(id)));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_conflicts_with_concurrent_columnar_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-conflict.redb"), 2_500)?;
+
+    let mut txn = database.begin_transaction()?;
+    assert!(txn.get_row("sales", &Value::Int(2_100))?.is_some());
+    database.table("sales")?.insert(sales_row(5_000))?;
+    txn.update_row(
+        "sales",
+        vec![
+            Value::Int(2_100),
+            Value::Str("changed".to_owned()),
+            Value::Float(1.0),
+        ],
+    )?;
+    assert!(matches!(
+        txn.commit(),
+        Err(DbError::Storage(StorageError::Conflict))
+    ));
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_501);
+    assert!(sales.get(&Value::Int(5_000))?.is_some());
+    assert_eq!(sales.get(&Value::Int(2_100))?, Some(sales_row(2_100)));
+
+    Ok(())
+}
+
+#[test]
+fn analytical_read_committed_transaction_keeps_rows_beyond_first_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = analytical_sales_database(
+        temp_dir.path().join("analytical-read-committed.redb"),
+        2_500,
+    )?;
+    let read_committed = || {
+        database.begin_transaction_with_options(txn::TxnOptions {
+            isolation: txn::IsolationLevel::ReadCommitted,
+            ..txn::TxnOptions::default()
+        })
+    };
+
+    let mut txn = read_committed()?;
+    assert!(txn.get_row("sales", &Value::Int(2_200))?.is_some());
+    txn.insert_row("sales", sales_row(5_001))?;
+    txn.commit()?;
+    assert_eq!(database.table("sales")?.scan()?.len(), 2_501);
+
+    // Read committed sees a concurrent commit in every segment, but rewriting
+    // segments that changed after the transaction began still conflicts.
+    let mut txn = read_committed()?;
+    database.table("sales")?.insert(sales_row(5_000))?;
+    assert!(txn.get_row("sales", &Value::Int(5_000))?.is_some());
+    txn.insert_row("sales", sales_row(5_002))?;
+    assert!(matches!(
+        txn.commit(),
+        Err(DbError::Storage(StorageError::Conflict))
+    ));
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_502);
+    for id in [1_100, 2_200, 2_499, 5_000, 5_001] {
+        assert!(sales.get(&Value::Int(id))?.is_some(), "row {id} is missing");
+    }
+    assert_eq!(sales.get(&Value::Int(5_002))?, None);
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_deletes_committed_segments_it_no_longer_needs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-shrink.redb"), 1_025)?;
+    let (start, end) = database.table("sales")?.columnar_segment_bounds();
+    let stored_keys = |table: &str| -> Result<Vec<Vec<u8>>, ReplError> {
+        Ok(database
+            .range(table, &start, &end, ReadConsistency::Strong)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    };
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?.len(), 2);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?.len(), 2);
+
+    // 1,024 rows fit one segment, so the committed second segment must go.
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(7)))?;
+
+    let expected = (0..1_025)
+        .filter(|id| *id != 7)
+        .map(sales_row)
+        .collect::<Vec<_>>();
+    assert_eq!(database.table("sales")?.scan()?, expected);
+    let segments = stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?, segments);
 
     Ok(())
 }
@@ -4619,6 +5092,24 @@ fn sales_schema() -> TableSchema {
         ],
         0,
     )
+}
+
+fn sales_row(id: i64) -> Row {
+    vec![
+        Value::Int(id),
+        Value::Str(format!("cat{}", id % 4)),
+        Value::Float(10.0),
+    ]
+}
+
+fn analytical_sales_database(
+    path: std::path::PathBuf,
+    rows: i64,
+) -> Result<Database, Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, path))?;
+    let sales = database.create_table("sales", Some(sales_schema()), Vec::new())?;
+    database.propose_batch(sales.columnar_replace_ops((0..rows).map(sales_row).collect())?)?;
+    Ok(database)
 }
 
 fn user_doc_fields() -> Vec<DocField> {

@@ -1131,6 +1131,37 @@ impl Database {
         &self.performance
     }
 
+    /// Sets the query governor: at most `max_concurrent_queries` statements run
+    /// at once, and a statement that finds no free slot waits up to
+    /// `queue_timeout_ms` before it fails with [`QueryError::Busy`]
+    /// (SQLSTATE 53200).
+    ///
+    /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// # Errors
+    /// Fails when either limit is zero or `max_concurrent_queries` is more than
+    /// the governor can count.
+    pub fn set_query_governor(
+        &mut self,
+        max_concurrent_queries: usize,
+        queue_timeout_ms: u64,
+    ) -> Result<(), ConfigError> {
+        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Unsupported(format!(
+                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if queue_timeout_ms == 0 {
+            return Err(ConfigError::Unsupported(
+                "query governor queue timeout must be at least 1 ms".to_owned(),
+            ));
+        }
+        self.performance.query.max_concurrent_queries = max_concurrent_queries;
+        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        self.query_permits = query_permits_for(&self.performance);
+        Ok(())
+    }
+
     #[must_use]
     pub const fn encryption_config(&self) -> Option<&EncryptionConfig> {
         self.encryption.as_ref()
@@ -1331,6 +1362,40 @@ impl Database {
         self.principals = registry;
     }
 
+    /// Reports whether `ensure_bootstrap_admin_principal` would leave the
+    /// security state unchanged, so that callers can skip it and the exclusive
+    /// access it needs.
+    #[must_use]
+    pub(crate) fn has_bootstrap_admin_principal(&self) -> bool {
+        let (role, principal) = self.bootstrap_admin_updates();
+        role.is_none() && principal.is_none()
+    }
+
+    /// The bootstrap admin role and principal merged into the loaded security
+    /// state, keeping grants and roles they already hold. Each is `None` when
+    /// the merge would not change it.
+    fn bootstrap_admin_updates(&self) -> (Option<Role>, Option<Principal>) {
+        let (bootstrap_role, bootstrap_principal) = bootstrap_admin_identity();
+        let current_role = self.authz.roles().get(bootstrap_role.name());
+        let mut role = current_role
+            .cloned()
+            .unwrap_or_else(|| Role::new(bootstrap_role.name()));
+        for (resource, permissions) in bootstrap_role.grants() {
+            for permission in permissions {
+                role = role.grant(resource.clone(), *permission);
+            }
+        }
+        let current_principal = self.principals.principals().get(bootstrap_principal.name());
+        let principal = current_principal
+            .cloned()
+            .unwrap_or_else(|| Principal::new(bootstrap_principal.name()))
+            .with_role(bootstrap_role.name());
+        (
+            (current_role != Some(&role)).then_some(role),
+            (current_principal != Some(&principal)).then_some(principal),
+        )
+    }
+
     /// Ensures the bootstrap admin identity can use password-backed sessions.
     ///
     /// Merges the bootstrap admin role and principal into the loaded security
@@ -1339,30 +1404,16 @@ impl Database {
     /// # Errors
     /// Fails when the updated security metadata cannot be persisted.
     pub fn ensure_bootstrap_admin_principal(&mut self) -> Result<(), DbError> {
-        let current_role = self.authz.roles().get("admin");
-        let admin_role = current_role
-            .cloned()
-            .unwrap_or_else(|| Role::new("admin"))
-            .grant(Resource::System, Permission::Admin)
-            .grant(Resource::Database, Permission::Read)
-            .grant(Resource::Database, Permission::Write)
-            .grant(Resource::Database, Permission::Admin);
-        let role_changed = current_role != Some(&admin_role);
-        let current_principal = self.principals.principals().get("admin");
-        let admin_principal = current_principal
-            .cloned()
-            .unwrap_or_else(|| Principal::new("admin"))
-            .with_role("admin");
-        let principal_changed = current_principal != Some(&admin_principal);
-        if !role_changed && !principal_changed {
+        let (role, principal) = self.bootstrap_admin_updates();
+        if role.is_none() && principal.is_none() {
             return Ok(());
         }
-
-        if role_changed {
-            self.authz = self.authz.clone().allow(admin_role);
+        if let Some(role) = role {
+            self.authz = self.authz.clone().allow(role);
         }
-        if principal_changed {
-            self.principals.insert("admin", admin_principal);
+        if let Some(principal) = principal {
+            self.principals
+                .insert(principal.name().to_owned(), principal);
         }
         self.persist_security_state()
     }
@@ -4179,7 +4230,7 @@ impl Database {
         )
         .await
         .map_err(|_| {
-            QueryError::ResourceLimit(format!(
+            QueryError::Busy(format!(
                 "query queue exceeded {} ms",
                 self.performance.query.queue_timeout_ms
             ))
@@ -4857,11 +4908,14 @@ impl MultiModelTxn<'_> {
     pub fn get_row(&self, table: &str, primary_key: &Value) -> Result<Option<Row>, DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            return Ok(self.columnar_rows(&table)?.into_iter().find(|row| {
-                table
-                    .primary_key_value_for_row(row)
-                    .is_ok_and(|key| key == *primary_key)
-            }));
+            let segments = self.columnar_segments(&table)?;
+            return Ok(Self::columnar_rows(&table, &segments)?
+                .into_iter()
+                .find(|row| {
+                    table
+                        .primary_key_value_for_row(row)
+                        .is_ok_and(|key| key == *primary_key)
+                }));
         }
 
         let row_key = table.row_key_for_primary_key(primary_key)?;
@@ -4875,7 +4929,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if rows.iter().any(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4885,7 +4940,7 @@ impl MultiModelTxn<'_> {
             }
 
             rows.push(row);
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4905,7 +4960,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if let Some(index) = rows.iter().position(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4916,7 +4972,7 @@ impl MultiModelTxn<'_> {
                 rows.push(row);
             }
 
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4936,7 +4992,8 @@ impl MultiModelTxn<'_> {
     pub fn delete_row(&mut self, table: &str, primary_key: &Value) -> Result<(), DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             let before = rows.len();
             rows.retain(|row| {
                 !table
@@ -4945,7 +5002,7 @@ impl MultiModelTxn<'_> {
             });
 
             if rows.len() != before {
-                self.queue_ops(table.columnar_replace_ops(rows)?);
+                self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             }
 
             return Ok(());
@@ -5085,10 +5142,17 @@ impl MultiModelTxn<'_> {
         Ok(decode_row_bytes(&bytes)?)
     }
 
-    fn columnar_rows(&self, table: &RelTable) -> Result<Vec<Row>, DbError> {
-        let key = table.columnar_segment_key();
-        let bytes = self.read_raw(REL_COLUMNAR_SEGMENTS_TABLE, &key)?;
-        Ok(table.decode_columnar_rows(bytes.as_deref())?)
+    fn columnar_segments(&self, table: &RelTable) -> Result<Vec<(Bytes, Bytes)>, DbError> {
+        let (start, end) = table.columnar_segment_bounds();
+        self.range_raw(REL_COLUMNAR_SEGMENTS_TABLE, &start, &end)
+    }
+
+    fn columnar_rows(table: &RelTable, segments: &[(Bytes, Bytes)]) -> Result<Vec<Row>, DbError> {
+        let mut rows = Vec::new();
+        for (_, bytes) in segments {
+            rows.extend(table.decode_columnar_rows(Some(bytes))?);
+        }
+        Ok(rows)
     }
 
     fn queue_ops(&mut self, ops: Vec<Op>) {
@@ -6695,6 +6759,23 @@ fn query_permits_for(performance: &PerformanceConfig) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(
         performance.query.max_concurrent_queries.max(1),
     ))
+}
+
+/// The bootstrap `admin` role and the `admin` principal that holds it.
+///
+/// Password-backed Control Plane sessions and the insecure local admin act as
+/// this principal. `Database::ensure_bootstrap_admin_principal` merges this
+/// definition into the stored `admin` role and principal, and
+/// `Database::has_bootstrap_admin_principal` reports whether that merge would
+/// change anything, so a grant change here applies to both.
+pub(crate) fn bootstrap_admin_identity() -> (Role, Principal) {
+    let role = Role::new("admin")
+        .grant(Resource::System, Permission::Admin)
+        .grant(Resource::Database, Permission::Read)
+        .grant(Resource::Database, Permission::Write)
+        .grant(Resource::Database, Permission::Admin);
+    let principal = Principal::new("admin").with_role(role.name());
+    (role, principal)
 }
 
 #[cfg(test)]
