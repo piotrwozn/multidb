@@ -9,13 +9,36 @@ Implemented in this phase:
   deterministic `file://` implementation used by tests and local deployments;
   non-local providers are opened through the same config path and can be added
   behind features without changing model code.
-- Tiered storage for immutable columnar segments. A local Parquet segment can be
+- Tiered storage for columnar segments. A local Parquet segment can be
   uploaded to an object-store URI and replaced by a checked pointer. Reads are
   transparent and verify CRC32 before handing bytes to the Parquet reader.
+- Tiered objects are content-addressed at
+  `segments/rel_columnar_segments/<segment-key-hex>/<blake3>.parquet` and are
+  never rewritten with different bytes; re-tiering identical bytes reuses the
+  existing object. Pointers written by earlier builds to the legacy
+  `segments/rel_columnar_segments/<segment-key-hex>.parquet` layout stay
+  readable because every pointer stores its own path.
+- The pointer is installed with a conditional write that requires the segment to
+  still hold exactly the uploaded bytes. Segments rewritten or deleted by
+  concurrent DML while they are being tiered are left as they are and counted in
+  `TieringReport::conflicted_segments`; the next tiering run picks up the new
+  content.
+- Tiering requires conditional writes (single-node, `strong_cp`, and sharded
+  databases with CP or local shards). `eventual_ap` databases are rejected with
+  `CloudError::Unsupported` before any upload.
 - Tiering state is persisted in `__cloud_segments` with `Local`, `Uploading`,
   `Remote`, `DeletePending`, and `Failed` states. Interrupted uploads are
-  recovered idempotently: valid remote objects are finalized, missing objects
-  fall back to local retry, and corrupt objects are marked failed.
+  recovered idempotently: a valid remote object is finalized only when the
+  segment still holds the uploaded bytes (or already holds the same pointer);
+  otherwise, and when the object is missing or corrupt, the metadata is
+  reconciled with the current segment value (local, remote, or failed when the
+  segment no longer exists).
+- Full backups (and therefore hibernation and `multidb backup`) fetch,
+  CRC-check, and inline tiered segment bytes, together with the matching current
+  `__txn_mvcc` versions. They need the object store to be reachable and fail
+  closed when an object is missing or corrupt. Restoring a full backup then needs
+  no object store for current data; restored segments are local until the next
+  tiering run.
 - Object-store backup wrappers for full backup, incremental backup, verify, and
   restore. `gc_backup_uri` removes unretained backup objects while preserving
   parent chains required by retained incrementals.
@@ -35,8 +58,13 @@ Operational notes:
 
 - Use encrypted storage before tiering when object-store bytes must be treated as
   untrusted.
-- Keep `__cloud_segments` as the source of truth for segment placement.
-  Object-store listing is used for backup GC, not for deciding whether a segment
-  is remote.
+- The segment value (pointer or local bytes) is authoritative for reads.
+  `__cloud_segments` records tiering progress and can be stale after DML or
+  restore until the next tiering run reconciles it. Object-store listing is used
+  for backup GC, not for deciding whether a segment is remote.
+- multidb never deletes tiered segment objects. Objects are immutable, so
+  retaining them is safe, but storage grows with every re-tiering. External
+  lifecycle rules must not delete objects that are still referenced by live
+  pointers, MVCC history, commit-log records, or retained incremental backups.
 - Monitor `multidb_cloud_object_operations_total` and
   `multidb_cloud_tier_read_total` to track request and byte cost.
