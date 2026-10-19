@@ -4443,11 +4443,6 @@ struct TxnSavepoint {
     read_ranges: Vec<TxnReadRange>,
 }
 
-enum SnapshotLookup {
-    Missing,
-    Found(Option<Bytes>),
-}
-
 impl MultiModelTxn<'_> {
     #[must_use]
     pub const fn snapshot_id(&self) -> TxnId {
@@ -4583,32 +4578,8 @@ impl MultiModelTxn<'_> {
     }
 
     fn read_snapshot_raw(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
-        if let SnapshotLookup::Found(value) = self.read_mvcc_snapshot_raw(table, key)? {
-            return Ok(value);
-        }
+        // `self.read` is the point-in-time storage snapshot that defined `snapshot_id`.
         Ok(self.read.get(table, key)?)
-    }
-
-    fn read_mvcc_snapshot_raw(&self, table: &str, key: &[u8]) -> Result<SnapshotLookup, DbError> {
-        let prefix = txn::version_key(table, key)?;
-        let end = keyenc::range_end(&prefix);
-        let mut selected = None;
-        let rows = self
-            .read
-            .range(txn::TXN_MVCC_TABLE, &prefix, &end)?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (version_key, value) in rows {
-            if version_key.len() != prefix.len() + 8 || !version_key.starts_with(&prefix) {
-                continue;
-            }
-            let version = txn::decode_txn_id(&version_key[prefix.len()..])?;
-            if version <= self.snapshot_id {
-                selected = Some((version, txn::decode_mvcc_record(&value)?.value));
-            }
-        }
-        Ok(selected.map_or(SnapshotLookup::Missing, |(_, value)| {
-            SnapshotLookup::Found(value)
-        }))
     }
 
     fn record_read_key(&self, table: &str, key: &[u8]) {
