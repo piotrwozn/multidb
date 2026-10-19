@@ -16,6 +16,13 @@ pub const FULL_TEXT_DOCS_TABLE: &str = "full_text_docs";
 pub const FULL_TEXT_META_TABLE: &str = "__full_text_meta";
 
 const EMPTY: &[u8] = b"";
+/// Source documents read per page, and indexed documents buffered per batch, while
+/// rebuilding an index.
+const REFRESH_PAGE_ROWS: usize = 256;
+/// Index writes buffered before a rebuild flushes a batch.
+const REFRESH_PAGE_OPS: usize = 4_096;
+/// Index keys deleted per batch while clearing an index.
+const CLEAR_PAGE_KEYS: usize = 1_024;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum TextSource {
@@ -30,6 +37,8 @@ pub struct FullTextIndexConfig {
     pub name: String,
     pub source: TextSource,
     pub language: String,
+    /// Retained for compatibility: index entries are maintained synchronously with
+    /// document writes made through `Database::collection` handles.
     pub refresh_lag_target: u64,
 }
 
@@ -43,6 +52,7 @@ pub struct TextHit {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct FullTextIndexState {
     pub refreshed_to: ResumeToken,
+    /// Number of indexed documents at the last rebuild, backfill or incremental refresh.
     pub indexed_documents: usize,
 }
 
@@ -139,48 +149,92 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
         metadata_ops(config)
     }
 
-    /// Rebuilds the derived index from the source documents.
+    /// Builds system metadata writes that publish `state` together with the config.
     /// # Errors
-    /// Fails when source documents cannot be read or writes fail.
+    /// Fails when metadata cannot be serialized.
+    pub(crate) fn metadata_ops_with_state(
+        config: &FullTextIndexConfig,
+        state: &FullTextIndexState,
+    ) -> Result<Vec<Op>, TextError> {
+        metadata_ops_with_state(config, state)
+    }
+
+    /// Rebuilds the derived index from the source documents and records the refresh state.
+    ///
+    /// This is a repair tool: document writes made through `Database::collection` handles
+    /// already maintain the index in their own batch. The rebuild clears and rewrites the
+    /// index in bounded batches, so readers can see partial results while it runs. The
+    /// resume token is taken before the scan, so `refresh_incremental` replays writes that
+    /// land during the rebuild.
+    /// # Errors
+    /// Fails when source documents cannot be read or decoded, or writes fail.
     pub fn refresh_full(&self) -> Result<FullTextIndexState, TextError> {
+        let state = self.rebuild_entries()?;
+        propose_system_batch(
+            self.repl,
+            vec![put_json_op(
+                FULL_TEXT_META_TABLE,
+                meta_state_key(&self.config.name),
+                &state,
+            )?],
+        )?;
+        Ok(state)
+    }
+
+    /// Clears and rebuilds the index entries in bounded batches without writing the
+    /// refresh state.
+    /// # Errors
+    /// Fails when source documents cannot be read or decoded, or writes fail.
+    pub(crate) fn rebuild_entries(&self) -> Result<FullTextIndexState, TextError> {
         let TextSource::Collection {
             collection_id,
             path,
         } = &self.config.source;
-        let (prefix, end) = keyenc::u32_prefix_range(collection_id.as_u32());
-        let rows = self
-            .repl
-            .range(DOCUMENT_TABLE, &prefix, &end, ReadConsistency::Strong)?;
-
+        // Take the token before scanning: a write that commits during the scan is then
+        // replayed by `refresh_incremental` instead of being lost.
         let refreshed_to = cdc::current_resume_token(self.repl)?;
-        let mut ops = clear_index_ops(self.repl, &self.config.name)?;
+        clear_index_entries(self.repl, &self.config.name)?;
+
+        let (mut cursor, end) = keyenc::u32_prefix_range(collection_id.as_u32());
+        let mut ops = Vec::new();
+        let mut buffered_docs = 0_usize;
         let mut indexed = 0_usize;
-        for (key, value) in rows {
-            let Some(id) = document_id_from_key(&key) else {
-                continue;
-            };
-            if let Some(text) = document_text(&value, path)? {
+        loop {
+            let page = scan_page(self.repl, DOCUMENT_TABLE, &cursor, &end, REFRESH_PAGE_ROWS)?;
+            for (key, value) in &page {
+                let Some(id) = document_id_from_key(key) else {
+                    continue;
+                };
+                let Some(text) = document_text(value, path)? else {
+                    continue;
+                };
                 append_index_doc_ops(&self.config.name, id, &text, &mut ops)?;
                 indexed += 1;
+                buffered_docs += 1;
+                if buffered_docs >= REFRESH_PAGE_ROWS || ops.len() >= REFRESH_PAGE_OPS {
+                    propose_system_batch(self.repl, std::mem::take(&mut ops))?;
+                    buffered_docs = 0;
+                }
             }
+            let Some(next) = next_page_start(&page, REFRESH_PAGE_ROWS, &end) else {
+                break;
+            };
+            cursor = next;
         }
-
-        let state = FullTextIndexState {
-            refreshed_to,
-            indexed_documents: indexed,
-        };
-        ops.push(put_json_op(
-            FULL_TEXT_META_TABLE,
-            meta_state_key(&self.config.name),
-            &state,
-        )?);
         if !ops.is_empty() {
             propose_system_batch(self.repl, ops)?;
         }
-        Ok(state)
+        Ok(FullTextIndexState {
+            refreshed_to,
+            indexed_documents: indexed,
+        })
     }
 
     /// Replays committed changes after the stored LSN and updates the derived index.
+    ///
+    /// This is a catch-up/repair tool for raw-key writes that bypass `Database::collection`
+    /// handles (stored procedures, raw batches). Changes to the same document within one
+    /// changefeed page are coalesced, so only its final version is indexed.
     /// # Errors
     /// Fails when the database uses AP replication (no commit log to replay; use
     /// `refresh_full`), or CDC or storage fails.
@@ -225,23 +279,12 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
             }
 
             let mut ops = Vec::new();
-            for event in events {
-                match event.op {
-                    ChangeOp::Upsert { key, value_after } => {
-                        let Some(id) = document_id_from_key(&key) else {
-                            continue;
-                        };
-                        remove_existing_doc_ops(self.repl, &self.config.name, id, &mut ops)?;
-                        if let Some(text) = document_text(&value_after, path)? {
-                            append_index_doc_ops(&self.config.name, id, &text, &mut ops)?;
-                        }
-                    }
-                    ChangeOp::Delete { key } => {
-                        if let Some(id) = document_id_from_key(&key) {
-                            remove_existing_doc_ops(self.repl, &self.config.name, id, &mut ops)?;
-                        }
-                    }
-                    ChangeOp::TxBegin | ChangeOp::TxCommit | ChangeOp::Ddl { .. } => {}
+            for (id, value_after) in coalesce_document_changes(events) {
+                remove_existing_doc_ops(self.repl, &self.config.name, id, &mut ops)?;
+                if let Some(value_after) = value_after
+                    && let Some(text) = document_text(&value_after, path)?
+                {
+                    append_index_doc_ops(&self.config.name, id, &text, &mut ops)?;
                 }
             }
             state.refreshed_to = next;
@@ -295,6 +338,10 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
                     .iter()
                     .filter(|candidate| *candidate == &term)
                     .count();
+                if tf == 0 {
+                    // A posting whose document no longer contains the term is stale.
+                    continue;
+                }
                 let score = bm25_score(tf, doc.terms.len(), avg_len, idf);
                 let entry = scores.entry(id).or_insert((0.0, doc.text));
                 entry.0 += score;
@@ -349,25 +396,144 @@ fn metadata_ops(config: &FullTextIndexConfig) -> Result<Vec<Op>, TextError> {
         refreshed_to: ResumeToken::default(),
         indexed_documents: 0,
     };
+    metadata_ops_with_state(config, &state)
+}
+
+fn metadata_ops_with_state(
+    config: &FullTextIndexConfig,
+    state: &FullTextIndexState,
+) -> Result<Vec<Op>, TextError> {
     Ok(vec![
         put_json_op(FULL_TEXT_META_TABLE, meta_config_key(&config.name), config)?,
-        put_json_op(FULL_TEXT_META_TABLE, meta_state_key(&config.name), &state)?,
+        put_json_op(FULL_TEXT_META_TABLE, meta_state_key(&config.name), state)?,
     ])
 }
 
-fn clear_index_ops<R: Replication + ?Sized>(repl: &R, index: &str) -> Result<Vec<Op>, TextError> {
-    let mut ops = Vec::new();
-    for table in [FULL_TEXT_DOCS_TABLE, FULL_TEXT_POSTINGS_TABLE] {
-        let prefix = index_prefix(index);
-        let end = keyenc::range_end(&prefix);
-        for (key, _) in repl.range(table, &prefix, &end, ReadConsistency::Strong)? {
+/// Appends the index writes for one document change.
+///
+/// The writes are a diff between the `old` and `new` document values, so they can be
+/// queued in the same batch as the document write itself. Nothing is emitted when the
+/// indexed text is unchanged.
+/// # Errors
+/// Fails when the indexed document entry cannot be serialized.
+pub(crate) fn append_document_change_ops(
+    config: &FullTextIndexConfig,
+    id: DocumentId,
+    old: Option<&Value>,
+    new: Option<&Value>,
+    ops: &mut Vec<Op>,
+) -> Result<(), TextError> {
+    let TextSource::Collection { path, .. } = &config.source;
+    let old_text = old.and_then(|doc| value_text(doc, path));
+    let new_text = new.and_then(|doc| value_text(doc, path));
+    if old_text == new_text {
+        return Ok(());
+    }
+
+    let new_terms = new_text.map_or_else(BTreeSet::new, unique_terms);
+    if let Some(old_text) = old_text {
+        for term in unique_terms(old_text).difference(&new_terms) {
             ops.push(Op::Delete {
-                table: table.to_owned(),
-                key,
+                table: FULL_TEXT_POSTINGS_TABLE.to_owned(),
+                key: posting_key(&config.name, term, id),
             });
         }
     }
-    Ok(ops)
+    match new_text {
+        Some(text) => append_index_doc_ops(&config.name, id, text, ops)?,
+        None => ops.push(Op::Delete {
+            table: FULL_TEXT_DOCS_TABLE.to_owned(),
+            key: doc_key(&config.name, id),
+        }),
+    }
+    Ok(())
+}
+
+/// Keeps the final version of each document changed in one changefeed page; `None`
+/// marks a delete.
+fn coalesce_document_changes(
+    events: impl IntoIterator<Item = cdc::ChangeEvent>,
+) -> BTreeMap<DocumentId, Option<Bytes>> {
+    let mut changes = BTreeMap::new();
+    for event in events {
+        match event.op {
+            ChangeOp::Upsert { key, value_after } => {
+                if let Some(id) = document_id_from_key(&key) {
+                    changes.insert(id, Some(value_after));
+                }
+            }
+            ChangeOp::Delete { key } => {
+                if let Some(id) = document_id_from_key(&key) {
+                    changes.insert(id, None);
+                }
+            }
+            ChangeOp::TxBegin | ChangeOp::TxCommit | ChangeOp::Ddl { .. } => {}
+        }
+    }
+    changes
+}
+
+/// Deletes every entry of `index` in bounded batches.
+fn clear_index_entries<R: Replication + ?Sized>(repl: &R, index: &str) -> Result<(), TextError> {
+    let prefix = index_prefix(index);
+    let end = keyenc::range_end(&prefix);
+    for table in [FULL_TEXT_DOCS_TABLE, FULL_TEXT_POSTINGS_TABLE] {
+        let mut cursor = prefix.clone();
+        loop {
+            let page = scan_page(repl, table, &cursor, &end, CLEAR_PAGE_KEYS)?;
+            let next = next_page_start(&page, CLEAR_PAGE_KEYS, &end);
+            let ops = page
+                .into_iter()
+                .map(|(key, _)| Op::Delete {
+                    table: table.to_owned(),
+                    key,
+                })
+                .collect::<Vec<_>>();
+            if !ops.is_empty() {
+                propose_system_batch(repl, ops)?;
+            }
+            let Some(next) = next else {
+                break;
+            };
+            cursor = next;
+        }
+    }
+    Ok(())
+}
+
+/// Reads at most `rows` entries starting at `start`.
+fn scan_page<R: Replication + ?Sized>(
+    repl: &R,
+    table: &str,
+    start: &[u8],
+    end: &[u8],
+    rows: usize,
+) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+    let mut page = Vec::new();
+    repl.scan_range_batches(
+        table,
+        start,
+        end,
+        ReadConsistency::Strong,
+        rows,
+        &|| false,
+        &mut |batch| {
+            page.extend_from_slice(batch);
+            Ok(false)
+        },
+    )?;
+    Ok(page)
+}
+
+/// Returns the first key after a full page, or `None` when the range is exhausted.
+fn next_page_start(page: &[(Bytes, Bytes)], rows: usize, end: &[u8]) -> Option<Bytes> {
+    if page.len() < rows {
+        return None;
+    }
+    let (last, _) = page.last()?;
+    let mut next = last.clone();
+    next.push(0);
+    (end.is_empty() || next.as_slice() < end).then_some(next)
 }
 
 fn count_indexed_after_ops<R: Replication + ?Sized>(
@@ -411,10 +577,18 @@ fn collection_name_for(
 
 fn document_text(bytes: &[u8], path: &FieldPath) -> Result<Option<String>, TextError> {
     let value = decode_value(bytes)?;
-    Ok(match extract_path(&value, path) {
-        Some(Value::Str(text)) if !text.trim().is_empty() => Some(text.clone()),
+    Ok(value_text(&value, path).map(str::to_owned))
+}
+
+fn value_text<'doc>(doc: &'doc Value, path: &FieldPath) -> Option<&'doc str> {
+    match extract_path(doc, path) {
+        Some(Value::Str(text)) if !text.trim().is_empty() => Some(text),
         _ => None,
-    })
+    }
+}
+
+fn unique_terms(text: &str) -> BTreeSet<String> {
+    tokenize(text).into_iter().collect()
 }
 
 fn append_index_doc_ops(
@@ -601,15 +775,26 @@ fn meta_state_key(index: &str) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
-
-    use crate::{
-        db::{DbConfig, Profile, create_database},
-        model::{DocumentCollection, FieldPath, Value},
-        repl::Replication,
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
     };
 
-    use super::{FullTextIndex, FullTextIndexConfig};
+    use crate::{
+        db::{Database, DbConfig, Profile, create_database},
+        geo::{GEO_INDEX_TABLE, GEO_POINTS_TABLE, GeoIndexConfig},
+        keyenc,
+        model::{CollectionId, DocumentCollection, DocumentId, FieldPath, Value},
+        query::{ColumnType, DocField},
+        repl::{Op, ReadConsistency, Replication},
+    };
+
+    use super::{
+        FULL_TEXT_DOCS_TABLE, FULL_TEXT_POSTINGS_TABLE, FullTextIndex, FullTextIndexConfig,
+        IndexedDoc, TextHit, doc_key, index_prefix, posting_key,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn full_text_refresh_and_bm25_search() -> Result<(), Box<dyn std::error::Error>> {
@@ -640,6 +825,284 @@ mod tests {
             index.search("rust database", 5)?
         );
         Ok(())
+    }
+
+    #[test]
+    fn full_text_index_tracks_document_writes_without_refresh() -> TestResult {
+        let mut database = posts_database()?;
+        let a = database
+            .collection("posts")?
+            .insert(&doc("rust database"))?;
+        database.create_full_text_index(posts_text_config())?;
+        let index = database.full_text_index("posts_text")?;
+        assert_eq!(hit_ids(&index.search("rust", 5)?), BTreeSet::from([a]));
+
+        let posts = database.collection("posts")?;
+        let b = posts.insert(&doc("rust tokio"))?;
+        for body in ["go compiler", "zig allocator", "rust parser"] {
+            posts.update(a, &doc(body))?;
+        }
+        for term in ["database", "go", "zig"] {
+            assert!(index.search(term, 5)?.is_empty(), "{term}");
+        }
+        assert_eq!(hit_ids(&index.search("parser", 5)?), BTreeSet::from([a]));
+        assert_eq!(hit_ids(&index.search("rust", 5)?), BTreeSet::from([a, b]));
+        assert_eq!(postings_for(&database, a)?, 2);
+
+        posts.delete(a)?;
+        assert_eq!(postings_for(&database, a)?, 0);
+        assert!(!has_doc_entry(&database, a)?);
+        assert_eq!(hit_ids(&index.search("rust", 5)?), BTreeSet::from([b]));
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_rewrites_do_not_leave_ghost_postings() -> TestResult {
+        let mut database = posts_database()?;
+        let a = database.collection("posts")?.insert(&doc("seed text"))?;
+        database.create_full_text_index(posts_text_config())?;
+
+        database.transaction(|txn| {
+            txn.update_document("posts", a, &doc("alpha beta"))?;
+            txn.update_document("posts", a, &doc("gamma"))
+        })?;
+        let index = database.full_text_index("posts_text")?;
+        for term in ["seed", "alpha", "beta"] {
+            assert!(index.search(term, 5)?.is_empty(), "{term}");
+        }
+        assert_eq!(hit_ids(&index.search("gamma", 5)?), BTreeSet::from([a]));
+        assert_eq!(postings_for(&database, a)?, 1);
+
+        let c = database.transaction(|txn| {
+            let c = txn.insert_document("posts", &doc("delta epsilon"))?;
+            txn.update_document("posts", c, &doc("delta epsilon"))?;
+            txn.delete_document("posts", c)?;
+            Ok(c)
+        })?;
+        assert_eq!(postings_for(&database, c)?, 0);
+        assert!(!has_doc_entry(&database, c)?);
+        assert!(
+            index.search("delta", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("delta", 5)?
+        );
+
+        database.transaction(|txn| txn.delete_document("posts", a))?;
+        assert_eq!(postings_for(&database, a)?, 0);
+        assert!(!has_doc_entry(&database, a)?);
+        assert!(
+            index.search("gamma", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("gamma", 5)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_without_indexed_change_emits_no_derived_ops() -> TestResult {
+        let mut database = posts_database()?;
+        database.create_full_text_index(posts_text_config())?;
+        database.create_geo_index(GeoIndexConfig::new(
+            "posts_geo",
+            CollectionId::new(7),
+            FieldPath::new(["point"]),
+        ))?;
+        let posts = database.collection("posts")?;
+        let id = DocumentId::generate();
+        let old = post("rust database", 1);
+        let ops = posts.replace_ops_with_old(id, Some(&old), &post("rust database", 2))?;
+        assert!(!ops.iter().any(is_derived_op), "{ops:?}");
+
+        let ops = posts.replace_ops_with_old(id, Some(&old), &post("rust compiler", 2))?;
+        assert!(ops.iter().any(is_derived_op));
+        assert!(!ops.iter().any(is_geo_op));
+        assert!(!ops.iter().any(|op| is_posting_delete(op, "rust", id)));
+        assert!(ops.iter().any(|op| is_posting_delete(op, "database", id)));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_incremental_coalesces_repeated_changes() -> TestResult {
+        let mut database = posts_database()?;
+        database.create_full_text_index(posts_text_config())?;
+        // A bare handle has no derived indexes attached, like a raw-key writer.
+        let raw = DocumentCollection::new(&database, CollectionId::new(7));
+        let id = raw.insert(&doc("one two"))?;
+        raw.update(id, &doc("three"))?;
+        raw.update(id, &doc("four"))?;
+
+        let index = database.full_text_index("posts_text")?;
+        index.refresh_incremental(database.catalog())?;
+        for term in ["one", "two", "three"] {
+            assert!(index.search(term, 5)?.is_empty(), "{term}");
+        }
+        assert_eq!(hit_ids(&index.search("four", 5)?), BTreeSet::from([id]));
+        assert_eq!(postings_for(&database, id)?, 1);
+
+        raw.delete(id)?;
+        index.refresh_incremental(database.catalog())?;
+        assert_eq!(postings_for(&database, id)?, 0);
+        assert!(!has_doc_entry(&database, id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn search_ignores_postings_without_term_frequency() -> TestResult {
+        let mut database = posts_database()?;
+        let id = database
+            .collection("posts")?
+            .insert(&doc("rust database"))?;
+        database.create_full_text_index(posts_text_config())?;
+        Replication::propose_batch(
+            &database,
+            vec![Op::Put {
+                table: FULL_TEXT_POSTINGS_TABLE.to_owned(),
+                key: posting_key("posts_text", "ghost", id),
+                value: Vec::new(),
+            }],
+        )?;
+        let index = database.full_text_index("posts_text")?;
+        assert!(
+            index.search("ghost", 5)?.is_empty(),
+            "expected an empty value, got {:?}",
+            index.search("ghost", 5)?
+        );
+        assert_eq!(hit_ids(&index.search("rust", 5)?), BTreeSet::from([id]));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_full_rebuilds_large_collections_in_pages() -> TestResult {
+        let mut database = posts_database()?;
+        database.create_full_text_index(posts_text_config())?;
+        {
+            let raw = DocumentCollection::new(&database, CollectionId::new(7));
+            for n in 0..300 {
+                raw.insert(&doc(&format!("shared alpha{n} beta{n} gamma{n}")))?;
+            }
+        }
+        let stale = DocumentId::generate();
+        let stale_doc = IndexedDoc {
+            text: "shared".to_owned(),
+            terms: vec!["shared".to_owned()],
+        };
+        Replication::propose_batch(
+            &database,
+            vec![
+                Op::Put {
+                    table: FULL_TEXT_POSTINGS_TABLE.to_owned(),
+                    key: posting_key("posts_text", "shared", stale),
+                    value: Vec::new(),
+                },
+                Op::Put {
+                    table: FULL_TEXT_DOCS_TABLE.to_owned(),
+                    key: doc_key("posts_text", stale),
+                    value: serde_json::to_vec(&stale_doc)?,
+                },
+            ],
+        )?;
+
+        let index = database.full_text_index("posts_text")?;
+        assert_eq!(index.refresh_full()?.indexed_documents, 300);
+        assert_eq!(index.search("shared", 300)?.len(), 300);
+        assert_eq!(postings_for(&database, stale)?, 0);
+        assert!(!has_doc_entry(&database, stale)?);
+
+        // A second rebuild clears more postings than one clear batch holds.
+        assert_eq!(index.refresh_full()?.indexed_documents, 300);
+        assert_eq!(index.search("shared", 300)?.len(), 300);
+        assert_eq!(index.search("gamma299", 5)?.len(), 1);
+        Ok(())
+    }
+
+    fn posts_database() -> Result<Database, Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_collection(
+            "posts",
+            CollectionId::new(7),
+            vec![DocField::path(
+                "body",
+                FieldPath::new(["body"]),
+                ColumnType::Str,
+            )],
+            Vec::new(),
+        )?;
+        Ok(database)
+    }
+
+    fn posts_text_config() -> FullTextIndexConfig {
+        FullTextIndexConfig::collection(
+            "posts_text",
+            CollectionId::new(7),
+            FieldPath::new(["body"]),
+        )
+    }
+
+    fn hit_ids(hits: &[TextHit]) -> BTreeSet<DocumentId> {
+        hits.iter().map(|hit| hit.id).collect()
+    }
+
+    fn postings_for(
+        database: &Database,
+        id: DocumentId,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let prefix = index_prefix("posts_text");
+        let end = keyenc::range_end(&prefix);
+        Ok(Replication::range(
+            database,
+            FULL_TEXT_POSTINGS_TABLE,
+            &prefix,
+            &end,
+            ReadConsistency::Strong,
+        )?
+        .into_iter()
+        .filter(|(key, _)| key.ends_with(&id.as_bytes()))
+        .count())
+    }
+
+    fn has_doc_entry(
+        database: &Database,
+        id: DocumentId,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(Replication::read(
+            database,
+            FULL_TEXT_DOCS_TABLE,
+            &doc_key("posts_text", id),
+            ReadConsistency::Strong,
+        )?
+        .is_some())
+    }
+
+    fn is_geo_op(op: &Op) -> bool {
+        let (Op::Put { table, .. } | Op::Delete { table, .. }) = op;
+        table == GEO_POINTS_TABLE || table == GEO_INDEX_TABLE
+    }
+
+    fn is_derived_op(op: &Op) -> bool {
+        let (Op::Put { table, .. } | Op::Delete { table, .. }) = op;
+        table == FULL_TEXT_POSTINGS_TABLE || table == FULL_TEXT_DOCS_TABLE || is_geo_op(op)
+    }
+
+    fn is_posting_delete(op: &Op, term: &str, id: DocumentId) -> bool {
+        matches!(
+            op,
+            Op::Delete { table, key }
+                if table == FULL_TEXT_POSTINGS_TABLE && *key == posting_key("posts_text", term, id)
+        )
+    }
+
+    fn post(body: &str, views: i64) -> Value {
+        Value::Object(BTreeMap::from([
+            ("body".to_owned(), Value::Str(body.to_owned())),
+            (
+                "point".to_owned(),
+                Value::GeoPoint {
+                    lon: 21.0122,
+                    lat: 52.2297,
+                },
+            ),
+            ("views".to_owned(), Value::Int(views)),
+        ]))
     }
 
     fn doc(body: &str) -> Value {

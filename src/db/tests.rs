@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, io, sync::Arc, thread};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    sync::Arc,
+    thread,
+};
 
 use super::{
     ConfigError, Database, DbConfig, DbError, EncryptionConfig, KEY_LAYOUT, META_TABLE,
@@ -27,7 +32,8 @@ use crate::federation::{ForeignSource, ForeignTableOptions};
 use crate::geo::{GeoError, GeoIndexConfig, GeoPoint};
 use crate::graph::{GraphId, GraphNodeId, TraversalOptions};
 use crate::model::{
-    CollectionId, FieldPath, IndexId, IndexSpec, PlanKind, Predicate, Value, decode_value,
+    CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, PlanKind, Predicate, Value,
+    decode_value,
 };
 use crate::performance::{
     BenchmarkReport, CompressionAlgorithm, PerformanceConfig, RegressionGate,
@@ -2569,6 +2575,7 @@ async fn phase19_models_are_cataloged_queryable_and_reopen()
             CollectionId::new(190),
             FieldPath::new(["body"]),
         ))?;
+        assert_eq!(text.search("rust", 5)?.len(), 1);
         assert_eq!(text.refresh_full()?.indexed_documents, 1);
 
         let geo = database.create_geo_index(GeoIndexConfig::new(
@@ -2660,6 +2667,273 @@ async fn phase19_models_are_cataloged_queryable_and_reopen()
         1
     );
     Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn full_text_and_geo_indexes_follow_document_writes_without_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    const RUST: &str = "SELECT * FROM match('places_text', 'rust', 10)";
+    const ZIG: &str = "SELECT * FROM match('places_text', 'zig', 10)";
+    const NEAR_WARSAW: &str = "SELECT * FROM within_radius('places_geo', 21.0122, 52.2297, 1000)";
+    const NEAR_PARIS: &str = "SELECT * FROM within_radius('places_geo', 2.3522, 48.8566, 1000)";
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("derived_indexes.redb");
+    let warsaw = Value::GeoPoint {
+        lon: 21.0122,
+        lat: 52.2297,
+    };
+    let (p, r) = {
+        let mut database = create_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+        database.create_collection(
+            "places",
+            CollectionId::new(191),
+            vec![DocField::path(
+                "body",
+                FieldPath::new(["body"]),
+                ColumnType::Str,
+            )],
+            Vec::new(),
+        )?;
+        let p = database
+            .collection("places")?
+            .insert(&place("rust database", warsaw.clone()))?;
+        database.create_full_text_index(FullTextIndexConfig::collection(
+            "places_text",
+            CollectionId::new(191),
+            FieldPath::new(["body"]),
+        ))?;
+        database.create_geo_index(GeoIndexConfig::new(
+            "places_geo",
+            CollectionId::new(191),
+            FieldPath::new(["location"]),
+        ))?;
+
+        let q = database.collection("places")?.insert(&place(
+            "rust tokio",
+            lon_lat(Value::Float(-0.1276), Value::Float(51.5072)),
+        ))?;
+        let r = database.transaction(|txn| {
+            txn.insert_document(
+                "places",
+                &place("go tooling", lon_lat(Value::Int(21), Value::Int(52))),
+            )
+        })?;
+        database.collection("places")?.update(
+            p,
+            &place(
+                "zig allocator",
+                Value::GeoPoint {
+                    lon: 2.3522,
+                    lat: 48.8566,
+                },
+            ),
+        )?;
+        database.transaction(|txn| {
+            txn.update_document("places", r, &place("rust compiler", warsaw.clone()))
+        })?;
+        database.transaction(|txn| txn.delete_document("places", q))?;
+
+        assert_eq!(result_ids(&database, RUST).await?, ids([r]));
+        assert_eq!(result_ids(&database, ZIG).await?, ids([p]));
+        assert_eq!(result_ids(&database, NEAR_WARSAW).await?, ids([r]));
+        assert_eq!(result_ids(&database, NEAR_PARIS).await?, ids([p]));
+
+        let text = database.full_text_index("places_text")?;
+        let rust_hits = text.search("rust", 10)?;
+        assert_eq!(
+            rust_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![r]
+        );
+        assert!(
+            text.search("tokio", 10)?.is_empty(),
+            "expected an empty value, got {:?}",
+            text.search("tokio", 10)?
+        );
+        assert!(
+            text.search("go", 10)?.is_empty(),
+            "expected an empty value, got {:?}",
+            text.search("go", 10)?
+        );
+        let geo = database.geo_index("places_geo")?;
+        let near_warsaw = geo.within_radius(GeoPoint::new(21.0122, 52.2297)?, 1_000.0)?;
+        assert_eq!(
+            near_warsaw.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![r]
+        );
+        assert!(
+            geo.within_radius(GeoPoint::new(-0.1276, 51.5072)?, 1_000.0)?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            geo.within_radius(GeoPoint::new(-0.1276, 51.5072)?, 1_000.0)?
+        );
+        (p, r)
+    };
+
+    let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(result_ids(&database, ZIG).await?, ids([p]));
+    assert_eq!(result_ids(&database, NEAR_WARSAW).await?, ids([r]));
+
+    // Writes after reopen keep the indexes current, so maintenance reattaches from the catalog.
+    database
+        .collection("places")?
+        .update(p, &place("rust kernel", warsaw))?;
+    assert_eq!(result_ids(&database, RUST).await?, ids([p, r]));
+    assert!(result_ids(&database, ZIG).await?.is_empty());
+    assert!(result_ids(&database, NEAR_PARIS).await?.is_empty());
+    assert_eq!(result_ids(&database, NEAR_WARSAW).await?, ids([p, r]));
+    Ok(())
+}
+
+#[test]
+fn full_text_and_geo_index_creation_requires_document_collection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_vector_collection(
+        "embeddings",
+        VectorCollectionConfig::new(CollectionId::new(50), 3),
+    )?;
+
+    for (collection_id, expect_missing) in [
+        (CollectionId::new(999), true),
+        (CollectionId::new(50), false),
+    ] {
+        let text = database
+            .create_full_text_index(FullTextIndexConfig::collection(
+                "orphan_text",
+                collection_id,
+                FieldPath::new(["body"]),
+            ))
+            .err();
+        assert!(
+            is_index_source_error(text.as_ref(), expect_missing),
+            "{text:?}"
+        );
+        let geo = database
+            .create_geo_index(GeoIndexConfig::new(
+                "orphan_geo",
+                collection_id,
+                FieldPath::new(["point"]),
+            ))
+            .err();
+        assert!(
+            is_index_source_error(geo.as_ref(), expect_missing),
+            "{geo:?}"
+        );
+        assert!(!database.catalog().contains_key("orphan_text"));
+        assert!(!database.catalog().contains_key("orphan_geo"));
+    }
+    Ok(())
+}
+
+fn is_index_source_error(error: Option<&DbError>, expect_missing: bool) -> bool {
+    match error {
+        Some(DbError::MissingCatalogObject(_)) => expect_missing,
+        Some(DbError::CatalogKindMismatch { .. }) => !expect_missing,
+        _ => false,
+    }
+}
+
+async fn result_ids(
+    database: &Database,
+    sql: &str,
+) -> Result<BTreeSet<DocumentId>, Box<dyn std::error::Error>> {
+    let SqlOutput::Rows(rows) = database.query(sql).await? else {
+        return Err(format!("{sql} should return rows").into());
+    };
+    let mut ids = BTreeSet::new();
+    for row in rows.rows {
+        let Some(Value::Bytes(bytes)) = row.first() else {
+            return Err(format!("{sql} returned a row without an id").into());
+        };
+        let bytes: [u8; 16] = bytes.as_slice().try_into()?;
+        ids.insert(DocumentId::from_bytes(bytes));
+    }
+    Ok(ids)
+}
+
+fn ids<const N: usize>(ids: [DocumentId; N]) -> BTreeSet<DocumentId> {
+    BTreeSet::from(ids)
+}
+
+#[tokio::test]
+async fn index_search_requires_source_collection_read_and_respects_its_policies()
+-> Result<(), Box<dyn std::error::Error>> {
+    const SEARCH: &str = "SELECT * FROM match('notes_text', 'rust', 10)";
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_collection(
+        "notes",
+        CollectionId::new(301),
+        vec![DocField::path(
+            "body",
+            FieldPath::new(["body"]),
+            ColumnType::Str,
+        )],
+        Vec::new(),
+    )?;
+    database.collection("notes")?.insert(&place(
+        "rust secret",
+        lon_lat(Value::Float(21.0), Value::Float(52.0)),
+    ))?;
+    database.create_full_text_index(FullTextIndexConfig::collection(
+        "notes_text",
+        CollectionId::new(301),
+        FieldPath::new(["body"]),
+    ))?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("indexer").grant(
+            Resource::FullTextIndex("notes_text".to_owned()),
+            Permission::Read,
+        ),
+        Role::new("reader")
+            .grant(
+                Resource::FullTextIndex("notes_text".to_owned()),
+                Permission::Read,
+            )
+            .grant(Resource::Collection("notes".to_owned()), Permission::Read),
+    ]));
+    let indexer = Principal::new("ivan").with_role("indexer");
+    let reader = Principal::new("alice").with_role("reader");
+
+    assert!(matches!(
+        database.query_as(&indexer, SEARCH).await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    let SqlOutput::Rows(rows) = database.query_as(&reader, SEARCH).await? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(rows.rows.len(), 1);
+
+    database.set_policy_config(&PolicyConfig {
+        validations: Vec::new(),
+        masking: vec![MaskingPolicy {
+            resource: Resource::Collection("notes".to_owned()),
+            paths: vec![FieldPath::new(["body"])],
+            replacement: Value::Str("***".to_owned()),
+        }],
+        row_policies: Vec::new(),
+        limits: LimitPolicy::default(),
+    })?;
+    assert!(matches!(
+        database.query_as(&reader, SEARCH).await,
+        Err(DbError::Extension(ExtensionError::PolicyDenied(_)))
+    ));
+    Ok(())
+}
+
+fn place(body: &str, location: Value) -> Value {
+    Value::Object(BTreeMap::from([
+        ("body".to_owned(), Value::Str(body.to_owned())),
+        ("location".to_owned(), location),
+    ]))
+}
+
+fn lon_lat(lon: Value, lat: Value) -> Value {
+    Value::Object(BTreeMap::from([
+        ("lon".to_owned(), lon),
+        ("lat".to_owned(), lat),
+    ]))
 }
 
 #[test]
