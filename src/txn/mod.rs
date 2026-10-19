@@ -432,39 +432,63 @@ where
         .checked_add(1)
         .ok_or_else(|| StorageError::Backend("transaction id overflow".to_owned()))?;
 
+    let hlc = next_hlc_in_txn(&txn)?;
+    let commit_log =
+        commit_log_record_with_clock_and_hlc(next_txn_id, write_set, &SystemClock, hlc);
+    apply_commit_record_in_txn(&mut txn, &commit_log)?;
+
+    if let Err(error) = extra(&mut txn, next_txn_id) {
+        txn.rollback();
+        return Err(error);
+    }
+
+    txn.commit()?;
+    Ok(next_txn_id)
+}
+
+/// Writes one commit-log record into storage exactly as a live commit does.
+///
+/// The live commit path and backup replay share this routine, so a replayed commit rebuilds
+/// the base rows, `__txn_versions`, `__txn_mvcc` history, the keyspace registry, the commit
+/// log, `current_txn_id` and the persisted HLC from the record alone. The stored HLC only
+/// moves forward: it becomes the larger of its current value and the record's HLC, and a
+/// legacy record without an HLC leaves it unchanged. The caller is responsible for conflict
+/// checks and for committing `txn`.
+/// # Errors
+/// Fails when keys or metadata cannot be encoded, the stored HLC is corrupt, or storage
+/// rejects a write.
+pub(crate) fn apply_commit_record_in_txn<T: WriteTransaction>(
+    txn: &mut T,
+    record: &CommitLogRecord,
+) -> Result<(), StorageError> {
     txn.put(
         TXN_META_TABLE,
         CURRENT_TXN_ID_KEY,
-        &encode_txn_id(next_txn_id),
+        &encode_txn_id(record.txn_id),
     )?;
 
-    let hlc = next_hlc_in_txn(&txn)?;
-    let commit_log =
-        commit_log_record_with_clock_and_hlc(next_txn_id, &write_set, &SystemClock, hlc);
-    let keyspaces = keyspaces_for_commit(&write_set);
-
-    for ((table, key), value) in write_set {
+    for write in &record.writes {
         txn.put(
             TXN_MVCC_TABLE,
-            &mvcc_key(&table, &key, next_txn_id)?,
+            &mvcc_key(&write.table, &write.key, record.txn_id)?,
             &encode_mvcc_record(&MvccRecord {
-                value: value.clone(),
+                value: write.value.clone(),
             })?,
         )?;
 
-        match value {
-            Some(bytes) => txn.put(&table, &key, &bytes)?,
-            None => txn.delete(&table, &key)?,
+        match &write.value {
+            Some(bytes) => txn.put(&write.table, &write.key, bytes)?,
+            None => txn.delete(&write.table, &write.key)?,
         }
 
         txn.put(
             TXN_VERSIONS_TABLE,
-            &version_key(&table, &key)?,
-            &encode_txn_id(next_txn_id),
+            &version_key(&write.table, &write.key)?,
+            &encode_txn_id(record.txn_id),
         )?;
     }
 
-    for keyspace in keyspaces {
+    for keyspace in keyspaces_for_commit(record.writes.iter().map(|write| write.table.as_str())) {
         txn.put(
             KEYSPACE_REGISTRY_TABLE,
             keyspace.as_bytes(),
@@ -474,18 +498,15 @@ where
 
     txn.put(
         COMMIT_LOG_TABLE,
-        &commit_log_key(next_txn_id),
-        &encode_commit_log_record(&commit_log)?,
+        &commit_log_key(record.txn_id),
+        &encode_commit_log_record(record)?,
     )?;
-    txn.put(HLC_TABLE, HLC_LOCAL_KEY, &encode_hlc(hlc)?)?;
 
-    if let Err(error) = extra(&mut txn, next_txn_id) {
-        txn.rollback();
-        return Err(error);
+    if let Some(hlc) = record.hlc {
+        let merged = stored_hlc_in_txn(&*txn)?.map_or(hlc, |stored| stored.max(hlc));
+        txn.put(HLC_TABLE, HLC_LOCAL_KEY, &encode_hlc(merged)?)?;
     }
-
-    txn.commit()?;
-    Ok(next_txn_id)
+    Ok(())
 }
 
 /// Reads the current committed transaction id from an existing read snapshot.
@@ -643,12 +664,12 @@ fn commit_log_record_with_clock(
     write_set: &WriteSet,
     clock: &impl Clock,
 ) -> CommitLogRecord {
-    commit_log_record_with_clock_and_hlc(txn_id, write_set, clock, HlcTimestamp::now())
+    commit_log_record_with_clock_and_hlc(txn_id, write_set.clone(), clock, HlcTimestamp::now())
 }
 
 fn commit_log_record_with_clock_and_hlc(
     txn_id: TxnId,
-    write_set: &WriteSet,
+    write_set: WriteSet,
     clock: &impl Clock,
     hlc: HlcTimestamp,
 ) -> CommitLogRecord {
@@ -657,23 +678,20 @@ fn commit_log_record_with_clock_and_hlc(
         committed_at: clock.now(),
         hlc: Some(hlc),
         writes: write_set
-            .iter()
-            .map(|((table, key), value)| CommitLogWrite {
-                table: table.clone(),
-                key: key.clone(),
-                value: value.clone(),
-            })
+            .into_iter()
+            .map(|((table, key), value)| CommitLogWrite { table, key, value })
             .collect(),
     }
 }
 
-fn next_hlc_in_txn(txn: &impl ReadTransaction) -> Result<HlcTimestamp, StorageError> {
-    let current = txn
-        .get(HLC_TABLE, HLC_LOCAL_KEY)?
+fn stored_hlc_in_txn(txn: &impl ReadTransaction) -> Result<Option<HlcTimestamp>, StorageError> {
+    txn.get(HLC_TABLE, HLC_LOCAL_KEY)?
         .map(|bytes| decode_hlc(&bytes))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(current.tick())
+        .transpose()
+}
+
+fn next_hlc_in_txn(txn: &impl ReadTransaction) -> Result<HlcTimestamp, StorageError> {
+    Ok(stored_hlc_in_txn(txn)?.unwrap_or_default().tick())
 }
 
 fn encode_hlc(timestamp: HlcTimestamp) -> Result<Bytes, StorageError> {
@@ -685,7 +703,7 @@ fn decode_hlc(bytes: &[u8]) -> Result<HlcTimestamp, StorageError> {
         .map_err(|error| StorageError::Corruption(format!("hlc timestamp: {error}")))
 }
 
-fn keyspaces_for_commit(write_set: &WriteSet) -> BTreeSet<String> {
+fn keyspaces_for_commit<'a>(tables: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut keyspaces = BTreeSet::new();
     keyspaces.insert(TXN_META_TABLE.to_owned());
     keyspaces.insert(TXN_VERSIONS_TABLE.to_owned());
@@ -693,8 +711,8 @@ fn keyspaces_for_commit(write_set: &WriteSet) -> BTreeSet<String> {
     keyspaces.insert(COMMIT_LOG_TABLE.to_owned());
     keyspaces.insert(KEYSPACE_REGISTRY_TABLE.to_owned());
     keyspaces.insert(HLC_TABLE.to_owned());
-    for (table, _) in write_set.keys() {
-        keyspaces.insert(table.clone());
+    for table in tables {
+        keyspaces.insert(table.to_owned());
     }
     keyspaces
 }
@@ -704,16 +722,124 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        ActiveSnapshotRegistry, COMMIT_LOG_BINARY_MAGIC, Clock, CommitLogRecord, CommitLogWrite,
-        MvccRecord, TXN_MVCC_TABLE, WriteSet, commit_log_record_with_clock, commit_ops_at_current,
-        decode_commit_log_record, decode_hlc, encode_commit_log_record, encode_mvcc_record,
-        gc_mvcc_versions_in_txn, mvcc_key,
+        ActiveSnapshotRegistry, COMMIT_LOG_BINARY_MAGIC, COMMIT_LOG_TABLE, Clock, CommitLogRecord,
+        CommitLogWrite, KEYSPACE_REGISTRY_TABLE, MvccRecord, TXN_META_TABLE, TXN_MVCC_TABLE,
+        TXN_VERSIONS_TABLE, WriteSet, apply_commit_record_in_txn, commit_log_record_with_clock,
+        commit_ops_at_current, current_txn_id_from, decode_commit_log_record, decode_hlc,
+        encode_commit_log_record, encode_mvcc_record, gc_mvcc_versions_in_txn, mvcc_key,
     };
     use crate::{
-        phase30::{HLC_LOCAL_KEY, HLC_TABLE},
+        phase30::{HLC_LOCAL_KEY, HLC_TABLE, HlcTimestamp},
         repl::Op,
-        storage::{MemEngine, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
+        storage::{
+            Bytes, MemEngine, ReadTransaction, StorageEngine, StorageError, WriteTransaction,
+        },
     };
+
+    fn put_op(key: &[u8], value: &[u8]) -> Op {
+        Op::Put {
+            table: "t".to_owned(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn table_rows(engine: &MemEngine, table: &str) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
+        let read = engine.begin_read()?;
+        let rows = read
+            .range(table, &[], &[])?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[test]
+    fn apply_commit_record_matches_live_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let live = MemEngine::new();
+        commit_ops_at_current(&live, vec![put_op(b"a", b"1")])?;
+        commit_ops_at_current(&live, vec![put_op(b"b", b"2")])?;
+        commit_ops_at_current(
+            &live,
+            vec![
+                Op::Delete {
+                    table: "t".to_owned(),
+                    key: b"a".to_vec(),
+                },
+                put_op(b"c", b"3"),
+            ],
+        )?;
+        let records = table_rows(&live, COMMIT_LOG_TABLE)?
+            .into_iter()
+            .map(|(_, value)| decode_commit_log_record(&value))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 3);
+
+        let replayed = MemEngine::new();
+        for record in &records {
+            let mut write = replayed.begin_write()?;
+            apply_commit_record_in_txn(&mut write, record)?;
+            write.commit()?;
+        }
+
+        for table in [
+            "t",
+            TXN_META_TABLE,
+            TXN_VERSIONS_TABLE,
+            TXN_MVCC_TABLE,
+            COMMIT_LOG_TABLE,
+            KEYSPACE_REGISTRY_TABLE,
+            HLC_TABLE,
+        ] {
+            assert_eq!(
+                table_rows(&replayed, table)?,
+                table_rows(&live, table)?,
+                "{table} differs after replay"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn apply_commit_record_keeps_hlc_monotonic_and_skips_legacy_hlc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let newest = HlcTimestamp {
+            physical_ms: 200,
+            logical: 1,
+        };
+        let older = HlcTimestamp {
+            physical_ms: 100,
+            logical: 0,
+        };
+        let engine = MemEngine::new();
+        let mut write = engine.begin_write()?;
+        for (txn_id, hlc) in (1..).zip([Some(newest), Some(older), None]) {
+            let record = CommitLogRecord {
+                txn_id,
+                committed_at: UNIX_EPOCH + Duration::from_secs(txn_id),
+                hlc,
+                writes: vec![CommitLogWrite {
+                    table: "t".to_owned(),
+                    key: txn_id.to_be_bytes().to_vec(),
+                    value: Some(b"v".to_vec()),
+                }],
+            };
+            apply_commit_record_in_txn(&mut write, &record)?;
+        }
+        write.commit()?;
+
+        let read = engine.begin_read()?;
+        let stored = read.get(HLC_TABLE, HLC_LOCAL_KEY)?.ok_or("missing HLC")?;
+        assert_eq!(decode_hlc(&stored)?, newest);
+        assert_eq!(current_txn_id_from(&read)?, 3);
+        assert!(
+            read.get(KEYSPACE_REGISTRY_TABLE, TXN_MVCC_TABLE.as_bytes())?
+                .is_some()
+        );
+        assert!(
+            read.get(KEYSPACE_REGISTRY_TABLE, HLC_TABLE.as_bytes())?
+                .is_some()
+        );
+        Ok(())
+    }
 
     #[test]
     fn commit_log_binary_round_trips_and_legacy_json_decodes()
