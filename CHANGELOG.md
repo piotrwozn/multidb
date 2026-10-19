@@ -90,6 +90,79 @@ All notable public changes will be recorded here.
   batches) must run between `rotate_dek` and shredding old keys. KEK rotation
   now takes effect in-process and is atomic, and opening a non-empty database
   whose envelope keyring is missing fails instead of minting a new keyring.
+- Columnar tiering no longer loses or resurrects rows written while a segment is
+  being tiered: pointers are installed with a conditional write, and segments
+  that changed are left alone and reported in `conflicted_segments`. Tiered
+  objects use immutable, content-addressed paths, and `eventual_ap` databases
+  are rejected. Full backups now inline CRC-checked tiered segment bytes, so
+  restoring them does not depend on the object store, and fail if a tiered
+  object is missing or corrupt. Hibernation uses full backups, so hibernating
+  a tenant now downloads its tiered segments into the backup and resume
+  restores them as local data until the next tiering run.
+- All user writes now run one write pipeline (before triggers, before-commit
+  hooks, tenant quota, commit, after-commit hooks and after triggers). SQL and
+  pgwire `INSERT`, `RelTable` handles and stored procedures (`CALL`) now run
+  WASM triggers, hooks and tenant quotas like `Database` writes do.
+  `MultiModelTxn` commits (including Control Plane row and document CRUD) now
+  also enforce tenant quotas and the tenant write limit.
+- A committed write is never reported as failed. After-commit hook and
+  after-trigger failures are logged, counted in
+  `multidb_post_commit_failures_total{stage}`, recorded in the
+  `__post_commit_failures` table and listed by
+  `Database::post_commit_failures()`. Previously a client could see an error for
+  a durable write, retry, and create a duplicate.
+- `HookTarget::Collection`, `VectorCollection` and `Graph` hooks only match
+  writes to the named object. Registering such a hook for a missing object, or
+  for an object of another kind, fails with `HookError::InvalidTarget`
+  (SQLSTATE `42704`).
+- A before trigger `replace` result is validated against the table schema, must
+  keep the primary key, and rebuilds the row's secondary-index entries. Replacing
+  documents or a row written twice in one batch is rejected. SQL `RETURNING`
+  still shows the row as written by the statement, before a trigger `replace`.
+- WASM triggers can no longer be registered on columnar tables. A columnar
+  write replaces a whole segment, so insert, update and delete events cannot be
+  told apart. Triggers stored earlier still cannot replace columnar segments.
+- Writes rejected by a before trigger or a before-commit hook fail with the new
+  `ReplError::Rejected` variant, reported over pgwire as SQLSTATE `P0001`
+  instead of the connection-failure code `08006`, so connection pools keep the
+  connection.
+- Removed `cdc::HookedReplication` and `cloud::QuotaReplication`; the write
+  pipeline replaces them.
+- Changefeed paging and `AS OF TIMESTAMP` resolution now read bounded
+  commit-log windows: catch-up is linear and memory is bounded by the page size
+  instead of the whole log. The earliest-LSN lookup reads the recorded floor or
+  LSN 1 directly; only a legacy log that has neither falls back to a full scan.
+- Added manual history GC: `Database::gc_history` and
+  `multidb maintenance gc --db <path> --profile <profile> [--dry-run]
+  [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>]
+  [--commit-log-retain-lsns <n>]`, with `multidb_history_gc_*` metrics. It
+  prunes MVCC versions below `min(current LSN, AS OF pins, temporal min_lsn,
+  current LSN - history-retain-lsns + 1)` in batches bounded by writes, record
+  bytes and commit-log window reads, and truncates the commit log only with an
+  explicit retention, never below durable consumer positions. It is local
+  single-node only, needs exclusive file access, and does not shrink the redb
+  file. `multidb serve` does not run history GC online or in the background
+  yet. Without `--history-retain-lsns` (`mvcc_retain_lsns`), GC removes `AS OF`
+  history below the GC watermark (the current LSN unless a temporal
+  `keep_history` retention or an `AS OF` pin is older) for every table without a
+  temporal `keep_history` retention, and the report carries a `note` saying so. On encrypted databases each pruned
+  MVCC version or commit-log record keeps its small key-version row in
+  `__enc_versions`, so GC reclaims value bytes but not those rows.
+- Commit-log truncation (`--commit-log-retain-lsns`) breaks the incremental
+  backup chain: take a new full backup afterwards. Run it while no writers are
+  active (the CLI is offline anyway); after-commit hook delivery that meets
+  truncated or missing commit records now fails closed instead of skipping
+  them. Materialized views, full-text indexes and geo indexes created after
+  truncation start from the current rows and LSN instead of replaying LSN 0.
+- `AS OF` reads below the GC history horizon fail with `RetentionExpired`, as
+  do system-versioned history scans and `enable_system_versioning` whose
+  `min_lsn` is below the horizon; changefeed tokens below a truncated commit
+  log fail with `TokenExpired`; incremental backups whose parent predates the
+  truncated log fail with `BackupError::CommitLogTruncated`. Older binaries
+  ignore the horizon, so do not downgrade a GC'd database file.
+- Repeated `ack_subscription` calls with the token that is already stored no
+  longer write a commit. A subscription worker's own ack still commits, so an
+  idle worker keeps adding one commit per poll interval.
 
 ### Added
 

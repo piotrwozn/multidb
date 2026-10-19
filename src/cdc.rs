@@ -8,25 +8,23 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use uuid::Uuid;
 
 use crate::{
     backup::{Lsn, TimelineId},
-    db::{CatalogEntry, DbError},
+    db::{CatalogEntry, ConfigError, DbError, read_catalog_entry_from_repl},
     geo::{GEO_INDEX_TABLE, GEO_POINTS_TABLE},
     graph::{GRAPH_IN_EDGES_TABLE, GRAPH_OUT_EDGES_TABLE},
     model::{DOCUMENT_TABLE, INDEX_TABLE, Value, decode_value},
     observability,
     phase30::{CdcWorkerConfig, HlcTimestamp},
     query::{REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, Row, decode_row_bytes},
-    repl::{
-        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, propose_system,
-        propose_system_batch,
-    },
+    repl::{Op, ReadConsistency, ReplError, Replication, propose_system, propose_system_batch},
     security::{AuthzError, AuthzPolicy, Permission, Principal, Resource},
     storage::{Bytes, StorageError},
     text::{FULL_TEXT_DOCS_TABLE, FULL_TEXT_META_TABLE, FULL_TEXT_POSTINGS_TABLE},
     timeseries::{TIME_SERIES_CHUNKS_TABLE, TIME_SERIES_LATEST_TABLE, TIME_SERIES_META_TABLE},
-    txn::{self, CommitLogRecord, TxnId, WriteSet},
+    txn::{self, CommitLogRecord, TxnId},
     vector::VECTOR_TABLE,
 };
 
@@ -37,6 +35,10 @@ pub const MATERIALIZED_VIEWS_TABLE: &str = "__materialized_views";
 pub const MATERIALIZED_VIEW_STATE_TABLE: &str = "__materialized_view_state";
 pub const HOOKS_TABLE: &str = "__hooks";
 pub const HOOK_DELIVERIES_TABLE: &str = "__hook_deliveries";
+pub const POST_COMMIT_FAILURES_TABLE: &str = "__post_commit_failures";
+
+#[cfg(test)]
+pub(crate) const FAIL_AFTER_HOOK_FOR_TESTS: &str = "test-fail-after-hook";
 
 const BACKUP_META_TABLE: &str = "__backup_meta";
 const KEY_TIMELINE_ID: &[u8] = b"timeline_id";
@@ -301,6 +303,12 @@ pub enum HookKind {
     AfterCommit,
 }
 
+/// The writes a hook applies to.
+///
+/// Named targets are scoped to that object: `Table`, `FullTextIndex`,
+/// `TimeSeries` and `GeoIndex` match by name, and `Collection`,
+/// `VectorCollection` and `Graph` resolve the name to the object's catalog id.
+/// A missing object, or an object of another kind, matches nothing.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum HookTarget {
     AnyUser,
@@ -331,6 +339,27 @@ pub struct HookDelivery {
     pub event_count: usize,
 }
 
+/// The post-commit stage that failed after a durable commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum PostCommitStage {
+    AfterHook,
+    AfterTrigger,
+}
+
+/// An after-commit hook or after-trigger failure recorded in
+/// [`POST_COMMIT_FAILURES_TABLE`]. The write itself is committed and was reported
+/// as successful; `start_lsn..=end_lsn` is the commit window the stage covered.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PostCommitFailure {
+    pub stage: PostCommitStage,
+    /// The after trigger name, or `after_commit_hooks` for the after-hook pass.
+    pub name: String,
+    pub start_lsn: Lsn,
+    pub end_lsn: Lsn,
+    pub error: String,
+    pub recorded_at: SystemTime,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum HookError {
     #[error("hook rejected write: {0}")]
@@ -339,15 +368,14 @@ pub enum HookError {
     #[error("hook timed out: {0}")]
     Timeout(String),
 
+    #[error("invalid hook target: {0}")]
+    InvalidTarget(String),
+
     #[error("replication: {0}")]
     Repl(#[from] ReplError),
 
     #[error("metadata serialization: {0}")]
     Serde(String),
-}
-
-pub struct HookedReplication {
-    inner: Arc<dyn Replication>,
 }
 
 impl ResumeToken {
@@ -460,6 +488,8 @@ impl HookSpec {
         }
     }
 
+    /// Builds an after-commit hook. After-commit hooks never fail the write that
+    /// triggered them: a failed delivery is recorded as a [`PostCommitFailure`].
     #[must_use]
     pub fn after(
         name: impl Into<String>,
@@ -478,82 +508,33 @@ impl HookSpec {
     }
 }
 
-impl HookedReplication {
+impl PostCommitStage {
     #[must_use]
-    pub fn new(inner: Arc<dyn Replication>) -> Self {
-        Self { inner }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AfterHook => "after_hook",
+            Self::AfterTrigger => "after_trigger",
+        }
     }
 }
 
-impl Replication for HookedReplication {
-    fn propose(&self, op: Op) -> Result<(), ReplError> {
-        self.propose_batch(vec![op])
-    }
-
-    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
-        validate_before_hooks(self.inner.as_ref(), &ops).map_err(hook_to_repl_error)?;
-        let before = current_lsn(self.inner.as_ref())?;
-        self.inner.propose_batch(ops)?;
-        let after = current_lsn(self.inner.as_ref())?;
-        deliver_after_hooks(self.inner.as_ref(), before, after).map_err(hook_to_repl_error)?;
-        Ok(())
-    }
-
-    fn propose_authorized_batch(
-        &self,
-        ops: Vec<Op>,
-        authorization: txn::WriteAuthorization,
-    ) -> Result<(), ReplError> {
-        self.inner.propose_authorized_batch(ops, authorization)
-    }
-
-    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        validate_before_hooks(self.inner.as_ref(), &batch.ops).map_err(hook_to_repl_error)?;
-        let before = current_lsn(self.inner.as_ref())?;
-        self.inner.propose_conditional_batch(batch)?;
-        let after = current_lsn(self.inner.as_ref())?;
-        deliver_after_hooks(self.inner.as_ref(), before, after).map_err(hook_to_repl_error)?;
-        Ok(())
-    }
-
-    fn read(
-        &self,
-        table: &str,
-        key: &[u8],
-        consistency: ReadConsistency,
-    ) -> Result<Option<Bytes>, ReplError> {
-        self.inner.read(table, key, consistency)
-    }
-
-    fn range(
-        &self,
-        table: &str,
-        start: &[u8],
-        end: &[u8],
-        consistency: ReadConsistency,
-    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
-        self.inner.range(table, start, end, consistency)
-    }
-
-    fn scan_range_batches(
-        &self,
-        table: &str,
-        start: &[u8],
-        end: &[u8],
-        consistency: ReadConsistency,
-        batch_rows: usize,
-        cancelled: &dyn Fn() -> bool,
-        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
-    ) -> Result<(), ReplError> {
-        self.inner.scan_range_batches(
-            table,
-            start,
-            end,
-            consistency,
-            batch_rows,
-            cancelled,
-            on_batch,
-        )
+impl PostCommitFailure {
+    #[must_use]
+    pub fn new(
+        stage: PostCommitStage,
+        name: impl Into<String>,
+        start_lsn: Lsn,
+        end_lsn: Lsn,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            name: name.into(),
+            start_lsn,
+            end_lsn,
+            error: error.into(),
+            recorded_at: SystemTime::now(),
+        }
     }
 }
 
@@ -603,12 +584,10 @@ pub fn poll_changefeed_page<R: Replication + ?Sized>(
     }
 
     let current = current_lsn(repl)?;
-    let mut records = commit_records_between(repl, from.lsn, current)?;
-    let limit = max.max(1);
-    let has_more = records.len() > limit;
-    if has_more {
-        records.truncate(limit);
-    }
+    let page = txn::history::commit_records_after(repl, from.lsn, current, max.max(1))?;
+    ensure_no_truncated_prefix(repl, &from, current, &page)?;
+    let has_more = page.has_more;
+    let records = page.records;
 
     let mut events = Vec::new();
     let mut last_lsn = from.lsn;
@@ -717,6 +696,9 @@ pub fn create_subscription_trusted(
 
 /// Acknowledges a subscription position.
 ///
+/// Re-acknowledging the token that is already stored returns the stored state
+/// without writing a commit.
+///
 /// # Errors
 /// Fails when the subscription is missing or metadata writes fail.
 pub fn ack_subscription(
@@ -726,6 +708,9 @@ pub fn ack_subscription(
 ) -> Result<SubscriptionState, SubscriptionError> {
     let mut state = read_subscription(repl, name)?
         .ok_or_else(|| SubscriptionError::MissingSubscription(name.to_owned()))?;
+    if state.last_ack == token {
+        return Ok(state);
+    }
     state.last_ack = token;
     state.updated_at = SystemTime::now();
     write_subscription(repl, &state)?;
@@ -827,6 +812,10 @@ async fn run_subscription_worker(
 
 /// Creates a materialized view and initializes it from the current source table.
 ///
+/// The view replays the changefeed from LSN 0. When history GC truncated the
+/// commit log, it instead starts from the current source rows and replays the
+/// changes after the LSN read before that scan.
+///
 /// # Errors
 /// Fails when the database uses AP replication, the spec is unsupported, source table is
 /// missing, or metadata writes fail.
@@ -844,7 +833,14 @@ pub fn create_materialized_view(
         source_rows: BTreeMap::new(),
         groups: BTreeMap::new(),
     };
-    let token = ResumeToken::new(timeline_id(database)?, 0);
+    let mut token = ResumeToken::new(timeline_id(database)?, 0);
+    if earliest_lsn(database)? > 1 {
+        // LSN 0 can no longer be replayed. Take the token before the scan: replaying
+        // a change the scan already saw is idempotent, because the state keeps the
+        // latest row per source key.
+        token = current_resume_token(database)?;
+        seed_view_from_source_rows(database, spec, &mut state)?;
+    }
     let filter = ChangefeedFilter {
         target: ChangefeedTarget::Table(spec.source_table.clone()),
     };
@@ -906,6 +902,18 @@ pub fn read_materialized_view(
 /// # Errors
 /// Fails when hook metadata cannot be written.
 pub fn register_hook(repl: &dyn Replication, hook: &HookSpec) -> Result<(), HookError> {
+    // A hook scoped to a missing object would match nothing, so a typo would
+    // silently turn a validation hook off. Refuse it instead.
+    if matches!(
+        hook.target,
+        HookTarget::Collection(_) | HookTarget::VectorCollection(_) | HookTarget::Graph(_)
+    ) && resolve_hook_scope(repl, hook)?.is_none()
+    {
+        return Err(HookError::InvalidTarget(format!(
+            "hook {} targets {:?}, which does not exist or has another kind",
+            hook.name, hook.target
+        )));
+    }
     let value = serde_json::to_vec(hook).map_err(|error| HookError::Serde(error.to_string()))?;
     propose_system(
         repl,
@@ -960,9 +968,10 @@ pub(crate) fn validate_before_hooks(repl: &dyn Replication, ops: &[Op]) -> Resul
         .iter()
         .filter(|hook| hook.enabled && hook.kind == HookKind::BeforeCommit)
     {
+        let scope = resolve_hook_scope(repl, hook)?;
         let started = Instant::now();
         for op in ops {
-            if hook_matches_op(hook, op) {
+            if hook_matches_op(hook, scope, op) {
                 apply_before_hook(hook, op)?;
             }
             if started.elapsed() > Duration::from_millis(hook.timeout_ms) {
@@ -973,25 +982,14 @@ pub(crate) fn validate_before_hooks(repl: &dyn Replication, ops: &[Op]) -> Resul
     Ok(())
 }
 
-pub(crate) fn validate_write_set_hooks(
-    repl: &dyn Replication,
-    write_set: &WriteSet,
-) -> Result<(), HookError> {
-    let ops = write_set
+/// Delivers after-commit hooks for the commits in `start..=end`. The caller has
+/// already committed the write, so an error here must be recorded, not returned
+/// to the writer.
+/// Reports whether any enabled after-commit hook is registered.
+pub(crate) fn has_enabled_after_commit_hooks(repl: &dyn Replication) -> Result<bool, HookError> {
+    Ok(read_hooks(repl)?
         .iter()
-        .map(|((table, key), value)| match value {
-            Some(value) => Op::Put {
-                table: table.clone(),
-                key: key.clone(),
-                value: value.clone(),
-            },
-            None => Op::Delete {
-                table: table.clone(),
-                key: key.clone(),
-            },
-        })
-        .collect::<Vec<_>>();
-    validate_before_hooks(repl, &ops)
+        .any(|hook| hook.enabled && hook.kind == HookKind::AfterCommit))
 }
 
 pub(crate) fn deliver_after_commit_hooks(
@@ -1013,6 +1011,16 @@ fn deliver_after_hooks(repl: &dyn Replication, start: Lsn, end: Lsn) -> Result<(
         .collect::<Vec<_>>();
     if after_hooks.is_empty() {
         return Ok(());
+    }
+    #[cfg(test)]
+    if let Some(hook) = after_hooks
+        .iter()
+        .find(|hook| hook.name == FAIL_AFTER_HOOK_FOR_TESTS)
+    {
+        return Err(HookError::Rejected(format!(
+            "{}: injected after-hook failure",
+            hook.name
+        )));
     }
 
     let records = commit_records_between(repl, start, end).map_err(|error| match error {
@@ -1038,11 +1046,12 @@ fn deliver_after_hooks(repl: &dyn Replication, start: Lsn, end: Lsn) -> Result<(
     })?;
     let mut ops = Vec::new();
     for hook in after_hooks {
+        let scope = resolve_hook_scope(repl, &hook)?;
         for record in &records {
             let event_count = record
                 .writes
                 .iter()
-                .filter(|write| hook_matches_parts(&hook, &write.table, &write.key))
+                .filter(|write| hook_matches_parts(&hook, scope, &write.table, &write.key))
                 .count();
             if event_count == 0 {
                 continue;
@@ -1067,15 +1076,95 @@ fn deliver_after_hooks(repl: &dyn Replication, start: Lsn, end: Lsn) -> Result<(
     Ok(())
 }
 
-fn hook_to_repl_error(error: HookError) -> ReplError {
-    let (kind, message) = match error {
-        HookError::Rejected(message) => ("rejected", format!("hook rejected write: {message}")),
-        HookError::Timeout(message) => ("timeout", format!("hook timed out: {message}")),
-        HookError::Repl(error) => ("replication", format!("replication: {error}")),
-        HookError::Serde(message) => ("serde", format!("metadata serialization: {message}")),
+/// Records post-commit failures: a warning and a metric for each one, then one
+/// best-effort system write to [`POST_COMMIT_FAILURES_TABLE`]. Never fails, because
+/// the write that caused the failures is already committed.
+pub(crate) fn record_post_commit_failures(repl: &dyn Replication, failures: &[PostCommitFailure]) {
+    let mut ops = Vec::with_capacity(failures.len());
+    for failure in failures {
+        tracing::warn!(
+            stage = failure.stage.as_str(),
+            name = %failure.name,
+            start_lsn = failure.start_lsn,
+            end_lsn = failure.end_lsn,
+            error = %failure.error,
+            "post-commit stage failed after a durable commit"
+        );
+        observability::record_post_commit_failure(failure.stage.as_str());
+        match serde_json::to_vec(failure) {
+            Ok(value) => ops.push(Op::Put {
+                table: POST_COMMIT_FAILURES_TABLE.to_owned(),
+                key: Uuid::now_v7().as_bytes().to_vec(),
+                value,
+            }),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    name = %failure.name,
+                    "post-commit failure was not recorded"
+                );
+                observability::record_post_commit_failure("unrecorded");
+            }
+        }
+    }
+    if ops.is_empty() {
+        return;
+    }
+
+    let count = ops.len();
+    if let Err(error) = propose_system_batch(repl, ops) {
+        tracing::error!(error = %error, count, "post-commit failures were not recorded");
+        for _ in 0..count {
+            observability::record_post_commit_failure("unrecorded");
+        }
+    }
+}
+
+/// Reads recorded post-commit failures, oldest first.
+///
+/// # Errors
+/// Fails when the records cannot be read or decoded.
+pub fn read_post_commit_failures(
+    repl: &dyn Replication,
+) -> Result<Vec<PostCommitFailure>, HookError> {
+    repl.range(
+        POST_COMMIT_FAILURES_TABLE,
+        &[],
+        &[],
+        ReadConsistency::Strong,
+    )?
+    .into_iter()
+    .map(|(_, value)| {
+        serde_json::from_slice(&value).map_err(|error| HookError::Serde(error.to_string()))
+    })
+    .collect()
+}
+
+/// Resolves the catalog id a `Collection`, `VectorCollection` or `Graph` hook is
+/// scoped to. `None` means the object is missing or has another kind, so the hook
+/// matches nothing. Other targets match by name and need no lookup.
+fn resolve_hook_scope(repl: &dyn Replication, hook: &HookSpec) -> Result<Option<u32>, HookError> {
+    let (HookTarget::Collection(name)
+    | HookTarget::VectorCollection(name)
+    | HookTarget::Graph(name)) = &hook.target
+    else {
+        return Ok(None);
     };
-    observability::record_hook_failure(kind);
-    ReplError::Unsupported(message)
+    let entry = read_catalog_entry_from_repl(repl, name).map_err(|error| match error {
+        ConfigError::Repl(error) => HookError::Repl(error),
+        other => HookError::Serde(format!(
+            "hook {} cannot resolve its target {name}: {other}",
+            hook.name
+        )),
+    })?;
+    Ok(match (&hook.target, entry) {
+        (HookTarget::Collection(_), Some(CatalogEntry::Collection { collection_id, .. }))
+        | (HookTarget::VectorCollection(_), Some(CatalogEntry::Vector { collection_id, .. })) => {
+            Some(collection_id.as_u32())
+        }
+        (HookTarget::Graph(_), Some(CatalogEntry::Graph { graph_id })) => Some(graph_id.as_u32()),
+        _ => None,
+    })
 }
 
 fn apply_before_hook(hook: &HookSpec, op: &Op) -> Result<(), HookError> {
@@ -1422,13 +1511,43 @@ fn read_timeline_record<R: Replication + ?Sized>(
 }
 
 fn earliest_lsn<R: Replication + ?Sized>(repl: &R) -> Result<Lsn, FeedError> {
-    let rows = repl.range(txn::COMMIT_LOG_TABLE, &[], &[], ReadConsistency::Strong)?;
-    let Some((key, _)) = rows.first() else {
-        return Ok(1);
-    };
-    txn::decode_txn_id(key).map_err(Into::into)
+    Ok(txn::history::earliest_commit_lsn(repl)?)
 }
 
+/// Re-checks the retained log floor when the page does not start right after
+/// `from`, so a truncation racing with this poll can never silently skip records.
+fn ensure_no_truncated_prefix<R: Replication + ?Sized>(
+    repl: &R,
+    from: &ResumeToken,
+    current: Lsn,
+    page: &txn::history::CommitRecordsPage,
+) -> Result<(), FeedError> {
+    if from.lsn >= current {
+        return Ok(());
+    }
+    let expected = from
+        .lsn
+        .checked_add(1)
+        .ok_or_else(|| FeedError::Serde("lsn overflow".to_owned()))?;
+    if page
+        .records
+        .first()
+        .is_some_and(|record| record.txn_id == expected)
+    {
+        return Ok(());
+    }
+    let earliest = earliest_lsn(repl)?;
+    if expected < earliest {
+        return Err(FeedError::TokenExpired {
+            requested: from.lsn,
+            earliest,
+        });
+    }
+    Ok(())
+}
+
+/// Reads every commit record in `(start, end]`, failing closed instead of
+/// skipping LSNs that history GC truncated or that are missing from the log.
 fn commit_records_between<R: Replication + ?Sized>(
     repl: &R,
     start: Lsn,
@@ -1440,17 +1559,41 @@ fn commit_records_between<R: Replication + ?Sized>(
     let first = start
         .checked_add(1)
         .ok_or_else(|| FeedError::Serde("lsn overflow".to_owned()))?;
+    ensure_commit_log_retained(repl, start)?;
     let start_key = txn::commit_log_key(first);
     let end_key = end.checked_add(1).map_or([0xFF; 8], txn::commit_log_key);
-    repl.range(
-        txn::COMMIT_LOG_TABLE,
-        &start_key,
-        &end_key,
-        ReadConsistency::Strong,
-    )?
-    .into_iter()
-    .map(|(_, value)| txn::decode_commit_log_record(&value).map_err(Into::into))
-    .collect()
+    let records = repl
+        .range(
+            txn::COMMIT_LOG_TABLE,
+            &start_key,
+            &end_key,
+            ReadConsistency::Strong,
+        )?
+        .into_iter()
+        .map(|(_, value)| txn::decode_commit_log_record(&value).map_err(FeedError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.iter().map(|record| record.txn_id).eq(first..=end) {
+        return Ok(records);
+    }
+    // A truncation that committed after the first check also leaves a gap.
+    ensure_commit_log_retained(repl, start)?;
+    Err(FeedError::Storage(StorageError::Corruption(format!(
+        "commit log is missing records in {first}..={end}"
+    ))))
+}
+
+fn ensure_commit_log_retained<R: Replication + ?Sized>(
+    repl: &R,
+    start: Lsn,
+) -> Result<(), FeedError> {
+    let earliest = earliest_lsn(repl)?;
+    if start.saturating_add(1) < earliest {
+        return Err(FeedError::TokenExpired {
+            requested: start,
+            earliest,
+        });
+    }
+    Ok(())
 }
 
 fn validate_view_spec(spec: &MaterializedViewSpec) -> Result<(), MaterializedViewError> {
@@ -1574,6 +1717,23 @@ fn apply_view_changefeed(
     }
 }
 
+/// Applies every stored row of the source table as an upsert, matching what a
+/// changefeed replay from LSN 0 leaves behind.
+fn seed_view_from_source_rows(
+    database: &crate::db::Database,
+    spec: &MaterializedViewSpec,
+    state: &mut MaterializedViewState,
+) -> Result<(), MaterializedViewError> {
+    let prefix = crate::temporal::table_prefix(&spec.source_table);
+    let end = crate::keyenc::range_end(&prefix);
+    for table in [REL_ROWS_TABLE, REL_COLUMNAR_SEGMENTS_TABLE] {
+        for (key, value) in database.range(table, &prefix, &end, ReadConsistency::Strong)? {
+            apply_view_upsert(spec, state, &key, &value)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_view_event(
     spec: &MaterializedViewSpec,
     state: &mut MaterializedViewState,
@@ -1587,6 +1747,15 @@ fn apply_view_event(
         }
         return Ok(());
     };
+    apply_view_upsert(spec, state, key, value_after)
+}
+
+fn apply_view_upsert(
+    spec: &MaterializedViewSpec,
+    state: &mut MaterializedViewState,
+    key: &[u8],
+    value_after: &[u8],
+) -> Result<(), MaterializedViewError> {
     let Some(row) = decode_row_bytes(value_after)? else {
         return Ok(());
     };
@@ -1753,15 +1922,18 @@ fn aggregate_to_value(value: &AggregateValue) -> Value {
     }
 }
 
-fn hook_matches_op(hook: &HookSpec, op: &Op) -> bool {
+fn hook_matches_op(hook: &HookSpec, scope: Option<u32>, op: &Op) -> bool {
     match op {
         Op::Put { table, key, .. } | Op::Delete { table, key } => {
-            hook_matches_parts(hook, table, key)
+            hook_matches_parts(hook, scope, table, key)
         }
     }
 }
 
-fn hook_matches_parts(hook: &HookSpec, table: &str, key: &[u8]) -> bool {
+/// `scope` is the resolved catalog id for `Collection`, `VectorCollection` and
+/// `Graph` targets (see [`resolve_hook_scope`]).
+fn hook_matches_parts(hook: &HookSpec, scope: Option<u32>, table: &str, key: &[u8]) -> bool {
+    let in_scope = |id: Option<u32>| scope.is_some() && id == scope;
     match &hook.target {
         HookTarget::AnyUser => !table.starts_with("__") && !is_derived_index_table(table),
         HookTarget::Keyspace(expected) => expected == table,
@@ -1769,8 +1941,10 @@ fn hook_matches_parts(hook: &HookSpec, table: &str, key: &[u8]) -> bool {
             matches!(table, REL_ROWS_TABLE | REL_COLUMNAR_SEGMENTS_TABLE)
                 && parse_table_name_from_key(key).is_some_and(|actual| &actual == expected)
         }
-        HookTarget::Collection(_) => table == DOCUMENT_TABLE,
-        HookTarget::VectorCollection(_) => table == VECTOR_TABLE,
+        HookTarget::Collection(_) => table == DOCUMENT_TABLE && in_scope(parse_collection_id(key)),
+        HookTarget::VectorCollection(_) => {
+            table == VECTOR_TABLE && in_scope(parse_collection_id(key))
+        }
         HookTarget::FullTextIndex(expected) => {
             matches!(table, FULL_TEXT_DOCS_TABLE | FULL_TEXT_POSTINGS_TABLE)
                 && parse_len_prefixed_name(key).is_some_and(|actual| &actual == expected)
@@ -1779,7 +1953,10 @@ fn hook_matches_parts(hook: &HookSpec, table: &str, key: &[u8]) -> bool {
             matches!(table, TIME_SERIES_CHUNKS_TABLE | TIME_SERIES_LATEST_TABLE)
                 && parse_len_prefixed_name(key).is_some_and(|actual| &actual == expected)
         }
-        HookTarget::Graph(_) => matches!(table, GRAPH_OUT_EDGES_TABLE | GRAPH_IN_EDGES_TABLE),
+        HookTarget::Graph(_) => {
+            matches!(table, GRAPH_OUT_EDGES_TABLE | GRAPH_IN_EDGES_TABLE)
+                && in_scope(parse_graph_id(key))
+        }
         HookTarget::GeoIndex(expected) => {
             matches!(table, GEO_POINTS_TABLE | GEO_INDEX_TABLE)
                 && parse_len_prefixed_name(key).is_some_and(|actual| &actual == expected)
@@ -2134,5 +2311,319 @@ mod tests {
         )?;
         assert!(events.is_empty(), "expected an empty value, got {events:?}");
         Ok(())
+    }
+
+    mod bounded_history {
+        use std::{
+            collections::BTreeMap,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        use crate::{
+            cdc::{
+                ChangeOp, ChangefeedFilter, ChangefeedOptions, FeedError, HOOK_DELIVERIES_TABLE,
+                HookAction, HookError, HookSpec, HookTarget, ResumeToken, SubscriptionConfig,
+                commit_records_between, current_resume_token, deliver_after_commit_hooks,
+                poll_changefeed, poll_changefeed_page, register_hook,
+            },
+            db::{DbConfig, Profile, create_database},
+            repl::{Op, ReadConsistency, ReplError, Replication, SingleNode},
+            storage::{Bytes, MemEngine, StorageEngine, StorageError, WriteTransaction},
+            txn::{self, WriteAuthorization},
+        };
+
+        /// Counts commit-log rows read and can truncate LSNs 1..=5 right before
+        /// the first commit-log range read, simulating a concurrent history GC.
+        struct LogProbe {
+            inner: SingleNode<MemEngine>,
+            commit_log_rows: AtomicUsize,
+            truncate_on_first_range: AtomicBool,
+        }
+
+        impl LogProbe {
+            fn with_commits(count: u8, truncate_on_first_range: bool) -> Result<Self, ReplError> {
+                let inner = SingleNode::new(MemEngine::new());
+                for id in 0..count {
+                    inner.propose(Op::Put {
+                        table: "t".to_owned(),
+                        key: vec![id],
+                        value: vec![id],
+                    })?;
+                }
+                Ok(Self {
+                    inner,
+                    commit_log_rows: AtomicUsize::new(0),
+                    truncate_on_first_range: AtomicBool::new(truncate_on_first_range),
+                })
+            }
+
+            fn take_rows(&self) -> usize {
+                self.commit_log_rows.swap(0, Ordering::SeqCst)
+            }
+
+            fn truncate_prefix(&self, record_floor: bool) -> Result<(), ReplError> {
+                let mut write = self.inner.storage().begin_write()?;
+                for lsn in 1..=5 {
+                    write.delete(txn::COMMIT_LOG_TABLE, &txn::commit_log_key(lsn))?;
+                }
+                if record_floor {
+                    write.put(
+                        txn::TXN_META_TABLE,
+                        txn::history::COMMIT_LOG_FLOOR_KEY,
+                        &txn::encode_txn_id(6),
+                    )?;
+                }
+                write.commit()?;
+                Ok(())
+            }
+        }
+
+        impl Replication for LogProbe {
+            fn propose(&self, op: Op) -> Result<(), ReplError> {
+                self.inner.propose(op)
+            }
+
+            fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+                self.inner.propose_batch(ops)
+            }
+
+            fn propose_authorized_batch(
+                &self,
+                ops: Vec<Op>,
+                authorization: WriteAuthorization,
+            ) -> Result<(), ReplError> {
+                self.inner.propose_authorized_batch(ops, authorization)
+            }
+
+            fn read(
+                &self,
+                table: &str,
+                key: &[u8],
+                consistency: ReadConsistency,
+            ) -> Result<Option<Bytes>, ReplError> {
+                self.inner.read(table, key, consistency)
+            }
+
+            fn range(
+                &self,
+                table: &str,
+                start: &[u8],
+                end: &[u8],
+                consistency: ReadConsistency,
+            ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+                if table == txn::COMMIT_LOG_TABLE
+                    && self.truncate_on_first_range.swap(false, Ordering::SeqCst)
+                {
+                    self.truncate_prefix(true)?;
+                }
+                let rows = self.inner.range(table, start, end, consistency)?;
+                if table == txn::COMMIT_LOG_TABLE {
+                    self.commit_log_rows.fetch_add(rows.len(), Ordering::SeqCst);
+                }
+                Ok(rows)
+            }
+        }
+
+        fn system_options() -> ChangefeedOptions {
+            ChangefeedOptions {
+                include_system: true,
+            }
+        }
+
+        #[test]
+        fn changefeed_page_reads_bounded_records() -> Result<(), Box<dyn std::error::Error>> {
+            let repl = LogProbe::with_commits(40, false)?;
+            let catalog = BTreeMap::new();
+            let filter = ChangefeedFilter::default();
+            let options = system_options();
+
+            repl.take_rows();
+            let page = poll_changefeed_page(
+                &repl,
+                &catalog,
+                &ResumeToken::default(),
+                &filter,
+                &options,
+                5,
+            )?;
+            assert!(page.has_more);
+            assert_eq!(page.next.lsn, 5);
+            let commits = page
+                .events
+                .iter()
+                .filter(|event| matches!(event.op, ChangeOp::TxCommit))
+                .count();
+            assert_eq!(commits, 5);
+            assert!(repl.take_rows() <= 6);
+
+            let (all, last) = poll_changefeed(
+                &repl,
+                &catalog,
+                &ResumeToken::default(),
+                &filter,
+                &options,
+                1_000,
+            )?;
+            let mut paged = Vec::new();
+            let mut token = ResumeToken::default();
+            loop {
+                let page = poll_changefeed_page(&repl, &catalog, &token, &filter, &options, 5)?;
+                paged.extend(page.events);
+                token = page.next;
+                if !page.has_more {
+                    break;
+                }
+            }
+            assert_eq!(paged, all);
+            assert_eq!(token, last);
+            assert_eq!(last.lsn, 40);
+            Ok(())
+        }
+
+        #[test]
+        fn changefeed_poll_detects_truncated_prefix() -> Result<(), Box<dyn std::error::Error>> {
+            let catalog = BTreeMap::new();
+            let filter = ChangefeedFilter::default();
+            let options = system_options();
+
+            let truncated = LogProbe::with_commits(10, false)?;
+            truncated.truncate_prefix(false)?;
+            assert!(matches!(
+                poll_changefeed(
+                    &truncated,
+                    &catalog,
+                    &ResumeToken::default(),
+                    &filter,
+                    &options,
+                    100
+                ),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+            let (_, next) = poll_changefeed(
+                &truncated,
+                &catalog,
+                &ResumeToken::new("default", 5),
+                &filter,
+                &options,
+                100,
+            )?;
+            assert_eq!(next.lsn, 10);
+
+            // The truncation lands after the expiry check passed; the leading-gap
+            // recheck must still refuse to skip LSNs 1..=5.
+            let racing = LogProbe::with_commits(10, true)?;
+            assert!(matches!(
+                poll_changefeed(
+                    &racing,
+                    &catalog,
+                    &ResumeToken::default(),
+                    &filter,
+                    &options,
+                    100
+                ),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+            Ok(())
+        }
+
+        #[test]
+        fn hook_commit_reads_fail_closed_on_missing_records()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let lsns = |records: &[txn::CommitLogRecord]| {
+                records
+                    .iter()
+                    .map(|record| record.txn_id)
+                    .collect::<Vec<_>>()
+            };
+
+            let intact = LogProbe::with_commits(10, false)?;
+            assert_eq!(
+                lsns(&commit_records_between(&intact, 0, 10)?),
+                (1..=10).collect::<Vec<_>>()
+            );
+
+            let truncated = LogProbe::with_commits(10, false)?;
+            truncated.truncate_prefix(true)?;
+            assert!(matches!(
+                commit_records_between(&truncated, 0, 10),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+            assert_eq!(
+                lsns(&commit_records_between(&truncated, 5, 10)?),
+                (6..=10).collect::<Vec<_>>()
+            );
+
+            // The truncation lands after the floor check passed.
+            let racing = LogProbe::with_commits(10, true)?;
+            assert!(matches!(
+                commit_records_between(&racing, 0, 10),
+                Err(FeedError::TokenExpired {
+                    requested: 0,
+                    earliest: 6
+                })
+            ));
+
+            // A hole above the floor is corruption, never a silently skipped record.
+            let holed = LogProbe::with_commits(10, false)?;
+            let mut write = holed.inner.storage().begin_write()?;
+            write.delete(txn::COMMIT_LOG_TABLE, &txn::commit_log_key(7))?;
+            write.commit()?;
+            assert!(matches!(
+                commit_records_between(&holed, 5, 10),
+                Err(FeedError::Storage(StorageError::Corruption(_)))
+            ));
+
+            // After-commit hook delivery surfaces the racing truncation and records nothing.
+            let hooked = LogProbe::with_commits(10, false)?;
+            register_hook(
+                &hooked,
+                &HookSpec::after(
+                    "audit",
+                    HookTarget::AnyUser,
+                    HookAction::RecordAfterCommit,
+                    1_000,
+                ),
+            )?;
+            hooked.truncate_on_first_range.store(true, Ordering::SeqCst);
+            let delivered = deliver_after_commit_hooks(&hooked, 0, 10);
+            assert!(
+                matches!(&delivered, Err(HookError::Serde(message)) if message.contains("expired")),
+                "{delivered:?}"
+            );
+            assert!(
+                hooked
+                    .range(HOOK_DELIVERIES_TABLE, &[], &[], ReadConsistency::Strong)?
+                    .is_empty(),
+                "expected an empty value, got {:?}",
+                hooked.range(HOOK_DELIVERIES_TABLE, &[], &[], ReadConsistency::Strong)?
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn ack_subscription_is_noop_for_unchanged_token() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let database = create_database(DbConfig::new(Profile::InMemory))?;
+            database.create_subscription(SubscriptionConfig::new("sub", ResumeToken::default()))?;
+            let token = ResumeToken::new("default", 1);
+            let first = database.ack_subscription("sub", token.clone())?;
+            let lsn = current_resume_token(&database)?.lsn;
+
+            let again = database.ack_subscription("sub", token)?;
+
+            assert_eq!(again, first);
+            assert_eq!(current_resume_token(&database)?.lsn, lsn);
+            assert_eq!(database.subscription_state("sub")?, first);
+            Ok(())
+        }
     }
 }
