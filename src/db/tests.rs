@@ -2843,6 +2843,58 @@ fn transaction_keeps_snapshot_after_concurrent_commit() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn transaction_snapshot_reads_base_rows_on_disk() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("snapshot.redb");
+    let mut database = create_database(DbConfig::on_disk(Profile::Balanced, path))?;
+    let table = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    table.insert(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(37),
+    ])?;
+    table.insert(vec![
+        Value::Int(2),
+        Value::Str("Grace".to_owned()),
+        Value::Int(85),
+    ])?;
+
+    let mut txn = database.begin_transaction()?;
+    table.update(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(38),
+    ])?;
+    table.delete(&Value::Int(2))?;
+    table.insert(vec![
+        Value::Int(3),
+        Value::Str("Linus".to_owned()),
+        Value::Int(55),
+    ])?;
+
+    assert_eq!(
+        txn.get_row("accounts", &Value::Int(1))?
+            .and_then(|row| row.get(2).cloned()),
+        Some(Value::Int(37))
+    );
+    assert!(txn.get_row("accounts", &Value::Int(2))?.is_some());
+    assert_eq!(txn.get_row("accounts", &Value::Int(3))?, None);
+
+    txn.insert_row(
+        "accounts",
+        vec![
+            Value::Int(3),
+            Value::Str("Linus".to_owned()),
+            Value::Int(56),
+        ],
+    )?;
+    let error = txn.commit().err().ok_or("stale insert committed")?;
+    assert!(error.is_conflict(), "unexpected error: {error}");
+
+    Ok(())
+}
+
+#[test]
 fn read_committed_transaction_observes_new_commits() -> Result<(), Box<dyn std::error::Error>> {
     let mut database = create_database(DbConfig::new(Profile::InMemory))?;
     let table = database.create_table("accounts", Some(account_schema()), Vec::new())?;
