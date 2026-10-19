@@ -676,7 +676,7 @@ exclusive file lock: a database another process holds open is refused.
 | `multidb config apply --spec <file> [--db <path>] (--confirm <prov_id> \| --auto-approve) [flags] [--json]` | Recomputes the plan and applies it: a missing or empty file is created with `provision_new_database`, an existing database is opened and converged with `apply_provision`. Without `--confirm` or `--auto-approve` a noop exits 0 and any other plan is printed with exit 2 |
 | `multidb config drift --spec <file> [--db <path>] [--unmanaged ignore\|report\|fail] [--json]` | How the database differs from the spec, for CI |
 | `multidb config status --db <path> [--json]` | The provision record with its guarantee statuses, the last 20 history entries, the profile manifest and the drift of the database against the spec the record applied |
-| `multidb config export --db <path> [--format yaml\|json] [--out <file>] [--force]` | `export_spec`: the applied spec, or an inferred version 2 spec, with `deployment.storage_path` pointing at the database relative to the directory of `--out` (the canonical absolute path on stdout), so `config plan --spec <file>` without `--db` plans the exported database. Without `--out` the spec goes to stdout and the notes to stderr; `--out` never replaces a file without `--force`, and never the database or another multidb database |
+| `multidb config export --db <path> [--format yaml\|json] [--out <file>] [--force]` | `export_spec`: the applied spec, or an inferred version 2 spec, with `deployment.storage_path` pointing at the database relative to the directory of `--out` (the canonical absolute path on stdout), so `config plan --spec <file>` without `--db` plans the exported database. Without `--out` the spec goes to stdout and the notes to stderr; `--out` never replaces a file without `--force`, and never the database or another multidb database. A spec larger than 1 MiB (`MAX_SPEC_BYTES`), which `config plan\|apply --spec` could not read back (the Rust API applies specs of any size), exits 2 with `SPEC_TOO_LARGE` and is written nowhere, neither to `--out` nor to stdout, as in `config upgrade` |
 | `multidb init --guided (--profile <p> \| --template <t>) --name <n> ... --apply [--db <path>] [--confirm <prov_id>]` | Writes the files as `init` always does, then provisions a new database from the spec |
 
 The flags of `config plan` and `config apply` are `--allow-weakening
@@ -707,7 +707,7 @@ single-node CP databases are provisioned, so an AP database is refused with
 | --- | --- |
 | 0 | the plan is ready or a noop; the apply applied or was a noop; the database is in sync |
 | 1 | a partial apply (printed with the failed step and "re-run plan"), a runtime or I/O error, a locked database, a usage error |
-| 2 | an invalid spec, a blocked plan, missing flags, a missing or rejected confirmation, a target that already holds a database (`init --apply`); for `config drift`, an invalid spec or no database path |
+| 2 | an invalid spec, a blocked plan, missing flags, a missing or rejected confirmation, a target that already holds a database (`init --apply`), an exported spec over 1 MiB (`config export`, `SPEC_TOO_LARGE`); for `config drift`, an invalid spec or no database path |
 | 3 | drift (`config drift` only): not in sync, including a missing database, a blocked plan and unmanaged objects under `--unmanaged fail` |
 | 4 | the confirmed `prov_` id is no longer the current plan |
 

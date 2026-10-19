@@ -372,7 +372,9 @@ All notable public changes will be recorded here.
   `config export --db <path> [--format yaml|json] [--out <file>] [--force]`
   (the exported `deployment.storage_path` points at the database relative to
   the directory of `--out`, or is its absolute path on stdout; `--out` never
-  names the database or another multidb database, even with `--force`).
+  names the database or another multidb database, even with `--force`; a
+  spec over 1 MiB, which `--spec` could not read back, exits 2 with
+  `SPEC_TOO_LARGE` and is written nowhere, as in `config upgrade`).
   `--allow-weakening` and `--allow-destructive` (repeatable or
   comma-separated), `--allow-format-upgrade` and `--unmanaged
   ignore|report|fail` are part of the `prov_` id. The target is `--db`, else

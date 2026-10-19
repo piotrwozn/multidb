@@ -400,16 +400,8 @@ fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
     let content = serialize_spec(&upgraded, format)?;
     // Re-serializing can grow a compact spec past the size limit, and with `--force` the
     // result would replace an input that multidb can read with one it refuses.
-    if content.len() > spec_io::MAX_SPEC_BYTES {
-        let too_large = SpecIoError::TooLarge {
-            limit: spec_io::MAX_SPEC_BYTES,
-            found: u64::try_from(content.len()).unwrap_or(u64::MAX),
-        };
-        let report = too_large
-            .validation_report()
-            .ok_or_else(|| CliError::Runtime(too_large.to_string()))?;
-        let source = out_path.as_deref().map(|out_path| ("--out", out_path));
-        return spec_report_run(&report, &output, source);
+    if let Some(refused) = refuse_oversized_spec(&content, &output, out_path.as_deref())? {
+        return Ok(refused);
     }
     // An invalid result is not written: with `--force` it could replace a valid input.
     let written = match &out_path {
@@ -1898,6 +1890,8 @@ where
 /// spec (`provision::export_spec`): the spec the provision record applied, else a version 2 spec
 /// inferred from the catalog, the profile manifest and the RBAC state. Without `--out` the spec
 /// goes to stdout and the notes to stderr; `--out` refuses to replace a file without `--force`.
+/// A spec over `spec_io::MAX_SPEC_BYTES`, which multidb could not read back, exits 2 with
+/// `SPEC_TOO_LARGE` and is written nowhere, as in `config upgrade`.
 fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
     let path = PathBuf::from(required_value(args, "--db")?);
     let out_path = flag_value(args, "--out")?.map(PathBuf::from);
@@ -1933,6 +1927,11 @@ fn run_config_export(args: &[String]) -> Result<CliRun, CliError> {
     };
     point_storage_path_at(&mut exported, &path, out_path.as_deref());
     let content = serialize_spec(&exported.spec, &format)?;
+    // A spec the Rust API applied, or one inferred from a large catalog, can serialize past
+    // the size limit; `config plan|apply --spec` would refuse to read it back.
+    if let Some(refused) = refuse_oversized_spec(&content, "text", out_path.as_deref())? {
+        return Ok(refused);
+    }
     let Some(out_path) = out_path else {
         // stdout carries only the spec, so it can be redirected into a file.
         for note in &exported.notes {
@@ -4402,6 +4401,29 @@ fn read_spec_file(path: &Path) -> Result<Result<DatabaseSpec, ValidationReport>,
             })
         }
     }
+}
+
+/// The `SPEC_TOO_LARGE` report (exit 2) for a serialized spec over `spec_io::MAX_SPEC_BYTES`,
+/// which multidb could not read back; `None` for one within the limit. `config upgrade` and
+/// `config export` write such a spec nowhere, neither to `--out` (named in the text report)
+/// nor to stdout.
+fn refuse_oversized_spec(
+    content: &str,
+    output: &str,
+    out_path: Option<&Path>,
+) -> Result<Option<CliRun>, CliError> {
+    if content.len() <= spec_io::MAX_SPEC_BYTES {
+        return Ok(None);
+    }
+    let too_large = SpecIoError::TooLarge {
+        limit: spec_io::MAX_SPEC_BYTES,
+        found: u64::try_from(content.len()).unwrap_or(u64::MAX),
+    };
+    let report = too_large
+        .validation_report()
+        .ok_or_else(|| CliError::Runtime(too_large.to_string()))?;
+    let source = out_path.map(|out_path| ("--out", out_path));
+    spec_report_run(&report, output, source).map(Some)
 }
 
 /// Prints the report of a spec that could not be decoded, with exit code 2.
@@ -8237,6 +8259,63 @@ mod tests {
                 MetadataProbe::Initialized(_)
             ));
         }
+        Ok(())
+    }
+
+    /// `config export` refuses a spec over `MAX_SPEC_BYTES` as `config upgrade` does: exit 2
+    /// with `SPEC_TOO_LARGE`, and the spec goes nowhere, neither to `--out` (even with `--force`)
+    /// nor to stdout. The Rust API applies specs of any size, so 300 operation hints of 4 KiB
+    /// each record an applied spec of more than 1 MiB.
+    #[test]
+    fn config_export_refuses_specs_over_the_spec_size_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::provision::{
+            Confirmation, ProvisionEnvironment, ProvisionOptions, ProvisionOutcome,
+            ProvisionSurface, provision_new_database,
+        };
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("shop.redb");
+        let mut spec = provision_spec(&json!([document_collection("orders")]))?;
+        let hint = "x".repeat(multidb::config_spec::MAX_MAP_VALUE_BYTES);
+        spec.operation_hints
+            .extend((0..300).map(|index| (format!("bulk.h{index}"), hint.clone())));
+        let (db, report) = provision_new_database(
+            &spec,
+            Some(&db_path),
+            &Confirmation::AutoApproveAdditive,
+            &ProvisionOptions::default(),
+            &ProvisionEnvironment::new(ProvisionSurface::RustApi),
+        )?;
+        assert_eq!(report.status, ProvisionOutcome::Applied, "{report:?}");
+        drop(db);
+
+        let db_arg = path_arg(&db_path);
+        let out = temp.path().join("exported.yaml");
+        let out_arg = path_arg(&out);
+        let kept = temp.path().join("kept.json");
+        std::fs::write(&kept, "keep")?;
+        let kept_arg = path_arg(&kept);
+        for extra in [
+            vec![],
+            vec!["--format", "json"],
+            vec!["--out", out_arg.as_str()],
+            vec!["--out", kept_arg.as_str(), "--force"],
+        ] {
+            let mut args = vec!["config", "export", "--db", db_arg.as_str()];
+            args.extend(extra);
+            let outcome = run(strings(&args))?;
+            assert_eq!(outcome.exit_code, 2, "{args:?}: {}", outcome.message);
+            assert!(
+                outcome.message.contains("SPEC_TOO_LARGE")
+                    && !outcome.message.contains("operation_hints")
+                    && !outcome.message.contains(&hint),
+                "{args:?}: {}",
+                outcome.message
+            );
+        }
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(&kept)?, "keep");
         Ok(())
     }
 
