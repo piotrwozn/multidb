@@ -6,8 +6,9 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    sync::{Mutex, MutexGuard},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use sqlparser::{
@@ -22,7 +23,7 @@ use crate::{
     performance::PerformanceConfig,
     query::{QueryError, QueryFingerprint, RelIndexSpec, SqlOutput, SqlRows, TableLayout},
     repl::{Op, ReadConsistency, ReplError, Replication, propose_system, propose_system_batch},
-    storage::Bytes,
+    storage::{Bytes, StorageError},
 };
 
 pub const WORKLOAD_TABLE: &str = "__workload";
@@ -34,6 +35,20 @@ pub const REPROFILE_JOBS_TABLE: &str = "__reprofile_jobs";
 const POLICY_KEY: &[u8] = b"default";
 const DEFAULT_HEAVY_SCAN_RATIO: f64 = 10.0;
 const DEFAULT_HEAVY_SCAN_ROWS: u64 = 100;
+
+/// Buffered SQL statements that trigger a workload flush.
+///
+/// Workload samples are advisory: SQL statements aggregate them per fingerprint in memory
+/// and the buffer is persisted as one batched system write once any `WORKLOAD_FLUSH_*`
+/// threshold is reached. Samples buffered since the last flush are lost on crash.
+const WORKLOAD_FLUSH_SAMPLES: u64 = 4_096;
+/// Distinct buffered fingerprints that trigger a workload flush.
+const WORKLOAD_FLUSH_FINGERPRINTS: usize = 256;
+/// Buffered fingerprint and canonical SQL bytes that trigger a workload flush.
+const WORKLOAD_FLUSH_BYTES: usize = 1024 * 1024;
+/// Age of the oldest buffered sample that triggers a workload flush. There is no background
+/// flusher: the age is checked when the next statement is recorded.
+const WORKLOAD_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(thiserror::Error, Debug)]
 pub enum TuningError {
@@ -241,6 +256,27 @@ pub struct ReprofileJob {
 
 pub struct WorkloadProfiler;
 pub struct IndexAdvisor;
+
+/// In-memory, per-fingerprint aggregation of workload samples.
+///
+/// SQL statements record into this buffer instead of making one durable system commit each.
+/// Buffered deltas are merged into the persisted workload counters with one batched system
+/// write when a flush threshold is reached or a flush is requested. A single lock serialises
+/// recording, the read-merge-write of a flush and reports, so statements running concurrently
+/// in one process neither lose nor double-count updates. A failed flush discards the drained
+/// deltas, keeping memory bounded on nodes that cannot write.
+#[derive(Debug, Default)]
+pub(crate) struct WorkloadBuffer {
+    state: Mutex<PendingWorkload>,
+}
+
+#[derive(Debug, Default)]
+struct PendingWorkload {
+    entries: BTreeMap<Bytes, WorkloadEntry>,
+    samples: u64,
+    bytes: usize,
+    oldest: Option<Instant>,
+}
 
 impl Default for WorkloadSample {
     fn default() -> Self {
@@ -652,52 +688,105 @@ impl ReprofileJob {
     }
 }
 
+impl PendingWorkload {
+    fn add(&mut self, delta: WorkloadEntry, now: Instant) {
+        self.samples = self.samples.saturating_add(1);
+        self.oldest.get_or_insert(now);
+        match self.entries.entry(workload_key(&delta.fingerprint)) {
+            Entry::Occupied(mut entry) => merge_workload_entry(entry.get_mut(), &delta),
+            Entry::Vacant(entry) => {
+                self.bytes = self
+                    .bytes
+                    .saturating_add(delta.fingerprint.0.len())
+                    .saturating_add(delta.canonical_sql.len());
+                entry.insert(delta);
+            }
+        }
+    }
+
+    fn should_flush(&self, now: Instant) -> bool {
+        self.samples >= WORKLOAD_FLUSH_SAMPLES
+            || self.entries.len() >= WORKLOAD_FLUSH_FINGERPRINTS
+            || self.bytes >= WORKLOAD_FLUSH_BYTES
+            || self.oldest.is_some_and(|oldest| {
+                now.saturating_duration_since(oldest) >= WORKLOAD_FLUSH_INTERVAL
+            })
+    }
+}
+
+impl WorkloadBuffer {
+    /// Aggregates one sample in memory and flushes the buffer once a threshold is reached.
+    pub(crate) fn record(
+        &self,
+        repl: &dyn Replication,
+        sample: &WorkloadSample,
+    ) -> Result<(), TuningError> {
+        self.record_at(repl, sample, Instant::now())
+    }
+
+    fn record_at(
+        &self,
+        repl: &dyn Replication,
+        sample: &WorkloadSample,
+        now: Instant,
+    ) -> Result<(), TuningError> {
+        let delta = workload_entry_from_sample(sample, now_millis());
+        observability::record_workload_fingerprint(&delta.fingerprint.0);
+        let mut state = self.lock()?;
+        state.add(delta, now);
+        if state.should_flush(now) {
+            Self::flush_locked(repl, &mut state)?;
+        }
+        Ok(())
+    }
+
+    /// Persists every buffered sample with one batched system write.
+    pub(crate) fn flush(&self, repl: &dyn Replication) -> Result<(), TuningError> {
+        let mut state = self.lock()?;
+        Self::flush_locked(repl, &mut state)
+    }
+
+    /// Reports the persisted workload merged with buffered samples, without writing.
+    pub(crate) fn report(
+        &self,
+        repl: &dyn Replication,
+        window: WorkloadWindow,
+    ) -> Result<WorkloadReport, TuningError> {
+        let state = self.lock()?;
+        WorkloadProfiler::report_with_pending(repl, window, &state.entries)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, PendingWorkload>, TuningError> {
+        self.state.lock().map_err(|_| {
+            TuningError::Repl(ReplError::Storage(StorageError::Backend(
+                "workload buffer lock poisoned".to_owned(),
+            )))
+        })
+    }
+
+    fn flush_locked(
+        repl: &dyn Replication,
+        state: &mut PendingWorkload,
+    ) -> Result<(), TuningError> {
+        if state.entries.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(state);
+        WorkloadProfiler::persist_deltas(repl, pending.entries.into_values())
+    }
+}
+
 impl WorkloadProfiler {
+    /// Records one sample with its own durable system write.
+    ///
+    /// The read-merge-write is not atomic, so callers must serialise calls against the same
+    /// backend. `Database` routes SQL observations through an in-memory `WorkloadBuffer`
+    /// that batches these writes instead.
     pub fn record(repl: &dyn Replication, sample: &WorkloadSample) -> Result<(), TuningError> {
-        let now = now_millis();
-        let fingerprint = QueryFingerprint::new(&sample.sql);
-        let key = workload_key(&fingerprint);
-        let previous = repl
-            .read(WORKLOAD_TABLE, &key, ReadConsistency::Strong)?
-            .map(|bytes| decode::<WorkloadEntry>(&bytes))
-            .transpose()?;
-        let mut entry = previous.unwrap_or_else(|| WorkloadEntry {
-            fingerprint: fingerprint.clone(),
-            canonical_sql: canonical_sql(&sample.sql),
-            executions: 0,
-            total_latency_ms: 0.0,
-            max_latency_ms: 0.0,
-            returned_rows: 0,
-            examined_rows: 0,
-            access_pattern: access_pattern_from_sample(sample),
-            used_indexes: BTreeSet::new(),
-            first_seen_millis: now,
-            last_seen_millis: now,
-        });
-
-        entry.executions = entry.executions.saturating_add(1);
-        entry.total_latency_ms += sample.latency_ms.max(0.0);
-        entry.max_latency_ms = entry.max_latency_ms.max(sample.latency_ms.max(0.0));
-        entry.returned_rows = entry.returned_rows.saturating_add(sample.returned_rows);
-        entry.examined_rows = entry.examined_rows.saturating_add(sample.examined_rows);
-        if let Some(index) = sample.used_index {
-            entry.used_indexes.insert(index);
-        }
-        entry.last_seen_millis = now;
-        if matches!(entry.access_pattern, AccessPattern::Unknown) {
-            entry.access_pattern = access_pattern_from_sample(sample);
-        }
-
-        let value = encode(&entry)?;
-        propose_system(
-            repl,
-            Op::Put {
-                table: WORKLOAD_TABLE.to_owned(),
-                key,
-                value,
-            },
-        )?;
-        observability::record_workload_fingerprint(&entry.fingerprint.0);
+        let entry = workload_entry_from_sample(sample, now_millis());
+        let fingerprint = entry.fingerprint.0.clone();
+        Self::persist_deltas(repl, [entry])?;
+        observability::record_workload_fingerprint(&fingerprint);
         Ok(())
     }
 
@@ -705,18 +794,62 @@ impl WorkloadProfiler {
         repl: &dyn Replication,
         window: WorkloadWindow,
     ) -> Result<WorkloadReport, TuningError> {
+        Self::report_with_pending(repl, window, &BTreeMap::new())
+    }
+
+    fn persist_deltas(
+        repl: &dyn Replication,
+        deltas: impl IntoIterator<Item = WorkloadEntry>,
+    ) -> Result<(), TuningError> {
+        let mut ops = Vec::new();
+        for delta in deltas {
+            let key = workload_key(&delta.fingerprint);
+            let entry = match repl.read(WORKLOAD_TABLE, &key, ReadConsistency::Strong)? {
+                Some(bytes) => {
+                    let mut entry = decode::<WorkloadEntry>(&bytes)?;
+                    merge_workload_entry(&mut entry, &delta);
+                    entry
+                }
+                None => delta,
+            };
+            ops.push(Op::Put {
+                table: WORKLOAD_TABLE.to_owned(),
+                key,
+                value: encode(&entry)?,
+            });
+        }
+        if !ops.is_empty() {
+            propose_system_batch(repl, ops)?;
+        }
+        Ok(())
+    }
+
+    fn report_with_pending(
+        repl: &dyn Replication,
+        window: WorkloadWindow,
+        pending: &BTreeMap<Bytes, WorkloadEntry>,
+    ) -> Result<WorkloadReport, TuningError> {
         let now = now_millis();
         let min_seen = window.duration().and_then(|duration| {
             let millis = u128_to_u64(duration.as_millis());
             now.checked_sub(millis)
         });
-        let mut entries = Vec::new();
-        for (_, value) in repl.range(WORKLOAD_TABLE, &[], &[0xFF], ReadConsistency::Strong)? {
-            let entry = decode::<WorkloadEntry>(&value)?;
-            if min_seen.is_none_or(|min| entry.last_seen_millis >= min) {
-                entries.push(entry);
+        let mut merged = BTreeMap::new();
+        for (key, value) in repl.range(WORKLOAD_TABLE, &[], &[0xFF], ReadConsistency::Strong)? {
+            merged.insert(key, decode::<WorkloadEntry>(&value)?);
+        }
+        for (key, delta) in pending {
+            match merged.entry(key.clone()) {
+                Entry::Occupied(mut entry) => merge_workload_entry(entry.get_mut(), delta),
+                Entry::Vacant(entry) => {
+                    entry.insert(delta.clone());
+                }
             }
         }
+        let mut entries = merged
+            .into_values()
+            .filter(|entry| min_seen.is_none_or(|min| entry.last_seen_millis >= min))
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| Reverse(entry.examined_rows));
         Ok(WorkloadReport {
             window,
@@ -1130,6 +1263,40 @@ fn persist_advice(repl: &dyn Replication, advice: &IndexAdviceReport) -> Result<
     Ok(())
 }
 
+fn workload_entry_from_sample(sample: &WorkloadSample, now: u64) -> WorkloadEntry {
+    let fingerprint = QueryFingerprint::new(&sample.sql);
+    let latency_ms = sample.latency_ms.max(0.0);
+    WorkloadEntry {
+        canonical_sql: fingerprint.0.clone(),
+        fingerprint,
+        executions: 1,
+        total_latency_ms: latency_ms,
+        max_latency_ms: latency_ms,
+        returned_rows: sample.returned_rows,
+        examined_rows: sample.examined_rows,
+        access_pattern: access_pattern_from_sample(sample),
+        used_indexes: sample.used_index.into_iter().collect(),
+        first_seen_millis: now,
+        last_seen_millis: now,
+    }
+}
+
+fn merge_workload_entry(target: &mut WorkloadEntry, delta: &WorkloadEntry) {
+    target.executions = target.executions.saturating_add(delta.executions);
+    target.total_latency_ms += delta.total_latency_ms;
+    target.max_latency_ms = target.max_latency_ms.max(delta.max_latency_ms);
+    target.returned_rows = target.returned_rows.saturating_add(delta.returned_rows);
+    target.examined_rows = target.examined_rows.saturating_add(delta.examined_rows);
+    target
+        .used_indexes
+        .extend(delta.used_indexes.iter().copied());
+    target.first_seen_millis = target.first_seen_millis.min(delta.first_seen_millis);
+    target.last_seen_millis = target.last_seen_millis.max(delta.last_seen_millis);
+    if matches!(target.access_pattern, AccessPattern::Unknown) {
+        target.access_pattern = delta.access_pattern.clone();
+    }
+}
+
 fn access_pattern_from_sample(sample: &WorkloadSample) -> AccessPattern {
     if let (Some(table), Some(column)) = (&sample.resource, &sample.filter_column) {
         return AccessPattern::PointLookup {
@@ -1218,10 +1385,6 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, TuningError> {
     Ok(rendered)
 }
 
-fn canonical_sql(sql: &str) -> String {
-    QueryFingerprint::new(sql).0
-}
-
 fn advice_id(kind: &str, table: &str, column: &str) -> String {
     format!(
         "{kind}-{}-{}",
@@ -1299,14 +1462,19 @@ fn u64_to_usize(value: u64) -> Result<usize, TuningError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        IndexAdvisor, ParameterEnvelope, ReprofilePlan, ReprofileStatus, TunableParameter,
-        TuningDecision, TuningDecisionStatus, TuningPolicy, WorkloadProfiler, WorkloadSample,
-        WorkloadWindow, advance_reprofile_job, apply_decision_to_config,
-        apply_decision_to_config_with_history, read_policy, read_reprofile_job, read_tuning_log,
-        rollback_decision_in_config, start_reprofile_job, write_policy, write_tuning_log,
+        IndexAdvisor, ParameterEnvelope, PendingWorkload, ReprofilePlan, ReprofileStatus,
+        TunableParameter, TuningDecision, TuningDecisionStatus, TuningError, TuningPolicy,
+        WORKLOAD_FLUSH_BYTES, WORKLOAD_FLUSH_FINGERPRINTS, WORKLOAD_FLUSH_INTERVAL,
+        WORKLOAD_FLUSH_SAMPLES, WorkloadBuffer, WorkloadProfiler, WorkloadSample, WorkloadWindow,
+        advance_reprofile_job, apply_decision_to_config, apply_decision_to_config_with_history,
+        read_policy, read_reprofile_job, read_tuning_log, rollback_decision_in_config,
+        start_reprofile_job, workload_entry_from_sample, write_policy, write_tuning_log,
     };
     use crate::{
         db::Profile,
@@ -1329,6 +1497,165 @@ mod tests {
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].executions, 2);
         assert_eq!(report.entries[0].examined_rows, 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn workload_pending_should_flush_on_each_trigger() -> Result<(), Box<dyn std::error::Error>> {
+        let t0 = Instant::now();
+        assert!(!PendingWorkload::default().should_flush(t0));
+
+        let delta =
+            workload_entry_from_sample(&WorkloadSample::new("SELECT * FROM t WHERE id = 1"), 0);
+        let mut samples = PendingWorkload::default();
+        for _ in 1..WORKLOAD_FLUSH_SAMPLES {
+            samples.add(delta.clone(), t0);
+        }
+        assert_eq!(samples.entries.len(), 1);
+        assert!(!samples.should_flush(t0));
+        samples.add(delta.clone(), t0);
+        assert!(samples.should_flush(t0));
+
+        let mut fingerprints = PendingWorkload::default();
+        for column in 1..WORKLOAD_FLUSH_FINGERPRINTS {
+            let sample = WorkloadSample::new(format!("SELECT c{column} FROM t"));
+            fingerprints.add(workload_entry_from_sample(&sample, 0), t0);
+        }
+        assert_eq!(fingerprints.entries.len(), WORKLOAD_FLUSH_FINGERPRINTS - 1);
+        assert!(!fingerprints.should_flush(t0));
+        let sample = WorkloadSample::new("SELECT c0 FROM t");
+        fingerprints.add(workload_entry_from_sample(&sample, 0), t0);
+        assert!(fingerprints.should_flush(t0));
+
+        let mut bytes = PendingWorkload::default();
+        let column = "a".repeat(WORKLOAD_FLUSH_BYTES);
+        let sample = WorkloadSample::new(format!("SELECT {column} FROM t")).with_access("t", "a");
+        bytes.add(workload_entry_from_sample(&sample, 0), t0);
+        assert!(bytes.should_flush(t0));
+
+        let mut aged = PendingWorkload::default();
+        aged.add(delta, t0);
+        assert!(!aged.should_flush(t0));
+        let later = t0
+            .checked_add(WORKLOAD_FLUSH_INTERVAL)
+            .ok_or("instant overflow")?;
+        assert!(aged.should_flush(later));
+        Ok(())
+    }
+
+    #[test]
+    fn workload_buffer_defers_persistence_until_sample_threshold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repl = SingleNode::new(MemEngine::new());
+        let buffer = WorkloadBuffer::default();
+        let sample = WorkloadSample::new("SELECT * FROM users WHERE age = 37")
+            .with_access("users", "age")
+            .with_observed_rows(1, 10);
+        let before = repl.current_txn_id()?;
+        // A fixed instant keeps the age trigger out of this test on slow machines.
+        let now = Instant::now();
+        for _ in 1..WORKLOAD_FLUSH_SAMPLES {
+            buffer.record_at(&repl, &sample, now)?;
+        }
+
+        assert_eq!(repl.current_txn_id()?, before);
+        assert!(
+            WorkloadProfiler::report(&repl, WorkloadWindow::All)?
+                .entries
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            WorkloadProfiler::report(&repl, WorkloadWindow::All)?.entries
+        );
+        let buffered = buffer.report(&repl, WorkloadWindow::All)?;
+        assert_eq!(buffered.entries.len(), 1);
+        assert_eq!(buffered.entries[0].executions, WORKLOAD_FLUSH_SAMPLES - 1);
+        assert_eq!(
+            buffered.entries[0].examined_rows,
+            (WORKLOAD_FLUSH_SAMPLES - 1) * 10
+        );
+
+        buffer.record_at(&repl, &sample, now)?;
+        assert_eq!(repl.current_txn_id()?, before + 1);
+        let persisted = WorkloadProfiler::report(&repl, WorkloadWindow::All)?;
+        assert_eq!(persisted.entries.len(), 1);
+        assert_eq!(persisted.entries[0].executions, WORKLOAD_FLUSH_SAMPLES);
+        let merged = buffer.report(&repl, WorkloadWindow::All)?;
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(merged.entries[0].executions, WORKLOAD_FLUSH_SAMPLES);
+        Ok(())
+    }
+
+    #[test]
+    fn workload_buffer_flush_merges_into_persisted_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repl = SingleNode::new(MemEngine::new());
+        let buffer = WorkloadBuffer::default();
+        let sample = WorkloadSample::new("SELECT * FROM users WHERE age = 37")
+            .with_latency_ms(2.0)
+            .with_observed_rows(1, 500);
+        WorkloadProfiler::record(&repl, &sample)?;
+        WorkloadProfiler::record(&repl, &sample)?;
+        for _ in 0..3 {
+            buffer.record(&repl, &sample)?;
+        }
+
+        let buffered = buffer.report(&repl, WorkloadWindow::All)?;
+        assert_eq!(buffered.entries.len(), 1);
+        assert_eq!(buffered.entries[0].executions, 5);
+        assert_eq!(buffered.entries[0].examined_rows, 2_500);
+
+        let before = repl.current_txn_id()?;
+        buffer.flush(&repl)?;
+        assert_eq!(repl.current_txn_id()?, before + 1);
+        let persisted = WorkloadProfiler::report(&repl, WorkloadWindow::All)?;
+        assert_eq!(persisted.entries.len(), 1);
+        assert_eq!(persisted.entries[0].executions, 5);
+        assert_eq!(persisted.entries[0].returned_rows, 5);
+        assert_eq!(persisted.entries[0].examined_rows, 2_500);
+        let merged = buffer.report(&repl, WorkloadWindow::All)?;
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(merged.entries[0].executions, 5);
+
+        buffer.flush(&repl)?;
+        assert_eq!(repl.current_txn_id()?, before + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn workload_buffer_concurrent_records_do_not_lose_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const THREADS: u64 = 4;
+        let repl = SingleNode::new(MemEngine::new());
+        let buffer = WorkloadBuffer::default();
+        let sample = WorkloadSample::new("SELECT * FROM users WHERE age = 37")
+            .with_access("users", "age")
+            .with_observed_rows(1, 10);
+        let per_thread = WORKLOAD_FLUSH_SAMPLES / 2 + 3;
+
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let mut recorders = Vec::new();
+            for _ in 0..THREADS {
+                recorders.push(scope.spawn(|| -> Result<(), TuningError> {
+                    for _ in 0..per_thread {
+                        buffer.record(&repl, &sample)?;
+                    }
+                    Ok(())
+                }));
+            }
+            for recorder in recorders {
+                recorder.join().map_err(|_| "recorder panicked")??;
+            }
+            Ok(())
+        })?;
+        buffer.flush(&repl)?;
+
+        let persisted = WorkloadProfiler::report(&repl, WorkloadWindow::All)?;
+        assert_eq!(persisted.entries.len(), 1);
+        assert_eq!(persisted.entries[0].executions, THREADS * per_thread);
+        assert_eq!(
+            persisted.entries[0].examined_rows,
+            THREADS * per_thread * 10
+        );
         Ok(())
     }
 
