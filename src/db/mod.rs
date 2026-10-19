@@ -97,6 +97,7 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod history;
 mod runtime;
 
 use runtime::wasm_runtime_for_database;
@@ -582,6 +583,7 @@ pub struct Database {
     audit_enabled: bool,
     audit_config: AuditConfig,
     audit_lock: Arc<Mutex<()>>,
+    history_pins: Arc<Mutex<txn::ActiveSnapshotRegistry>>,
     encryption: Option<EncryptionConfig>,
     plan_cache: Arc<Mutex<PlanCache>>,
     performance: PerformanceConfig,
@@ -1868,7 +1870,8 @@ impl Database {
     /// Enables MVCC-backed system versioning for a table and registers its history object.
     /// # Errors
     /// Fails when the database uses AP replication, the base table is missing, untyped, or the
-    /// history name collides.
+    /// history name collides, and with `RetentionExpired` when `retention.min_lsn` is below the
+    /// history GC horizon.
     pub fn enable_system_versioning(
         &mut self,
         table: &str,
@@ -1888,6 +1891,7 @@ impl Database {
         })?;
         let history_name = format!("{table}_history");
         self.ensure_name_available(&history_name)?;
+        self.ensure_retention_above_history_horizon(retention.min_lsn)?;
         let entry = CatalogEntry::TemporalTable {
             base_table: table.to_owned(),
             schema,
@@ -3471,6 +3475,7 @@ impl Database {
         }
         let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
+        let _history_pin = self.pin_history_lsn(lsn)?;
         let engine = self.sql_engine()?.with_snapshot_lsn(lsn);
         Ok(engine.execute(sql).await?)
     }
@@ -4044,6 +4049,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4075,6 +4081,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4106,6 +4113,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4136,6 +4144,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,

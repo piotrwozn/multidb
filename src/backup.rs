@@ -164,6 +164,16 @@ pub enum BackupError {
     #[error("missing commit log range: {start}..={end}")]
     MissingLogRange { start: Lsn, end: Lsn },
 
+    /// History GC truncated commit-log records an incremental backup needs.
+    /// Take a new full backup to start a new chain.
+    #[error(
+        "commit log truncated: parent backup ends at lsn {parent_end_lsn} but the earliest retained commit is lsn {earliest_retained_lsn}; take a new full backup"
+    )]
+    CommitLogTruncated {
+        parent_end_lsn: Lsn,
+        earliest_retained_lsn: Lsn,
+    },
+
     #[error("missing parent backup: {0}")]
     MissingParent(BackupId),
 
@@ -283,7 +293,8 @@ pub(crate) fn ensure_incremental_backup_supported(database: &Database) -> Result
 ///
 /// # Errors
 /// Fails when the database uses AP replication (its writes are not recorded in the commit log),
-/// the parent manifest is invalid, commit logs are missing, or files cannot be written.
+/// the parent manifest is invalid, commit logs are missing or were truncated by history GC
+/// ([`BackupError::CommitLogTruncated`]), or files cannot be written.
 pub fn incremental_backup(
     database: &Database,
     dest_root: impl AsRef<Path>,
@@ -303,6 +314,15 @@ pub fn incremental_backup(
             "database lsn {end_lsn} is older than parent backup {}",
             parent.end_lsn
         )));
+    }
+    if let Some(floor) = txn::history::read_history_meta(&read, txn::history::COMMIT_LOG_FLOOR_KEY)?
+        && parent.end_lsn < end_lsn
+        && parent.end_lsn.saturating_add(1) < floor
+    {
+        return Err(BackupError::CommitLogTruncated {
+            parent_end_lsn: parent.end_lsn,
+            earliest_retained_lsn: floor,
+        });
     }
 
     let records = read_commit_logs_from(&read, parent.end_lsn, end_lsn)?;
