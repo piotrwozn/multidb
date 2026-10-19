@@ -4844,11 +4844,14 @@ impl MultiModelTxn<'_> {
     pub fn get_row(&self, table: &str, primary_key: &Value) -> Result<Option<Row>, DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            return Ok(self.columnar_rows(&table)?.into_iter().find(|row| {
-                table
-                    .primary_key_value_for_row(row)
-                    .is_ok_and(|key| key == *primary_key)
-            }));
+            let segments = self.columnar_segments(&table)?;
+            return Ok(Self::columnar_rows(&table, &segments)?
+                .into_iter()
+                .find(|row| {
+                    table
+                        .primary_key_value_for_row(row)
+                        .is_ok_and(|key| key == *primary_key)
+                }));
         }
 
         let row_key = table.row_key_for_primary_key(primary_key)?;
@@ -4862,7 +4865,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if rows.iter().any(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4872,7 +4876,7 @@ impl MultiModelTxn<'_> {
             }
 
             rows.push(row);
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4892,7 +4896,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if let Some(index) = rows.iter().position(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4903,7 +4908,7 @@ impl MultiModelTxn<'_> {
                 rows.push(row);
             }
 
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4923,7 +4928,8 @@ impl MultiModelTxn<'_> {
     pub fn delete_row(&mut self, table: &str, primary_key: &Value) -> Result<(), DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             let before = rows.len();
             rows.retain(|row| {
                 !table
@@ -4932,7 +4938,7 @@ impl MultiModelTxn<'_> {
             });
 
             if rows.len() != before {
-                self.queue_ops(table.columnar_replace_ops(rows)?);
+                self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             }
 
             return Ok(());
@@ -5083,10 +5089,17 @@ impl MultiModelTxn<'_> {
         Ok(decode_row_bytes(&bytes)?)
     }
 
-    fn columnar_rows(&self, table: &RelTable) -> Result<Vec<Row>, DbError> {
-        let key = table.columnar_segment_key();
-        let bytes = self.read_raw(REL_COLUMNAR_SEGMENTS_TABLE, &key)?;
-        Ok(table.decode_columnar_rows(bytes.as_deref())?)
+    fn columnar_segments(&self, table: &RelTable) -> Result<Vec<(Bytes, Bytes)>, DbError> {
+        let (start, end) = table.columnar_segment_bounds();
+        self.range_raw(REL_COLUMNAR_SEGMENTS_TABLE, &start, &end)
+    }
+
+    fn columnar_rows(table: &RelTable, segments: &[(Bytes, Bytes)]) -> Result<Vec<Row>, DbError> {
+        let mut rows = Vec::new();
+        for (_, bytes) in segments {
+            rows.extend(table.decode_columnar_rows(Some(bytes))?);
+        }
+        Ok(rows)
     }
 
     fn queue_ops(&mut self, ops: Vec<Op>) {

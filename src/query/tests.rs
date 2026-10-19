@@ -192,13 +192,17 @@ fn columnar_table_round_trips_through_parquet() -> Result<(), Box<dyn std::error
 
     table.delete(&Value::Int(2))?;
     assert_eq!(table.get(&Value::Int(2))?, None);
+    let (start, end) = table.columnar_segment_bounds();
     assert!(
-        repl.read(
-            REL_COLUMNAR_SEGMENTS_TABLE,
-            &table.columnar_segment_key(),
-            ReadConsistency::Strong
-        )?
-        .is_some()
+        !repl
+            .range(
+                REL_COLUMNAR_SEGMENTS_TABLE,
+                &start,
+                &end,
+                ReadConsistency::Strong
+            )?
+            .is_empty(),
+        "expected a non-empty value"
     );
 
     Ok(())
