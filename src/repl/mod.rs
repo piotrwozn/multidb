@@ -105,6 +105,9 @@ pub enum ReplError {
     #[error("unsupported replication operation: {0}")]
     Unsupported(String),
 
+    #[error("write rejected: {0}")]
+    Rejected(String),
+
     #[error(
         "quota exceeded for tenant {tenant}: requested {requested} bytes, remaining {remaining} bytes"
     )]
@@ -124,6 +127,7 @@ impl ReplError {
             Self::Storage(_) => "storage",
             Self::Transport(_) => "transport",
             Self::Unsupported(_) => "unsupported",
+            Self::Rejected(_) => "rejected",
             Self::QuotaExceeded { .. } => "quota_exceeded",
         }
     }
