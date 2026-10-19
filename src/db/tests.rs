@@ -41,8 +41,9 @@ use crate::performance::{
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_INDEX_TABLE,
-    REL_ROWS_TABLE, RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint,
+    REL_COLUMNAR_SEGMENT_META_TABLE, REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE,
+    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -3965,6 +3966,38 @@ fn analytical_read_committed_transaction_keeps_rows_beyond_first_segment()
         assert!(sales.get(&Value::Int(id))?.is_some(), "row {id} is missing");
     }
     assert_eq!(sales.get(&Value::Int(5_002))?, None);
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_deletes_committed_segments_it_no_longer_needs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-shrink.redb"), 1_025)?;
+    let (start, end) = database.table("sales")?.columnar_segment_bounds();
+    let stored_keys = |table: &str| -> Result<Vec<Vec<u8>>, ReplError> {
+        Ok(database
+            .range(table, &start, &end, ReadConsistency::Strong)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    };
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?.len(), 2);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?.len(), 2);
+
+    // 1,024 rows fit one segment, so the committed second segment must go.
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(7)))?;
+
+    let expected = (0..1_025)
+        .filter(|id| *id != 7)
+        .map(sales_row)
+        .collect::<Vec<_>>();
+    assert_eq!(database.table("sales")?.scan()?, expected);
+    let segments = stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?, segments);
 
     Ok(())
 }
