@@ -145,6 +145,9 @@ Consistency status:
   background task. Samples buffered since the last flush are lost on crash or
   when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
   AP and sharded databases do not flush on drop.
+- History GC (`multidb maintenance gc`) is manual and offline; `multidb serve`
+  does not run it online or in the background yet. Commit-log truncation
+  requires a new full backup afterwards.
 
 ## Migration Guide
 
