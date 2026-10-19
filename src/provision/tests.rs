@@ -4092,8 +4092,10 @@ fn rbac_changes_only_managed_names_in_one_batch() -> TestResult {
 /// series persisted before the bound existed accepts any future timestamp (the runtime reads it
 /// back as `i64::MAX`): it conflicts with a spec that leaves the bound at its default, and its
 /// export writes the bound as `null` (no bound), never as `i64::MAX`, which JavaScript clients
-/// cannot represent. The exported spec round-trips through JSON and adopts the series.
+/// cannot represent. The exported spec round-trips through JSON and adopts the series, and no
+/// apply report, provision record, drift report or later export of it carries `i64::MAX`.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult {
     let temp_dir = tempfile::tempdir()?;
     let series = |physical: JsonValue| {
@@ -4163,12 +4165,23 @@ fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult 
     drop(db);
 
     let defaulted = series(json!({}))?;
-    let mut legacy = create_with_profile(&temp_dir.path().join("legacy.redb"), &defaulted)?;
-    legacy.create_time_series(
-        TimeSeriesConfig::new("metrics")
-            .with_chunk_millis(3_600_000)
-            .with_max_future_skew_millis(i64::MAX),
+    let legacy_path = temp_dir.path().join("legacy.redb");
+    let mut legacy = create_with_profile(&legacy_path, &defaulted)?;
+    legacy.create_time_series(TimeSeriesConfig::new("metrics").with_chunk_millis(3_600_000))?;
+    // The catalog entry as a build before the bound existed wrote it, without
+    // max_future_skew_millis: reopened, the runtime reads the series back as i64::MAX.
+    propose_system(
+        &legacy,
+        Op::Put {
+            table: "__catalog__".to_owned(),
+            key: b"metrics".to_vec(),
+            value: br#"{"TimeSeries":{"config":{"name":"metrics","chunk_millis":3600000,"retention_millis":null}}}"#
+                .to_vec(),
+        },
     )?;
+    drop(legacy);
+    let mut legacy = open_database(DbConfig::on_disk(Profile::Balanced, &legacy_path))?;
+    assert_eq!(skew_of(&legacy), Some(i64::MAX));
     let conflict = plan_open(&defaulted, &legacy)?;
     assert_blocked(&conflict, "PROVISION_OBJECT_CONFLICT");
     let diff = conflict
@@ -4221,24 +4234,50 @@ fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult 
             StepSafety::Additive
         ));
     }
-    assert_applied(&apply_cli(
-        &mut legacy,
-        &round_tripped,
-        &ProvisionOptions::default(),
-    )?);
+    // Neither the apply report, nor the stored record and its applied spec, nor drift, nor a
+    // second export carry i64::MAX.
+    let unbounded_nowhere = |db: &Database, report: &ProvisionApplyReport, spec: &DatabaseSpec| {
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        let stored = db
+            .read(PROVISION_TABLE, RECORD_KEY, ReadConsistency::Strong)?
+            .ok_or("the stored record")?;
+        assert_eq!(
+            serde_json::to_value(&record)?["applied_spec"]["collections"][0]["physical"]["max_future_skew_millis"],
+            JsonValue::Null
+        );
+        for text in [
+            serde_json::to_string(report)?,
+            serde_json::to_string(&record)?,
+            String::from_utf8(stored)?,
+            serde_json::to_string(&drift(db, spec, &ProvisionOptions::default())?)?,
+            serde_json::to_string(&export_spec(db)?.spec)?,
+        ] {
+            assert!(!text.contains(&unbounded), "{text}");
+        }
+        Ok::<_, Error>(())
+    };
+    let report = apply_cli(&mut legacy, &round_tripped, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert_eq!(skew_of(&legacy), Some(i64::MAX));
     assert_eq!(
         plan_open(&round_tripped, &legacy)?.outcome,
         PlanOutcome::Noop
     );
+    unbounded_nowhere(&legacy, &report, &round_tripped)?;
 
-    // A new series built from the exported spec has no bound either.
-    let mut rebuilt = create_with_profile(&temp_dir.path().join("rebuilt.redb"), &round_tripped)?;
-    assert_applied(&apply_cli(
-        &mut rebuilt,
-        &round_tripped,
-        &ProvisionOptions::default(),
-    )?);
-    assert_eq!(skew_of(&rebuilt), Some(i64::MAX));
+    // A new series built from the exported spec, or from one that spells the bound out as
+    // i64::MAX, has no bound either, and its record writes null.
+    for (file, spec) in [
+        ("rebuilt.redb", &round_tripped),
+        ("spelled.redb", &spelled_out),
+    ] {
+        let mut rebuilt = create_with_profile(&temp_dir.path().join(file), spec)?;
+        let report = apply_cli(&mut rebuilt, spec, &ProvisionOptions::default())?;
+        assert_applied(&report);
+        assert_eq!(skew_of(&rebuilt), Some(i64::MAX));
+        assert_eq!(plan_open(spec, &rebuilt)?.outcome, PlanOutcome::Noop);
+        unbounded_nowhere(&rebuilt, &report, spec)?;
+    }
     Ok(())
 }
 

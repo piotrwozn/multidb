@@ -544,7 +544,7 @@
           "type": "string"
         },
         "max_future_skew_millis": {
-          "description": "time_series: how far ahead of the server clock a point's timestamp may lie; later points are refused. Defaults to 300000 when left out; null means no bound (as for series created before the bound existed, which export writes as null). Fixed at creation.",
+          "description": "time_series: how far ahead of the server clock a point's timestamp may lie; later points are refused. Defaults to 300000 when left out; null means no bound, as for series created before the bound existed. 9223372036854775807 is read as null, and no bound is always written as null. Fixed at creation.",
           "minimum": 0,
           "type": [
             "integer",

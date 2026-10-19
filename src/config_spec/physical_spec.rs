@@ -152,11 +152,13 @@ pub struct PhysicalObjectSpec {
     /// later points are refused. Fixed at creation. Left out (`None`) it is
     /// [`DEFAULT_MAX_FUTURE_SKEW_MILLIS`]; an explicit `null` (`Some(None)`) means no bound, as
     /// for every series created before the bound existed, which the runtime reads back as
-    /// `i64::MAX`. Export writes such a series as `null`, since JavaScript clients cannot
-    /// represent `i64::MAX`. See [`PhysicalObjectSpec::future_skew_bound`].
+    /// `i64::MAX`. `i64::MAX` is the same bound: it is read as `Some(None)` and always written
+    /// as `null`, since JavaScript clients cannot represent it. See
+    /// [`PhysicalObjectSpec::future_skew_bound`].
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "unbounded_as_null",
         deserialize_with = "null_is_unbounded"
     )]
     pub max_future_skew_millis: Option<Option<i64>>,
@@ -179,13 +181,29 @@ impl PhysicalObjectSpec {
     }
 }
 
-/// `physical.max_future_skew_millis` when it is present: a number, or `null` for no bound. A
-/// field that is left out never reaches this function and stays `None`, the default bound.
+/// `physical.max_future_skew_millis` when it is present: a number, or `null` for no bound, which
+/// `i64::MAX` also means. A field that is left out never reaches this function and stays
+/// `None`, the default bound.
 fn null_is_unbounded<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<i64>::deserialize(deserializer).map(Some)
+    Option::<i64>::deserialize(deserializer)
+        .map(|bound| Some(bound.filter(|millis| *millis != i64::MAX)))
+}
+
+/// Writes a present `physical.max_future_skew_millis`: the number, or `null` for no bound, also
+/// when the bound is `i64::MAX`, so no spec, record or response carries a number JavaScript
+/// clients would round. `serialize_with` passes the field by reference.
+#[allow(clippy::ref_option)]
+fn unbounded_as_null<S>(bound: &Option<Option<i64>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match bound.flatten().filter(|millis| *millis != i64::MAX) {
+        Some(millis) => serializer.serialize_i64(millis),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// `physical.retention_millis` when it is present: a number. `null` is refused instead of

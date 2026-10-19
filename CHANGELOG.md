@@ -267,7 +267,9 @@ All notable public changes will be recorded here.
   bound existed, which the runtime reads back as `i64::MAX`, exports as
   `null` with a note, and plans show its bound as `null`, since JavaScript
   clients cannot represent `i64::MAX`; plan and apply read `null` as no
-  bound, so the exported spec round-trips.
+  bound, so the exported spec round-trips. A spec that spells the bound out
+  as `i64::MAX` is read as `null`, and specs, plans, apply reports, provision
+  records and drift reports always write no bound as `null`.
 - `database_spec_v2_schema()` and `docs/schemas/database-spec-v2.schema.json`
   describe `physical`, `security`, `provisioning` and `geo`.
 - `multidb::provision::physical::project`, which projects a spec onto the

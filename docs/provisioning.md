@@ -139,9 +139,12 @@ bound back as `i64::MAX`. `export_spec` (and so `config export` and
 a note, and plans show it as `null` in object parameters and field diffs,
 because JavaScript clients such as the SDK and Studio cannot represent
 `i64::MAX` and would send back a rounded value that no longer fits an `i64`.
-Plan and apply read `null` as no bound, as they read `i64::MAX`, so the
-exported spec adopts the series, and a series built from it accepts any
-future timestamp too.
+Plan and apply read `null` as no bound, so the exported spec adopts the
+series, and a series built from it accepts any future timestamp too. A spec
+that spells the bound out as `9223372036854775807` (`i64::MAX`, as specs
+exported by earlier builds did) is read as `null`, the same spec with the
+same digest, and every spec, plan, apply report, provision record and drift
+report writes no bound as `null`, never as a number.
 
 These defaults are pinned by tests: a later build projects the same objects from
 the same spec, so upgrading never creates false drift.

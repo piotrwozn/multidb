@@ -7740,6 +7740,29 @@ mod tests {
             "{plan}"
         );
         assert!(!plan.to_string().contains(&unbounded), "{plan}");
+
+        // Applying it, and the record, drift and live spec that follow, keep writing null.
+        let plan_id = plan["data"]["plan_id"].as_str().ok_or("a plan id")?;
+        let apply = serde_json::json!({ "spec": live["data"]["spec"], "confirm": plan_id });
+        let (status, applied) = post_as(&app, "/provision/apply", &apply, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(applied["data"]["status"], "applied", "{applied}");
+        let (status, state) = get_as(&app, "/provision/state", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert!(
+            state["data"]["record"]["applied_spec"]["collections"][0]["physical"]
+                .get("max_future_skew_millis")
+                .is_some_and(Value::is_null),
+            "{state}"
+        );
+        let (status, drift) = post_as(&app, "/provision/drift", &body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{drift}");
+        assert_eq!(drift["data"]["in_sync"], true, "{drift}");
+        let (status, relive) = get_as(&app, "/config/live", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{relive}");
+        for response in [&applied, &state, &drift, &relive] {
+            assert!(!response.to_string().contains(&unbounded), "{response}");
+        }
         Ok(())
     }
 

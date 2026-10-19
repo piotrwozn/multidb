@@ -6621,6 +6621,98 @@ mod tests {
         Ok(())
     }
 
+    /// `physical.max_future_skew_millis` is a tri-state: left out is the default bound, a
+    /// number is that bound, and `null` is no bound. `i64::MAX`, the runtime's value for no
+    /// bound, is read as `null` and never written back as a number, in JSON or YAML, also when a
+    /// caller builds the spec with it, since JavaScript clients cannot represent it. Both
+    /// spellings are one spec with one digest.
+    #[test]
+    fn an_unbounded_future_skew_round_trips_as_null() -> Result<(), Box<dyn std::error::Error>> {
+        use super::spec_io::{SpecFormat, decode_spec_bytes, decode_spec_value};
+
+        let metrics = |physical: serde_json::Value| {
+            v2_spec_with(json!([{
+                "name": "metrics",
+                "role": "time_series",
+                "domain": "primary",
+                "indexes": ["time_series"],
+                "physical": physical
+            }]))
+        };
+        let skew = |spec: &DatabaseSpec| {
+            spec.collections[0].physical.as_ref().map(|physical| {
+                (
+                    physical.max_future_skew_millis,
+                    physical.future_skew_bound(),
+                )
+            })
+        };
+        let written = |spec: &DatabaseSpec| -> Result<_, Box<dyn std::error::Error>> {
+            Ok(serde_json::to_value(spec)?["collections"][0]["physical"]
+                .get("max_future_skew_millis")
+                .cloned())
+        };
+        let unbounded = i64::MAX.to_string();
+
+        let defaulted = metrics(json!({ "chunk_millis": 3_600_000 }))?;
+        assert_eq!(skew(&defaulted), Some((None, 300_000)));
+        assert_eq!(written(&defaulted)?, None);
+        let bounded = metrics(json!({ "max_future_skew_millis": 5_000 }))?;
+        assert_eq!(skew(&bounded), Some((Some(Some(5_000)), 5_000)));
+        assert_eq!(written(&bounded)?, Some(json!(5_000)));
+        // A negative bound is kept as written, so validation can name it.
+        let negative = metrics(json!({ "max_future_skew_millis": -1 }))?;
+        assert_eq!(skew(&negative), Some((Some(Some(-1)), -1)));
+
+        let null = metrics(json!({ "max_future_skew_millis": null }))?;
+        let spelled_out = metrics(json!({ "max_future_skew_millis": i64::MAX }))?;
+        let mut built = metrics(json!({}))?;
+        if let Some(physical) = built.collections[0].physical.as_mut() {
+            physical.max_future_skew_millis = Some(Some(i64::MAX));
+        }
+        assert_eq!(skew(&null), Some((Some(None), i64::MAX)));
+        assert_eq!(spelled_out, null);
+        assert_eq!(skew(&built), Some((Some(Some(i64::MAX)), i64::MAX)));
+        for spec in [&null, &spelled_out, &built] {
+            assert_eq!(written(spec)?, Some(serde_json::Value::Null));
+            let json = serde_json::to_string(spec)?;
+            let yaml = serde_norway::to_string(spec)?;
+            assert!(yaml.contains("max_future_skew_millis: null"), "{yaml}");
+            for (text, format) in [(&json, SpecFormat::Json), (&yaml, SpecFormat::Yaml)] {
+                assert!(!text.contains(&unbounded), "{text}");
+                assert_eq!(decode_spec_bytes(text.as_bytes(), format)?, null);
+            }
+            assert_eq!(super::spec_digest(spec), super::spec_digest(&null));
+        }
+        // YAML reads i64::MAX as no bound too, and a bounded spec reads back unchanged.
+        let yaml = serde_norway::to_string(&bounded)?.replace(
+            "max_future_skew_millis: 5000",
+            &format!("max_future_skew_millis: {unbounded}"),
+        );
+        assert!(yaml.contains(&unbounded), "{yaml}");
+        assert_eq!(decode_spec_bytes(yaml.as_bytes(), SpecFormat::Yaml)?, null);
+        assert_eq!(
+            decode_spec_bytes(
+                serde_json::to_string(&bounded)?.as_bytes(),
+                SpecFormat::Json
+            )?,
+            bounded
+        );
+
+        // What a JavaScript client sends for i64::MAX (2^63) does not fit and is refused, as is
+        // any other value that is not an integer.
+        for refused in [
+            json!(9_223_372_036_854_775_808_u64),
+            json!(1.5),
+            json!("none"),
+        ] {
+            let mut value = serde_json::to_value(&defaulted)?;
+            value["collections"][0]["physical"]["max_future_skew_millis"] = refused.clone();
+            assert!(decode_spec_value(value).is_err(), "{refused}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn collection_names_warn_in_v1_and_fail_in_v2() -> Result<(), Box<dyn std::error::Error>> {
         let mut spec = catalog_spec("balanced", ConsistencyMode::StrongCp);
