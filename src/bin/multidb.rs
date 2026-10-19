@@ -36,6 +36,7 @@ use multidb::{
         TemplateMaterialization, TemplateOutputFormat, built_in_template, built_in_templates,
         materialize_template,
     },
+    txn::history::HistoryGcOptions,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -172,6 +173,7 @@ fn run_command(args: &[String]) -> Result<String, CliError> {
         "import" => run_import(&args[1..]),
         "export" => run_export(&args[1..]),
         "migrate" => run_migrate(&args[1..]),
+        "maintenance" => run_maintenance(&args[1..]),
         "admin" => run_admin(&args[1..]),
         "config" => run_config(&args[1..]).map(|outcome| outcome.message),
         "template" => run_template(&args[1..]).map(|outcome| outcome.message),
@@ -876,6 +878,104 @@ fn run_migrate(args: &[String]) -> Result<String, CliError> {
             "unsupported migrate command {other}"
         ))),
     }
+}
+
+fn run_maintenance(args: &[String]) -> Result<String, CliError> {
+    let Some(command) = args.first() else {
+        return Err(maintenance_usage());
+    };
+    if command != "gc" {
+        return Err(CliError::Usage(format!(
+            "unsupported maintenance command {command}\n{MAINTENANCE_USAGE}"
+        )));
+    }
+    let options = history_gc_options(args)?;
+    let database = open_cli_database(args)?;
+    let report = database.gc_history(&options)?;
+    serde_json::to_string_pretty(&report).map_err(Into::into)
+}
+
+const MAINTENANCE_USAGE: &str = "multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]\n\
+     Runs offline and needs exclusive access to the database file: stop `multidb serve` first; serve does not run history GC in the background.\n\
+     Without --history-retain-lsns <n>, AS OF history below the GC watermark (the current LSN unless a temporal keep_history retention or an AS OF pin is older) is removed for every table without a temporal keep_history retention; with it the last <n> LSNs stay queryable unless an earlier run already pruned them.\n\
+     --commit-log-retain-lsns <n> truncates the commit log and breaks the incremental backup chain: take a new full backup afterwards.";
+
+fn maintenance_usage() -> CliError {
+    CliError::Usage(MAINTENANCE_USAGE.to_owned())
+}
+
+/// Flags `maintenance gc` accepts with a value. GC removes history, so a typo or
+/// a missing value must not fall back to the defaults.
+const MAINTENANCE_GC_VALUE_FLAGS: [&str; 6] = [
+    "--db",
+    "--profile",
+    "--batch-size",
+    "--max-batches",
+    "--history-retain-lsns",
+    "--commit-log-retain-lsns",
+];
+
+fn ensure_known_gc_args(args: &[String]) -> Result<(), CliError> {
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        if arg == "--dry-run" {
+            index += 1;
+        } else if MAINTENANCE_GC_VALUE_FLAGS.contains(&arg.as_str()) {
+            match args.get(index + 1) {
+                Some(value) if !value.starts_with("--") => index += 2,
+                _ => return Err(CliError::Usage(format!("{arg} requires a value"))),
+            }
+        } else {
+            return Err(CliError::Usage(format!(
+                "unknown maintenance gc argument {arg}\n{MAINTENANCE_USAGE}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn history_gc_options(args: &[String]) -> Result<HistoryGcOptions, CliError> {
+    ensure_known_gc_args(args)?;
+    let defaults = HistoryGcOptions::default();
+    let batch_size = optional_value(args, "--batch-size")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --batch-size: {error}")))?
+        .unwrap_or(defaults.batch_size);
+    let max_batches = optional_value(args, "--max-batches")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --max-batches: {error}")))?;
+    if max_batches == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --max-batches: must be at least 1".to_owned(),
+        ));
+    }
+    let mvcc_retain_lsns = optional_value(args, "--history-retain-lsns")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --history-retain-lsns: {error}")))?;
+    if mvcc_retain_lsns == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --history-retain-lsns: must be at least 1".to_owned(),
+        ));
+    }
+    let commit_log_retain_lsns = optional_value(args, "--commit-log-retain-lsns")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --commit-log-retain-lsns: {error}")))?;
+    if commit_log_retain_lsns == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --commit-log-retain-lsns: must be at least 1".to_owned(),
+        ));
+    }
+    Ok(HistoryGcOptions {
+        dry_run: has_flag(args, "--dry-run"),
+        batch_size,
+        max_batches,
+        mvcc_retain_lsns,
+        commit_log_retain_lsns,
+    })
 }
 
 fn run_serve(args: &[String]) -> Result<String, CliError> {
@@ -1868,7 +1968,8 @@ fn usage() -> CliError {
          multidb import <csv|jsonl|pg> --db <path> --profile <profile> --file <path> [--table <name>] [--batch-size <n>] [--resume-token <path>] [--reject-file <path>]\n\
          multidb admin status --db <path> --profile <profile>\n\
          multidb admin serve --db <path> --profile <profile> [--bind <addr>] [--admin-password <password>|--admin-password-file <path>|--admin-token <token>|--insecure-local-admin]\n\
-         multidb migrate value-codec --db <path> --profile <profile>"
+         multidb migrate value-codec --db <path> --profile <profile>\n\
+         multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]"
             .to_owned(),
     )
 }
@@ -2644,6 +2745,152 @@ mod tests {
             matches!(error, Err(CliError::Usage(ref message)) if message.contains("profile list")),
             "unexpected error: {error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_gc_dry_run_and_prune_report_json() -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::{
+            db::open_database,
+            repl::{Op, ReadConsistency, Replication},
+        };
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("maintenance.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        for value in 0..5_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: vec![value],
+            })?;
+        }
+        drop(database);
+        let gc_args = |extra: &[&str]| {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "gc".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let dry_run = run(gc_args(&["--dry-run"]))?;
+        assert_eq!(dry_run.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&dry_run.message)?;
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["mvcc_versions_pruned"], 0);
+        assert!(
+            report["pending_commits"]
+                .as_u64()
+                .is_some_and(|pending| pending > 0)
+        );
+
+        let pruned = run(gc_args(&["--batch-size", "2"]))?;
+        assert_eq!(pruned.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&pruned.message)?;
+        assert_eq!(report["dry_run"], false);
+        assert!(
+            report["mvcc_versions_pruned"]
+                .as_u64()
+                .is_some_and(|count| count >= 4)
+        );
+        assert_eq!(report["complete"], true);
+
+        let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        assert_eq!(
+            reopened.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(vec![4])
+        );
+        drop(reopened);
+
+        let mut bogus = gc_args(&[]);
+        bogus[1] = "bogus".to_owned();
+        for args in [
+            gc_args(&["--commit-log-retain-lsns", "0"]),
+            gc_args(&["--history-retain-lsns", "0"]),
+            gc_args(&["--history-retain-lsns", "-1"]),
+            gc_args(&["--max-batches", "0"]),
+            gc_args(&["--batch-size", "abc"]),
+            gc_args(&["--history-retain-lsns"]),
+            gc_args(&["--history-retain-lsns", "--dry-run"]),
+            gc_args(&["--history-retain-lsn", "100"]),
+            gc_args(&["--dryrun"]),
+            bogus,
+        ] {
+            let result = run(args);
+            assert!(
+                matches!(result, Err(CliError::Usage(_))),
+                "unexpected result: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_gc_history_retain_lsns_keeps_recent_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::repl::{Op, Replication};
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("retain.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        for value in 0..6_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: vec![value],
+            })?;
+        }
+        drop(database);
+        let gc_args = |extra: &[&str]| {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "gc".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let retained = run(gc_args(&["--history-retain-lsns", "3"]))?;
+        assert_eq!(retained.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&retained.message)?;
+        let current = report["current_lsn"]
+            .as_u64()
+            .ok_or("missing current_lsn")?;
+        assert_eq!(report["watermark"].as_u64(), Some(current - 2));
+        assert_eq!(report["history_horizon"].as_u64(), Some(current - 2));
+        assert_eq!(report["limited_by"], "MvccRetainLsns");
+        assert!(report["note"].is_null());
+
+        let default = run(gc_args(&["--dry-run"]))?;
+        let report = serde_json::from_str::<serde_json::Value>(&default.message)?;
+        assert_eq!(report["limited_by"], "CurrentLsn");
+        assert!(
+            report["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("--history-retain-lsns"))
+        );
+
+        let Err(CliError::Usage(help)) = run(vec!["maintenance".to_owned()]) else {
+            return Err("maintenance without a command should print its usage".into());
+        };
+        for expected in [
+            "--history-retain-lsns",
+            "AS OF history",
+            "new full backup",
+            "serve",
+        ] {
+            assert!(help.contains(expected), "{expected} missing from {help}");
+        }
         Ok(())
     }
 }

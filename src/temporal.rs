@@ -122,16 +122,20 @@ pub fn table_rows_as_of(
 
 /// Reads rows for a table at a resolved LSN from MVCC history.
 /// # Errors
-/// Fails when MVCC data is unavailable, corrupt, or incompatible with the table schema.
+/// Fails when the LSN is below the history GC horizon, or MVCC data is unavailable,
+/// corrupt, or incompatible with the table schema.
 pub fn rows_as_of_lsn(
     repl: &dyn Replication,
     table: &str,
     schema: &TableSchema,
     snapshot_lsn: Lsn,
 ) -> Result<Vec<Row>, TemporalError> {
+    ensure_history_retained(repl, snapshot_lsn)?;
     let prefix = txn::version_key(REL_ROWS_TABLE, &table_prefix(table))?;
     let end = keyenc::range_end(&prefix);
     let versions = repl.range(txn::TXN_MVCC_TABLE, &prefix, &end, ReadConsistency::Strong)?;
+    // History GC may have committed between the first check and the range read.
+    ensure_history_retained(repl, snapshot_lsn)?;
     let mut by_key = std::collections::BTreeMap::<Bytes, (TxnId, Option<Bytes>)>::new();
     for (version_key, value) in versions {
         if version_key.len() < prefix.len() + 8 || !version_key.starts_with(&prefix) {
@@ -166,16 +170,21 @@ pub fn rows_as_of_lsn(
 
 /// Builds system-versioned history rows for a table.
 /// # Errors
-/// Fails when MVCC data is unavailable, corrupt, or outside retention.
+/// Fails when MVCC data is unavailable, corrupt, or outside retention, and with
+/// `RetentionExpired` when `retention.min_lsn` is below the history GC horizon,
+/// where pruned versions would silently be missing.
 pub fn history_rows_for_table(
     repl: &dyn Replication,
     table: &str,
     schema: &TableSchema,
     retention: TemporalRetention,
 ) -> Result<Vec<Row>, TemporalError> {
+    ensure_history_retained(repl, retention.min_lsn)?;
     let prefix = txn::version_key(REL_ROWS_TABLE, &table_prefix(table))?;
     let end = keyenc::range_end(&prefix);
     let versions = repl.range(txn::TXN_MVCC_TABLE, &prefix, &end, ReadConsistency::Strong)?;
+    // History GC may have committed between the first check and the range read.
+    ensure_history_retained(repl, retention.min_lsn)?;
     let mut rows = Vec::new();
     for (version_key, value) in versions {
         if version_key.len() < prefix.len() + 8 || !version_key.starts_with(&prefix) {
@@ -199,17 +208,21 @@ pub fn history_rows_for_table(
 }
 
 fn lsn_for_timestamp(repl: &dyn Replication, timestamp: SystemTime) -> Result<Lsn, TemporalError> {
-    let records = repl.range(txn::COMMIT_LOG_TABLE, &[], &[], ReadConsistency::Strong)?;
-    let mut selected = None;
-    for (_, value) in records {
-        let record = txn::decode_commit_log_record(&value)?;
-        if record.committed_at <= timestamp {
-            selected = Some(record.txn_id);
-        }
+    txn::history::latest_commit_at_or_before(repl, timestamp)?.ok_or(TemporalError::MissingPoint(
+        TemporalPoint::Timestamp(timestamp),
+    ))
+}
+
+/// Rejects reads below the history GC horizon, where MVCC versions may be pruned.
+fn ensure_history_retained(repl: &dyn Replication, lsn: Lsn) -> Result<(), TemporalError> {
+    let horizon = txn::history::history_horizon(repl)?;
+    if lsn < horizon {
+        return Err(TemporalError::RetentionExpired {
+            requested: lsn,
+            earliest: horizon,
+        });
     }
-    selected.ok_or(TemporalError::MissingPoint(TemporalPoint::Timestamp(
-        timestamp,
-    )))
+    Ok(())
 }
 
 fn validate_temporal_row(schema: &TableSchema, row: &Row) -> Result<(), TemporalError> {
