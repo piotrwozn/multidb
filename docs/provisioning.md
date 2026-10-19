@@ -99,7 +99,7 @@ Every collection becomes exactly one container object. Its kind is
 | `document` | `create_collection`, or `create_collection_auto_id` without a pinned id | `collection_id`; `fields` (`{name, path, type}`, empty means one field `id` holding the document id); `document_indexes` (`{path, id}`) |
 | `table` | `Database::create_table_with_layout` | `layout` (analytics: columnar; otherwise the database layout); `columns` (`{name, type, nullable: false}`; empty means a schemaless row table); `primary_key`; `table_indexes` (`{column, expression: column \| lower_ascii, include, id}`); `system_versioning`, `keep_history` |
 | `vector` | `create_vector_collection`, or `_auto_id` | `collection_id`; `dim` (1..=65536, required); `metric` (`cosine` \| `l2`, cosine); `hnsw` (`m` 1..=255, `ef_construction` >= m, `ef_search` >= 1; 16/200/48) |
-| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; left out it takes the knob, and an explicit `null` is refused when the spec is decoded, since it could mean either the knob or no retention, so a series cannot ask for no retention when its profile sets a default retention); `max_future_skew_millis` (at least 0; 300000, the runtime default for new series, when left out): how far ahead of the server clock a point's timestamp may lie, later points are refused |
+| `time_series` | `create_time_series` | `chunk_millis` (1000..=2678400000; `time_series.default_chunk_millis`, 3600000 in every preset); `retention_millis` (> 0 and at least one chunk; `time_series.default_retention_millis`, none in every preset; left out it takes the knob, and an explicit `null` is refused when the spec is decoded, since it could mean either the knob or no retention, so a series cannot ask for no retention when its profile sets a default retention); `max_future_skew_millis` (at least 0; 300000, the runtime default for new series, when left out; an explicit `null` means no bound): how far ahead of the server clock a point's timestamp may lie, later points are refused |
 | `graph` | `create_graph`, or `create_graph_auto_id` | `graph_id` |
 
 A document collection also derives:
@@ -133,8 +133,15 @@ least one chunk, and `max_future_skew_millis` at least 0. All three are fixed
 at creation and compared on every plan, the future-skew bound included, so a
 series whose bound differs from the spec (also from the 300000 default when
 the spec leaves it out) is an object conflict. A series created before the
-runtime bounded future timestamps accepts any of them: its bound reads as
-9223372036854775807 (`i64::MAX`), which `export_spec` pins, with a note.
+runtime bounded future timestamps accepts any of them: the runtime reads its
+bound back as `i64::MAX`. `export_spec` (and so `config export` and
+`GET /config/live`) writes that bound as `max_future_skew_millis: null`, with
+a note, and plans show it as `null` in object parameters and field diffs,
+because JavaScript clients such as the SDK and Studio cannot represent
+`i64::MAX` and would send back a rounded value that no longer fits an `i64`.
+Plan and apply read `null` as no bound, as they read `i64::MAX`, so the
+exported spec adopts the series, and a series built from it accepts any
+future timestamp too.
 
 These defaults are pinned by tests: a later build projects the same objects from
 the same spec, so upgrading never creates false drift.

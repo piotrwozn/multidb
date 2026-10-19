@@ -131,7 +131,8 @@ export type PhysicalObjectSpec = JsonObject & {
   hnsw?: JsonObject & { m?: number; ef_construction?: number; ef_search?: number };
   chunk_millis?: number;
   retention_millis?: number;
-  max_future_skew_millis?: number;
+  /** Left out: 300000. `null`: no bound, as export writes a series that accepts any future timestamp. */
+  max_future_skew_millis?: number | null;
 };
 
 export type PermissionSpec = "read" | "write" | "admin";

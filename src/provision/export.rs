@@ -438,12 +438,16 @@ fn container_collection(
                      retention\" when the profile sets time_series.default_retention_millis"
                 ));
             }
-            if config.max_future_skew_millis == i64::MAX {
+            // `i64::MAX`, the runtime's value for a series created before the bound existed, is
+            // written as `null` (no bound): JavaScript clients cannot represent it, and would
+            // send back a rounded value that no longer fits an i64.
+            let unbounded = config.max_future_skew_millis == i64::MAX;
+            if unbounded {
                 findings.notes.push(format!(
-                    "time series {name} accepts any future timestamp (max_future_skew_millis {}, \
-                     as for every series created before the bound existed); the spec pins that \
-                     value, so a new series built from it accepts any future timestamp too",
-                    i64::MAX
+                    "time series {name} accepts any future timestamp, as every series created \
+                     before the bound existed does; the spec writes max_future_skew_millis: \
+                     null (no bound), so a new series built from it accepts any future \
+                     timestamp too"
                 ));
             }
             Some(collection_spec(
@@ -454,7 +458,9 @@ fn container_collection(
                     kind: Some(PhysicalKind::TimeSeries),
                     chunk_millis: Some(config.chunk_millis),
                     retention_millis: config.retention_millis,
-                    max_future_skew_millis: Some(config.max_future_skew_millis),
+                    max_future_skew_millis: Some(
+                        (!unbounded).then_some(config.max_future_skew_millis),
+                    ),
                     ..PhysicalObjectSpec::default()
                 },
             ))

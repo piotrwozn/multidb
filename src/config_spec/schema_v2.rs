@@ -303,8 +303,8 @@ fn physical_schema() -> JsonValue {
                 "minimum": 1
             },
             "max_future_skew_millis": {
-                "description": "time_series: how far ahead of the server clock a point's timestamp may lie; later points are refused. Defaults to 300000, fixed at creation.",
-                "type": "integer",
+                "description": "time_series: how far ahead of the server clock a point's timestamp may lie; later points are refused. Defaults to 300000 when left out; null means no bound (as for series created before the bound existed, which export writes as null). Fixed at creation.",
+                "type": ["integer", "null"],
                 "minimum": 0
             },
             "graph_id": id_schema("graph: a pinned graph id; unpinned ids are allocated at creation.")
@@ -977,7 +977,7 @@ mod tests {
             hnsw: Some(crate::config_spec::HnswSpec::default()),
             chunk_millis: Some(1_000),
             retention_millis: Some(1_000),
-            max_future_skew_millis: Some(0),
+            max_future_skew_millis: Some(Some(0)),
             graph_id: Some(1),
         })?;
         let fields = documented.as_object().cloned().unwrap_or_default();
@@ -1108,6 +1108,22 @@ operation_hints: {}
         many["collections"][0]["physical"]["full_text"] =
             JsonValue::Array(vec![json!({ "path": "notes" }); 17]);
         assert!(conforms(&schema, &schema, &many, "$").is_err());
+        // A future-skew bound is an integer of at least 0, or null for no bound.
+        for (skew, conforming) in [
+            (json!(0), true),
+            (json!(i64::MAX), true),
+            (JsonValue::Null, true),
+            (json!(-1), false),
+            (json!("none"), false),
+        ] {
+            let mut skewed = value.clone();
+            skewed["collections"][2]["physical"]["max_future_skew_millis"] = skew.clone();
+            assert_eq!(
+                conforms(&schema, &schema, &skewed, "$").is_ok(),
+                conforming,
+                "{skew}"
+            );
+        }
         let mut dim = value;
         dim["collections"][2]["physical"]["dim"] = json!(65_537);
         assert!(conforms(&schema, &schema, &dim, "$").is_err());

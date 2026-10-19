@@ -305,6 +305,8 @@ fn vector_json(
     })
 }
 
+/// No future-skew bound (`i64::MAX`) is `null`, as in a spec: plans and drift go to JavaScript
+/// clients, which cannot represent `i64::MAX`.
 fn time_series_json(
     chunk_millis: i64,
     retention_millis: Option<i64>,
@@ -314,7 +316,7 @@ fn time_series_json(
         "kind": "time_series",
         "chunk_millis": chunk_millis,
         "retention_millis": retention_millis,
-        "max_future_skew_millis": max_future_skew_millis,
+        "max_future_skew_millis": (max_future_skew_millis != i64::MAX).then_some(max_future_skew_millis),
     })
 }
 
@@ -1342,9 +1344,11 @@ mod tests {
         Ok(())
     }
 
+    /// A number is the bound; `null` and `i64::MAX` both mean no bound, which `params_json`
+    /// shows as `null`, since JavaScript clients cannot represent `i64::MAX`.
     #[test]
     fn an_explicit_future_skew_bound_reaches_the_time_series_config() -> TestResult {
-        let skewed = |skew: i64| {
+        let skewed = |skew: JsonValue| {
             v2_spec(
                 "balanced",
                 &[json!({
@@ -1353,14 +1357,23 @@ mod tests {
                 })],
             )
         };
-        for skew in [0, 5_000, i64::MAX] {
-            let objects = projected(&skewed(skew)?)?;
-            assert_eq!(objects[0].params_json()["max_future_skew_millis"], skew);
+        for (skew, params, bound) in [
+            (json!(0), json!(0), 0),
+            (json!(5_000), json!(5_000), 5_000),
+            (json!(i64::MAX), JsonValue::Null, i64::MAX),
+            (JsonValue::Null, JsonValue::Null, i64::MAX),
+        ] {
+            let objects = projected(&skewed(skew.clone())?)?;
+            assert_eq!(
+                objects[0].params_json()["max_future_skew_millis"],
+                params,
+                "{skew}"
+            );
             let config = time_series_config("metrics", &objects[0].kind).ok_or("time series")?;
-            assert_eq!(config.max_future_skew_millis, skew);
+            assert_eq!(config.max_future_skew_millis, bound, "{skew}");
         }
         assert_eq!(
-            rejected(&skewed(-1)?)?,
+            rejected(&skewed(json!(-1))?)?,
             [pair(
                 "TIME_SERIES_PARAMS_INVALID",
                 "collections[0].physical.max_future_skew_millis"

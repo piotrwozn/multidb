@@ -4089,8 +4089,10 @@ fn rbac_changes_only_managed_names_in_one_batch() -> TestResult {
 }
 
 /// `physical.max_future_skew_millis` is created, enforced, compared and exported end to end. A
-/// series persisted before the bound existed accepts any future timestamp: it conflicts with a
-/// spec that leaves the bound at its default, and its export pins it, so the export adopts it.
+/// series persisted before the bound existed accepts any future timestamp (the runtime reads it
+/// back as `i64::MAX`): it conflicts with a spec that leaves the bound at its default, and its
+/// export writes the bound as `null` (no bound), never as `i64::MAX`, which JavaScript clients
+/// cannot represent. The exported spec round-trips through JSON and adopts the series.
 #[test]
 fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult {
     let temp_dir = tempfile::tempdir()?;
@@ -4167,9 +4169,17 @@ fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult 
             .with_chunk_millis(3_600_000)
             .with_max_future_skew_millis(i64::MAX),
     )?;
-    assert_blocked(
-        &plan_open(&defaulted, &legacy)?,
-        "PROVISION_OBJECT_CONFLICT",
+    let conflict = plan_open(&defaulted, &legacy)?;
+    assert_blocked(&conflict, "PROVISION_OBJECT_CONFLICT");
+    let diff = conflict
+        .objects
+        .iter()
+        .find(|object| object.name == "metrics")
+        .and_then(|object| object.diff.first())
+        .ok_or("a metrics diff")?;
+    assert_eq!(
+        (&diff.expected, &diff.actual),
+        (&json!(300_000), &JsonValue::Null)
     );
     let exported = export_spec(&legacy)?;
     assert_eq!(
@@ -4177,23 +4187,58 @@ fn time_series_future_skew_is_provisioned_compared_and_exported() -> TestResult 
             .physical
             .as_ref()
             .and_then(|physical| physical.max_future_skew_millis),
-        Some(i64::MAX)
+        Some(None)
     );
     assert!(
-        exported
-            .notes
-            .iter()
-            .any(|note| note.contains("accepts any future timestamp")),
+        exported.notes.iter().any(|note| {
+            note.contains("accepts any future timestamp")
+                && note.contains("max_future_skew_millis: null")
+        }),
         "{:#?}",
         exported.notes
     );
-    let plan = plan_open(&exported.spec, &legacy)?;
-    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
-    assert!(has_step(
-        &plan,
-        ProvisionStepKind::AdoptObject,
-        StepSafety::Additive
-    ));
+    let unbounded = i64::MAX.to_string();
+    let json = serde_json::to_string(&exported.spec)?;
+    assert!(json.contains("\"max_future_skew_millis\":null"), "{json}");
+    let yaml = serde_norway::to_string(&exported.spec)?;
+    for text in [&json, &yaml] {
+        assert!(!text.contains(&unbounded), "{text}");
+    }
+    let plan_json = serde_json::to_string(&conflict)?;
+    assert!(!plan_json.contains(&unbounded), "{plan_json}");
+
+    // The exported spec, read back as a client would send it, adopts the series, and so does
+    // a spec that spells the bound out as i64::MAX.
+    let round_tripped = decode_spec_bytes(json.as_bytes(), SpecFormat::Json)?;
+    assert_eq!(round_tripped, exported.spec);
+    let spelled_out = series(json!({ "max_future_skew_millis": i64::MAX }))?;
+    for spec in [&round_tripped, &spelled_out] {
+        let plan = plan_open(spec, &legacy)?;
+        assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+        assert!(has_step(
+            &plan,
+            ProvisionStepKind::AdoptObject,
+            StepSafety::Additive
+        ));
+    }
+    assert_applied(&apply_cli(
+        &mut legacy,
+        &round_tripped,
+        &ProvisionOptions::default(),
+    )?);
+    assert_eq!(
+        plan_open(&round_tripped, &legacy)?.outcome,
+        PlanOutcome::Noop
+    );
+
+    // A new series built from the exported spec has no bound either.
+    let mut rebuilt = create_with_profile(&temp_dir.path().join("rebuilt.redb"), &round_tripped)?;
+    assert_applied(&apply_cli(
+        &mut rebuilt,
+        &round_tripped,
+        &ProvisionOptions::default(),
+    )?);
+    assert_eq!(skew_of(&rebuilt), Some(i64::MAX));
     Ok(())
 }
 

@@ -261,9 +261,13 @@ All notable public changes will be recorded here.
   other than `simple`. `TIME_SERIES_PARAMS_INVALID` follows the runtime's
   time-series rules: a positive `retention_millis` of at least one chunk and
   a `physical.max_future_skew_millis` of at least 0. The future-skew bound
-  defaults to the runtime default for new series (300000 ms), is set at
-  creation, compared by every plan and pinned by `export_spec` (a series
-  created before the bound existed exports `i64::MAX`, with a note).
+  defaults to the runtime default for new series (300000 ms) when it is left
+  out, and an explicit `null` means no bound; it is set at creation, compared
+  by every plan and pinned by `export_spec`. A series created before the
+  bound existed, which the runtime reads back as `i64::MAX`, exports as
+  `null` with a note, and plans show its bound as `null`, since JavaScript
+  clients cannot represent `i64::MAX`; plan and apply read `null` as no
+  bound, so the exported spec round-trips.
 - `database_spec_v2_schema()` and `docs/schemas/database-spec-v2.schema.json`
   describe `physical`, `security`, `provisioning` and `geo`.
 - `multidb::provision::physical::project`, which projects a spec onto the

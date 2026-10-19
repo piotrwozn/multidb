@@ -6916,8 +6916,14 @@ mod tests {
             assert!(!report.valid, "{code} {path}");
         }
 
-        // As in the runtime, any future-skew bound of at least 0 is accepted.
-        for skew in [0, 5_000, i64::MAX] {
+        // As in the runtime, any future-skew bound of at least 0 is accepted, and so is `null`,
+        // no bound.
+        for skew in [
+            json!(0),
+            json!(5_000),
+            json!(i64::MAX),
+            serde_json::Value::Null,
+        ] {
             let report = GuaranteeValidator::validate(&v2_spec_with(
                 json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "max_future_skew_millis": skew } }]),
             )?);

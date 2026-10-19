@@ -7696,6 +7696,53 @@ mod tests {
         Ok(())
     }
 
+    /// A served time series without a future-skew bound (`i64::MAX` in the runtime, as for one
+    /// created before the bound existed) is `null` in `GET /config/live` and in plans, never
+    /// `i64::MAX`, which JavaScript clients (the SDK, Studio) cannot represent. The live spec
+    /// posted back as it came adopts the series.
+    #[tokio::test]
+    async fn live_config_writes_an_unbounded_future_skew_as_null()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut database = provisioning_database(&temp.path().join("app.redb"))?;
+        database.create_time_series(
+            crate::timeseries::TimeSeriesConfig::new("metrics")
+                .with_chunk_millis(3_600_000)
+                .with_max_future_skew_millis(i64::MAX),
+        )?;
+        let app = super::router(
+            AdminState::from_database_handle(Arc::new(Mutex::new(database)))
+                .with_admin_token("secret"),
+        );
+        let unbounded = i64::MAX.to_string();
+
+        let (status, live) = get_as(&app, "/config/live", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let physical = &live["data"]["spec"]["collections"][0]["physical"];
+        assert_eq!(physical["kind"], "time_series", "{live}");
+        assert!(
+            physical
+                .get("max_future_skew_millis")
+                .is_some_and(Value::is_null),
+            "{live}"
+        );
+        assert!(!live.to_string().contains(&unbounded), "{live}");
+
+        let body = serde_json::json!({ "spec": live["data"]["spec"] });
+        let (status, plan) = post_as(&app, "/provision/plan", &body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        assert!(
+            plan["data"]["steps"].as_array().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| step["kind"] == "adopt_object" && step["object"] == "metrics")
+            }),
+            "{plan}"
+        );
+        assert!(!plan.to_string().contains(&unbounded), "{plan}");
+        Ok(())
+    }
+
     /// `/config/apply` recomputes the plan from `{current, desired, confirm}` and records
     /// `plan_source: recomputed`; a client plan, even a forged one, is recorded as `client`.
     /// Both stay audit-only.

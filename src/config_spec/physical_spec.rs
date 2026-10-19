@@ -149,13 +149,43 @@ pub struct PhysicalObjectSpec {
     )]
     pub retention_millis: Option<i64>,
     /// Time series: how far ahead of the server clock a point's timestamp may lie, at least 0;
-    /// later points are refused. Defaults to [`DEFAULT_MAX_FUTURE_SKEW_MILLIS`], and is fixed
-    /// at creation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_future_skew_millis: Option<i64>,
+    /// later points are refused. Fixed at creation. Left out (`None`) it is
+    /// [`DEFAULT_MAX_FUTURE_SKEW_MILLIS`]; an explicit `null` (`Some(None)`) means no bound, as
+    /// for every series created before the bound existed, which the runtime reads back as
+    /// `i64::MAX`. Export writes such a series as `null`, since JavaScript clients cannot
+    /// represent `i64::MAX`. See [`PhysicalObjectSpec::future_skew_bound`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "null_is_unbounded"
+    )]
+    pub max_future_skew_millis: Option<Option<i64>>,
     /// Graph: a pinned graph id. Unpinned ids are allocated at apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_id: Option<u32>,
+}
+
+impl PhysicalObjectSpec {
+    /// The future-skew bound a time series gets, as the runtime stores it: the number
+    /// `max_future_skew_millis` names, `i64::MAX` (no bound) for an explicit `null`, and
+    /// [`DEFAULT_MAX_FUTURE_SKEW_MILLIS`] when it is left out.
+    #[must_use]
+    pub fn future_skew_bound(&self) -> i64 {
+        match self.max_future_skew_millis {
+            None => DEFAULT_MAX_FUTURE_SKEW_MILLIS,
+            Some(None) => i64::MAX,
+            Some(Some(millis)) => millis,
+        }
+    }
+}
+
+/// `physical.max_future_skew_millis` when it is present: a number, or `null` for no bound. A
+/// field that is left out never reaches this function and stays `None`, the default bound.
+fn null_is_unbounded<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
 }
 
 /// `physical.retention_millis` when it is present: a number. `null` is refused instead of
@@ -1584,9 +1614,7 @@ impl Planner<'_> {
                 );
             }
         }
-        let max_future_skew_millis = physical
-            .max_future_skew_millis
-            .unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MILLIS);
+        let max_future_skew_millis = physical.future_skew_bound();
         if max_future_skew_millis < 0 {
             self.time_series_invalid(
                 context,
