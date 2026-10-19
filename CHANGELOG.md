@@ -54,6 +54,19 @@ All notable public changes will be recorded here.
   `Database::workload_report` include buffered samples without writing.
   Advisory statistics buffered since the last flush can be lost on crash or
   process stop. `query_as` audit behaviour is unchanged.
+- Incremental and point-in-time restore now replays commit records through the
+  same routine as live commits. This rebuilds `__txn_mvcc` history and the HLC
+  from each record, so transactional reads, inserts after a delete, document
+  index maintenance and `AS OF LSN`/`AS OF TIMESTAMP` queries see replayed
+  commits. Snapshot transactions now read base rows from their storage
+  snapshot. Restore and verify reject broken backup chains: an LSN gap or
+  overlap with the parent, a timeline mismatch, a parent directory holding a
+  different `backup_id`, a full backup with a parent, a cycle, a commit-log gap
+  inside an incremental, or a full payload whose LSN differs from its manifest.
+  `RestoreTarget::Time` earlier than the full backup now fails with
+  `Unsupported`, as an LSN target already did. Databases restored from
+  incremental chains by earlier builds should be restored again to rebuild
+  their MVCC history.
 - `multidb serve` and `multidb admin serve` share the database between
   PostgreSQL wire and the Control Plane through a reader-writer lock instead
   of a mutex. Statements and Control Plane data, catalog, audit and advice
