@@ -2675,8 +2675,9 @@ mod tests {
 
     /// Tiering composes with profile manifests: on a zstd-framed analytical manifest database
     /// the pointer is stored framed and reads resolve it, and a full backup inlines the segment,
-    /// so verify and restore succeed without the object store and the restored manifest
-    /// database stores the segment bytes framed again.
+    /// so verify and restore succeed without the object store, the restored manifest database
+    /// stores the segment bytes framed again and its latest MVCC version and transactional reads
+    /// see the inlined segment, not a pointer.
     #[test]
     fn tiered_segments_of_a_profile_manifest_database_back_up_and_restore()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2751,6 +2752,19 @@ mod tests {
         assert_eq!(restored.table("sales")?.scan()?, rows);
         let segment = segment_value(&restored, &key)?.ok_or("missing restored segment")?;
         assert!(decode_tiered_segment_pointer(&segment)?.is_none());
+        assert!(
+            restored
+                .begin_transaction()?
+                .get_row("sales", &Value::Int(1))?
+                .is_some()
+        );
+        let latest = latest_mvcc_value(
+            &restored,
+            &txn::version_key(REL_COLUMNAR_SEGMENTS_TABLE, &key)?,
+        )?
+        .ok_or("latest segment version is a delete")?;
+        assert!(decode_tiered_segment_pointer(&latest)?.is_none());
+        assert_eq!(latest, segment);
         Ok(())
     }
 
