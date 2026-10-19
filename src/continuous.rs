@@ -75,6 +75,9 @@ pub struct TriggerSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum TriggerTiming {
     Before,
+    /// Runs after the commit. Only `accept` counts as success: any other result or
+    /// error is recorded in [`crate::cdc::POST_COMMIT_FAILURES_TABLE`] and never
+    /// fails the committed write.
     After,
 }
 
