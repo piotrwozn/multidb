@@ -1085,8 +1085,8 @@ fn limit_not_enforced(path: &str) -> ValidationIssue {
         ValidationSeverity::Error,
         format!("{KNOB_PATH_PREFIX}.{path}"),
         format!(
-            "{path} is planned but not enforced: no user write path checks it until the single \
-             write pipeline lands"
+            "{path} is planned but not enforced: only unlimited is accepted because the write \
+             pipeline does not check it yet"
         ),
         format!("Remove {path} or set it to unlimited."),
         CertificationImpact::BlocksCertified,

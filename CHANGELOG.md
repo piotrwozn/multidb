@@ -172,8 +172,8 @@ All notable public changes will be recorded here.
   profiles (`profile_variants`), and the pure resolver `resolve_profile` /
   `resolve_named_profile`, which records the provenance of every knob and a
   `prof_` digest. Presets equal today's runtime defaults: compression none,
-  limits unlimited (planned until the single write pipeline lands) and query
-  concurrency auto. See `docs/profiles.md`.
+  limits unlimited (planned: the write pipeline does not enforce them yet) and
+  query concurrency auto. See `docs/profiles.md`.
 - `PerformanceConfig::with_profile_knobs`, `ResolvedProfile::performance_config`,
   `parse_knob_assignment` (`path=value` with did-you-mean suggestions) and
   `built_in_profile_normalized` (trims, lowercases and maps `-` to `_`;

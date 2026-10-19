@@ -135,8 +135,8 @@ profile.
 | `query.max_statements` | 1..=1024 | every open | SQL parser limits | enforced | retune |
 | `query.max_values_rows` | 1..=1000000 | every open | SQL parser limits | enforced | retune |
 | `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits; DataFusion parses the SELECTs it plans again, with its own fixed limit of 50 | enforced | retune |
-| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
-| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
+| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
+| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
 | `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | declarative: recorded only until provisioning exists | provisioning |
 | `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | declarative: recorded only until provisioning exists | provisioning |
 | `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |

@@ -402,7 +402,7 @@
           "additionalProperties": false,
           "properties": {
             "max_batch_ops": {
-              "description": "Largest accepted write batch; only unlimited is accepted until the single write pipeline lands.",
+              "description": "Largest accepted write batch; only unlimited is accepted because the write pipeline does not enforce it yet.",
               "oneOf": [
                 {
                   "const": "unlimited"
@@ -415,7 +415,7 @@
               ]
             },
             "max_value_bytes": {
-              "description": "Largest accepted user value; only unlimited is accepted until the single write pipeline lands.",
+              "description": "Largest accepted user value; only unlimited is accepted because the write pipeline does not enforce it yet.",
               "oneOf": [
                 {
                   "const": "unlimited"

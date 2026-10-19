@@ -4695,7 +4695,7 @@ mod tests {
         assert_eq!(commit["timing"], "creation");
         assert_eq!(
             knob_row(&report, "limits.max_value_bytes")?["enforcement"]["planned"]["tracking"],
-            "single write pipeline"
+            "write pipeline limit check"
         );
 
         let text = run(strings(&["profile", "show", "high_durability"]))?;

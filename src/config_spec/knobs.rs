@@ -11,8 +11,8 @@ const MIB: u32 = 1_024 * KIB;
 const MIB_U64: u64 = 1_024 * 1_024;
 const GIB_U64: u64 = 1_024 * MIB_U64;
 const TIB_U64: u64 = 1_024 * GIB_U64;
-const PLANNED_WRITE_PIPELINE: KnobEnforcement = KnobEnforcement::Planned {
-    tracking: "single write pipeline",
+const PLANNED_WRITE_PIPELINE_LIMIT: KnobEnforcement = KnobEnforcement::Planned {
+    tracking: "write pipeline limit check",
 };
 
 /// One profile knob: its value domain, when it takes effect, where the runtime reads it and
@@ -347,11 +347,11 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
             max: 64 * MIB,
         },
         timing: KnobTiming::EveryOpen,
-        sink: "LimitPolicy.max_value_bytes (no user write path checks it yet)",
-        enforcement: PLANNED_WRITE_PIPELINE,
+        sink: "LimitPolicy.max_value_bytes (the write pipeline does not check it yet)",
+        enforcement: PLANNED_WRITE_PIPELINE_LIMIT,
         after_creation: ChangePolicy::Provisioning,
-        description: "Largest accepted user value; only unlimited is accepted until the single \
-                      write pipeline lands.",
+        description: "Largest accepted user value; only unlimited is accepted because the \
+                      write pipeline does not enforce it yet.",
     },
     KnobDefinition {
         path: "limits.max_batch_ops",
@@ -360,11 +360,11 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
             max: 1_000_000,
         },
         timing: KnobTiming::EveryOpen,
-        sink: "LimitPolicy.max_batch_ops (no user write path checks it yet)",
-        enforcement: PLANNED_WRITE_PIPELINE,
+        sink: "LimitPolicy.max_batch_ops (the write pipeline does not check it yet)",
+        enforcement: PLANNED_WRITE_PIPELINE_LIMIT,
         after_creation: ChangePolicy::Provisioning,
-        description: "Largest accepted write batch; only unlimited is accepted until the single \
-                      write pipeline lands.",
+        description: "Largest accepted write batch; only unlimited is accepted because the \
+                      write pipeline does not enforce it yet.",
     },
     KnobDefinition {
         path: "history.system_versioning",
