@@ -50,8 +50,8 @@ use crate::geo::{GeoError, GeoIndex, GeoIndexConfig, GeoPoint};
 use crate::graph::{Graph, GraphError, GraphId, GraphNodeId, TraversalOptions};
 use crate::keyenc;
 use crate::model::{
-    CollectionId, DOCUMENT_TABLE, DocumentCollection, DocumentId, IndexSpec, ModelError, Predicate,
-    QueryResult, Value, collection_range_bounds, decode_value, encode_value,
+    CollectionId, DOCUMENT_TABLE, DerivedIndexes, DocumentCollection, DocumentId, IndexSpec,
+    ModelError, Predicate, QueryResult, Value, collection_range_bounds, decode_value, encode_value,
 };
 use crate::observability;
 use crate::observability::MetricsConfig;
@@ -82,15 +82,15 @@ use crate::security::{
     AuthzPolicy, FileAuditSink, Permission, Principal, PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{
-    AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, StorageEngine, StorageError,
-    WriteTransaction, decode_stored_value, is_framed,
+    AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, ReencryptionReport, StorageEngine,
+    StorageError, WriteTransaction, decode_stored_value, is_framed,
 };
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
-use crate::text::{FullTextIndex, FullTextIndexConfig, TextError};
+use crate::text::{FullTextIndex, FullTextIndexConfig, TextError, TextSource};
 use crate::timeseries::{TimeSeriesCollection, TimeSeriesConfig, TimeSeriesError, time_bucket};
 use crate::tuning::{
     self, IndexAdviceReport, IndexAdvisor, ReprofileJob, ReprofilePlan, ReprofileStatus,
-    TuningDecision, TuningError, TuningLogEntry, TuningPolicy, TuningSystemView, WorkloadProfiler,
+    TuningDecision, TuningError, TuningLogEntry, TuningPolicy, TuningSystemView, WorkloadBuffer,
     WorkloadReport, WorkloadSample, WorkloadWindow,
 };
 use crate::txn::{self, IsolationLevel, TxnId, TxnOptions, WriteKey, WriteSet};
@@ -659,6 +659,7 @@ pub struct Database {
     tenant: Option<TenantRuntime>,
     wasm_runtime: WasmRuntime,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
+    workload: WorkloadBuffer,
 }
 
 pub type DatabaseSelfHealingController =
@@ -1148,6 +1149,9 @@ impl Database {
     }
 
     /// Rotates the current data encryption key for an envelope-encrypted database.
+    ///
+    /// New writes use the new key; existing values keep their old key until
+    /// [`Self::reencrypt_existing_values`] rewrites them.
     /// # Errors
     /// Fails when the database is not encrypted or the key provider cannot rotate.
     pub fn rotate_dek(&self) -> Result<u64, DbError> {
@@ -1162,8 +1166,15 @@ impl Database {
     }
 
     /// Destroys one data encryption key version for crypto-shredding.
+    ///
+    /// Refuses the current key, the last live key, and any key that still
+    /// protects stored values: call [`Self::rotate_dek`], then
+    /// [`Self::reencrypt_existing_values`] until it reports nothing left to
+    /// rewrite, then destroy the old key. Backups and other residual copies
+    /// encrypted under a destroyed key become permanently unreadable.
     /// # Errors
-    /// Fails when the database is not encrypted or the key id is unknown.
+    /// Fails when the database is not encrypted, the key id is unknown, or the
+    /// key is current, last, or still in use.
     pub fn destroy_dek(&self, key_id: u64) -> Result<(), DbError> {
         Ok(self
             .local_storage()
@@ -1173,6 +1184,29 @@ impl Database {
                 )
             })?
             .destroy_dek(key_id)?)
+    }
+
+    /// Re-encrypts every stored value under the current data encryption key.
+    ///
+    /// Runs in committed batches of at most `batch_size` values and is safe to
+    /// rerun; rerun it until `reencrypted_values` is zero before destroying old
+    /// keys. Each batch holds the storage writer and the call is synchronous, so
+    /// async callers should use `spawn_blocking`.
+    /// # Errors
+    /// Fails when the database is not encrypted, `batch_size` is zero, or a
+    /// batch cannot be read, decrypted, or committed.
+    pub fn reencrypt_existing_values(
+        &self,
+        batch_size: usize,
+    ) -> Result<ReencryptionReport, DbError> {
+        Ok(self
+            .local_storage()
+            .ok_or_else(|| {
+                ConfigError::Unsupported(
+                    "replication backend has no local encrypted storage".to_owned(),
+                )
+            })?
+            .reencrypt_existing_values(batch_size)?)
     }
 
     /// Lists live data encryption key versions.
@@ -1678,12 +1712,12 @@ impl Database {
             None,
         ))?;
 
+        let derived = self.derived_indexes_for(collection_id);
         let repl: &dyn Replication = self;
-        Ok(DocumentCollection::with_indexes(
-            repl,
-            collection_id,
-            returned_indexes,
-        ))
+        Ok(
+            DocumentCollection::with_indexes(repl, collection_id, returned_indexes)
+                .with_derived_indexes(derived),
+        )
     }
 
     /// Creates a vector collection after checking `Admin` on the database.
@@ -1715,8 +1749,12 @@ impl Database {
     }
 
     /// Creates a full-text index after checking `Admin` on the database.
+    ///
+    /// Existing documents are backfilled and later document writes keep the index current
+    /// (see `create_full_text_index`).
     /// # Errors
-    /// Fails when authorization, catalog, or index metadata persistence fails.
+    /// Fails when authorization, catalog validation, the backfill, or index metadata
+    /// persistence fails, including when the source is not a document collection.
     pub fn create_full_text_index_as(
         &mut self,
         principal: &Principal,
@@ -1794,8 +1832,12 @@ impl Database {
     }
 
     /// Creates a geo index after checking `Admin` on the database.
+    ///
+    /// Existing documents are backfilled and later document writes keep the index current
+    /// (see `create_geo_index`).
     /// # Errors
-    /// Fails when authorization, catalog, or index validation fails.
+    /// Fails when authorization, catalog validation, the backfill, or index validation
+    /// fails, including when the source is not a document collection.
     pub fn create_geo_index_as(
         &mut self,
         principal: &Principal,
@@ -1935,12 +1977,12 @@ impl Database {
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
 
+        let derived = self.derived_indexes_for(collection_id);
         let repl: &dyn Replication = self;
-        Ok(DocumentCollection::with_indexes(
-            repl,
-            collection_id,
-            indexes,
-        ))
+        Ok(
+            DocumentCollection::with_indexes(repl, collection_id, indexes)
+                .with_derived_indexes(derived),
+        )
     }
 
     /// Creates a document collection with the next available collection id.
@@ -2011,22 +2053,32 @@ impl Database {
     }
 
     /// Creates a named full-text index and persists it in the catalog.
+    ///
+    /// Documents already in the source collection are backfilled before the index is
+    /// published. After that, document writes made through `collection` handles,
+    /// transactions and Control Plane document CRUD maintain the index in the same batch.
     /// # Errors
-    /// Fails when the name collides or storage rejects metadata.
+    /// Fails when the name collides, the source is not an existing document collection,
+    /// the backfill fails, or storage rejects metadata.
     pub fn create_full_text_index(
         &mut self,
         config: FullTextIndexConfig,
     ) -> Result<FullTextIndex<'_, dyn Replication + '_>, DbError> {
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
-        {
+        let TextSource::Collection { collection_id, .. } = &config.source;
+        self.ensure_document_collection(*collection_id)?;
+        // Backfill before the catalog entry becomes visible: `&mut self` keeps in-process
+        // writers out until it is published, and every later write through `collection`
+        // handles maintains the index itself.
+        let state = {
             let repl: &dyn Replication = self;
-            FullTextIndex::new(repl, config.clone())?;
-        }
+            FullTextIndex::new(repl, config.clone())?.rebuild_entries()?
+        };
         let entry = CatalogEntry::FullTextIndex {
             config: config.clone(),
         };
-        let mut ops = FullTextIndex::<dyn Replication>::metadata_ops(&config)?;
+        let mut ops = FullTextIndex::<dyn Replication>::metadata_ops_with_state(&config, &state)?;
         ops.push(catalog_put_op(&name, &entry)?);
         propose_system_batch(&self.repl, ops)?;
         self.catalog.insert(name, entry);
@@ -2100,22 +2152,32 @@ impl Database {
     }
 
     /// Creates a named geo index and persists it in the catalog.
+    ///
+    /// Documents already in the source collection are backfilled before the index is
+    /// published; documents with an invalid point are skipped and counted. After that,
+    /// document writes made through `collection` handles, transactions and Control Plane
+    /// document CRUD maintain the index in the same batch.
     /// # Errors
-    /// Fails when the name collides or index validation fails.
+    /// Fails when the name collides, the source is not an existing document collection,
+    /// index validation or the backfill fails, or storage rejects metadata.
     pub fn create_geo_index(
         &mut self,
         config: GeoIndexConfig,
     ) -> Result<GeoIndex<'_, dyn Replication + '_>, DbError> {
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
-        {
+        self.ensure_document_collection(config.collection_id)?;
+        // Backfill before the catalog entry becomes visible: `&mut self` keeps in-process
+        // writers out until it is published, and every later write through `collection`
+        // handles maintains the index itself.
+        let state = {
             let repl: &dyn Replication = self;
-            let _ = GeoIndex::new(repl, config.clone())?;
-        }
+            GeoIndex::new(repl, config.clone())?.rebuild_entries()?
+        };
         let entry = CatalogEntry::GeoIndex {
             config: config.clone(),
         };
-        let mut ops = GeoIndex::<dyn Replication>::metadata_ops(&config)?;
+        let mut ops = GeoIndex::<dyn Replication>::metadata_ops_with_state(&config, &state)?;
         ops.push(catalog_put_op(&name, &entry)?);
         propose_system_batch(&self.repl, ops)?;
         self.catalog.insert(name, entry);
@@ -2141,6 +2203,9 @@ impl Database {
     }
 
     /// Opens a named document collection from the catalog.
+    ///
+    /// Writes built by the handle also maintain the collection's full-text and geo
+    /// indexes in the same batch.
     /// # Errors
     /// Fails when the name is missing or has the wrong kind.
     pub fn collection(
@@ -2153,12 +2218,12 @@ impl Database {
                 indexes,
                 ..
             }) => {
+                let derived = self.derived_indexes_for(*collection_id);
                 let repl: &dyn Replication = self;
-                Ok(DocumentCollection::with_indexes(
-                    repl,
-                    *collection_id,
-                    indexes.clone(),
-                ))
+                Ok(
+                    DocumentCollection::with_indexes(repl, *collection_id, indexes.clone())
+                        .with_derived_indexes(derived),
+                )
             }
             Some(other) => Err(kind_mismatch(name, "collection", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -2281,17 +2346,37 @@ impl Database {
     }
 
     /// Records one workload observation from trusted code or tests.
+    ///
+    /// The sample is persisted, together with any buffered SQL observations, in one system
+    /// write before this returns.
     /// # Errors
     /// Fails when workload metadata cannot be persisted.
     pub fn record_workload_sample(&self, sample: &WorkloadSample) -> Result<(), DbError> {
-        Ok(WorkloadProfiler::record(self.replication_ref(), sample)?)
+        self.workload.record(self.replication_ref(), sample)?;
+        self.flush_workload_samples()
     }
 
-    /// Reads the persisted workload profile.
+    /// Persists buffered workload observations in one batched system write.
+    ///
+    /// SQL statements only aggregate workload samples in memory. The buffer is also flushed
+    /// once enough statements, distinct fingerprints or SQL text have accumulated, on the
+    /// first statement after the oldest buffered sample is 10 seconds old, best-effort before
+    /// index or runtime advice, and when a single-node database is dropped. Samples buffered
+    /// since the last flush are lost on crash.
+    /// # Errors
+    /// Fails when workload metadata cannot be read or persisted; the drained samples are
+    /// discarded.
+    pub fn flush_workload_samples(&self) -> Result<(), DbError> {
+        Ok(self.workload.flush(self.replication_ref())?)
+    }
+
+    /// Reads the workload profile, including SQL observations still buffered in memory.
+    ///
+    /// This performs no write.
     /// # Errors
     /// Fails when workload metadata cannot be read.
     pub fn workload_report(&self, window: WorkloadWindow) -> Result<WorkloadReport, DbError> {
-        Ok(WorkloadProfiler::report(self.replication_ref(), window)?)
+        Ok(self.workload.report(self.replication_ref(), window)?)
     }
 
     /// Reads workload profile after checking system read permission.
@@ -2312,9 +2397,12 @@ impl Database {
     }
 
     /// Builds and persists index recommendations from workload observations.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when workload metadata or advice storage fails.
     pub fn index_advice(&self) -> Result<IndexAdviceReport, DbError> {
+        self.flush_workload_samples_before_advice();
         Ok(IndexAdvisor::advise(
             self.replication_ref(),
             &self.catalog_index_map(),
@@ -2346,9 +2434,12 @@ impl Database {
     }
 
     /// Builds Runtime Advisor V2 recommendations from workload, planner feedback and config state.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when advisor metadata or dry-run planning cannot be read.
     pub fn runtime_advice(&self) -> Result<RuntimeAdviceReport, DbError> {
+        self.flush_workload_samples_before_advice();
         let current = DatabaseSpec::from_db_config("current", self.config());
         Ok(RuntimeAdvisor::advise(
             self.replication_ref(),
@@ -2383,9 +2474,12 @@ impl Database {
     }
 
     /// Returns the dry-run migration plan for a runtime advice id.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when the advice cannot be generated or the id is unknown.
     pub fn runtime_advice_plan(&self, advice_id: &str) -> Result<MigrationPlan, DbError> {
+        self.flush_workload_samples_before_advice();
         let current = DatabaseSpec::from_db_config("current", self.config());
         Ok(RuntimeAdvisor::plan_by_id(
             self.replication_ref(),
@@ -3430,7 +3524,15 @@ impl Database {
             return Ok(());
         }
         let sample = tuning::output_to_workload_sample(sql, elapsed, output);
-        self.record_workload_sample(&sample)
+        Ok(self.workload.record(self.replication_ref(), &sample)?)
+    }
+
+    fn flush_workload_samples_before_advice(&self) {
+        // Advice falls back to persisted statistics when the flush fails, as it did when
+        // per-statement workload writes failed.
+        if self.flush_workload_samples().is_err() {
+            tracing::debug!("failed to flush workload observations before advice");
+        }
     }
 
     fn execute_tuning_system_sql(&self, sql: &str) -> Result<Option<SqlOutput>, DbError> {
@@ -3621,6 +3723,22 @@ impl Database {
         };
         let policy = self.policy_config()?;
         let resources = policy_resources(requirements);
+        // Index search rows do not carry the source document's field names, so the source
+        // collection's row and masking policies cannot be applied to them.
+        let searches_index = requirements.iter().any(|(resource, _)| {
+            matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
+        });
+        if searches_index
+            && resources
+                .iter()
+                .any(|resource| policy_has_row_or_masking(&policy, resource))
+        {
+            return Err(ExtensionError::PolicyDenied(
+                "index searches over collections with row or masking policies are not supported"
+                    .to_owned(),
+            )
+            .into());
+        }
         if resources.len() != 1 {
             if resources
                 .iter()
@@ -3940,6 +4058,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3970,6 +4089,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -4000,6 +4120,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -4029,6 +4150,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -4423,6 +4545,52 @@ impl Database {
         Ok(())
     }
 
+    /// Requires `collection_id` to name an existing document collection.
+    fn ensure_document_collection(&self, collection_id: CollectionId) -> Result<(), DbError> {
+        for (name, entry) in &self.catalog {
+            match entry {
+                CatalogEntry::Collection {
+                    collection_id: existing,
+                    ..
+                } if *existing == collection_id => return Ok(()),
+                CatalogEntry::Vector {
+                    collection_id: existing,
+                    ..
+                } if *existing == collection_id => {
+                    return Err(kind_mismatch(name, "collection", entry));
+                }
+                _ => {}
+            }
+        }
+        Err(DbError::MissingCatalogObject(format!(
+            "collection id {}",
+            collection_id.as_u32()
+        )))
+    }
+
+    /// Collects the full-text and geo indexes whose source is `collection_id`.
+    fn derived_indexes_for(&self, collection_id: CollectionId) -> DerivedIndexes {
+        let mut derived = DerivedIndexes::default();
+        for entry in self.catalog.values() {
+            match entry {
+                CatalogEntry::FullTextIndex { config } => {
+                    let TextSource::Collection {
+                        collection_id: source,
+                        ..
+                    } = &config.source;
+                    if *source == collection_id {
+                        derived.full_text.push(config.clone());
+                    }
+                }
+                CatalogEntry::GeoIndex { config } if config.collection_id == collection_id => {
+                    derived.geo.push(config.clone());
+                }
+                _ => {}
+            }
+        }
+        derived
+    }
+
     fn ensure_graph_id_available(&self, graph_id: GraphId) -> Result<(), DbError> {
         if self.catalog.values().any(|entry| {
             matches!(entry, CatalogEntry::Graph { graph_id: existing } if *existing == graph_id)
@@ -4500,11 +4668,6 @@ struct TxnSavepoint {
     write_set: WriteSet,
     read_keys: BTreeSet<WriteKey>,
     read_ranges: Vec<TxnReadRange>,
-}
-
-enum SnapshotLookup {
-    Missing,
-    Found(Option<Bytes>),
 }
 
 impl MultiModelTxn<'_> {
@@ -4642,32 +4805,8 @@ impl MultiModelTxn<'_> {
     }
 
     fn read_snapshot_raw(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
-        if let SnapshotLookup::Found(value) = self.read_mvcc_snapshot_raw(table, key)? {
-            return Ok(value);
-        }
+        // `self.read` is the point-in-time storage snapshot that defined `snapshot_id`.
         Ok(self.read.get(table, key)?)
-    }
-
-    fn read_mvcc_snapshot_raw(&self, table: &str, key: &[u8]) -> Result<SnapshotLookup, DbError> {
-        let prefix = txn::version_key(table, key)?;
-        let end = keyenc::range_end(&prefix);
-        let mut selected = None;
-        let rows = self
-            .read
-            .range(txn::TXN_MVCC_TABLE, &prefix, &end)?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (version_key, value) in rows {
-            if version_key.len() != prefix.len() + 8 || !version_key.starts_with(&prefix) {
-                continue;
-            }
-            let version = txn::decode_txn_id(&version_key[prefix.len()..])?;
-            if version <= self.snapshot_id {
-                selected = Some((version, txn::decode_mvcc_record(&value)?.value));
-            }
-        }
-        Ok(selected.map_or(SnapshotLookup::Missing, |(_, value)| {
-            SnapshotLookup::Found(value)
-        }))
     }
 
     fn record_read_key(&self, table: &str, key: &[u8]) {
@@ -5269,6 +5408,19 @@ fn trigger_event_name(event: TriggerEvent) -> &'static str {
         TriggerEvent::Insert => "insert",
         TriggerEvent::Update => "update",
         TriggerEvent::Delete => "delete",
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Workload statistics are advisory. Cluster backends are skipped so drop never blocks
+        // on Raft or quorum writes, and nothing is written when no sample is buffered.
+        if std::thread::panicking() || !matches!(self.repl, DatabaseRepl::SingleNode(_)) {
+            return;
+        }
+        if self.flush_workload_samples().is_err() {
+            tracing::debug!("failed to flush workload observations on drop");
+        }
     }
 }
 
@@ -6345,7 +6497,7 @@ fn sql_requirements(
         });
     }
 
-    if let Some(requirements) = phase19_requirements(sql)? {
+    if let Some(requirements) = phase19_requirements(sql, catalog)? {
         return Ok(requirements);
     }
 
@@ -6410,19 +6562,22 @@ fn sql_requirements(
     Ok(requirements)
 }
 
-fn phase19_requirements(sql: &str) -> Result<Option<Vec<(Resource, Permission)>>, QueryError> {
+fn phase19_requirements(
+    sql: &str,
+    catalog: &BTreeMap<String, CatalogEntry>,
+) -> Result<Option<Vec<(Resource, Permission)>>, QueryError> {
     let Some(call) = parse_phase19_call(sql)? else {
         return Ok(None);
     };
     let requirements = match call.name.as_str() {
-        "match" => vec![(
-            Resource::FullTextIndex(phase19_resource_name(&call, "match")?),
-            Permission::Read,
-        )],
-        "within_radius" => vec![(
-            Resource::GeoIndex(phase19_resource_name(&call, "within_radius")?),
-            Permission::Read,
-        )],
+        "match" => {
+            let name = phase19_resource_name(&call, "match")?;
+            index_with_source_requirements(Resource::FullTextIndex(name.clone()), &name, catalog)
+        }
+        "within_radius" => {
+            let name = phase19_resource_name(&call, "within_radius")?;
+            index_with_source_requirements(Resource::GeoIndex(name.clone()), &name, catalog)
+        }
         "graph_neighbors" => vec![(
             Resource::Graph(phase19_resource_name(&call, "graph_neighbors")?),
             Permission::Read,
@@ -6431,6 +6586,41 @@ fn phase19_requirements(sql: &str) -> Result<Option<Vec<(Resource, Permission)>>
         _ => Vec::new(),
     };
     Ok(Some(requirements))
+}
+
+/// Index searches return source document text, ids and points, so they also need Read on the
+/// source collection; its row and masking policies then deny the multi-resource result.
+fn index_with_source_requirements(
+    index: Resource,
+    name: &str,
+    catalog: &BTreeMap<String, CatalogEntry>,
+) -> Vec<(Resource, Permission)> {
+    let source = match catalog.get(name) {
+        Some(CatalogEntry::FullTextIndex { config }) => {
+            let TextSource::Collection { collection_id, .. } = &config.source;
+            Some(*collection_id)
+        }
+        Some(CatalogEntry::GeoIndex { config }) => Some(config.collection_id),
+        _ => None,
+    };
+    let mut requirements = vec![(index, Permission::Read)];
+    if let Some(collection) = source.and_then(|id| collection_name_for_id(catalog, id)) {
+        requirements.push((Resource::Collection(collection), Permission::Read));
+    }
+    requirements
+}
+
+fn collection_name_for_id(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    collection_id: CollectionId,
+) -> Option<String> {
+    catalog.iter().find_map(|(name, entry)| match entry {
+        CatalogEntry::Collection {
+            collection_id: existing,
+            ..
+        } if *existing == collection_id => Some(name.clone()),
+        _ => None,
+    })
 }
 
 fn phase19_resource_name(call: &Phase19Call, function: &str) -> Result<String, QueryError> {

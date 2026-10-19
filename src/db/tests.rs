@@ -42,7 +42,8 @@ use crate::federation::{ForeignSource, ForeignTableOptions};
 use crate::geo::{GeoError, GeoIndexConfig, GeoPoint};
 use crate::graph::{GraphId, GraphNodeId, TraversalOptions};
 use crate::model::{
-    CollectionId, FieldPath, IndexId, IndexSpec, PlanKind, Predicate, Value, decode_value,
+    CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, PlanKind, Predicate, Value,
+    decode_value,
 };
 use crate::performance::{
     BenchmarkReport, CompressionAlgorithm, PerformanceConfig, RegressionGate,
@@ -52,8 +53,8 @@ use crate::provision::{
     ProvisionActor, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus, RECORD_VERSION,
 };
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, REL_ROWS_TABLE, RelIndexSpec,
-    RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_ROWS_TABLE,
+    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -73,7 +74,7 @@ use crate::text::{FullTextIndexConfig, TextError};
 use crate::timeseries::{TimePoint, TimeSeriesConfig, TimeSeriesError};
 use crate::tuning::{
     ParameterEnvelope, ReprofilePlan, ReprofileStatus, TunableParameter, TuningDecision,
-    TuningPolicy, WorkloadSample,
+    TuningPolicy, WORKLOAD_TABLE, WorkloadEntry, WorkloadSample, WorkloadWindow,
 };
 use crate::txn;
 use crate::vector::{HnswParams, VectorCollectionConfig, VectorMetric};
@@ -313,6 +314,154 @@ async fn phase21_workload_system_view_requires_rbac_and_records_queries()
     };
     assert!(rows.columns.contains(&"fingerprint".to_owned()));
     assert!(!rows.rows.is_empty(), "expected a non-empty value");
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_read_only_selects_do_not_commit_workload_samples()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let mut database = create_database(DbConfig::on_disk(
+        Profile::Balanced,
+        temp_dir.path().join("workload.redb"),
+    ))?;
+    seed_orders(&mut database)?;
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let fingerprint = QueryFingerprint::new(sql).0;
+    let before = latest_lsn(&database)?;
+
+    for _ in 0..16 {
+        database.query(sql).await?;
+    }
+    let SqlOutput::Rows(view) = database.query("SELECT * FROM system.workload").await? else {
+        panic!("system workload should return rows");
+    };
+    assert!(view.rows.iter().any(|row| {
+        row.first() == Some(&Value::Str(fingerprint.clone())) && row.get(1) == Some(&Value::Int(16))
+    }));
+
+    assert_eq!(latest_lsn(&database)?, before);
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        None
+    );
+    assert_eq!(workload_executions(&database, &fingerprint)?, 16);
+
+    database.flush_workload_samples()?;
+    assert_eq!(latest_lsn(&database)?, before + 1);
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        Some(16)
+    );
+    assert_eq!(workload_executions(&database, &fingerprint)?, 16);
+
+    database.flush_workload_samples()?;
+    assert_eq!(latest_lsn(&database)?, before + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_query_as_selects_commit_only_audit_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut database)?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read)
+    ]));
+    let reader = Principal::new("alice").with_role("reader");
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let before = latest_lsn(&database)?;
+    let events_before = database.audit_events()?;
+
+    for _ in 0..16 {
+        database.query_as(&reader, sql).await?;
+    }
+
+    assert_eq!(latest_lsn(&database)? - before, 16);
+    let events = database.audit_events()?;
+    assert_eq!(events.len(), events_before.len() + 16);
+    let query_events = |events: &[crate::security::AuditEvent]| {
+        events
+            .iter()
+            .filter(|event| event.action == "query")
+            .count()
+    };
+    assert_eq!(query_events(&events), query_events(&events_before) + 16);
+    assert_eq!(
+        workload_executions(&database, &QueryFingerprint::new(sql).0)?,
+        16
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_workload_samples_survive_clean_drop_and_merge_with_persisted_counts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("workload.redb");
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let fingerprint = QueryFingerprint::new(sql).0;
+
+    let mut database = create_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    seed_orders(&mut database)?;
+    database.record_workload_sample(&WorkloadSample::new(sql))?;
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        Some(1)
+    );
+    for _ in 0..5 {
+        database.query(sql).await?;
+    }
+    assert_eq!(
+        persisted_workload_executions(&database, &fingerprint)?,
+        Some(1)
+    );
+    assert_eq!(workload_executions(&database, &fingerprint)?, 6);
+    drop(database);
+
+    let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(
+        persisted_workload_executions(&reopened, &fingerprint)?,
+        Some(6)
+    );
+    assert_eq!(workload_executions(&reopened, &fingerprint)?, 6);
+    let lsn = latest_lsn(&reopened)?;
+    drop(reopened);
+
+    let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(latest_lsn(&reopened)?, lsn);
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase21_runtime_advice_flushes_buffered_workload_samples()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sql = "SELECT name FROM users WHERE id = 1";
+    let fingerprint = QueryFingerprint::new(sql).0;
+
+    let mut runtime = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut runtime)?;
+    for _ in 0..8 {
+        runtime.query(sql).await?;
+    }
+    assert_eq!(persisted_workload_executions(&runtime, &fingerprint)?, None);
+    runtime.runtime_advice()?;
+    assert_eq!(
+        persisted_workload_executions(&runtime, &fingerprint)?,
+        Some(8)
+    );
+
+    let mut index = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut index)?;
+    for _ in 0..8 {
+        index.query(sql).await?;
+    }
+    assert_eq!(persisted_workload_executions(&index, &fingerprint)?, None);
+    index.index_advice()?;
+    assert_eq!(
+        persisted_workload_executions(&index, &fingerprint)?,
+        Some(8)
+    );
     Ok(())
 }
 
@@ -1405,6 +1554,128 @@ async fn create_database_with_ops_encrypts_and_reopens() -> Result<(), Box<dyn s
         Err(error) => panic!("expected corruption, got {error:?}"),
         Ok(_) => panic!("wrong encryption key unexpectedly opened the database"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn envelope_rotate_reencrypt_shred_keeps_database_readable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("envelope.redb");
+    let keyring_path = temp_dir.path().join("keyring.json");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [5_u8; 32])?;
+    let ops = || {
+        OperationalConfig::new()
+            .with_encryption(EncryptionConfig::local_envelope(&keyring_path, &kek_path))
+    };
+
+    {
+        let mut database =
+            create_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), ops())?;
+        seed_orders(&mut database)?;
+        assert_eq!(database.rotate_dek()?, 2);
+        database.table("users")?.insert(vec![
+            Value::Int(3),
+            Value::Str("Linus".to_owned()),
+            Value::Int(54),
+        ])?;
+
+        match database.destroy_dek(1) {
+            Err(DbError::Storage(StorageError::Backend(message))) => {
+                assert!(message.contains("still encrypted"), "{message}");
+            }
+            other => panic!("expected in-use key refusal, got {other:?}"),
+        }
+        match database.destroy_dek(2) {
+            Err(DbError::Storage(StorageError::Backend(message))) => {
+                assert!(message.contains("current"), "{message}");
+            }
+            other => panic!("expected current key refusal, got {other:?}"),
+        }
+
+        assert!(database.reencrypt_existing_values(4)?.reencrypted_values > 0);
+        assert_eq!(database.reencrypt_existing_values(4)?.reencrypted_values, 0);
+        database.destroy_dek(1)?;
+        assert_eq!(database.encryption_key_versions()?, vec![2]);
+    }
+
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), &ops())?;
+    let SqlOutput::Rows(rows) = reopened.query("SELECT name FROM users").await? else {
+        panic!("user query should return rows");
+    };
+    assert_eq!(rows.rows.len(), 3);
+
+    let (events, _) = reopened.poll_changefeed(
+        &ResumeToken::default(),
+        &ChangefeedFilter {
+            target: ChangefeedTarget::Table("users".to_owned()),
+        },
+        &ChangefeedOptions::default(),
+        100,
+    )?;
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event.op, ChangeOp::Upsert { .. }))
+            .count()
+            >= 3
+    );
+
+    crate::backup::full_backup(
+        &reopened,
+        temp_dir.path().join("backups"),
+        &crate::backup::BackupConfig::default(),
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn envelope_database_with_missing_keyring_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("envelope.redb");
+    let keyring_path = temp_dir.path().join("keyring.json");
+    let kek_path = temp_dir.path().join("kek.bin");
+    std::fs::write(&kek_path, [5_u8; 32])?;
+    let ops = || {
+        OperationalConfig::new()
+            .with_encryption(EncryptionConfig::local_envelope(&keyring_path, &kek_path))
+    };
+
+    {
+        let mut database =
+            create_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), ops())?;
+        seed_orders(&mut database)?;
+    }
+    let keyring = std::fs::read(&keyring_path)?;
+    std::fs::remove_file(&keyring_path)?;
+
+    match open_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), &ops()) {
+        Err(ConfigError::Storage(StorageError::Corruption(message))) => {
+            assert!(message.contains("keyring"), "{message}");
+        }
+        Err(error) => panic!("expected missing keyring corruption, got {error:?}"),
+        Ok(_) => panic!("database opened without its keyring"),
+    }
+    assert!(!keyring_path.exists());
+    match create_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), ops()) {
+        Err(ConfigError::Storage(StorageError::Corruption(message))) => {
+            assert!(message.contains("keyring"), "{message}");
+        }
+        Err(error) => panic!("expected missing keyring corruption, got {error:?}"),
+        Ok(_) => panic!("database was recreated without its keyring"),
+    }
+    assert!(!keyring_path.exists());
+
+    std::fs::write(&keyring_path, keyring)?;
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::Transactional, &path), &ops())?;
+    let SqlOutput::Rows(rows) = reopened.query("SELECT name FROM users").await? else {
+        panic!("user query should return rows");
+    };
+    assert_eq!(rows.rows.len(), 2);
     Ok(())
 }
 
@@ -3029,6 +3300,7 @@ async fn phase19_models_are_cataloged_queryable_and_reopen()
             CollectionId::new(190),
             FieldPath::new(["body"]),
         ))?;
+        assert_eq!(text.search("rust", 5)?.len(), 1);
         assert_eq!(text.refresh_full()?.indexed_documents, 1);
 
         let geo = database.create_geo_index(GeoIndexConfig::new(
@@ -3120,6 +3392,273 @@ async fn phase19_models_are_cataloged_queryable_and_reopen()
         1
     );
     Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn full_text_and_geo_indexes_follow_document_writes_without_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    const RUST: &str = "SELECT * FROM match('places_text', 'rust', 10)";
+    const ZIG: &str = "SELECT * FROM match('places_text', 'zig', 10)";
+    const NEAR_WARSAW: &str = "SELECT * FROM within_radius('places_geo', 21.0122, 52.2297, 1000)";
+    const NEAR_PARIS: &str = "SELECT * FROM within_radius('places_geo', 2.3522, 48.8566, 1000)";
+
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("derived_indexes.redb");
+    let warsaw = Value::GeoPoint {
+        lon: 21.0122,
+        lat: 52.2297,
+    };
+    let (p, r) = {
+        let mut database = create_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+        database.create_collection(
+            "places",
+            CollectionId::new(191),
+            vec![DocField::path(
+                "body",
+                FieldPath::new(["body"]),
+                ColumnType::Str,
+            )],
+            Vec::new(),
+        )?;
+        let p = database
+            .collection("places")?
+            .insert(&place("rust database", warsaw.clone()))?;
+        database.create_full_text_index(FullTextIndexConfig::collection(
+            "places_text",
+            CollectionId::new(191),
+            FieldPath::new(["body"]),
+        ))?;
+        database.create_geo_index(GeoIndexConfig::new(
+            "places_geo",
+            CollectionId::new(191),
+            FieldPath::new(["location"]),
+        ))?;
+
+        let q = database.collection("places")?.insert(&place(
+            "rust tokio",
+            lon_lat(Value::Float(-0.1276), Value::Float(51.5072)),
+        ))?;
+        let r = database.transaction(|txn| {
+            txn.insert_document(
+                "places",
+                &place("go tooling", lon_lat(Value::Int(21), Value::Int(52))),
+            )
+        })?;
+        database.collection("places")?.update(
+            p,
+            &place(
+                "zig allocator",
+                Value::GeoPoint {
+                    lon: 2.3522,
+                    lat: 48.8566,
+                },
+            ),
+        )?;
+        database.transaction(|txn| {
+            txn.update_document("places", r, &place("rust compiler", warsaw.clone()))
+        })?;
+        database.transaction(|txn| txn.delete_document("places", q))?;
+
+        assert_eq!(result_ids(&database, RUST).await?, ids([r]));
+        assert_eq!(result_ids(&database, ZIG).await?, ids([p]));
+        assert_eq!(result_ids(&database, NEAR_WARSAW).await?, ids([r]));
+        assert_eq!(result_ids(&database, NEAR_PARIS).await?, ids([p]));
+
+        let text = database.full_text_index("places_text")?;
+        let rust_hits = text.search("rust", 10)?;
+        assert_eq!(
+            rust_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![r]
+        );
+        assert!(
+            text.search("tokio", 10)?.is_empty(),
+            "expected an empty value, got {:?}",
+            text.search("tokio", 10)?
+        );
+        assert!(
+            text.search("go", 10)?.is_empty(),
+            "expected an empty value, got {:?}",
+            text.search("go", 10)?
+        );
+        let geo = database.geo_index("places_geo")?;
+        let near_warsaw = geo.within_radius(GeoPoint::new(21.0122, 52.2297)?, 1_000.0)?;
+        assert_eq!(
+            near_warsaw.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![r]
+        );
+        assert!(
+            geo.within_radius(GeoPoint::new(-0.1276, 51.5072)?, 1_000.0)?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            geo.within_radius(GeoPoint::new(-0.1276, 51.5072)?, 1_000.0)?
+        );
+        (p, r)
+    };
+
+    let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(result_ids(&database, ZIG).await?, ids([p]));
+    assert_eq!(result_ids(&database, NEAR_WARSAW).await?, ids([r]));
+
+    // Writes after reopen keep the indexes current, so maintenance reattaches from the catalog.
+    database
+        .collection("places")?
+        .update(p, &place("rust kernel", warsaw))?;
+    assert_eq!(result_ids(&database, RUST).await?, ids([p, r]));
+    assert!(result_ids(&database, ZIG).await?.is_empty());
+    assert!(result_ids(&database, NEAR_PARIS).await?.is_empty());
+    assert_eq!(result_ids(&database, NEAR_WARSAW).await?, ids([p, r]));
+    Ok(())
+}
+
+#[test]
+fn full_text_and_geo_index_creation_requires_document_collection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_vector_collection(
+        "embeddings",
+        VectorCollectionConfig::new(CollectionId::new(50), 3),
+    )?;
+
+    for (collection_id, expect_missing) in [
+        (CollectionId::new(999), true),
+        (CollectionId::new(50), false),
+    ] {
+        let text = database
+            .create_full_text_index(FullTextIndexConfig::collection(
+                "orphan_text",
+                collection_id,
+                FieldPath::new(["body"]),
+            ))
+            .err();
+        assert!(
+            is_index_source_error(text.as_ref(), expect_missing),
+            "{text:?}"
+        );
+        let geo = database
+            .create_geo_index(GeoIndexConfig::new(
+                "orphan_geo",
+                collection_id,
+                FieldPath::new(["point"]),
+            ))
+            .err();
+        assert!(
+            is_index_source_error(geo.as_ref(), expect_missing),
+            "{geo:?}"
+        );
+        assert!(!database.catalog().contains_key("orphan_text"));
+        assert!(!database.catalog().contains_key("orphan_geo"));
+    }
+    Ok(())
+}
+
+fn is_index_source_error(error: Option<&DbError>, expect_missing: bool) -> bool {
+    match error {
+        Some(DbError::MissingCatalogObject(_)) => expect_missing,
+        Some(DbError::CatalogKindMismatch { .. }) => !expect_missing,
+        _ => false,
+    }
+}
+
+async fn result_ids(
+    database: &Database,
+    sql: &str,
+) -> Result<BTreeSet<DocumentId>, Box<dyn std::error::Error>> {
+    let SqlOutput::Rows(rows) = database.query(sql).await? else {
+        return Err(format!("{sql} should return rows").into());
+    };
+    let mut ids = BTreeSet::new();
+    for row in rows.rows {
+        let Some(Value::Bytes(bytes)) = row.first() else {
+            return Err(format!("{sql} returned a row without an id").into());
+        };
+        let bytes: [u8; 16] = bytes.as_slice().try_into()?;
+        ids.insert(DocumentId::from_bytes(bytes));
+    }
+    Ok(ids)
+}
+
+fn ids<const N: usize>(ids: [DocumentId; N]) -> BTreeSet<DocumentId> {
+    BTreeSet::from(ids)
+}
+
+#[tokio::test]
+async fn index_search_requires_source_collection_read_and_respects_its_policies()
+-> Result<(), Box<dyn std::error::Error>> {
+    const SEARCH: &str = "SELECT * FROM match('notes_text', 'rust', 10)";
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_collection(
+        "notes",
+        CollectionId::new(301),
+        vec![DocField::path(
+            "body",
+            FieldPath::new(["body"]),
+            ColumnType::Str,
+        )],
+        Vec::new(),
+    )?;
+    database.collection("notes")?.insert(&place(
+        "rust secret",
+        lon_lat(Value::Float(21.0), Value::Float(52.0)),
+    ))?;
+    database.create_full_text_index(FullTextIndexConfig::collection(
+        "notes_text",
+        CollectionId::new(301),
+        FieldPath::new(["body"]),
+    ))?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("indexer").grant(
+            Resource::FullTextIndex("notes_text".to_owned()),
+            Permission::Read,
+        ),
+        Role::new("reader")
+            .grant(
+                Resource::FullTextIndex("notes_text".to_owned()),
+                Permission::Read,
+            )
+            .grant(Resource::Collection("notes".to_owned()), Permission::Read),
+    ]));
+    let indexer = Principal::new("ivan").with_role("indexer");
+    let reader = Principal::new("alice").with_role("reader");
+
+    assert!(matches!(
+        database.query_as(&indexer, SEARCH).await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    let SqlOutput::Rows(rows) = database.query_as(&reader, SEARCH).await? else {
+        return Err("expected rows".into());
+    };
+    assert_eq!(rows.rows.len(), 1);
+
+    database.set_policy_config(&PolicyConfig {
+        validations: Vec::new(),
+        masking: vec![MaskingPolicy {
+            resource: Resource::Collection("notes".to_owned()),
+            paths: vec![FieldPath::new(["body"])],
+            replacement: Value::Str("***".to_owned()),
+        }],
+        row_policies: Vec::new(),
+        limits: LimitPolicy::default(),
+    })?;
+    assert!(matches!(
+        database.query_as(&reader, SEARCH).await,
+        Err(DbError::Extension(ExtensionError::PolicyDenied(_)))
+    ));
+    Ok(())
+}
+
+fn place(body: &str, location: Value) -> Value {
+    Value::Object(BTreeMap::from([
+        ("body".to_owned(), Value::Str(body.to_owned())),
+        ("location".to_owned(), location),
+    ]))
+}
+
+fn lon_lat(lon: Value, lat: Value) -> Value {
+    Value::Object(BTreeMap::from([
+        ("lon".to_owned(), lon),
+        ("lat".to_owned(), lat),
+    ]))
 }
 
 #[test]
@@ -3298,6 +3837,58 @@ fn transaction_keeps_snapshot_after_concurrent_commit() -> Result<(), Box<dyn st
             Value::Int(37),
         ])
     );
+
+    Ok(())
+}
+
+#[test]
+fn transaction_snapshot_reads_base_rows_on_disk() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("snapshot.redb");
+    let mut database = create_database(DbConfig::on_disk(Profile::Balanced, path))?;
+    let table = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    table.insert(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(37),
+    ])?;
+    table.insert(vec![
+        Value::Int(2),
+        Value::Str("Grace".to_owned()),
+        Value::Int(85),
+    ])?;
+
+    let mut txn = database.begin_transaction()?;
+    table.update(vec![
+        Value::Int(1),
+        Value::Str("Ada".to_owned()),
+        Value::Int(38),
+    ])?;
+    table.delete(&Value::Int(2))?;
+    table.insert(vec![
+        Value::Int(3),
+        Value::Str("Linus".to_owned()),
+        Value::Int(55),
+    ])?;
+
+    assert_eq!(
+        txn.get_row("accounts", &Value::Int(1))?
+            .and_then(|row| row.get(2).cloned()),
+        Some(Value::Int(37))
+    );
+    assert!(txn.get_row("accounts", &Value::Int(2))?.is_some());
+    assert_eq!(txn.get_row("accounts", &Value::Int(3))?, None);
+
+    txn.insert_row(
+        "accounts",
+        vec![
+            Value::Int(3),
+            Value::Str("Linus".to_owned()),
+            Value::Int(56),
+        ],
+    )?;
+    let error = txn.commit().err().ok_or("stale insert committed")?;
+    assert!(error.is_conflict(), "unexpected error: {error}");
 
     Ok(())
 }
@@ -4385,6 +4976,36 @@ fn latest_lsn(database: &Database) -> Result<u64, Box<dyn std::error::Error>> {
         .max()
         .ok_or("missing commit log")?;
     Ok(lsn)
+}
+
+fn workload_executions(
+    database: &Database,
+    fingerprint: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let entry = database
+        .workload_report(WorkloadWindow::All)?
+        .entries
+        .into_iter()
+        .find(|entry| entry.fingerprint.0 == fingerprint)
+        .ok_or("missing workload entry")?;
+    Ok(entry.executions)
+}
+
+fn persisted_workload_executions(
+    database: &Database,
+    fingerprint: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let Some(bytes) = database.read(
+        WORKLOAD_TABLE,
+        fingerprint.as_bytes(),
+        ReadConsistency::Strong,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_json::from_slice::<WorkloadEntry>(&bytes)?.executions,
+    ))
 }
 
 fn seed_orders(database: &mut Database) -> Result<(), Box<dyn std::error::Error>> {

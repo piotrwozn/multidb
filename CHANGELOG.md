@@ -43,6 +43,53 @@ All notable public changes will be recorded here.
   (incremental backups, changefeeds, CDC subscriptions, continuous queries,
   materialized views, after-commit hooks, system versioning and incremental
   full-text/geo refresh) with `Unsupported` instead of returning empty results.
+- SQL statements, including read-only `SELECT`s, no longer make a durable
+  system commit per statement for the workload profiler. Samples are aggregated
+  in memory per query fingerprint and persisted in one batched write after
+  4,096 statements, 256 distinct fingerprints or 1 MiB of buffered fingerprint
+  data, or on the first statement once the oldest buffered sample is 10
+  seconds old;
+  also before index or runtime advice, on `Database::flush_workload_samples`,
+  and when a single-node database is dropped. `system.workload` and
+  `Database::workload_report` include buffered samples without writing.
+  Advisory statistics buffered since the last flush can be lost on crash or
+  process stop. `query_as` audit behaviour is unchanged.
+- Incremental and point-in-time restore now replays commit records through the
+  same routine as live commits. This rebuilds `__txn_mvcc` history and the HLC
+  from each record, so transactional reads, inserts after a delete, document
+  index maintenance and `AS OF LSN`/`AS OF TIMESTAMP` queries see replayed
+  commits. Snapshot transactions now read base rows from their storage
+  snapshot. Restore and verify reject broken backup chains: an LSN gap or
+  overlap with the parent, a timeline mismatch, a parent directory holding a
+  different `backup_id`, a full backup with a parent, a cycle, a commit-log gap
+  inside an incremental, or a full payload whose LSN differs from its manifest.
+  `RestoreTarget::Time` earlier than the full backup now fails with
+  `Unsupported`, as an LSN target already did. Databases restored from
+  incremental chains by earlier builds should be restored again to rebuild
+  their MVCC history.
+- Full-text (`match`) and geo (`within_radius`) indexes are now backfilled when
+  they are created and maintained in the same write batch as document inserts,
+  updates and deletes made through collection handles, multi-model transactions
+  and Control Plane document CRUD. Creating one now requires an existing
+  document collection: a missing collection id or a vector collection is
+  rejected. `refresh_full` is a bounded repair rebuild and `refresh_incremental`
+  coalesces repeated changes to a document when repairing raw-key writes. Geo
+  indexes accept integer `lon`/`lat` and skip invalid points (counted in
+  `skipped_documents`) instead of failing, and searches no longer return
+  zero-score postings or stale geo cells. Indexes created by earlier builds need
+  one `refresh_full()`; Control Plane-only users can instead create a new index
+  under a new name, which is backfilled on create. Because these searches
+  return source document text, ids and points, `match()` and `within_radius()`
+  through `query_as` now also require Read on the source collection, and are
+  denied while that collection has row or masking policies. Index entries are
+  computed from the document as written by the client, so a before-trigger
+  that replaces a document leaves its index entries on the pre-trigger value.
+- Made the encryption key lifecycle fail closed. `destroy_dek`/`crypto_shred`
+  now refuse the current key, the last live key, and any key still used by
+  stored values. The new `reencrypt_existing_values` (bounded, rerunnable
+  batches) must run between `rotate_dek` and shredding old keys. KEK rotation
+  now takes effect in-process and is atomic, and opening a non-empty database
+  whose envelope keyring is missing fails instead of minting a new keyring.
 
 ### Added
 

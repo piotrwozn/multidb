@@ -62,6 +62,14 @@ impl RedbEngine {
         })
     }
 
+    /// Reports whether the database already contains any table.
+    /// # Errors
+    /// Fails if redb cannot open a read snapshot or list its tables.
+    pub(crate) fn has_tables(&self) -> Result<bool, StorageError> {
+        let read = self.db.begin_read().map_err(to_storage_err)?;
+        Ok(read.list_tables().map_err(to_storage_err)?.next().is_some())
+    }
+
     /// Opens an existing redb file read-write without ever creating one, which runs redb's crash
     /// recovery when the file was not closed cleanly, and closes it again. The recovery restores
     /// the last committed state, as every read-write open does first; nothing else is written.

@@ -386,11 +386,18 @@ pub fn incremental_backup(
 
 /// Restores a full or incremental backup chain into the database described by `config`, with
 /// the default [`RestoreConfig`]: unencrypted backup files only, and unmet profile floors
-/// refused (see [`restore_backup_with_config`]).
+/// refused. It takes the steps described for [`restore_backup_with_config`].
+///
+/// Incremental commits are replayed through the same routine as live commits, so the restored
+/// database gets the source's `__txn_mvcc` history, key versions, commit log and HLC.
 ///
 /// # Errors
-/// Fails when the backup chain is corrupt, the target is not empty, the restored database would
-/// not meet a profile floor, or storage rejects restored records.
+/// Fails as described for [`restore_backup_with_config`]: when the target is not empty, the
+/// backup chain is broken or corrupt, the restore target is earlier than the full backup, a
+/// backup file is encrypted (the default config has no restore key), the backed-up profile
+/// manifest is corrupt, newer than this build or for another storage profile, the restored
+/// database would not meet a profile floor (`ProfileFloorsNotMet`; the default config does not
+/// opt in), or storage rejects restored records.
 pub fn restore_backup(
     backup_dir: impl AsRef<Path>,
     config: DbConfig,
@@ -401,17 +408,55 @@ pub fn restore_backup(
 
 /// Restores a backup chain with explicit backup decryption settings.
 ///
-/// Every backup file is read and checked before the target is created: a first pass reads the
-/// incremental payloads one at a time, keeping only what the floor check needs, and the apply
-/// pass reads them again, so restore holds the full payload and at most one incremental payload
-/// in memory. A backup whose profile manifest sets a floor the restored database would not meet
-/// is refused unless `restore_config.allow_unmet_profile_floors` is set (see
+/// Every backup file is read and checked before the target is created. Restore first loads the
+/// chain from `backup_dir` back to its full backup, validating every link, and resolves
+/// `target` to an LSN (a `RestoreTarget::Time` reads the incremental payloads to do so). It then
+/// reads the full payload and, in a first pass, every incremental payload one at a time,
+/// checking its checksums, decryption, decoding and commit-log LSNs and keeping only what the
+/// floor check needs. A backup whose profile manifest sets a floor the restored database would
+/// not meet is then refused unless `restore_config.allow_unmet_profile_floors` is set (see
 /// [`RestoreConfig`]).
 ///
+/// Only then is the target created, from the backed-up profile manifest, so a restored manifest
+/// database is framed the way its manifest says. The full payload is applied and its LSN
+/// checked, and the apply pass reads each incremental payload again and replays its commits up
+/// to the target LSN through the same routine as live commits, which rebuilds the source's
+/// `__txn_mvcc` history, key versions, commit log and HLC. So restore holds the full payload and
+/// at most one incremental payload in memory. The restored records and the restore metadata are
+/// committed in one write transaction.
+///
 /// # Errors
-/// Fails when the backup chain is corrupt, encrypted without a key, the target is not empty,
-/// the restored database would not meet a profile floor (`ProfileFloorsNotMet`), or storage
-/// rejects restored records.
+/// Before anything is created, restore fails with:
+/// - `BackupError::Unsupported` when the target path is not empty, a backup file is encrypted
+///   and `restore_config` has no key, or a `RestoreTarget::Lsn` or `RestoreTarget::Time` is
+///   earlier than the full backup;
+/// - `BackupError::Corruption` when the backup chain is corrupt: it does not start with a full
+///   backup, a manifest has an unsupported format version, a link is broken (LSN gap or overlap
+///   with its parent, an incremental that ends before it starts, timeline mismatch, a parent id
+///   that is not a plain directory name, a parent directory holding a different `backup_id`, a
+///   full backup with a parent, or a cycle), a `RestoreTarget::Lsn` is newer than the end of the
+///   chain, a backup file is missing from its manifest, fails a checksum or fails decryption, an
+///   incremental commit log skips or repeats an LSN or does not end at its manifest's `end_lsn`,
+///   the backed-up profile manifest is corrupt, or the backed-up audit flag is not a boolean
+///   while that manifest sets `floors.audit`;
+/// - `BackupError::MissingParent` when a parent backup directory is missing;
+/// - `BackupError::Io` when the target path, a manifest or a backup file cannot be read, or a
+///   backup file cannot be decompressed, and `BackupError::Serde` when a manifest or backup file
+///   cannot be decoded;
+/// - `BackupError::Storage` when the restore key cannot be loaded or lacks the key a backup file
+///   was encrypted with;
+/// - `BackupError::Config` when the backed-up profile manifest was written by a newer build
+///   (`ConfigError::UnsupportedProfileManifest`) or describes another storage profile than
+///   `config` (`ConfigError::ProfileMismatch`);
+/// - `BackupError::ProfileFloorsNotMet` when the restored database would not meet a floor of the
+///   backed-up profile manifest and `allow_unmet_profile_floors` is not set.
+///
+/// Creating the target can fail with `BackupError::Config`, for example when its storage cannot
+/// be opened. Once the target exists, restore fails, leaving the initialised target file behind
+/// without any restored records, when the target has no local storage
+/// (`BackupError::Unsupported`), when the full payload's LSN differs from its manifest's
+/// `end_lsn` (`BackupError::Corruption`), or when storage rejects restored records
+/// (`BackupError::Storage`).
 pub fn restore_backup_with_config(
     backup_dir: impl AsRef<Path>,
     config: DbConfig,
@@ -437,9 +482,9 @@ pub fn restore_backup_with_config(
         required_file(&chain[0].manifest, FULL_DATA_FILE)?,
         backup_keys.as_ref(),
     )?;
-    let manifest = restore_target_manifest(&config, &full_payload)?;
     let audit_flag =
         check_incremental_payloads(&chain, backup_keys.as_ref(), &full_payload, target_lsn)?;
+    let manifest = restore_target_manifest(&config, &full_payload)?;
     if let Some(manifest) = &manifest {
         check_restore_floors(manifest, audit_flag.as_deref(), restore_config)?;
     }
@@ -450,18 +495,15 @@ pub fn restore_backup_with_config(
     })?;
     let mut write = storage.begin_write()?;
     apply_full_payload(&mut write, &full_payload)?;
-
-    let mut applied = 0_usize;
-    for item in chain.iter().skip(1) {
-        let payload = read_incremental_payload(item, backup_keys.as_ref())?;
-        for record in payload.records {
-            if record.txn_id > target_lsn {
-                continue;
-            }
-            apply_commit_record(&mut write, &record)?;
-            applied = applied.saturating_add(1);
-        }
+    let full_lsn = txn::current_txn_id_from(&write)?;
+    if full_lsn != chain[0].manifest.end_lsn {
+        return Err(BackupError::Corruption(format!(
+            "full backup {} payload is at lsn {full_lsn} but its manifest ends at lsn {}",
+            chain[0].manifest.backup_id, chain[0].manifest.end_lsn
+        )));
     }
+
+    let applied = replay_incrementals(&mut write, &chain, target_lsn, backup_keys.as_ref())?;
 
     write_restore_metadata(&mut write, &chain[0].manifest.timeline_id, target_lsn)?;
     write.commit()?;
@@ -477,7 +519,10 @@ pub fn restore_backup_with_config(
 /// Verifies backup checksums and performs a temporary restore drill.
 ///
 /// # Errors
-/// Fails when any manifest, checksum, or restore step fails.
+/// Fails when any manifest, checksum, or restore step fails, including the chain-link,
+/// commit-log contiguity and full payload LSN checks described for
+/// [`restore_backup_with_config`], but not when the restored database would not meet a profile
+/// floor (see [`verify_backup_with_config`]).
 pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<VerifyReport, BackupError> {
     verify_backup_with_config(backup_dir, &RestoreConfig::default())
 }
@@ -486,13 +531,16 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<VerifyReport, Backu
 ///
 /// The drill restores without checking profile floors, as if
 /// `allow_unmet_profile_floors` were set: its target is a temporary redb file under
-/// [`std::env::temp_dir`] that only this verification reads and that is deleted after a
-/// successful drill, so no restored database keeps running below a floor. Like every restore
-/// target, that file is not encrypted at rest: while the drill runs it holds the restored
-/// values in plaintext, also when the backup files are encrypted.
+/// [`std::env::temp_dir`] that only this verification reads and that is removed when the drill
+/// ends, also when it fails, so no restored database keeps running below a floor. Like every
+/// restore target, that file is not encrypted at rest: while the drill runs it holds the
+/// restored values in plaintext, also when the backup files are encrypted.
 ///
 /// # Errors
-/// Fails when any manifest, checksum, decryption, or restore step fails.
+/// Fails when any manifest, checksum, decryption, or restore step fails, including the
+/// chain-link, commit-log contiguity and full payload LSN checks described for
+/// [`restore_backup_with_config`], but not when the restored database would not meet a profile
+/// floor.
 pub fn verify_backup_with_config(
     backup_dir: impl AsRef<Path>,
     restore_config: &RestoreConfig,
@@ -512,6 +560,8 @@ pub fn verify_backup_with_config(
     }
 
     let restore_path = std::env::temp_dir().join(format!("multidb-verify-{}.redb", new_id()));
+    // The drill database holds decrypted data, so it is removed on every path.
+    let drill = RemoveOnDrop(restore_path.clone());
     let config = DbConfig::on_disk(selected.manifest.profile, &restore_path);
     let drill_config = RestoreConfig {
         allow_unmet_profile_floors: true,
@@ -519,9 +569,7 @@ pub fn verify_backup_with_config(
     };
     let report =
         restore_backup_with_config(&selected.path, config, RestoreTarget::Latest, &drill_config)?;
-    if fs::remove_file(&restore_path).is_err() {
-        tracing::debug!("temporary verify database could not be removed");
-    }
+    drop(drill);
     observability::record_backup_verify("ok", started.elapsed());
 
     Ok(VerifyReport {
@@ -553,6 +601,17 @@ pub fn list_backups(root: impl AsRef<Path>) -> Result<Vec<BackupManifest>, Backu
     }
     manifests.sort_by_key(|manifest| manifest.taken_at);
     Ok(manifests)
+}
+
+/// Removes a temporary file when dropped, including on early error returns.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if self.0.exists() && fs::remove_file(&self.0).is_err() {
+            tracing::debug!("temporary verify database could not be removed");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -921,31 +980,161 @@ fn required_file<'a>(
         .ok_or_else(|| BackupError::Corruption(format!("missing backup file {path}")))
 }
 
+/// Rejects parent ids that are not a single plain directory name, so a manifest cannot point
+/// the chain outside the backup root.
+fn validate_parent_backup_id(child_id: &str, parent_id: &str) -> Result<(), BackupError> {
+    let plain = !parent_id.is_empty()
+        && parent_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_');
+    if plain {
+        Ok(())
+    } else {
+        Err(BackupError::Corruption(format!(
+            "backup {child_id} references an invalid parent id"
+        )))
+    }
+}
+
 fn load_chain(selected_dir: &Path) -> Result<Vec<ChainItem>, BackupError> {
     let mut chain = Vec::new();
     let mut current_path = selected_dir.to_path_buf();
-    loop {
-        let manifest = read_manifest(&current_path)?;
-        let parent_id = manifest.parent_backup_id.clone();
-        chain.push(ChainItem {
-            path: current_path.clone(),
-            manifest,
-        });
-
-        let Some(parent_id) = parent_id else {
-            break;
-        };
+    let mut manifest = read_manifest(&current_path)?;
+    let mut seen = BTreeSet::from([manifest.backup_id.clone()]);
+    while let Some(parent_id) = manifest.parent_backup_id.clone() {
+        if manifest.kind != BackupKind::Incremental {
+            return Err(BackupError::Corruption(format!(
+                "full backup {} must not reference a parent",
+                manifest.backup_id
+            )));
+        }
+        if seen.contains(&parent_id) {
+            return Err(BackupError::Corruption(format!(
+                "backup chain cycles back to {parent_id}"
+            )));
+        }
+        validate_parent_backup_id(&manifest.backup_id, &parent_id)?;
         let Some(root) = current_path.parent() else {
             return Err(BackupError::MissingParent(parent_id));
         };
-        current_path = root.join(&parent_id);
-        if !current_path.exists() {
+        let parent_path = root.join(&parent_id);
+        if !parent_path.exists() {
             return Err(BackupError::MissingParent(parent_id));
         }
+        let parent = read_manifest(&parent_path)?;
+        validate_chain_link(&manifest, &parent_id, &parent)?;
+        seen.insert(parent_id);
+        chain.push(ChainItem {
+            path: current_path,
+            manifest,
+        });
+        current_path = parent_path;
+        manifest = parent;
     }
+    chain.push(ChainItem {
+        path: current_path,
+        manifest,
+    });
 
     chain.reverse();
     Ok(chain)
+}
+
+fn validate_chain_link(
+    child: &BackupManifest,
+    parent_id: &str,
+    parent: &BackupManifest,
+) -> Result<(), BackupError> {
+    if parent.backup_id != parent_id {
+        return Err(BackupError::Corruption(format!(
+            "backup {} references parent {parent_id} but that directory holds backup {}",
+            child.backup_id, parent.backup_id
+        )));
+    }
+    if parent.timeline_id != child.timeline_id {
+        return Err(BackupError::Corruption(format!(
+            "backup {} is on timeline {} but parent {parent_id} is on timeline {}",
+            child.backup_id, child.timeline_id, parent.timeline_id
+        )));
+    }
+    if child.start_lsn != parent.end_lsn {
+        return Err(BackupError::Corruption(format!(
+            "backup {} starts at lsn {} but parent {parent_id} ends at lsn {}",
+            child.backup_id, child.start_lsn, parent.end_lsn
+        )));
+    }
+    if child.end_lsn < child.start_lsn {
+        return Err(BackupError::Corruption(format!(
+            "backup {} ends at lsn {} before it starts at lsn {}",
+            child.backup_id, child.end_lsn, child.start_lsn
+        )));
+    }
+    Ok(())
+}
+
+/// The apply pass, after `check_incremental_payloads`: reads each incremental payload of `chain`
+/// again, one at a time, checks its commit log once more, as the file was read again, and
+/// replays its commits up to `target_lsn` through the live commit routine
+/// (`txn::apply_commit_record_in_txn`), which rebuilds the `__txn_mvcc` history, key versions,
+/// commit log and HLC. Returns the number of replayed commits.
+fn replay_incrementals(
+    write: &mut impl WriteTransaction,
+    chain: &[ChainItem],
+    target_lsn: Lsn,
+    encryption: Option<&ConfiguredKeyProvider>,
+) -> Result<usize, BackupError> {
+    let mut applied = 0_usize;
+    let mut last_lsn = full_backup_end_lsn(chain)?;
+    for item in chain.iter().skip(1) {
+        let payload = read_incremental_payload(item, encryption)?;
+        last_lsn = check_commit_log(item, &payload, last_lsn)?;
+        for record in payload
+            .records
+            .iter()
+            .filter(|record| record.txn_id <= target_lsn)
+        {
+            txn::apply_commit_record_in_txn(write, record)?;
+            applied = applied.saturating_add(1);
+        }
+    }
+    Ok(applied)
+}
+
+/// Checks the commit log of the incremental backup `item`, whose parent in the chain ends at
+/// `last_lsn`: its commits, also those after the restore target, must follow on from `last_lsn`
+/// without a gap or overlap and end at its manifest's `end_lsn`, which is returned.
+fn check_commit_log(
+    item: &ChainItem,
+    payload: &CommitLogPayload,
+    mut last_lsn: Lsn,
+) -> Result<Lsn, BackupError> {
+    for record in &payload.records {
+        let expected = last_lsn
+            .checked_add(1)
+            .ok_or_else(|| BackupError::Corruption("commit log lsn overflow".to_owned()))?;
+        if record.txn_id != expected {
+            return Err(BackupError::Corruption(format!(
+                "backup {} has commit lsn {} where {expected} was expected",
+                item.manifest.backup_id, record.txn_id
+            )));
+        }
+        last_lsn = record.txn_id;
+    }
+    if last_lsn != item.manifest.end_lsn {
+        return Err(BackupError::Corruption(format!(
+            "backup {} commit log ends at lsn {last_lsn} but its manifest ends at lsn {}",
+            item.manifest.backup_id, item.manifest.end_lsn
+        )));
+    }
+    Ok(last_lsn)
+}
+
+/// The LSN the full backup of `chain` ends at, where its first incremental starts.
+fn full_backup_end_lsn(chain: &[ChainItem]) -> Result<Lsn, BackupError> {
+    chain
+        .first()
+        .map(|item| item.manifest.end_lsn)
+        .ok_or_else(|| BackupError::Corruption("backup chain is empty".to_owned()))
 }
 
 fn resolve_target_lsn(
@@ -988,10 +1177,13 @@ fn target_lsn_for_time(
     let first = chain
         .first()
         .ok_or_else(|| BackupError::Corruption("backup chain is empty".to_owned()))?;
-    let mut selected = first.manifest.end_lsn;
-    if time <= first.manifest.taken_at {
-        return Ok(selected);
+    if time < first.manifest.taken_at {
+        return Err(BackupError::Unsupported(
+            "cannot restore before the full backup snapshot time".to_owned(),
+        ));
     }
+
+    let mut selected = first.manifest.end_lsn;
 
     for item in chain.iter().skip(1) {
         let payload = read_backup_payload::<CommitLogPayload>(
@@ -1059,11 +1251,12 @@ fn read_incremental_payload(
 }
 
 /// The first pass over the incremental payloads of `chain`, before the target is created: each
-/// payload is read (checksum, decryption, decoding) and dropped before the next one, so a
-/// payload that fails leaves nothing behind and restore never holds more than one of them.
-/// Returns the stored `__authz_policy.audit_enabled` value the restored database will hold:
-/// the last commit-log write at or below `target_lsn` (`None` when it deleted the flag), else
-/// the full payload's record, else `None`.
+/// payload is read (checksum, decryption, decoding), its commit log checked by
+/// `check_commit_log` (no LSN gap or overlap, and its manifest's `end_lsn` at the end), and
+/// dropped before the next one, so a payload that fails leaves nothing behind and restore never
+/// holds more than one of them. Returns the stored `__authz_policy.audit_enabled` value the
+/// restored database will hold: the last commit-log write at or below `target_lsn` (`None` when
+/// it deleted the flag), else the full payload's record, else `None`.
 fn check_incremental_payloads(
     chain: &[ChainItem],
     encryption: Option<&ConfiguredKeyProvider>,
@@ -1076,8 +1269,10 @@ fn check_incremental_payloads(
         .iter()
         .find(|record| is_flag(&record.table, &record.key))
         .map(|record| record.value.clone());
+    let mut last_lsn = full_backup_end_lsn(chain)?;
     for item in chain.iter().skip(1) {
         let payload = read_incremental_payload(item, encryption)?;
+        last_lsn = check_commit_log(item, &payload, last_lsn)?;
         for write in payload
             .records
             .iter()
@@ -1151,53 +1346,6 @@ fn apply_full_payload(
     Ok(())
 }
 
-fn apply_commit_record(
-    txn: &mut impl WriteTransaction,
-    record: &CommitLogRecord,
-) -> Result<(), BackupError> {
-    for write in &record.writes {
-        match &write.value {
-            Some(value) => txn.put(&write.table, &write.key, value)?,
-            None => txn.delete(&write.table, &write.key)?,
-        }
-        txn.put(
-            txn::TXN_VERSIONS_TABLE,
-            &txn::version_key(&write.table, &write.key)?,
-            &txn::encode_txn_id(record.txn_id),
-        )?;
-        txn.put(
-            txn::KEYSPACE_REGISTRY_TABLE,
-            write.table.as_bytes(),
-            KEYSPACE_PRESENT_VALUE,
-        )?;
-    }
-
-    for keyspace in [
-        txn::TXN_META_TABLE,
-        txn::TXN_VERSIONS_TABLE,
-        txn::COMMIT_LOG_TABLE,
-        txn::KEYSPACE_REGISTRY_TABLE,
-    ] {
-        txn.put(
-            txn::KEYSPACE_REGISTRY_TABLE,
-            keyspace.as_bytes(),
-            KEYSPACE_PRESENT_VALUE,
-        )?;
-    }
-
-    txn.put(
-        txn::COMMIT_LOG_TABLE,
-        &txn::commit_log_key(record.txn_id),
-        &txn::encode_commit_log_record(record)?,
-    )?;
-    txn.put(
-        txn::TXN_META_TABLE,
-        txn::CURRENT_TXN_ID_KEY,
-        &txn::encode_txn_id(record.txn_id),
-    )?;
-    Ok(())
-}
-
 fn write_restore_metadata(
     txn: &mut impl WriteTransaction,
     timeline_id: &str,
@@ -1224,32 +1372,46 @@ fn write_restore_metadata(
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::Path;
+    use std::time::{Duration, SystemTime};
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        BackupConfig, BackupDataPayload, BackupDataRecord, BackupError, KEY_PROFILE_MANIFEST,
-        META_TABLE, RestoreConfig, RestoreTarget, full_backup, incremental_backup, list_backups,
-        restore_backup, restore_backup_with_config, restore_target_manifest, verify_backup,
-        verify_backup_with_config,
+        BackupConfig, BackupDataPayload, BackupDataRecord, BackupError, BackupManifest,
+        BackupReport, CommitLogPayload, KEY_PROFILE_MANIFEST, Lsn, META_TABLE, RestoreConfig,
+        RestoreTarget, WAL_DATA_FILE, full_backup, incremental_backup, list_backups, new_id,
+        read_backup_payload, read_manifest, required_file, restore_backup,
+        restore_backup_with_config, restore_target_manifest, verify_backup,
+        verify_backup_with_config, write_compressed_json, write_manifest,
     };
     use crate::config_spec::{
         PolicyCompiler, ProfileKnobOverrides, resolve_named_profile,
         spec_io::{SpecFormat, decode_spec_bytes},
     };
     use crate::db::{
-        ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
-        ReplicationKind, RuntimeProfileBinding, create_ap_database, create_database,
-        create_database_with_ops, create_database_with_profile, create_restore_target,
-        inspect_database_metadata, open_database,
+        ConfigError, Database, DbConfig, DbError, EncryptionConfig, MetadataProbe,
+        OperationalConfig, Profile, ReplicationKind, RuntimeProfileBinding, create_ap_database,
+        create_database, create_database_with_ops, create_database_with_profile,
+        create_restore_target, inspect_database_metadata, open_database,
+    };
+    use crate::model::{
+        CollectionId, DOCUMENT_TABLE, DocumentId, FieldPath, INDEX_TABLE, IndexId, IndexSpec,
+        Predicate, Value,
     };
     use crate::performance::CompressionAlgorithm;
-    use crate::repl::{ApClusterConfig, Op, ReadConsistency, Replication, propose_system};
-    use crate::storage::{EngineKind, ReadTransaction, RedbEngine, StorageEngine};
+    use crate::phase30::{HLC_LOCAL_KEY, HLC_TABLE, HlcTimestamp};
+    use crate::query::{ColumnDef, ColumnType, DocField, REL_ROWS_TABLE, SqlOutput, TableSchema};
+    use crate::repl::{
+        ApClusterConfig, Op, ReadConsistency, ReplError, Replication, propose_system,
+    };
+    use crate::storage::{Bytes, EngineKind, ReadTransaction, RedbEngine, StorageEngine};
+    use crate::temporal::TemporalPoint;
+    use crate::txn;
 
     /// Binds the built-in profile `name` with knob `overrides` to a database at `path`.
     fn profile_binding(
@@ -2030,6 +2192,609 @@ mod tests {
             "unexpected result: {result:?}"
         );
         assert!(!target.exists(), "nothing is created for a corrupt payload");
+        Ok(())
+    }
+
+    struct MvccFixture {
+        source: Database,
+        full: BackupReport,
+        incremental: BackupReport,
+        doc_id: DocumentId,
+        lsn_doc: Lsn,
+        lsn_update: Lsn,
+        lsn_delete: Lsn,
+    }
+
+    struct ChainFixture {
+        full: BackupReport,
+        first: BackupReport,
+        second: BackupReport,
+    }
+
+    fn on_disk(path: impl AsRef<Path>) -> DbConfig {
+        DbConfig::on_disk(Profile::Balanced, path.as_ref())
+    }
+
+    fn account_schema() -> TableSchema {
+        TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("name", ColumnType::Str, false),
+                ColumnDef::new("age", ColumnType::Int, false),
+            ],
+            0,
+        )
+    }
+
+    fn account(id: i64, name: &str, age: i64) -> Vec<Value> {
+        vec![Value::Int(id), Value::Str(name.to_owned()), Value::Int(age)]
+    }
+
+    fn city_path() -> FieldPath {
+        FieldPath::new(["city"])
+    }
+
+    fn city_doc(city: &str) -> Value {
+        Value::Object([("city".to_owned(), Value::Str(city.to_owned()))].into())
+    }
+
+    fn city_eq(city: &str) -> Predicate {
+        Predicate::Eq {
+            path: city_path(),
+            value: Value::Str(city.to_owned()),
+        }
+    }
+
+    fn put_item(key: &[u8], value: &[u8]) -> Op {
+        Op::Put {
+            table: "items".to_owned(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn source_lsn(database: &Database) -> Result<Lsn, Box<dyn Error>> {
+        let storage = database
+            .local_storage()
+            .ok_or("source has no local storage")?;
+        Ok(txn::current_txn_id(storage)?)
+    }
+
+    fn table_rows(database: &Database, table: &str) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+        database.range(table, &[], &[], ReadConsistency::Strong)
+    }
+
+    fn mvcc_version(key: &[u8]) -> Result<Lsn, Box<dyn Error>> {
+        let split = key
+            .len()
+            .checked_sub(8)
+            .ok_or("mvcc key is missing its version")?;
+        Ok(txn::decode_txn_id(&key[split..])?)
+    }
+
+    fn edit_manifest(
+        dir: &Path,
+        edit: impl FnOnce(&mut BackupManifest),
+    ) -> Result<(), BackupError> {
+        let mut manifest = read_manifest(dir)?;
+        edit(&mut manifest);
+        write_manifest(dir, &manifest)
+    }
+
+    /// Full backup, then a document update, a row update and a row delete in one incremental.
+    fn mvcc_restore_fixture(dir: &Path) -> Result<MvccFixture, Box<dyn Error>> {
+        let mut source = create_database(on_disk(dir.join("source.redb")))?;
+        let accounts = source.create_table("accounts", Some(account_schema()), Vec::new())?;
+        accounts.insert(account(1, "Ada", 37))?;
+        accounts.insert(account(2, "Grace", 85))?;
+        let doc_id = source
+            .create_collection(
+                "profiles",
+                CollectionId::new(10),
+                vec![DocField::path("city", city_path(), ColumnType::Str)],
+                vec![IndexSpec::new(IndexId::new(1), city_path())],
+            )?
+            .insert(&city_doc("Warsaw"))?;
+        let root = dir.join("backups");
+        let full = full_backup(&source, &root, &BackupConfig::default())?;
+
+        source
+            .collection("profiles")?
+            .update(doc_id, &city_doc("Krakow"))?;
+        let lsn_doc = source_lsn(&source)?;
+        accounts.update(account(1, "Ada", 38))?;
+        let lsn_update = source_lsn(&source)?;
+        accounts.delete(&Value::Int(2))?;
+        let lsn_delete = source_lsn(&source)?;
+        let incremental = incremental_backup(&source, &root, &full.path, &BackupConfig::default())?;
+
+        Ok(MvccFixture {
+            source,
+            full,
+            incremental,
+            doc_id,
+            lsn_doc,
+            lsn_update,
+            lsn_delete,
+        })
+    }
+
+    /// Full backup, an incremental with two commits, then an incremental with one commit.
+    fn chain_fixture(dir: &Path) -> Result<ChainFixture, Box<dyn Error>> {
+        let database = create_database(on_disk(dir.join("source.redb")))?;
+        let root = dir.join("backups");
+        database.propose(put_item(b"a", b"1"))?;
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        database.propose(put_item(b"b", b"2"))?;
+        database.propose(put_item(b"c", b"3"))?;
+        let first = incremental_backup(&database, &root, &full.path, &BackupConfig::default())?;
+        database.propose(put_item(b"d", b"4"))?;
+        let second = incremental_backup(&database, &root, &first.path, &BackupConfig::default())?;
+        Ok(ChainFixture {
+            full,
+            first,
+            second,
+        })
+    }
+
+    fn assert_chain_rejected(
+        selected: &Path,
+        restore_path: &Path,
+        phrase: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        match restore_backup(selected, on_disk(restore_path), RestoreTarget::Latest) {
+            Err(BackupError::Corruption(message)) => {
+                assert!(message.contains(phrase), "unexpected message: {message}");
+            }
+            other => {
+                return Err(format!("expected corruption about {phrase:?}, got {other:?}").into());
+            }
+        }
+        assert!(verify_backup(selected).is_err());
+        assert!(!restore_path.exists());
+        Ok(())
+    }
+
+    async fn as_of_rows(
+        database: &Database,
+        sql: &str,
+        lsn: Lsn,
+    ) -> Result<Vec<Vec<Value>>, Box<dyn Error>> {
+        match database.query_as_of(sql, TemporalPoint::Lsn(lsn)).await? {
+            SqlOutput::Rows(rows) => Ok(rows.rows),
+            SqlOutput::AffectedRows(_) => Err("AS OF query did not return rows".into()),
+        }
+    }
+
+    fn assert_restored_transactions(
+        restored: &Database,
+        fixture: &MvccFixture,
+    ) -> Result<(), Box<dyn Error>> {
+        let reader = restored.begin_transaction()?;
+        assert_eq!(
+            reader.get_document("profiles", fixture.doc_id)?,
+            Some(city_doc("Krakow"))
+        );
+        assert_eq!(
+            reader.get_row("accounts", &Value::Int(1))?,
+            Some(account(1, "Ada", 38))
+        );
+        assert_eq!(reader.get_row("accounts", &Value::Int(2))?, None);
+        reader.rollback();
+
+        restored.transaction(|txn| txn.insert_row("accounts", account(2, "Grace", 86)))?;
+        assert_eq!(
+            restored.table("accounts")?.get(&Value::Int(2))?,
+            Some(account(2, "Grace", 86))
+        );
+
+        restored.transaction(|txn| {
+            let row = txn.get_row("accounts", &Value::Int(1))?;
+            let Some(Value::Int(age)) = row.as_ref().and_then(|row| row.get(2)) else {
+                return Err(DbError::TransactionAborted("missing age".to_owned()));
+            };
+            txn.update_row("accounts", account(1, "Ada", age + 1))
+        })?;
+        assert_eq!(
+            restored.table("accounts")?.get(&Value::Int(1))?,
+            Some(account(1, "Ada", 39))
+        );
+
+        assert_eq!(table_rows(restored, INDEX_TABLE)?.len(), 1);
+        restored.transaction(|txn| {
+            txn.update_document("profiles", fixture.doc_id, &city_doc("Gdansk"))
+        })?;
+        assert_eq!(table_rows(restored, INDEX_TABLE)?.len(), 1);
+        let found = restored.find("profiles", &city_eq("Gdansk"))?;
+        assert_eq!(
+            found
+                .documents
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![fixture.doc_id]
+        );
+        assert!(
+            restored
+                .find("profiles", &city_eq("Krakow"))?
+                .documents
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            restored.find("profiles", &city_eq("Krakow"))?.documents
+        );
+
+        let mut first_writer = restored.begin_transaction()?;
+        let mut second_writer = restored.begin_transaction()?;
+        first_writer.update_row("accounts", account(1, "Ada", 40))?;
+        second_writer.update_row("accounts", account(1, "Ada", 41))?;
+        first_writer.commit()?;
+        let error = second_writer
+            .commit()
+            .err()
+            .ok_or("concurrent update committed")?;
+        assert!(error.is_conflict(), "unexpected error: {error}");
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_restore_rebuilds_mvcc_history() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let fixture = mvcc_restore_fixture(temp.path())?;
+        let restore_path = temp.path().join("restore.redb");
+        let report = restore_backup(
+            &fixture.incremental.path,
+            on_disk(&restore_path),
+            RestoreTarget::Latest,
+        )?;
+        assert_eq!(report.restored_lsn, fixture.incremental.manifest.end_lsn);
+        let restored = open_database(on_disk(&restore_path))?;
+
+        for table in [
+            txn::TXN_MVCC_TABLE,
+            txn::TXN_VERSIONS_TABLE,
+            txn::COMMIT_LOG_TABLE,
+            HLC_TABLE,
+            REL_ROWS_TABLE,
+            DOCUMENT_TABLE,
+            INDEX_TABLE,
+        ] {
+            assert_eq!(
+                table_rows(&restored, table)?,
+                table_rows(&fixture.source, table)?,
+                "{table} differs between source and restore"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_restore_serves_as_of_and_transactions() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let fixture = mvcc_restore_fixture(temp.path())?;
+        let restore_path = temp.path().join("restore.redb");
+        restore_backup(
+            &fixture.incremental.path,
+            on_disk(&restore_path),
+            RestoreTarget::Latest,
+        )?;
+        let restored = open_database(on_disk(&restore_path))?;
+
+        let age_sql = "SELECT age FROM accounts WHERE id = 1";
+        for (lsn, age) in [
+            (fixture.full.manifest.end_lsn, 37),
+            (fixture.lsn_doc, 37),
+            (fixture.lsn_update, 38),
+        ] {
+            assert_eq!(
+                as_of_rows(&restored, age_sql, lsn).await?,
+                vec![vec![Value::Int(age)]],
+                "age as of lsn {lsn}"
+            );
+        }
+        let grace_sql = "SELECT id FROM accounts WHERE id = 2";
+        assert_eq!(
+            as_of_rows(&restored, grace_sql, fixture.lsn_update).await?,
+            vec![vec![Value::Int(2)]]
+        );
+        assert!(
+            as_of_rows(&restored, grace_sql, fixture.lsn_delete)
+                .await?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            as_of_rows(&restored, grace_sql, fixture.lsn_delete).await?
+        );
+
+        assert_restored_transactions(&restored, &fixture)
+    }
+
+    #[test]
+    fn incremental_restore_to_intermediate_lsn_rebuilds_mvcc() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let fixture = mvcc_restore_fixture(temp.path())?;
+        let restore_path = temp.path().join("restore.redb");
+        let report = restore_backup(
+            &fixture.incremental.path,
+            on_disk(&restore_path),
+            RestoreTarget::Lsn(fixture.lsn_update),
+        )?;
+        assert_eq!(report.restored_lsn, fixture.lsn_update);
+        assert_eq!(
+            report.applied_commits,
+            usize::try_from(fixture.lsn_update - fixture.full.manifest.end_lsn)?
+        );
+        let restored = open_database(on_disk(&restore_path))?;
+
+        let reader = restored.begin_transaction()?;
+        assert_eq!(reader.snapshot_id(), fixture.lsn_update);
+        assert_eq!(
+            reader.get_row("accounts", &Value::Int(1))?,
+            Some(account(1, "Ada", 38))
+        );
+        assert_eq!(
+            reader.get_row("accounts", &Value::Int(2))?,
+            Some(account(2, "Grace", 85))
+        );
+        reader.rollback();
+
+        let record = fixture
+            .source
+            .read(
+                txn::COMMIT_LOG_TABLE,
+                &txn::commit_log_key(fixture.lsn_update),
+                ReadConsistency::Strong,
+            )?
+            .ok_or("missing source commit record")?;
+        let source_hlc = txn::decode_commit_log_record(&record)?
+            .hlc
+            .ok_or("source commit has no HLC")?;
+        let restored_hlc = restored
+            .read(HLC_TABLE, HLC_LOCAL_KEY, ReadConsistency::Strong)?
+            .ok_or("restored database has no HLC")?;
+        assert_eq!(
+            postcard::from_bytes::<HlcTimestamp>(&restored_hlc)?,
+            source_hlc
+        );
+
+        let mut expected_mvcc = Vec::new();
+        for (key, value) in table_rows(&fixture.source, txn::TXN_MVCC_TABLE)? {
+            if mvcc_version(&key)? <= fixture.lsn_update {
+                expected_mvcc.push((key, value));
+            }
+        }
+        assert_eq!(table_rows(&restored, txn::TXN_MVCC_TABLE)?, expected_mvcc);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_and_verify_accept_valid_two_incremental_chain() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+
+        let latest = restore_backup(
+            &chain.second.path,
+            on_disk(temp.path().join("latest.redb")),
+            RestoreTarget::Latest,
+        )?;
+        assert_eq!(latest.restored_lsn, chain.second.manifest.end_lsn);
+        let middle = restore_backup(
+            &chain.second.path,
+            on_disk(temp.path().join("middle.redb")),
+            RestoreTarget::Lsn(chain.first.manifest.end_lsn),
+        )?;
+        assert_eq!(middle.restored_lsn, chain.first.manifest.end_lsn);
+        let verified = verify_backup(&chain.second.path)?;
+        assert_eq!(verified.restored_lsn, chain.second.manifest.end_lsn);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_chain_with_lsn_gap() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        let gap_start = chain.first.manifest.end_lsn + 1;
+        edit_manifest(&chain.second.path, |manifest| {
+            manifest.start_lsn = gap_start;
+        })?;
+        assert_chain_rejected(
+            &chain.second.path,
+            &temp.path().join("restore.redb"),
+            "starts at lsn",
+        )
+    }
+
+    #[test]
+    fn restore_rejects_chain_with_wrong_timeline() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        edit_manifest(&chain.second.path, |manifest| {
+            manifest.timeline_id = new_id();
+        })?;
+        assert_chain_rejected(
+            &chain.second.path,
+            &temp.path().join("restore.redb"),
+            "timeline",
+        )
+    }
+
+    #[test]
+    fn restore_rejects_parent_with_mismatched_backup_id() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        edit_manifest(&chain.first.path, |manifest| {
+            manifest.backup_id = new_id();
+        })?;
+        assert_chain_rejected(
+            &chain.second.path,
+            &temp.path().join("restore.redb"),
+            "references parent",
+        )
+    }
+
+    #[test]
+    fn restore_rejects_backup_chain_cycle() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        let second_id = chain.second.manifest.backup_id.clone();
+        edit_manifest(&chain.first.path, |manifest| {
+            manifest.parent_backup_id = Some(second_id.clone());
+        })?;
+        assert_chain_rejected(
+            &chain.second.path,
+            &temp.path().join("two-cycle.redb"),
+            "cycle",
+        )?;
+
+        edit_manifest(&chain.second.path, |manifest| {
+            manifest.parent_backup_id = Some(second_id);
+        })?;
+        assert_chain_rejected(
+            &chain.second.path,
+            &temp.path().join("self-loop.redb"),
+            "cycle",
+        )
+    }
+
+    #[test]
+    fn restore_rejects_parent_id_outside_backup_root() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        for parent in ["../escape", "", "a/b"] {
+            edit_manifest(&chain.second.path, |manifest| {
+                manifest.parent_backup_id = Some(parent.to_owned());
+            })?;
+            assert_chain_rejected(
+                &chain.second.path,
+                &temp.path().join("restore.redb"),
+                "invalid parent id",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_full_backup_with_parent() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        let first_id = chain.first.manifest.backup_id.clone();
+        edit_manifest(&chain.full.path, |manifest| {
+            manifest.parent_backup_id = Some(first_id);
+        })?;
+        assert_chain_rejected(
+            &chain.full.path,
+            &temp.path().join("restore.redb"),
+            "must not reference a parent",
+        )
+    }
+
+    #[test]
+    fn restore_rejects_commit_log_gap_inside_incremental() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        let mut payload: CommitLogPayload = read_backup_payload(
+            &chain.first.path,
+            required_file(&chain.first.manifest, WAL_DATA_FILE)?,
+            None,
+        )?;
+        assert!(payload.records.len() >= 2);
+        payload.records.remove(0);
+        let entry = write_compressed_json(
+            &chain.first.path,
+            WAL_DATA_FILE,
+            &payload,
+            &BackupConfig::default(),
+            None,
+        )?;
+        edit_manifest(&chain.first.path, |manifest| {
+            manifest.files = vec![entry];
+        })?;
+
+        let restore_path = temp.path().join("restore.redb");
+        match restore_backup(
+            &chain.second.path,
+            on_disk(&restore_path),
+            RestoreTarget::Latest,
+        ) {
+            Err(BackupError::Corruption(message)) => {
+                assert!(
+                    message.contains("was expected"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => return Err(format!("expected a commit log gap, got {other:?}").into()),
+        }
+        // The first pass checks commit-log contiguity before the target is created.
+        assert!(
+            !restore_path.exists(),
+            "nothing is created for a commit-log gap"
+        );
+        Ok(())
+    }
+
+    /// The first pass also checks that each commit log ends at its manifest's `end_lsn`, so an
+    /// incremental whose last commit is missing is rejected before the target is created.
+    #[test]
+    fn restore_rejects_commit_log_ending_before_its_manifest() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        let mut payload: CommitLogPayload = read_backup_payload(
+            &chain.first.path,
+            required_file(&chain.first.manifest, WAL_DATA_FILE)?,
+            None,
+        )?;
+        payload
+            .records
+            .pop()
+            .ok_or("the incremental has no commits")?;
+        let entry = write_compressed_json(
+            &chain.first.path,
+            WAL_DATA_FILE,
+            &payload,
+            &BackupConfig::default(),
+            None,
+        )?;
+        edit_manifest(&chain.first.path, |manifest| {
+            manifest.files = vec![entry];
+        })?;
+
+        assert_chain_rejected(
+            &chain.second.path,
+            &temp.path().join("restore.redb"),
+            "commit log ends at lsn",
+        )
+    }
+
+    #[test]
+    fn restore_rejects_time_target_before_full_backup() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let chain = chain_fixture(temp.path())?;
+        let before_full = chain
+            .full
+            .manifest
+            .taken_at
+            .checked_sub(Duration::from_secs(1))
+            .ok_or("time underflow")?;
+        let early_path = temp.path().join("early.redb");
+        match restore_backup(
+            &chain.second.path,
+            on_disk(&early_path),
+            RestoreTarget::Time(before_full),
+        ) {
+            Err(BackupError::Unsupported(message)) => {
+                assert!(
+                    message.contains("before the full backup"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => return Err(format!("expected an unsupported target, got {other:?}").into()),
+        }
+        assert!(!early_path.exists());
+
+        let report = restore_backup(
+            &chain.second.path,
+            on_disk(temp.path().join("now.redb")),
+            RestoreTarget::Time(SystemTime::now()),
+        )?;
+        assert_eq!(report.restored_lsn, chain.second.manifest.end_lsn);
         Ok(())
     }
 }
