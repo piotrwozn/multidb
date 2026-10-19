@@ -81,8 +81,8 @@ use crate::security::{
     AuthzPolicy, FileAuditSink, Permission, Principal, PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{
-    AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, StorageEngine, StorageError,
-    WriteTransaction,
+    AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, ReencryptionReport, StorageEngine,
+    StorageError, WriteTransaction,
 };
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
 use crate::text::{FullTextIndex, FullTextIndexConfig, TextError, TextSource};
@@ -1083,6 +1083,9 @@ impl Database {
     }
 
     /// Rotates the current data encryption key for an envelope-encrypted database.
+    ///
+    /// New writes use the new key; existing values keep their old key until
+    /// [`Self::reencrypt_existing_values`] rewrites them.
     /// # Errors
     /// Fails when the database is not encrypted or the key provider cannot rotate.
     pub fn rotate_dek(&self) -> Result<u64, DbError> {
@@ -1097,8 +1100,15 @@ impl Database {
     }
 
     /// Destroys one data encryption key version for crypto-shredding.
+    ///
+    /// Refuses the current key, the last live key, and any key that still
+    /// protects stored values: call [`Self::rotate_dek`], then
+    /// [`Self::reencrypt_existing_values`] until it reports nothing left to
+    /// rewrite, then destroy the old key. Backups and other residual copies
+    /// encrypted under a destroyed key become permanently unreadable.
     /// # Errors
-    /// Fails when the database is not encrypted or the key id is unknown.
+    /// Fails when the database is not encrypted, the key id is unknown, or the
+    /// key is current, last, or still in use.
     pub fn destroy_dek(&self, key_id: u64) -> Result<(), DbError> {
         Ok(self
             .local_storage()
@@ -1108,6 +1118,29 @@ impl Database {
                 )
             })?
             .destroy_dek(key_id)?)
+    }
+
+    /// Re-encrypts every stored value under the current data encryption key.
+    ///
+    /// Runs in committed batches of at most `batch_size` values and is safe to
+    /// rerun; rerun it until `reencrypted_values` is zero before destroying old
+    /// keys. Each batch holds the storage writer and the call is synchronous, so
+    /// async callers should use `spawn_blocking`.
+    /// # Errors
+    /// Fails when the database is not encrypted, `batch_size` is zero, or a
+    /// batch cannot be read, decrypted, or committed.
+    pub fn reencrypt_existing_values(
+        &self,
+        batch_size: usize,
+    ) -> Result<ReencryptionReport, DbError> {
+        Ok(self
+            .local_storage()
+            .ok_or_else(|| {
+                ConfigError::Unsupported(
+                    "replication backend has no local encrypted storage".to_owned(),
+                )
+            })?
+            .reencrypt_existing_values(batch_size)?)
     }
 
     /// Lists live data encryption key versions.
