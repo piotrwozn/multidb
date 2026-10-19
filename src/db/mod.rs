@@ -50,8 +50,8 @@ use crate::geo::{GeoError, GeoIndex, GeoIndexConfig, GeoPoint};
 use crate::graph::{Graph, GraphError, GraphId, GraphNodeId, TraversalOptions};
 use crate::keyenc;
 use crate::model::{
-    CollectionId, DOCUMENT_TABLE, DocumentCollection, DocumentId, IndexSpec, ModelError, Predicate,
-    QueryResult, Value, collection_range_bounds, decode_value, encode_value,
+    CollectionId, DOCUMENT_TABLE, DerivedIndexes, DocumentCollection, DocumentId, IndexSpec,
+    ModelError, Predicate, QueryResult, Value, collection_range_bounds, decode_value, encode_value,
 };
 use crate::observability;
 use crate::observability::MetricsConfig;
@@ -85,7 +85,7 @@ use crate::storage::{
     WriteTransaction,
 };
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
-use crate::text::{FullTextIndex, FullTextIndexConfig, TextError};
+use crate::text::{FullTextIndex, FullTextIndexConfig, TextError, TextSource};
 use crate::timeseries::{TimeSeriesCollection, TimeSeriesConfig, TimeSeriesError, time_bucket};
 use crate::tuning::{
     self, IndexAdviceReport, IndexAdvisor, ReprofileJob, ReprofilePlan, ReprofileStatus,
@@ -1558,12 +1558,12 @@ impl Database {
             None,
         ))?;
 
+        let derived = self.derived_indexes_for(collection_id);
         let repl: &dyn Replication = self;
-        Ok(DocumentCollection::with_indexes(
-            repl,
-            collection_id,
-            returned_indexes,
-        ))
+        Ok(
+            DocumentCollection::with_indexes(repl, collection_id, returned_indexes)
+                .with_derived_indexes(derived),
+        )
     }
 
     /// Creates a vector collection after checking `Admin` on the database.
@@ -1595,8 +1595,12 @@ impl Database {
     }
 
     /// Creates a full-text index after checking `Admin` on the database.
+    ///
+    /// Existing documents are backfilled and later document writes keep the index current
+    /// (see `create_full_text_index`).
     /// # Errors
-    /// Fails when authorization, catalog, or index metadata persistence fails.
+    /// Fails when authorization, catalog validation, the backfill, or index metadata
+    /// persistence fails, including when the source is not a document collection.
     pub fn create_full_text_index_as(
         &mut self,
         principal: &Principal,
@@ -1674,8 +1678,12 @@ impl Database {
     }
 
     /// Creates a geo index after checking `Admin` on the database.
+    ///
+    /// Existing documents are backfilled and later document writes keep the index current
+    /// (see `create_geo_index`).
     /// # Errors
-    /// Fails when authorization, catalog, or index validation fails.
+    /// Fails when authorization, catalog validation, the backfill, or index validation
+    /// fails, including when the source is not a document collection.
     pub fn create_geo_index_as(
         &mut self,
         principal: &Principal,
@@ -1839,12 +1847,12 @@ impl Database {
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
 
+        let derived = self.derived_indexes_for(collection_id);
         let repl: &dyn Replication = self;
-        Ok(DocumentCollection::with_indexes(
-            repl,
-            collection_id,
-            indexes,
-        ))
+        Ok(
+            DocumentCollection::with_indexes(repl, collection_id, indexes)
+                .with_derived_indexes(derived),
+        )
     }
 
     /// Creates a document collection with the next available collection id.
@@ -1915,22 +1923,32 @@ impl Database {
     }
 
     /// Creates a named full-text index and persists it in the catalog.
+    ///
+    /// Documents already in the source collection are backfilled before the index is
+    /// published. After that, document writes made through `collection` handles,
+    /// transactions and Control Plane document CRUD maintain the index in the same batch.
     /// # Errors
-    /// Fails when the name collides or storage rejects metadata.
+    /// Fails when the name collides, the source is not an existing document collection,
+    /// the backfill fails, or storage rejects metadata.
     pub fn create_full_text_index(
         &mut self,
         config: FullTextIndexConfig,
     ) -> Result<FullTextIndex<'_, dyn Replication + '_>, DbError> {
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
-        {
+        let TextSource::Collection { collection_id, .. } = &config.source;
+        self.ensure_document_collection(*collection_id)?;
+        // Backfill before the catalog entry becomes visible: `&mut self` keeps in-process
+        // writers out until it is published, and every later write through `collection`
+        // handles maintains the index itself.
+        let state = {
             let repl: &dyn Replication = self;
-            FullTextIndex::new(repl, config.clone())?;
-        }
+            FullTextIndex::new(repl, config.clone())?.rebuild_entries()?
+        };
         let entry = CatalogEntry::FullTextIndex {
             config: config.clone(),
         };
-        let mut ops = FullTextIndex::<dyn Replication>::metadata_ops(&config)?;
+        let mut ops = FullTextIndex::<dyn Replication>::metadata_ops_with_state(&config, &state)?;
         ops.push(catalog_put_op(&name, &entry)?);
         propose_system_batch(&self.repl, ops)?;
         self.catalog.insert(name, entry);
@@ -2004,22 +2022,32 @@ impl Database {
     }
 
     /// Creates a named geo index and persists it in the catalog.
+    ///
+    /// Documents already in the source collection are backfilled before the index is
+    /// published; documents with an invalid point are skipped and counted. After that,
+    /// document writes made through `collection` handles, transactions and Control Plane
+    /// document CRUD maintain the index in the same batch.
     /// # Errors
-    /// Fails when the name collides or index validation fails.
+    /// Fails when the name collides, the source is not an existing document collection,
+    /// index validation or the backfill fails, or storage rejects metadata.
     pub fn create_geo_index(
         &mut self,
         config: GeoIndexConfig,
     ) -> Result<GeoIndex<'_, dyn Replication + '_>, DbError> {
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
-        {
+        self.ensure_document_collection(config.collection_id)?;
+        // Backfill before the catalog entry becomes visible: `&mut self` keeps in-process
+        // writers out until it is published, and every later write through `collection`
+        // handles maintains the index itself.
+        let state = {
             let repl: &dyn Replication = self;
-            let _ = GeoIndex::new(repl, config.clone())?;
-        }
+            GeoIndex::new(repl, config.clone())?.rebuild_entries()?
+        };
         let entry = CatalogEntry::GeoIndex {
             config: config.clone(),
         };
-        let mut ops = GeoIndex::<dyn Replication>::metadata_ops(&config)?;
+        let mut ops = GeoIndex::<dyn Replication>::metadata_ops_with_state(&config, &state)?;
         ops.push(catalog_put_op(&name, &entry)?);
         propose_system_batch(&self.repl, ops)?;
         self.catalog.insert(name, entry);
@@ -2045,6 +2073,9 @@ impl Database {
     }
 
     /// Opens a named document collection from the catalog.
+    ///
+    /// Writes built by the handle also maintain the collection's full-text and geo
+    /// indexes in the same batch.
     /// # Errors
     /// Fails when the name is missing or has the wrong kind.
     pub fn collection(
@@ -2057,12 +2088,12 @@ impl Database {
                 indexes,
                 ..
             }) => {
+                let derived = self.derived_indexes_for(*collection_id);
                 let repl: &dyn Replication = self;
-                Ok(DocumentCollection::with_indexes(
-                    repl,
-                    *collection_id,
-                    indexes.clone(),
-                ))
+                Ok(
+                    DocumentCollection::with_indexes(repl, *collection_id, indexes.clone())
+                        .with_derived_indexes(derived),
+                )
             }
             Some(other) => Err(kind_mismatch(name, "collection", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -3559,6 +3590,22 @@ impl Database {
         };
         let policy = self.policy_config()?;
         let resources = policy_resources(requirements);
+        // Index search rows do not carry the source document's field names, so the source
+        // collection's row and masking policies cannot be applied to them.
+        let searches_index = requirements.iter().any(|(resource, _)| {
+            matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
+        });
+        if searches_index
+            && resources
+                .iter()
+                .any(|resource| policy_has_row_or_masking(&policy, resource))
+        {
+            return Err(ExtensionError::PolicyDenied(
+                "index searches over collections with row or masking policies are not supported"
+                    .to_owned(),
+            )
+            .into());
+        }
         if resources.len() != 1 {
             if resources
                 .iter()
@@ -4374,6 +4421,52 @@ impl Database {
             )));
         }
         Ok(())
+    }
+
+    /// Requires `collection_id` to name an existing document collection.
+    fn ensure_document_collection(&self, collection_id: CollectionId) -> Result<(), DbError> {
+        for (name, entry) in &self.catalog {
+            match entry {
+                CatalogEntry::Collection {
+                    collection_id: existing,
+                    ..
+                } if *existing == collection_id => return Ok(()),
+                CatalogEntry::Vector {
+                    collection_id: existing,
+                    ..
+                } if *existing == collection_id => {
+                    return Err(kind_mismatch(name, "collection", entry));
+                }
+                _ => {}
+            }
+        }
+        Err(DbError::MissingCatalogObject(format!(
+            "collection id {}",
+            collection_id.as_u32()
+        )))
+    }
+
+    /// Collects the full-text and geo indexes whose source is `collection_id`.
+    fn derived_indexes_for(&self, collection_id: CollectionId) -> DerivedIndexes {
+        let mut derived = DerivedIndexes::default();
+        for entry in self.catalog.values() {
+            match entry {
+                CatalogEntry::FullTextIndex { config } => {
+                    let TextSource::Collection {
+                        collection_id: source,
+                        ..
+                    } = &config.source;
+                    if *source == collection_id {
+                        derived.full_text.push(config.clone());
+                    }
+                }
+                CatalogEntry::GeoIndex { config } if config.collection_id == collection_id => {
+                    derived.geo.push(config.clone());
+                }
+                _ => {}
+            }
+        }
+        derived
     }
 
     fn ensure_graph_id_available(&self, graph_id: GraphId) -> Result<(), DbError> {
@@ -6173,7 +6266,7 @@ fn sql_requirements(
         });
     }
 
-    if let Some(requirements) = phase19_requirements(sql)? {
+    if let Some(requirements) = phase19_requirements(sql, catalog)? {
         return Ok(requirements);
     }
 
@@ -6240,19 +6333,22 @@ fn sql_requirements(
     Ok(requirements)
 }
 
-fn phase19_requirements(sql: &str) -> Result<Option<Vec<(Resource, Permission)>>, QueryError> {
+fn phase19_requirements(
+    sql: &str,
+    catalog: &BTreeMap<String, CatalogEntry>,
+) -> Result<Option<Vec<(Resource, Permission)>>, QueryError> {
     let Some(call) = parse_phase19_call(sql)? else {
         return Ok(None);
     };
     let requirements = match call.name.as_str() {
-        "match" => vec![(
-            Resource::FullTextIndex(phase19_resource_name(&call, "match")?),
-            Permission::Read,
-        )],
-        "within_radius" => vec![(
-            Resource::GeoIndex(phase19_resource_name(&call, "within_radius")?),
-            Permission::Read,
-        )],
+        "match" => {
+            let name = phase19_resource_name(&call, "match")?;
+            index_with_source_requirements(Resource::FullTextIndex(name.clone()), &name, catalog)
+        }
+        "within_radius" => {
+            let name = phase19_resource_name(&call, "within_radius")?;
+            index_with_source_requirements(Resource::GeoIndex(name.clone()), &name, catalog)
+        }
         "graph_neighbors" => vec![(
             Resource::Graph(phase19_resource_name(&call, "graph_neighbors")?),
             Permission::Read,
@@ -6261,6 +6357,41 @@ fn phase19_requirements(sql: &str) -> Result<Option<Vec<(Resource, Permission)>>
         _ => Vec::new(),
     };
     Ok(Some(requirements))
+}
+
+/// Index searches return source document text, ids and points, so they also need Read on the
+/// source collection; its row and masking policies then deny the multi-resource result.
+fn index_with_source_requirements(
+    index: Resource,
+    name: &str,
+    catalog: &BTreeMap<String, CatalogEntry>,
+) -> Vec<(Resource, Permission)> {
+    let source = match catalog.get(name) {
+        Some(CatalogEntry::FullTextIndex { config }) => {
+            let TextSource::Collection { collection_id, .. } = &config.source;
+            Some(*collection_id)
+        }
+        Some(CatalogEntry::GeoIndex { config }) => Some(config.collection_id),
+        _ => None,
+    };
+    let mut requirements = vec![(index, Permission::Read)];
+    if let Some(collection) = source.and_then(|id| collection_name_for_id(catalog, id)) {
+        requirements.push((Resource::Collection(collection), Permission::Read));
+    }
+    requirements
+}
+
+fn collection_name_for_id(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    collection_id: CollectionId,
+) -> Option<String> {
+    catalog.iter().find_map(|(name, entry)| match entry {
+        CatalogEntry::Collection {
+            collection_id: existing,
+            ..
+        } if *existing == collection_id => Some(name.clone()),
+        _ => None,
+    })
 }
 
 fn phase19_resource_name(call: &Phase19Call, function: &str) -> Result<String, QueryError> {
