@@ -17,13 +17,14 @@ use super::{
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
-    HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewError,
-    MaterializedViewSpec, ResumeToken, SubscriptionConfig,
+    FAIL_AFTER_HOOK_FOR_TESTS, HOOK_DELIVERIES_TABLE, HookAction, HookError, HookSpec, HookTarget,
+    MaterializedViewError, MaterializedViewSpec, PostCommitStage, ResumeToken, SubscriptionConfig,
 };
-use crate::cloud::ObjectStoreUri;
+use crate::cloud::{ObjectStoreUri, TenantConfig, TenantQuota};
 use crate::config_spec::{ApplyStatus, ConsistencyMode, DatabaseSpec, MigrationPlanner};
 use crate::continuous::{
-    ContinuousQuerySpec, OutboxConnectorSpec, OutboxSink, TriggerEvent, TriggerSpec, TriggerTiming,
+    ContinuousQuerySpec, OutboxConnectorSpec, OutboxSink, ProcedureSpec, TriggerEvent, TriggerSpec,
+    TriggerTiming,
 };
 use crate::extension::{
     AbiVersion, ExtensionError, LimitPolicy, MaskingPolicy, PolicyConfig, UdfBudget,
@@ -40,8 +41,8 @@ use crate::performance::{
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_ROWS_TABLE,
-    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_INDEX_TABLE,
+    REL_ROWS_TABLE, RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -52,7 +53,9 @@ use crate::security::{
     AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditOutcome, AuthzPolicy, Permission, Principal,
     PrincipalRegistry, Resource, Role,
 };
-use crate::storage::{EngineKind, RedbEngine, StorageEngine, StorageError, WriteTransaction};
+use crate::storage::{
+    Bytes, EngineKind, RedbEngine, StorageEngine, StorageError, WriteTransaction,
+};
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
 use crate::text::{FullTextIndexConfig, TextError};
 use crate::timeseries::{TimePoint, TimeSeriesConfig, TimeSeriesError};
@@ -4114,6 +4117,622 @@ fn phase32_before_wasm_trigger_can_replace_transaction_row()
         ])
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_rejects_sql_and_table_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let created = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_insert",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("writer")
+        .grant(Resource::Table("accounts".to_owned()), Permission::Read)
+        .grant(Resource::Table("accounts".to_owned()), Permission::Write)]));
+    let writer = Principal::new("alice").with_role("writer");
+    let sql = "INSERT INTO accounts (id, name, age) VALUES (1, 'Ada', 37)";
+
+    assert_rejected("SQL INSERT", database.query(sql).await, "rejected write");
+    match database.query_as(&writer, sql).await {
+        Err(DbError::AuthzDenied(error)) => panic!("writer must be authorized: {error}"),
+        result => assert_rejected("SQL INSERT as writer", result, "rejected write"),
+    }
+    assert_rejected(
+        "catalog table handle",
+        database
+            .table("accounts")?
+            .insert(account_row(1, "Ada", 37)),
+        "rejected write",
+    );
+    assert_rejected(
+        "create_table handle",
+        created.insert(account_row(1, "Ada", 37)),
+        "rejected write",
+    );
+
+    assert!(
+        database.table("accounts")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.table("accounts")?.scan()?
+    );
+    let SqlOutput::Rows(rows) = database.query("SELECT id FROM accounts").await? else {
+        panic!("SELECT must return rows");
+    };
+    assert!(
+        rows.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        rows.rows
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_is_validated_against_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            "wrong column type",
+            vec![Value::Int(1), Value::Int(5), Value::Int(99)],
+            "replacement is invalid",
+        ),
+        ("wrong arity", vec![Value::Int(1)], "replacement is invalid"),
+        (
+            "changed primary key",
+            account_row(2, "Grace", 99),
+            "must keep the primary key",
+        ),
+    ];
+
+    for (case, replacement, expected) in cases {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_table("accounts", Some(account_schema()), Vec::new())?;
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            &trigger_response("replace", Some(Value::Array(replacement))),
+        )?;
+
+        assert_rejected(
+            &format!("{case}: transaction"),
+            database.transaction(|txn| txn.insert_row("accounts", account_row(1, "Ada", 37))),
+            expected,
+        );
+        assert_rejected(
+            &format!("{case}: table handle"),
+            database
+                .table("accounts")?
+                .insert(account_row(1, "Ada", 37)),
+            expected,
+        );
+        assert_rejected(
+            &format!("{case}: SQL INSERT"),
+            database
+                .query("INSERT INTO accounts (id, name, age) VALUES (1, 'Ada', 37)")
+                .await,
+            expected,
+        );
+
+        let accounts = database.table("accounts")?;
+        assert_eq!(accounts.get(&Value::Int(1))?, None, "{case}");
+        assert_eq!(accounts.get(&Value::Int(2))?, None, "{case}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_maintains_secondary_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    // One database per entry path: the constant replacement always has primary key 1.
+    for path in ["table handle", "SQL INSERT", "transaction"] {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_table(
+            "accounts",
+            Some(account_schema()),
+            vec![RelIndexSpec::new(1, 1)],
+        )?;
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            &trigger_response("replace", Some(Value::Array(account_row(1, "Grace", 99)))),
+        )?;
+
+        match path {
+            "table handle" => {
+                database
+                    .table("accounts")?
+                    .insert(account_row(1, "Ada", 37))?;
+            }
+            "SQL INSERT" => {
+                database
+                    .query("INSERT INTO accounts (id, name, age) VALUES (1, 'Ada', 37)")
+                    .await?;
+            }
+            _ => {
+                database
+                    .transaction(|txn| txn.insert_row("accounts", account_row(1, "Ada", 37)))?;
+            }
+        }
+
+        let entries = rel_index_entries(&database)?;
+        assert_eq!(entries.len(), 1, "{path}: {entries:?}");
+        assert!(contains_bytes(&entries[0].0, b"Grace"), "{path}");
+        let accounts = database.table("accounts")?;
+        assert_eq!(
+            accounts.get(&Value::Int(1))?,
+            Some(account_row(1, "Grace", 99)),
+            "{path}"
+        );
+        assert_eq!(
+            accounts.query_eq(1, &Value::Str("Grace".to_owned()))?.rows,
+            vec![account_row(1, "Grace", 99)],
+            "{path}"
+        );
+        assert!(
+            accounts
+                .query_eq(1, &Value::Str("Ada".to_owned()))?
+                .rows
+                .is_empty(),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_on_update_rewrites_stale_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        ("table handle", account_row(1, "Grace", 99)),
+        ("transaction", account_row(1, "Grace", 99)),
+        ("SQL ON CONFLICT", account_row(1, "Grace", 99)),
+        (
+            "table handle keeps indexed value",
+            account_row(1, "Bob", 99),
+        ),
+        ("transaction keeps indexed value", account_row(1, "Bob", 99)),
+    ];
+
+    for (case, replacement) in cases {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_table(
+            "accounts",
+            Some(account_schema()),
+            vec![RelIndexSpec::new(1, 1).with_include(vec![2])],
+        )?;
+        database
+            .table("accounts")?
+            .insert(account_row(1, "Ada", 37))?;
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_update",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+            &trigger_response("replace", Some(Value::Array(replacement.clone()))),
+        )?;
+
+        if case.starts_with("table handle") {
+            database
+                .table("accounts")?
+                .update(account_row(1, "Bob", 40))?;
+        } else if case.starts_with("transaction") {
+            database.transaction(|txn| txn.update_row("accounts", account_row(1, "Bob", 40)))?;
+        } else {
+            database
+                .query(
+                    "INSERT INTO accounts (id, name, age) VALUES (1, 'Bob', 40) \
+                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                )
+                .await?;
+        }
+
+        let Value::Str(indexed) = &replacement[1] else {
+            panic!("{case}: replacement name must be a string");
+        };
+        let entries = rel_index_entries(&database)?;
+        assert_eq!(entries.len(), 1, "{case}: {entries:?}");
+        let (key, payload) = &entries[0];
+        assert!(contains_bytes(key, indexed.as_bytes()), "{case}: {key:?}");
+        assert_eq!(
+            decode_value(payload)?,
+            Value::Array(vec![Value::Int(99)]),
+            "{case}"
+        );
+        assert_eq!(
+            database.table("accounts")?.get(&Value::Int(1))?,
+            Some(replacement),
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_rejects_repeated_row_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "replace_accounts_insert",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+        &trigger_response("replace", Some(Value::Array(account_row(1, "Grace", 99)))),
+    )?;
+
+    assert_rejected(
+        "repeated row key",
+        database
+            .query(
+                "INSERT INTO accounts (id, name, age) VALUES (1, 'A', 1), (1, 'B', 2) \
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+            )
+            .await,
+        "more than once",
+    );
+    assert_eq!(database.table("accounts")?.get(&Value::Int(1))?, None);
+    Ok(())
+}
+
+#[test]
+fn phase32_wasm_triggers_are_refused_on_columnar_tables() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("columnar.redb");
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, &path))?;
+    let table = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    assert_eq!(table.layout(), TableLayout::Columnar);
+    let wasm = constant_value_wasm(&trigger_response(
+        "replace",
+        Some(Value::Array(account_row(1, "Grace", 99))),
+    ))?;
+    let spec = wasm_trigger(
+        "replace_accounts_insert",
+        "accounts",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+    );
+
+    match database.register_wasm_trigger(spec.clone(), &wasm) {
+        Err(DbError::Query(QueryError::Unsupported(message))) => {
+            assert!(message.contains("columnar table accounts"), "{message}");
+        }
+        other => panic!("columnar trigger registration must be refused, got {other:?}"),
+    }
+
+    // A trigger stored before registration refused columnar tables still cannot
+    // replace a whole segment.
+    let mut legacy = spec;
+    legacy.module_hash = crate::extension::register_wasm_module(
+        database.replication_ref(),
+        &database.wasm_runtime,
+        &wasm,
+    )?
+    .hash;
+    crate::continuous::register_trigger(database.replication_ref(), &legacy)?;
+    assert_rejected(
+        "columnar insert",
+        table.insert(account_row(1, "Ada", 37)),
+        "cannot replace columnar table segments",
+    );
+    assert!(
+        database.table("accounts")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.table("accounts")?.scan()?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_after_wasm_trigger_failure_keeps_committed_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_after_accounts_insert",
+        TriggerTiming::After,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+
+    database
+        .table("accounts")?
+        .insert(account_row(1, "Ada", 37))?;
+    database.transaction(|txn| txn.insert_row("accounts", account_row(2, "Grace", 41)))?;
+    database
+        .query("INSERT INTO accounts (id, name, age) VALUES (3, 'Lin', 29)")
+        .await?;
+    let ops = database
+        .table("accounts")?
+        .insert_ops(account_row(4, "Bo", 51))?;
+    database.propose_batch(ops)?;
+
+    assert_eq!(database.table("accounts")?.scan()?.len(), 4);
+    assert!(matches!(
+        database
+            .table("accounts")?
+            .insert(account_row(1, "Ada", 37)),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    let failures = database.post_commit_failures()?;
+    assert_eq!(failures.len(), 4, "{failures:?}");
+    assert!(failures.iter().all(|failure| {
+        failure.stage == PostCommitStage::AfterTrigger
+            && failure.name == "reject_after_accounts_insert"
+            && failure.error.contains("must return accept")
+    }));
+    let metrics = crate::observability::global_registry().render()?;
+    assert!(metrics.contains("multidb_post_commit_failures_total"));
+    Ok(())
+}
+
+#[test]
+fn after_trigger_failure_keeps_tenant_reservation() -> Result<(), Box<dyn std::error::Error>> {
+    let ops = OperationalConfig::new().with_tenant(TenantConfig::new(
+        "tenant-a",
+        TenantQuota::storage_bytes(1_500),
+    ));
+    let mut database = create_database_with_ops(DbConfig::new(Profile::InMemory), ops)?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_after_accounts_insert",
+        TriggerTiming::After,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+    let accounts = database.table("accounts")?;
+
+    accounts.insert(account_row(1, &"x".repeat(900), 1))?;
+    match accounts.insert(account_row(2, &"y".repeat(900), 2)) {
+        Err(QueryError::Repl(ReplError::QuotaExceeded { .. })) => {}
+        other => panic!("committed write must keep its quota reservation, got {other:?}"),
+    }
+    assert_eq!(accounts.scan()?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_commit_hook_failure_is_recorded_not_returned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    database.create_collection(
+        "events",
+        CollectionId::new(7),
+        user_doc_fields(),
+        Vec::new(),
+    )?;
+    database.register_hook(&HookSpec::after(
+        FAIL_AFTER_HOOK_FOR_TESTS,
+        HookTarget::AnyUser,
+        HookAction::RecordAfterCommit,
+        1_000,
+    ))?;
+
+    database
+        .table("accounts")?
+        .insert(account_row(1, "Ada", 37))?;
+    database.transaction(|txn| txn.insert_row("accounts", account_row(2, "Grace", 41)))?;
+    database
+        .query("INSERT INTO accounts (id, name, age) VALUES (3, 'Lin', 29)")
+        .await?;
+    database
+        .collection("events")?
+        .insert(&user_document(1, Some(Value::Str("Paris".to_owned()))))?;
+
+    assert_eq!(database.collection("events")?.scan()?.len(), 1);
+    let (events, _) = database.poll_changefeed(
+        &ResumeToken::default(),
+        &ChangefeedFilter {
+            target: ChangefeedTarget::Table("accounts".to_owned()),
+        },
+        &ChangefeedOptions::default(),
+        100,
+    )?;
+    let upserts = events
+        .iter()
+        .filter(|event| matches!(event.op, ChangeOp::Upsert { .. }))
+        .count();
+    assert_eq!(
+        upserts, 3,
+        "every committed row must be written exactly once"
+    );
+    let failures = database.post_commit_failures()?;
+    assert_eq!(failures.len(), 4, "{failures:?}");
+    assert!(failures.iter().all(|failure| {
+        failure.stage == PostCommitStage::AfterHook
+            && failure.error.contains(FAIL_AFTER_HOOK_FOR_TESTS)
+    }));
+    assert!(
+        database
+            .range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+            .is_empty(),
+        "expected an empty value, got {:?}",
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+    );
+    Ok(())
+}
+
+#[test]
+fn hook_targets_are_scoped_to_named_objects() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_collection("a", CollectionId::new(1), user_doc_fields(), Vec::new())?;
+    database.create_collection("b", CollectionId::new(2), user_doc_fields(), Vec::new())?;
+    database
+        .create_vector_collection("v1", VectorCollectionConfig::new(CollectionId::new(70), 3))?;
+    database
+        .create_vector_collection("v2", VectorCollectionConfig::new(CollectionId::new(71), 3))?;
+    database.create_graph("g1", GraphId::new(5))?;
+    database.create_graph("g2", GraphId::new(6))?;
+    for (name, target) in [
+        (
+            "small-missing",
+            HookTarget::Collection("missing".to_owned()),
+        ),
+        ("small-wrong-kind", HookTarget::Collection("v1".to_owned())),
+        ("graph-wrong-kind", HookTarget::Graph("a".to_owned())),
+    ] {
+        match database.register_hook(&HookSpec::before(
+            name,
+            target,
+            HookAction::MaxValueBytes(1),
+            1_000,
+        )) {
+            Err(DbError::Hook(HookError::InvalidTarget(_))) => {}
+            other => panic!("hook {name} with an unknown target must be refused, got {other:?}"),
+        }
+    }
+    for (name, target) in [
+        ("small-a", HookTarget::Collection("a".to_owned())),
+        ("small-v1", HookTarget::VectorCollection("v1".to_owned())),
+    ] {
+        database.register_hook(&HookSpec::before(
+            name,
+            target,
+            HookAction::MaxValueBytes(1),
+            1_000,
+        ))?;
+    }
+    database.register_hook(&HookSpec::after(
+        "g1-after",
+        HookTarget::Graph("g1".to_owned()),
+        HookAction::RecordAfterCommit,
+        1_000,
+    ))?;
+
+    let document = user_document(1, Some(Value::Str("Paris".to_owned())));
+    database.collection("b")?.insert(&document)?;
+    assert!(database.collection("a")?.insert(&document).is_err());
+    database
+        .vector_collection("v2")?
+        .insert_vector(&Value::Null, vec![1.0, 0.0, 0.0])?;
+    assert!(
+        database
+            .vector_collection("v1")?
+            .insert_vector(&Value::Null, vec![1.0, 0.0, 0.0])
+            .is_err()
+    );
+    assert_eq!(database.collection("b")?.scan()?.len(), 1);
+    assert!(
+        database.collection("a")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.collection("a")?.scan()?
+    );
+
+    let edge = |graph: &str| -> Result<(), Box<dyn std::error::Error>> {
+        database.graph(graph)?.add_edge(
+            GraphNodeId::from_str_id("alice"),
+            "knows",
+            GraphNodeId::from_str_id("bob"),
+            &Value::Null,
+        )?;
+        Ok(())
+    };
+    edge("g2")?;
+    assert!(
+        database
+            .range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+            .is_empty(),
+        "expected an empty value, got {:?}",
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+    );
+    edge("g1")?;
+    let deliveries =
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?;
+    assert_eq!(deliveries.len(), 1);
+    assert!(String::from_utf8_lossy(&deliveries[0].1).contains("g1-after"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn procedure_writes_run_through_write_pipeline() -> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.register_hook(&HookSpec::before(
+        "non-empty-kv",
+        HookTarget::Keyspace("kv".to_owned()),
+        HookAction::RejectEmptyValue,
+        1_000,
+    ))?;
+    let command = Value::Object(BTreeMap::from([
+        ("action".to_owned(), Value::Str("put".to_owned())),
+        ("table".to_owned(), Value::Str("kv".to_owned())),
+        ("key".to_owned(), Value::Str("k".to_owned())),
+        ("value".to_owned(), Value::Str(String::new())),
+    ]));
+    let wasm = constant_value_wasm(&Value::Array(vec![command]))?;
+    database.register_wasm_procedure(
+        ProcedureSpec {
+            name: "put_empty".to_owned(),
+            module_hash: String::new(),
+            entry: "udf_call".to_owned(),
+            budget: UdfBudget::default(),
+            abi: AbiVersion::V1,
+        },
+        &wasm,
+    )?;
+
+    assert_rejected(
+        "call_procedure",
+        database.call_procedure("put_empty", &[]),
+        "hook rejected write",
+    );
+    assert_rejected(
+        "SQL CALL",
+        database.query("CALL put_empty()").await,
+        "hook rejected write",
+    );
+    assert_eq!(database.read("kv", b"k", ReadConsistency::Strong)?, None);
+    Ok(())
+}
+
+fn account_row(id: i64, name: &str, age: i64) -> Row {
+    vec![Value::Int(id), Value::Str(name.to_owned()), Value::Int(age)]
+}
+
+fn register_accounts_trigger(
+    database: &Database,
+    name: &str,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    response: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let wasm = constant_value_wasm(response)?;
+    database.register_wasm_trigger(wasm_trigger(name, "accounts", timing, event), &wasm)?;
+    Ok(())
+}
+
+fn assert_rejected<T: std::fmt::Debug, E: std::fmt::Display>(
+    context: &str,
+    result: Result<T, E>,
+    expected: &str,
+) {
+    match result {
+        Ok(value) => panic!("{context}: expected an error containing {expected:?}, got {value:?}"),
+        Err(error) => assert!(
+            error.to_string().contains(expected),
+            "{context}: expected an error containing {expected:?}, got {error}"
+        ),
+    }
+}
+
+fn rel_index_entries(database: &Database) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+    database.range(REL_INDEX_TABLE, &[], &[0xFF], ReadConsistency::Strong)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn order_schema() -> TableSchema {
