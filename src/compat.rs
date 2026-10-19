@@ -9,6 +9,7 @@ use sqlparser::{
 };
 
 use crate::{
+    cdc::HookError,
     db::{CatalogEntry, DbConfig, DbError},
     model::Value,
     query::{ColumnType, QueryError, SqlOutput, SqlRows, TableLayout, TableSchema},
@@ -211,7 +212,9 @@ pub fn sqlstate_for_db_error(error: &DbError) -> &'static str {
         DbError::CatalogObjectExists(_) => "42710",
         DbError::CatalogKindMismatch { .. } => "42809",
         DbError::Storage(error) => sqlstate_for_storage(error),
-        DbError::Repl(error) => sqlstate_for_repl(error),
+        DbError::Repl(error) | DbError::Hook(HookError::Repl(error)) => sqlstate_for_repl(error),
+        DbError::Hook(HookError::Rejected(_) | HookError::Timeout(_)) => "P0001",
+        DbError::Hook(HookError::InvalidTarget(_)) => "42704",
         DbError::Query(error) => sqlstate_for_query(error),
         DbError::Config(_) => "08004",
         _ => "XX000",
@@ -243,6 +246,7 @@ pub fn sqlstate_for_repl(error: &ReplError) -> &'static str {
         ReplError::Conflict | ReplError::Storage(StorageError::Conflict) => "40001",
         ReplError::NoQuorum | ReplError::Transport(_) => "08006",
         ReplError::Unsupported(_) => "0A000",
+        ReplError::Rejected(_) => "P0001",
         ReplError::QuotaExceeded { .. } => "53100",
         ReplError::Storage(error) => sqlstate_for_storage(error),
     }
@@ -570,12 +574,15 @@ fn stable_oid(name: &str) -> i64 {
 mod tests {
     use super::{
         CatalogObject, CatalogObjectKind, PgCatalogSnapshot, SERVER_VERSION,
-        compat_sql_requirements, execute_compat_sql, sqlstate_for_query,
+        compat_sql_requirements, execute_compat_sql, sqlstate_for_db_error, sqlstate_for_query,
+        sqlstate_for_repl,
     };
     use crate::{
-        db::{DbConfig, Profile},
+        cdc::HookError,
+        db::{DbConfig, DbError, Profile},
         model::Value,
         query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
+        repl::ReplError,
     };
 
     #[test]
@@ -634,6 +641,22 @@ mod tests {
             sqlstate_for_query(&QueryError::MissingTable("users".to_owned())),
             "42P01"
         );
+    }
+
+    #[test]
+    fn write_rejections_do_not_map_to_connection_failures() {
+        let rejected = ReplError::Rejected("before trigger audit rejected write".to_owned());
+        assert_eq!(sqlstate_for_repl(&rejected), "P0001");
+        assert_eq!(sqlstate_for_query(&QueryError::Repl(rejected)), "P0001");
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Hook(HookError::Rejected("denied".to_owned()))),
+            "P0001"
+        );
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Hook(HookError::Timeout("slow".to_owned()))),
+            "P0001"
+        );
+        assert_eq!(sqlstate_for_repl(&ReplError::NoQuorum), "08006");
     }
 
     #[test]
