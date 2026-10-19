@@ -3504,6 +3504,62 @@ mod tests {
         Ok(())
     }
 
+    /// `serve` opens a profile-manifest database through the manifest openers and applies the
+    /// query governor overrides on top: unset, the manifest's governor knobs stay; set, only
+    /// those two change, for the process only, and the manifest's parser limits stay.
+    #[test]
+    fn serve_query_governor_overrides_a_profile_manifest_for_the_process_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("serve.redb");
+        let overrides = serde_json::from_value(json!({
+            "query": {
+                "max_concurrent_queries": 6,
+                "queue_timeout_ms": 900,
+                "max_sql_bytes": 2048
+            }
+        }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with query overrides must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(db_path.clone()))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::default(),
+        )?);
+
+        let db_arg = path_arg(&db_path);
+        let serve_env = |extra: &[(&str, &str)]| {
+            let mut env =
+                local_dev_env(&[("MULTIDB_PROFILE", "auto"), ("MULTIDB_DB_PATH", &db_arg)]);
+            env.extend(env_map(extra));
+            env
+        };
+        let env = serve_env(&[]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        drop(database);
+
+        let env = serve_env(&[("MULTIDB_MAX_CONCURRENT_QUERIES", "3")]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        let mut expected = binding.performance.clone();
+        expected.query.max_concurrent_queries = 3;
+        assert_eq!(database.performance_config(), &expected);
+        assert_eq!(database.performance_config().query.queue_timeout_ms, 900);
+        assert_eq!(database.performance_config().query.max_sql_bytes, 2_048);
+        drop(database);
+
+        let reopened = open_database(binding.db_config.clone())?;
+        assert_eq!(reopened.performance_config(), &binding.performance);
+        Ok(())
+    }
+
     #[test]
     fn serve_config_requires_tls_in_production() {
         let env = env_map(&[

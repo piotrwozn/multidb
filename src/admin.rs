@@ -3751,8 +3751,14 @@ mod tests {
         ConfigApplyRequest, ConfigPlanRequest, local_insecure_admin_allowed, login_client_label,
     };
     use crate::{
-        config_spec::{ApplyStatus, DatabaseSpec, MigrationPlanner},
-        db::{DbConfig, DbError, Profile, create_database, open_database},
+        config_spec::{
+            ApplyStatus, DatabaseSpec, MigrationPlanner, ProfileKnobOverrides,
+            resolve_named_profile,
+        },
+        db::{
+            DbConfig, DbError, OperationalConfig, Profile, ReplicationKind, create_database,
+            create_database_with_profile, open_database,
+        },
         query::{QueryError, SqlOutput},
         repl::ReplError,
         runtime_advisor::{
@@ -6628,6 +6634,104 @@ mod tests {
                 .as_array()
                 .is_some_and(|objects| objects.iter().any(|object| object["name"] == "later"))
         );
+        Ok(())
+    }
+
+    /// A database created with a custom profile and reopened through the manifest openers, as
+    /// `serve` opens it, keeps the manifest's runtime performance behind the shared lock: `/sql`
+    /// compatibility queries, writes and SELECTs run under the shared guard with the manifest's
+    /// `query.max_sql_bytes`. `/profiles` and `/config/validate` never touch the database, so
+    /// they answer while a writer holds the lock.
+    #[tokio::test]
+    async fn control_plane_sql_keeps_the_profile_manifest_parser_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let overrides: ProfileKnobOverrides = serde_json::from_value(serde_json::json!({
+            "query": { "max_sql_bytes": 1024 }
+        }))?;
+        let resolution = resolve_named_profile("high_durability", &overrides);
+        let resolved = resolution
+            .resolved()
+            .ok_or_else(|| format!("high_durability did not resolve: {:?}", resolution.issues()))?;
+        let binding =
+            resolved.bind(ReplicationKind::Cp, Some(temp.path().join("manifest.redb")))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::new(),
+        )?);
+        let mut database = open_database(binding.db_config.clone())?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.performance_config().query.max_sql_bytes, 1_024);
+        database.set_authz_policy(AuthzPolicy::new([Role::new("admin")
+            .grant(Resource::System, Permission::Admin)
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Database, Permission::Write)
+            .grant(Resource::Database, Permission::Admin)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin")),
+        );
+        let database = Arc::new(RwLock::new(database));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        create_users_table(&app).await?;
+
+        let padding = " ".repeat(1_024);
+        for (sql, within_limit) in [
+            ("SELECT version()".to_owned(), true),
+            (format!("SELECT version(){padding}"), false),
+            (
+                "INSERT INTO users (id, name) VALUES (1, 'Ada')".to_owned(),
+                true,
+            ),
+            (
+                format!("INSERT INTO users (id, name) VALUES (2, 'Lin'){padding}"),
+                false,
+            ),
+            ("SELECT name FROM users".to_owned(), true),
+            (format!("SELECT name FROM users{padding}"), false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/sql",
+                    Some(&serde_json::json!({ "sql": sql })),
+                )?)
+                .await?;
+            let status = response.status();
+            let body = json_body(response).await?;
+            if within_limit {
+                assert_eq!(status, StatusCode::OK, "{body}");
+            } else {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("limit is 1024 bytes")),
+                    "{body}"
+                );
+            }
+        }
+        assert_eq!(sql_ids(&app, "SELECT name FROM users").await?, ["Ada"]);
+
+        let writer = database.write().await;
+        let spec = studio_custom_profile_spec(
+            "balanced",
+            &serde_json::json!({ "mode": "single_node", "storage_path": "target/new-database.redb" }),
+            None,
+        );
+        for request in [
+            authed_request(Method::GET, "/profiles", None::<&()>)?,
+            authed_request(Method::POST, "/config/validate", Some(&spec))?,
+        ] {
+            let response =
+                tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(request))
+                    .await??;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        drop(writer);
         Ok(())
     }
 

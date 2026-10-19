@@ -456,6 +456,13 @@ these openers, so they honour the manifest too; their `--profile` or
 `MULTIDB_PROFILE` must name the database's storage class, or be `auto` to read
 it from the database (see [CLI](#cli)). An explicit
 `OperationalConfig.performance` wins for that session and logs one warning.
+`multidb serve` then applies `MULTIDB_MAX_CONCURRENT_QUERIES` and
+`MULTIDB_QUERY_QUEUE_TIMEOUT_MS` when they are set: they replace
+`query.max_concurrent_queries` and `query.queue_timeout_ms` for that process
+only (`Database::set_query_governor`), the manifest and every other knob stay,
+and unset they keep the manifest values. PostgreSQL wire and the Control Plane
+share that one database, so statements from either run with the manifest's
+runtime performance, SQL parser limits included.
 Every one of these openers also logs a warning (`tracing::warn!`, naming the
 floor) for each manifest floor the opened database does not meet: an engine
 without encryption misses `floors.encryption_at_rest`, and audit switched off

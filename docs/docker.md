@@ -71,7 +71,10 @@ Environment:
 `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` must be
 whole numbers in their range; any other non-empty value stops `multidb serve`
 at startup instead of falling back to the default. An empty value counts as
-unset and uses the default.
+unset and uses the default. For a database created with a custom profile the
+default is its profile manifest's `query.max_concurrent_queries` and
+`query.queue_timeout_ms` (see [Profiles](profiles.md)); a set value applies to
+that `serve` process only and is never written to the database.
 
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.
