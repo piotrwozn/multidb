@@ -927,34 +927,12 @@ impl Run<'_> {
             return Err(error.into());
         }
 
-        let mut disable_audit = None;
-        for step in rest {
-            if step.kind == ProvisionStepKind::DisableAudit {
-                disable_audit = Some(*step);
-                continue;
-            }
-            let lsn = self.db.commit_lsn().ok();
-            let result = match self.run_step(step) {
-                Ok(done) => {
-                    self.complete(step, done);
-                    // The step is applied even when its journal entry is not.
-                    self.db
-                        .write_provision_record(&self.record, None)
-                        .map_err(|error| (error, true))
-                }
-                Err(error) => {
-                    let wrote = self.wrote_since(lsn);
-                    if wrote {
-                        self.manage_committed_object(step);
-                    }
-                    self.push_failure(step, &error, wrote);
-                    Err((error, wrote))
-                }
-            };
-            if let Err((error, wrote)) = result {
+        let disable_audit = match self.run_steps(rest) {
+            Ok(disable_audit) => disable_audit,
+            Err((step, error, wrote)) => {
                 return Ok(self.fail(Some(&step.step_id), &error, wrote));
             }
-        }
+        };
 
         if let Err(error) = self.write_applied_record() {
             let last = steps.last().map(|step| step.step_id.clone());
@@ -992,6 +970,41 @@ impl Run<'_> {
             ProvisionOutcome::Applied,
             "every step of the plan was applied",
         ))
+    }
+
+    /// Runs `steps` in plan order and journals each one, all but the `disable_audit` step,
+    /// which is returned to run last. A failure returns the step, its error and whether the step
+    /// wrote to the database before it failed (a step whose journal entry fails did).
+    fn run_steps<'s>(
+        &mut self,
+        steps: &[&'s ProvisionStep],
+    ) -> Result<Option<&'s ProvisionStep>, (&'s ProvisionStep, DbError, bool)> {
+        let mut disable_audit = None;
+        for step in steps {
+            if step.kind == ProvisionStepKind::DisableAudit {
+                disable_audit = Some(*step);
+                continue;
+            }
+            let lsn = self.db.commit_lsn().ok();
+            match self.run_step(step) {
+                Ok(done) => {
+                    self.complete(step, done);
+                    // The step is applied even when its journal entry is not.
+                    self.db
+                        .write_provision_record(&self.record, None)
+                        .map_err(|error| (*step, error, true))?;
+                }
+                Err(error) => {
+                    let wrote = self.wrote_since(lsn);
+                    if wrote {
+                        self.manage_committed_object(step);
+                    }
+                    self.push_failure(step, &error, wrote);
+                    return Err((*step, error, wrote));
+                }
+            }
+        }
+        Ok(disable_audit)
     }
 
     /// Records a provisioning audit event as the actor.

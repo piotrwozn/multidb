@@ -183,7 +183,8 @@ impl PhysicalObjectSpec {
 
 /// `physical.max_future_skew_millis` when it is present: a number, or `null` for no bound, which
 /// `i64::MAX` also means. A field that is left out never reaches this function and stays
-/// `None`, the default bound.
+/// `None`, the default bound. The three states (left out, `null`, a number) are the field's.
+#[allow(clippy::option_option)]
 fn null_is_unbounded<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -194,8 +195,8 @@ where
 
 /// Writes a present `physical.max_future_skew_millis`: the number, or `null` for no bound, also
 /// when the bound is `i64::MAX`, so no spec, record or response carries a number JavaScript
-/// clients would round. `serialize_with` passes the field by reference.
-#[allow(clippy::ref_option)]
+/// clients would round. `serialize_with` passes the field by reference, with its three states.
+#[allow(clippy::ref_option, clippy::option_option)]
 fn unbounded_as_null<S>(bound: &Option<Option<i64>>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,

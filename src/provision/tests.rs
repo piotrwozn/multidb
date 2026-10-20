@@ -5700,7 +5700,8 @@ fn a_process_query_governor_is_not_a_session_pending_restart() -> TestResult {
     let report = apply_cli(&mut db, &governor, &ProvisionOptions::default())?;
     assert_applied(&report);
     assert!(!report.session_pending_restart);
-    assert!(drift_kinds(&plan_open(&governor, &db)?).is_empty());
+    let governed = plan_open(&governor, &db)?;
+    assert!(drift_kinds(&governed).is_empty(), "{:#?}", governed.drift);
     assert_eq!(
         db.performance_config().query.max_concurrent_queries,
         query.max_concurrent_queries + 1

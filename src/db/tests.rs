@@ -7888,7 +7888,8 @@ fn provisioning_writes_bypass_triggers_and_the_tenant_quota()
     assert!(database.catalog().contains_key("accounts_history"));
     assert!(database.authz_policy().roles().contains_key("accountant"));
     // No trigger ran, and nothing was charged to the tenant.
-    assert!(database.post_commit_failures()?.is_empty());
+    let failures = database.post_commit_failures()?;
+    assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(used(&database), before);
     assert_eq!(database.table("accounts")?.scan()?.len(), 1);
 
