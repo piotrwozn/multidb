@@ -3054,8 +3054,8 @@ async fn provision_plan_handler(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    // A plan never writes, so it runs under a shared guard next to statements; an apply
-    // recomputes it under the exclusive guard anyway.
+    // A plan only reads (a denial is audited, as on every read endpoint), so it runs under a
+    // shared guard next to statements; an apply recomputes it under the exclusive guard anyway.
     let database = Arc::clone(&state.database).read_owned().await;
     let principal = state.principal_from_headers(&database, &headers);
     run_blocking(move || plan_response(&database, &request, &principal)).await

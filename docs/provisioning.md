@@ -960,11 +960,12 @@ apply's answers:
 | 403 | `forbidden` | the principal lacks `System:Admin` or `Database:Admin` |
 | 500 | `provision_partially_applied` | a step failed; `data` is the report. The steps before it stay applied and the record says `failed`: plan again to see what remains |
 
-Retunes and the storage format upgrade are written to the profile manifest
-and take effect when `serve` restarts (`session_pending_restart` in the
-report), except for a query governor knob that `MULTIDB_MAX_CONCURRENT_QUERIES`
-or `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` sets for the process. The Control Plane never creates a database and never opens a path
-from a request: a spec `deployment.storage_path` is reported as the Advice
+Retunes and the storage format upgrade are written to the profile manifest and
+take effect when `serve` restarts (`session_pending_restart` in the report),
+except for a query governor knob that `MULTIDB_MAX_CONCURRENT_QUERIES` or
+`MULTIDB_QUERY_QUEUE_TIMEOUT_MS` sets for the process. The Control Plane never
+creates a database and never opens a path from a request: a spec
+`deployment.storage_path` is reported as the Advice
 `PROVISION_STORAGE_PATH_IGNORED`. Encryption at rest is not enforceable here
 (`GUARANTEE_NOT_ENFORCEABLE`), and audit is chained with the development key
 (`enforced_with_development_key`).
@@ -1007,19 +1008,20 @@ checks that `secure-saas` exits 2.
 
 ## The provision record
 
-Provisioning keeps what it owns in the system table `__provision`: the
-record (`ProvisionRecord`, key `record`) holds the status of the last apply,
-its plan id, the applied spec and its digest (while an apply is unfinished,
-also the spec the last finished apply converged to), the managed objects (with the
-collection or graph id each one got), roles and principals, released
-objects, guarantee statuses, completed and failed steps, flags, actor and
-binary version; `history/{seq:020}` keys hold one entry per finished or
-failed apply, at most 100 (`Database::provision_history()`). Backup and
-restore carry the table like every registered keyspace (a full backup with
-tiered columnar segments inlines them), history GC and commit-log truncation
-never touch it, and older binaries ignore it. `record_version` is read before the typed decode: a record of a
-newer build, or a corrupt one, is `PROVISION_RECORD_UNREADABLE` and blocks
-every plan. `Database::provision_state()` returns the record.
+Provisioning keeps what it owns in the system table `__provision`: the record
+(`ProvisionRecord`, key `record`) holds the status of the last apply, its plan
+id, the applied spec and its digest (while an apply is unfinished, also the
+spec the last finished apply converged to), the managed objects (with the
+collection or graph id each one got), roles and principals, released objects,
+guarantee statuses, completed and failed steps, flags, actor and binary
+version; `history/{seq:020}` keys hold one entry per finished or failed apply,
+at most 100 (`Database::provision_history()`). Backup and restore carry the
+table like every registered keyspace (a full backup with tiered columnar
+segments inlines them), history GC and commit-log truncation never touch it,
+and older binaries ignore it. `record_version` is read before the typed
+decode: a record of a newer build, or a corrupt one, is
+`PROVISION_RECORD_UNREADABLE` and blocks every plan.
+`Database::provision_state()` returns the record.
 
 ## Validation codes
 
