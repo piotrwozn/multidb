@@ -7978,6 +7978,86 @@ mod tests {
         Ok(())
     }
 
+    /// Plans, drift, state and the live spec take the shared guard, so they answer while a
+    /// statement holds the database. An apply takes the exclusive guard: it waits for the
+    /// statement, holds back new readers until it has run, and then applies the plan it
+    /// recomputed.
+    #[tokio::test]
+    async fn provisioning_reads_share_the_database_and_an_apply_waits_for_readers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+        let plan_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+
+        let reader = database.read().await;
+        for (method, path, body) in [
+            (Method::POST, "/provision/plan", Some(plan_body(&spec))),
+            (Method::POST, "/provision/drift", Some(plan_body(&spec))),
+            (Method::GET, "/provision/state", None),
+            (Method::GET, "/config/live", None),
+        ] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                app.clone()
+                    .oneshot(request_as(method, path, body.as_ref(), "root")?),
+            )
+            .await??;
+            let status = response.status();
+            let body = json_body(response).await?;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        }
+
+        let mut apply = tokio::spawn(app.clone().oneshot(request_as(
+            Method::POST,
+            "/provision/apply",
+            Some(&apply_body(&spec, &plan_id)),
+            "root",
+        )?));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut apply)
+                .await
+                .is_err()
+        );
+        // The queued apply holds back new readers until it has run.
+        assert!(database.try_read().is_err());
+        assert!(!reader.catalog().contains_key("orders"));
+        drop(reader);
+        let applied = tokio::time::timeout(Duration::from_secs(10), apply).await???;
+        let status = applied.status();
+        let body = json_body(applied).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["status"], "applied");
+        assert!(database.read().await.catalog().contains_key("orders"));
+        Ok(())
+    }
+
+    /// A provisioning error that wraps a busy query governor or an optimistic write conflict
+    /// keeps the retryable answers of `db_error`: 503 `busy` with `Retry-After`, 409 `conflict`.
+    #[tokio::test]
+    async fn provisioning_errors_keep_busy_and_conflict_retryable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let busy = super::provision_error(&crate::provision::ProvisionError::Db(DbError::Query(
+            QueryError::Busy("query queue exceeded 100 ms".to_owned()),
+        )));
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(json_body(busy).await?["error"]["code"], "busy");
+
+        let conflict = super::provision_error(&crate::provision::ProvisionError::Db(
+            DbError::Storage(StorageError::Conflict),
+        ));
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(conflict.headers().get(RETRY_AFTER).is_none());
+        assert_eq!(json_body(conflict).await?["error"]["code"], "conflict");
+        Ok(())
+    }
+
     /// `/config/apply` recomputes the plan from `{current, desired, confirm}` and records
     /// `plan_source: recomputed`; a client plan, even a forged one, is recorded as `client`.
     /// Both stay audit-only.

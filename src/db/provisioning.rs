@@ -71,6 +71,13 @@ impl Database {
         self.encryption.is_some()
     }
 
+    /// `set_query_governor` set this handle's query governor, as `multidb serve` does for
+    /// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`: its two governor
+    /// knobs are the caller's, and a restart sets them again.
+    pub(crate) const fn query_governor_overridden(&self) -> bool {
+        self.query_governor_overridden
+    }
+
     /// Audit events are chained with a configured key rather than the built-in development key.
     pub(crate) const fn audit_key_configured(&self) -> bool {
         self.audit_config.key_path.is_some()

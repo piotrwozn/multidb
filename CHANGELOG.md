@@ -591,10 +591,16 @@ All notable public changes will be recorded here.
   `POST /provision/drift`, `GET /provision/state` (the provision record,
   history, profile manifest, live fingerprint and the spec mode of `serve`)
   and `GET /config/live` (the served database as a spec, from its record or
-  inferred). Every endpoint needs `System:Admin`, and applying also
-  `Database:Admin`; a spec `storage_path` is the Advice
-  `PROVISION_STORAGE_PATH_IGNORED`, since the Control Plane never creates
-  databases or opens paths. The `OpenAPI` snapshot documents the five
+  inferred). Plans, drift, state and `/config/live` run under the shared
+  `serve` lock next to statements, and an apply holds the exclusive lock from
+  its recomputed plan through its last step; a wrapped busy query governor
+  stays 503 `busy` and a write conflict 409 `conflict`. A query governor set
+  for the process (`MULTIDB_MAX_CONCURRENT_QUERIES`,
+  `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, `Database::set_query_governor`) is not
+  reported as `session_pending_restart`. Every endpoint needs
+  `System:Admin`, and applying also `Database:Admin`; a spec `storage_path` is
+  the Advice `PROVISION_STORAGE_PATH_IGNORED`, since the Control Plane never
+  creates databases or opens paths. The `OpenAPI` snapshot documents the five
   operations (`x-multidb-stability: preview`, request bodies pointing at the
   version 2 spec schema, error envelopes that carry `data`), and
   `StudioManifest` gains `provisioning_supported: true` and the capability

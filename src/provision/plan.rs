@@ -3368,7 +3368,8 @@ fn plan_manifest(live: &LiveState, desired: &PersistedProfileManifest) -> Manife
             DriftResolution::Retune,
         ));
     }
-    if live.session_performance != performance_for_manifest(current) {
+    let session = &live.session_performance;
+    if *session != expected_session_performance(session, live.query_governor_overridden, current) {
         plan.drift.push(drift_item(
             "profile",
             DriftKind::SessionPendingRestart,
@@ -3487,7 +3488,11 @@ fn legacy_manifest_plan(
         ));
     }
     let session = without_compression(&live.session_performance);
-    let wanted = without_compression(&performance_for_manifest(desired));
+    let wanted = without_compression(&expected_session_performance(
+        &live.session_performance,
+        live.query_governor_overridden,
+        desired,
+    ));
     let safety = if session == wanted {
         StepSafety::Metadata
     } else {
@@ -3563,6 +3568,23 @@ fn format_upgrade_step(desired: &PersistedProfileManifest) -> ProvisionStep {
 }
 
 /// The session performance without compression, which only a value-framing engine applies.
+/// The performance a session opened with `manifest` runs with. A query governor set for the
+/// process (`Database::set_query_governor`; `multidb serve` sets it from
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`) keeps the session's own
+/// limits: they are never written to the database, and a restart sets them again.
+pub(super) fn expected_session_performance(
+    session: &PerformanceConfig,
+    query_governor_overridden: bool,
+    manifest: &PersistedProfileManifest,
+) -> PerformanceConfig {
+    let mut performance = performance_for_manifest(manifest);
+    if query_governor_overridden {
+        performance.query.max_concurrent_queries = session.query.max_concurrent_queries;
+        performance.query.queue_timeout_ms = session.query.queue_timeout_ms;
+    }
+    performance
+}
+
 fn without_compression(performance: &PerformanceConfig) -> PerformanceConfig {
     let mut performance = performance.clone();
     performance.compression.algorithm = CompressionAlgorithm::None;

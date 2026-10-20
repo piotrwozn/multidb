@@ -731,6 +731,10 @@ fn live_fingerprint_covers_every_part_of_the_live_state_but_document_counts() ->
             Box::new(|live| live.session_performance.cache.max_capacity += 1),
         ),
         (
+            "query governor override",
+            Box::new(|live| live.query_governor_overridden = true),
+        ),
+        (
             "metadata",
             Box::new(|live| live.metadata.schema_version = 2),
         ),
@@ -5377,5 +5381,70 @@ fn open_from_spec_resumes_an_interrupted_apply_only_in_additive_mode() -> TestRe
 
     let (_db, report) = open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &serve)?;
     assert_eq!(report.decision, StartupDecision::Start);
+    Ok(())
+}
+
+/// The kinds of the drift items of `plan`.
+fn drift_kinds(plan: &ProvisionPlan) -> Vec<DriftKind> {
+    plan.drift.items.iter().map(|item| item.kind).collect()
+}
+
+/// A query governor set for the process, as `multidb serve` sets it from
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, is not a session that
+/// waits for a restart: a restart sets it again. The plan stays a noop and drift in sync, and a
+/// retune of the governor knobs leaves nothing pending; a retune of another knob still does.
+#[test]
+fn a_process_query_governor_is_not_a_session_pending_restart() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = orders_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("governor.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let before = plan_open(&spec, &db)?;
+    assert_eq!(before.outcome, PlanOutcome::Noop);
+
+    let query = db.performance_config().query.clone();
+    db.set_query_governor(query.max_concurrent_queries + 1, query.queue_timeout_ms + 1)?;
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.drift);
+    assert!(drift_kinds(&plan).is_empty(), "{:#?}", plan.drift);
+    assert!(drift(&db, &spec, &ProvisionOptions::default())?.in_sync);
+    // The override is part of the live state a plan id covers.
+    assert_ne!(plan.live_fingerprint, before.live_fingerprint);
+
+    let governor = with_custom_profile(
+        spec.clone(),
+        "orders_governor",
+        &json!({
+            "extends": "balanced",
+            "knobs": { "query": { "max_concurrent_queries": 3, "queue_timeout_ms": 250 } }
+        }),
+    )?;
+    let report = apply_cli(&mut db, &governor, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert!(!report.session_pending_restart);
+    assert!(drift_kinds(&plan_open(&governor, &db)?).is_empty());
+    assert_eq!(
+        db.performance_config().query.max_concurrent_queries,
+        query.max_concurrent_queries + 1
+    );
+
+    let cache = with_custom_profile(
+        spec,
+        "orders_cache",
+        &json!({
+            "extends": "balanced",
+            "knobs": {
+                "query": { "max_concurrent_queries": 3, "queue_timeout_ms": 250 },
+                "cache": { "max_entries": 4096 }
+            }
+        }),
+    )?;
+    let report = apply_cli(&mut db, &cache, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert!(report.session_pending_restart);
+    assert_eq!(
+        drift_kinds(&plan_open(&cache, &db)?),
+        vec![DriftKind::SessionPendingRestart]
+    );
     Ok(())
 }

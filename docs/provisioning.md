@@ -504,7 +504,11 @@ unmanaged objects under `report` or `ignore`. Guarantee statuses such as
 `operator_managed` or `enforced_with_development_key` are reported in the
 plan, not as drift. `session_pending_restart` means the session runs other
 knobs than the profile manifest, for example after a retune; a restart
-resolves it.
+resolves it. A query governor set for the process is not drift:
+`Database::set_query_governor`, which `multidb serve` calls for
+`MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, keeps
+its two limits for the session, and a restart sets them again, so a retune
+of only those knobs leaves nothing pending.
 
 ## Export
 
@@ -896,9 +900,15 @@ own.
    anything that changed the database since the plan (for example a
    `/builder/*` call) is 409 `plan_changed`: plan again.
 
-The apply holds the server's database lock from the recomputed plan through
-the last step, so nothing changes in between (pgwire waits meanwhile). Its
-answers:
+`multidb serve` shares one read/write lock on the database between pgwire and
+the Control Plane. Plans, drift, `GET /provision/state` and `GET /config/live`
+only read, so they take the shared guard and run next to statements. The
+apply takes the exclusive guard from the recomputed plan through the last
+step: it waits for running statements and reads, new ones (pgwire included)
+wait for it, and nothing changes in between. An error that wraps a busy query
+governor is 503 `busy` with `Retry-After`, and an optimistic write conflict
+409 `conflict`, as on the other endpoints; both can be retried as is. The
+apply's answers:
 
 | status | code | when |
 | --- | --- | --- |
@@ -913,7 +923,8 @@ answers:
 
 Retunes and the storage format upgrade are written to the profile manifest
 and take effect when `serve` restarts (`session_pending_restart` in the
-report). The Control Plane never creates a database and never opens a path
+report), except for a query governor knob that `MULTIDB_MAX_CONCURRENT_QUERIES`
+or `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` sets for the process. The Control Plane never creates a database and never opens a path
 from a request: a spec `deployment.storage_path` is reported as the Advice
 `PROVISION_STORAGE_PATH_IGNORED`. Encryption at rest is not enforceable here
 (`GUARANTEE_NOT_ENFORCEABLE`), and audit is chained with the development key

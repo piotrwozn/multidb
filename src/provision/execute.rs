@@ -26,7 +26,7 @@ use super::physical::{self, DesiredKind, DesiredObject, entry_kind, time_series_
 use super::plan::{
     DriftKind, PlanOutcome, ProvisionEnvironment, ProvisionOptions, ProvisionPlan, ProvisionStep,
     ProvisionStepKind, ProvisionSurface, ProvisionTargetRef, StepSafety, desired_manifest,
-    object_resource, plan_provision, security_post_state,
+    expected_session_performance, object_resource, plan_provision, security_post_state,
 };
 use super::record::{
     ManagedObject, ObjectKind, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus,
@@ -1317,8 +1317,22 @@ impl Run<'_> {
     /// Writes the desired profile manifest, once: every profile step of a plan converges to the
     /// same manifest. Retunes and format upgrades take effect at the next open.
     fn write_profile(&mut self, step: &ProvisionStep) -> Result<Done, DbError> {
-        if matches!(step.safety, StepSafety::Retune | StepSafety::FormatUpgrade) {
-            self.session_pending_restart = true;
+        match step.safety {
+            StepSafety::FormatUpgrade => self.session_pending_restart = true,
+            // Only knobs the session does not already run wait for the next open: a query
+            // governor set for the process keeps its own limits.
+            StepSafety::Retune => {
+                let session = self.db.performance_config();
+                let expected = expected_session_performance(
+                    session,
+                    self.db.query_governor_overridden(),
+                    &self.manifest,
+                );
+                if *session != expected {
+                    self.session_pending_restart = true;
+                }
+            }
+            _ => {}
         }
         let schema_version = if self.manifest.storage_format.value_framing {
             SCHEMA_VERSION_FRAMED

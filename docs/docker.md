@@ -146,8 +146,11 @@ apply a reviewed spec itself through the preview Control Plane endpoints
 `POST /provision/plan` and `POST /provision/apply` (see
 [provisioning.md](provisioning.md#control-plane)); keep the mounted spec in
 step with what you apply, or the next `verify` start refuses. After
-provisioning, the admin password bootstrap runs as before; its `admin` and
-`root` names are reserved, so provisioning never touches them.
+provisioning, `MULTIDB_MAX_CONCURRENT_QUERIES` and
+`MULTIDB_QUERY_QUEUE_TIMEOUT_MS` set the query governor of the running server
+(never the database), and provisioning plans do not report them as drift.
+Then the admin password bootstrap runs as before; its `admin` and `root`
+names are reserved, so provisioning never touches them.
 
 Roles and principals that provisioning applied are stored in the database
 file like any other RBAC state, so they survive a restart with or without spec
@@ -221,8 +224,10 @@ Control Plane login limits:
 - One database is shared between PostgreSQL wire and the Control Plane
   through a reader-writer lock. Statements and Control Plane data, catalog,
   audit and advice reads run concurrently.
-- `/builder/*` and `/security` updates take an exclusive lock. They wait for
-  running statements, and new requests wait behind them. Admin login and
+- `/builder/*` and `/security` updates and `POST /provision/apply` take an
+  exclusive lock. They wait for running statements, and new requests wait
+  behind them. Provisioning plans, drift, `GET /provision/state` and
+  `GET /config/live` only read and run under the shared lock. Admin login and
   password change take it only when the bootstrap `admin` role or principal
   is missing or was changed, for example by a `/security` update.
 - Admin login and password change read the stored credential under the

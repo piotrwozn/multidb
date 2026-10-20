@@ -657,6 +657,9 @@ pub struct Database {
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
+    /// `set_query_governor` set the governor of this handle, so its limits are the caller's,
+    /// not the profile's.
+    query_governor_overridden: bool,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
@@ -1162,6 +1165,8 @@ impl Database {
     /// (SQLSTATE 53200).
     ///
     /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// The limits belong to this handle: they are never written to the database,
+    /// and provisioning plans do not report them as a session pending a restart.
     /// # Errors
     /// Fails when either limit is zero or `max_concurrent_queries` is more than
     /// the governor can count.
@@ -1184,6 +1189,7 @@ impl Database {
         self.performance.query.max_concurrent_queries = max_concurrent_queries;
         self.performance.query.queue_timeout_ms = queue_timeout_ms;
         self.query_permits = query_permits_for(&self.performance);
+        self.query_governor_overridden = true;
         Ok(())
     }
 
@@ -4158,6 +4164,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overridden: false,
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4190,6 +4197,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overridden: false,
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4222,6 +4230,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overridden: false,
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4253,6 +4262,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overridden: false,
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
