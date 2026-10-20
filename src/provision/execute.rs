@@ -47,26 +47,76 @@ use crate::model::CollectionId;
 use crate::security::{AuditOutcome, Principal, Resource};
 use crate::temporal::TemporalRetention;
 use crate::text::FullTextIndexConfig;
+use crate::txn::TxnId;
 use crate::vector::VectorCollectionConfig;
+
+/// The failures and perturbations tests inject into the applies of one thread.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestInjections {
+    /// The 0-based index of the plan step that fails before it changes anything.
+    fail_step: Option<usize>,
+    /// The 0-based index of the plan step that fails after its write committed.
+    fail_after_write: Option<usize>,
+    /// The provisioning audit event (`provision_apply_started`, ...) whose write fails.
+    fail_event: Option<&'static str>,
+    /// Runs on the database `provision_new_database` created, before it recomputes the plan.
+    new_database_hook: Option<fn(&mut Database)>,
+}
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_STEP: Cell<Option<usize>> = const { Cell::new(None) };
-    static NEW_DATABASE_HOOK: Cell<Option<fn(&mut Database)>> = const { Cell::new(None) };
+    static INJECTIONS: Cell<TestInjections> = const {
+        Cell::new(TestInjections {
+            fail_step: None,
+            fail_after_write: None,
+            fail_event: None,
+            new_database_hook: None,
+        })
+    };
+}
+
+#[cfg(test)]
+fn injections() -> TestInjections {
+    INJECTIONS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn inject(change: impl FnOnce(&mut TestInjections)) {
+    INJECTIONS.with(|cell| {
+        let mut injections = cell.get();
+        change(&mut injections);
+        cell.set(injections);
+    });
 }
 
 /// Makes the apply on this thread fail at the plan step with this 0-based index
 /// (`pstep-001` is 0) before the step changes anything; `None` turns the injection off.
 #[cfg(test)]
 pub(crate) fn fail_provision_step_for_tests(step: Option<usize>) {
-    FAIL_STEP.with(|fail| fail.set(step));
+    inject(|injections| injections.fail_step = step);
+}
+
+/// Makes the apply on this thread fail at the plan step with this 0-based index after the step
+/// wrote everything it writes, as when the audit event of a committed create fails; `None`
+/// turns the injection off.
+#[cfg(test)]
+pub(crate) fn fail_provision_step_after_write_for_tests(step: Option<usize>) {
+    inject(|injections| injections.fail_after_write = step);
+}
+
+/// Makes the provisioning audit event `action` (for example `provision_apply_completed`) fail
+/// to be written by the apply on this thread; `None` turns the injection off.
+#[cfg(test)]
+pub(crate) fn fail_provision_event_for_tests(action: Option<&'static str>) {
+    inject(|injections| injections.fail_event = action);
 }
 
 /// Runs `hook` on the database `provision_new_database` just created on this thread, before it
 /// recomputes the plan; `None` turns it off.
 #[cfg(test)]
 pub(crate) fn perturb_new_database_for_tests(hook: Option<fn(&mut Database)>) {
-    NEW_DATABASE_HOOK.with(|perturb| perturb.set(hook));
+    inject(|injections| injections.new_database_hook = hook);
 }
 
 /// Carries the test injections set on this thread into `work`, for an apply that runs on
@@ -76,20 +126,15 @@ pub(crate) fn perturb_new_database_for_tests(hook: Option<fn(&mut Database)>) {
 pub(crate) fn carry_test_injections<T>(
     work: impl FnOnce() -> T + Send,
 ) -> impl FnOnce() -> T + Send {
-    struct Restore(Option<usize>, Option<fn(&mut Database)>);
+    struct Restore(TestInjections);
     impl Drop for Restore {
         fn drop(&mut self) {
-            FAIL_STEP.with(|fail| fail.set(self.0));
-            NEW_DATABASE_HOOK.with(|perturb| perturb.set(self.1));
+            INJECTIONS.with(|cell| cell.set(self.0));
         }
     }
-    let fail = FAIL_STEP.with(Cell::get);
-    let hook = NEW_DATABASE_HOOK.with(Cell::get);
+    let carried = injections();
     move || {
-        let _restore = Restore(
-            FAIL_STEP.with(|current| current.replace(fail)),
-            NEW_DATABASE_HOOK.with(|current| current.replace(hook)),
-        );
+        let _restore = Restore(INJECTIONS.with(|cell| cell.replace(carried)));
         work()
     }
 }
@@ -173,11 +218,14 @@ pub enum ProvisionOutcome {
     /// The plan is blocked; nothing changed. `apply_provision` reports it as
     /// `ProvisionError::Blocked`; the status is for surfaces that answer with a report.
     Blocked,
-    /// The confirmed plan is not the current one; nothing changed. `apply_provision` reports it
-    /// as `ProvisionError::PlanChanged`.
+    /// The confirmed plan is not the current one. `apply_provision` reports it as
+    /// `ProvisionError::PlanChanged`, since nothing changed; `provision_new_database` reports it
+    /// when the plan it recomputed against the database it created differs, and then the new
+    /// database is the only change (`data_mutated` is true).
     PlanChanged,
-    /// A step failed: the steps before it stay applied, the record says `failed`, and the next
-    /// plan holds what remains.
+    /// A step failed, or the apply stopped between steps (`failed_step` is then `None`): what
+    /// was applied stays applied, including what a failed step wrote before it failed, the
+    /// record says `failed`, and the next plan holds what remains.
     PartiallyApplied,
 }
 
@@ -247,8 +295,8 @@ impl ProvisionRecordSummary {
 #[serde(deny_unknown_fields)]
 pub struct ProvisionApplyReport {
     pub status: ProvisionOutcome,
-    /// The confirmation check; `data_mutated` is true only for `applied` and
-    /// `partially_applied`.
+    /// The confirmation check; `data_mutated` is true only for `applied`, `partially_applied`
+    /// and the `plan_changed` report of a database `provision_new_database` created.
     pub check: ApplyCheckReport,
     /// The confirmed plan id; for a new database, the id of the plan against the absent target.
     pub plan_id: String,
@@ -271,14 +319,19 @@ pub struct ProvisionApplyReport {
 /// recomputed with it as `ProvisionEnvironment.principal`, so `RBAC_SELF_LOCKOUT` covers the
 /// actor that applies.
 ///
-/// A step failure is not an error: the report is `partially_applied`, the record `failed`, and
-/// applying again runs only what remains.
+/// Once anything changed the database, the apply answers with a report, never an error: a step
+/// failure is `partially_applied` with a `failed` record, and applying again runs only what
+/// remains; a step that failed after it wrote says so in its `detail`, and an object its create
+/// committed is managed by the record. A completion event that cannot be written leaves the
+/// apply `applied` with the Warning `PROVISION_COMPLETION_NOT_AUDITED` and `audit_recorded`
+/// false.
 /// # Errors
 /// Fails with `PlanChanged` when the confirmed `prov_` id is not the current one, `Blocked`,
 /// `AuditRequired` (audit is off and the spec keeps it off), `NeedsFlags`,
 /// `ConfirmationRequired` (auto-approval of a plan that is not `auto_approvable`),
-/// `PermissionMissing`, and as [`plan_provision`]; and with `Db` when the intent event, the
-/// journal, the completion event or audit before the first step cannot be written.
+/// `PermissionMissing`, and as [`plan_provision`]; and with `Db` when turning audit on before
+/// the first step fails without changing anything, or the intent event or the first journal
+/// write fails before any step changed the database.
 pub fn apply_provision(
     db: &mut Database,
     actor: &ProvisionActor,
@@ -320,14 +373,17 @@ pub fn apply_provision(
 /// and the steps run as the local operator of the surface (`local:cli`, `local:serve` or
 /// `local:embedded`). The record and the audit events carry the confirmed plan id.
 ///
-/// When the recomputed plan differs, the new database is kept but nothing else is applied:
-/// plan it through its open handle.
+/// Once the database is created, every outcome is a report with `data_mutated` true and the
+/// applied `create_database` step: when the recomputed plan differs the report is
+/// `plan_changed`, and when it cannot be recomputed or the apply stops before its first step it
+/// is `partially_applied`; the new database is kept but nothing else is applied: plan it through
+/// its open handle.
 /// # Errors
 /// Fails with `AlreadyInitialized` when the target holds a database, `Config(Unsupported)` on
 /// the Control Plane surface (which never creates databases), `ConfirmationRequired` when the
 /// confirmation is not a provisioning plan id or the plan is not `auto_approvable`, `PlanChanged`
-/// when the confirmed id or the recomputed plan differs, `Config` when the database cannot be
-/// created, and as [`apply_provision`].
+/// when the confirmed id is not the current one, `Config` when the database cannot be created,
+/// and as [`plan_provision`] before the database is created.
 pub fn provision_new_database(
     spec: &DatabaseSpec,
     path: Option<&Path>,
@@ -367,18 +423,12 @@ pub fn provision_new_database(
             other => ProvisionError::Config(other),
         })?;
     #[cfg(test)]
-    if let Some(hook) = NEW_DATABASE_HOOK.with(Cell::get) {
+    if let Some(hook) = injections().new_database_hook {
         hook(&mut db);
     }
 
-    let recomputed = plan_provision(spec, ProvisionTargetRef::Open(&db), opts, env)?;
-    if !continuation_matches(&confirmed, &recomputed) {
-        return Err(ProvisionError::PlanChanged {
-            confirmed: confirmed.plan_id,
-            current: recomputed.plan_id,
-        });
-    }
-    let created = confirmed
+    // The database exists from here on, so every outcome is a report that says so.
+    let created: Vec<AppliedStep> = confirmed
         .steps
         .iter()
         .filter(|step| step.kind == ProvisionStepKind::CreateDatabase)
@@ -391,9 +441,60 @@ pub fn provision_new_database(
             error_kind: None,
         })
         .collect();
+    let recomputed = match plan_provision(spec, ProvisionTargetRef::Open(&db), opts, env) {
+        Ok(recomputed) => recomputed,
+        Err(error) => {
+            let message = format!(
+                "the database was created, but its plan could not be recomputed: {error}; \
+                 nothing else was applied: plan the new database to see what remains"
+            );
+            let report = created_report(
+                &confirmed,
+                created,
+                ProvisionOutcome::PartiallyApplied,
+                message,
+            );
+            return Ok((db, report));
+        }
+    };
+    if !continuation_matches(&confirmed, &recomputed) {
+        let message = format!(
+            "the database was created, but the plan recomputed against it ({}) is not the \
+             confirmed plan ({}); nothing else was applied: plan the new database and confirm \
+             the new plan id",
+            recomputed.plan_id, confirmed.plan_id
+        );
+        let report = created_report(&confirmed, created, ProvisionOutcome::PlanChanged, message);
+        return Ok((db, report));
+    }
     let actor = ProvisionActor::local_operator(label);
-    let report = execute(&mut db, &actor, spec, &confirmed, opts, created)?;
+    let report = match execute(&mut db, &actor, spec, &confirmed, opts, created.clone()) {
+        Ok(report) => report,
+        Err(error) => created_report(
+            &confirmed,
+            created,
+            ProvisionOutcome::PartiallyApplied,
+            format!(
+                "the database was created, but the apply stopped before its next step: {error}; \
+                 plan the new database again to see what remains"
+            ),
+        ),
+    };
     Ok((db, report))
+}
+
+/// The report of a new database that was created, with nothing else applied.
+fn created_report(
+    plan: &ProvisionPlan,
+    created: Vec<AppliedStep>,
+    status: ProvisionOutcome,
+    message: String,
+) -> ProvisionApplyReport {
+    let mut report = unapplied_report(plan, status, ApplyStatus::Confirmed, message, None);
+    report.check.confirmation_matched = true;
+    report.check.data_mutated = true;
+    report.applied_steps = created;
+    report
 }
 
 /// The local operator label of a surface; `None` for the Control Plane, which applies as a
@@ -726,6 +827,7 @@ fn execute(
         warnings: plan_warnings(plan),
         security_committed: false,
         session_pending_restart: pending_restart(plan),
+        audit_recorded: true,
     };
     run.execute()
 }
@@ -767,6 +869,8 @@ struct Run<'a> {
     /// Every `apply_security` step commits with the first one.
     security_committed: bool,
     session_pending_restart: bool,
+    /// The completion or failure event of the apply was written.
+    audit_recorded: bool,
 }
 
 impl Run<'_> {
@@ -793,19 +897,35 @@ impl Run<'_> {
             else {
                 return Err(ProvisionError::AuditRequired);
             };
-            let enabled = self.run_step(first)?;
-            self.complete(first, enabled);
+            let lsn = self.db.commit_lsn().ok();
+            match self.run_step(first) {
+                Ok(enabled) => self.complete(first, enabled),
+                // Audit may be on without its event: the database changed, so report it.
+                Err(error) if self.wrote_since(lsn) => {
+                    self.push_failure(first, &error, true);
+                    return Ok(self.fail(Some(&first.step_id), &error, true));
+                }
+                Err(error) => return Err(error.into()),
+            }
             rest = tail;
         }
 
-        self.db.record_provision_event(
-            self.actor,
-            "provision_apply_started",
-            Resource::System,
-            AuditOutcome::Succeeded,
-            &self.intent_detail(),
-        )?;
-        self.db.write_provision_record(&self.record, None)?;
+        let intent = self
+            .event(
+                "provision_apply_started",
+                Resource::System,
+                AuditOutcome::Succeeded,
+                &self.intent_detail(),
+            )
+            .and_then(|()| self.db.write_provision_record(&self.record, None));
+        if let Err(error) = intent {
+            // Nothing is returned as an error once a step changed the database: audit turned on
+            // above, or the database `provision_new_database` created.
+            if self.applied_any() {
+                return Ok(self.fail(None, &error, false));
+            }
+            return Err(error.into());
+        }
 
         let mut disable_audit = None;
         for step in rest {
@@ -813,29 +933,36 @@ impl Run<'_> {
                 disable_audit = Some(*step);
                 continue;
             }
+            let lsn = self.db.commit_lsn().ok();
             let result = match self.run_step(step) {
                 Ok(done) => {
                     self.complete(step, done);
-                    self.db.write_provision_record(&self.record, None)
+                    // The step is applied even when its journal entry is not.
+                    self.db
+                        .write_provision_record(&self.record, None)
+                        .map_err(|error| (error, true))
                 }
                 Err(error) => {
-                    self.push_failure(step, &error);
-                    Err(error)
+                    let wrote = self.wrote_since(lsn);
+                    if wrote {
+                        self.manage_committed_object(step);
+                    }
+                    self.push_failure(step, &error, wrote);
+                    Err((error, wrote))
                 }
             };
-            if let Err(error) = result {
-                return Ok(self.fail(&step.step_id, &error));
+            if let Err((error, wrote)) = result {
+                return Ok(self.fail(Some(&step.step_id), &error, wrote));
             }
         }
 
         if let Err(error) = self.write_applied_record() {
-            let last = steps
-                .last()
-                .map_or_else(String::new, |step| step.step_id.clone());
-            return Ok(self.fail(&last, &error));
+            let last = steps.last().map(|step| step.step_id.clone());
+            return Ok(self.fail(last.as_deref(), &error, true));
         }
-        self.db.record_provision_event(
-            self.actor,
+        // Every step is applied and the record says so: a completion event that cannot be
+        // written is a Warning, never an error.
+        if let Err(error) = self.event(
             "provision_apply_completed",
             Resource::System,
             AuditOutcome::Succeeded,
@@ -844,15 +971,20 @@ impl Run<'_> {
                 plan.plan_id,
                 self.applied.len()
             ),
-        )?;
+        ) {
+            self.audit_recorded = false;
+            self.warnings.push(completion_not_audited(&error));
+        }
 
         // Audit is disabled last, after the completion event.
         if let Some(step) = disable_audit {
+            let lsn = self.db.commit_lsn().ok();
             match self.run_step(step) {
                 Ok(done) => self.complete(step, done),
                 Err(error) => {
-                    self.push_failure(step, &error);
-                    return Ok(self.fail(&step.step_id, &error));
+                    let wrote = self.wrote_since(lsn);
+                    self.push_failure(step, &error, wrote);
+                    return Ok(self.fail(Some(&step.step_id), &error, wrote));
                 }
             }
         }
@@ -860,6 +992,57 @@ impl Run<'_> {
             ProvisionOutcome::Applied,
             "every step of the plan was applied",
         ))
+    }
+
+    /// Records a provisioning audit event as the actor.
+    fn event(
+        &self,
+        action: &str,
+        resource: Resource,
+        outcome: AuditOutcome,
+        detail: &str,
+    ) -> Result<(), DbError> {
+        #[cfg(test)]
+        if injections().fail_event == Some(action) {
+            return Err(DbError::AuditIntegrity(format!(
+                "injected failure of {action}"
+            )));
+        }
+        self.db
+            .record_provision_event(self.actor, action, resource, outcome, detail)
+    }
+
+    /// Whether a step of this apply changed the database.
+    fn applied_any(&self) -> bool {
+        self.applied
+            .iter()
+            .any(|step| step.outcome == StepOutcome::Applied)
+    }
+
+    /// Whether anything committed since `lsn`, the commit LSN before a step. When either LSN
+    /// cannot be read, the step counts as having written.
+    fn wrote_since(&self, lsn: Option<TxnId>) -> bool {
+        match (lsn, self.db.commit_lsn().ok()) {
+            (Some(before), Some(now)) => now > before,
+            _ => true,
+        }
+    }
+
+    /// A create that failed after its catalog entry committed, for example on its audit event,
+    /// still created the object: the record takes it over, so the next plan finds it managed.
+    fn manage_committed_object(&mut self, step: &ProvisionStep) {
+        let Ok(object) = self.desired_object(step) else {
+            return;
+        };
+        let created = self
+            .db
+            .catalog()
+            .get(&object.name)
+            .map(entry_kind)
+            .is_some_and(|kind| kind == object.kind.object_kind());
+        if created && !self.record.objects.contains_key(&object.name) {
+            self.manage(&object, false);
+        }
     }
 
     fn intent_detail(&self) -> String {
@@ -879,7 +1062,7 @@ impl Run<'_> {
     /// Runs one step. Every step first checks whether it is already satisfied.
     fn run_step(&mut self, step: &ProvisionStep) -> Result<Done, DbError> {
         #[cfg(test)]
-        if let Some(index) = FAIL_STEP.with(Cell::get)
+        if let Some(index) = injections().fail_step
             && step.step_id == format!("pstep-{:03}", index + 1)
         {
             return Err(DbError::TransactionAborted(format!(
@@ -887,6 +1070,20 @@ impl Run<'_> {
                 step.step_id
             )));
         }
+        let done = self.run_step_kind(step)?;
+        #[cfg(test)]
+        if let Some(index) = injections().fail_after_write
+            && step.step_id == format!("pstep-{:03}", index + 1)
+        {
+            return Err(DbError::TransactionAborted(format!(
+                "injected failure of {} after its write",
+                step.step_id
+            )));
+        }
+        Ok(done)
+    }
+
+    fn run_step_kind(&mut self, step: &ProvisionStep) -> Result<Done, DbError> {
         match step.kind {
             ProvisionStepKind::CreateDatabase => Ok(Done::satisfied("the database exists")),
             ProvisionStepKind::EnableAudit => self.set_audit(true),
@@ -927,23 +1124,36 @@ impl Run<'_> {
         self.record.completed_steps.push(step.step_id.clone());
     }
 
-    fn push_failure(&mut self, step: &ProvisionStep, error: &DbError) {
+    /// Reports a failed step; `wrote` says that it committed a write before it failed.
+    fn push_failure(&mut self, step: &ProvisionStep, error: &DbError, wrote: bool) {
+        let detail = if wrote {
+            format!("{error}; the step wrote to the database before it failed")
+        } else {
+            error.to_string()
+        };
         self.applied.push(AppliedStep {
             step_id: step.step_id.clone(),
             kind: step.kind,
             object: step.object.clone(),
             outcome: StepOutcome::Failed,
-            detail: error.to_string(),
+            detail,
             error_kind: Some(error_kind(error).to_owned()),
         });
     }
 
     /// Records a failure: a `failed` record with a history entry, and `provision_apply_failed`.
     /// When either cannot be written, the report says so in a warning; the record then still
-    /// says `in_progress`, which the next plan treats the same way.
-    fn fail(mut self, failed_step: &str, error: &DbError) -> ProvisionApplyReport {
+    /// says `in_progress`, which the next plan treats the same way. `failed_step` is `None` when
+    /// the apply stopped between steps, and `wrote` says that the failed step committed a write
+    /// before it failed.
+    fn fail(
+        mut self,
+        failed_step: Option<&str>,
+        error: &DbError,
+        wrote: bool,
+    ) -> ProvisionApplyReport {
         self.record.status = ProvisionRecordStatus::Failed;
-        self.record.failed_step = (!failed_step.is_empty()).then(|| failed_step.to_owned());
+        self.record.failed_step = failed_step.map(str::to_owned);
         self.record.applied_at_millis = now_millis();
         let history = self.history_entry();
         if let Err(write_error) = self.db.write_provision_record(&self.record, Some(&history)) {
@@ -952,25 +1162,36 @@ impl Run<'_> {
             )));
         }
         let detail = format!(
-            "plan_id: {} failed_step: {failed_step} error: {} data_mutated: true",
+            "plan_id: {} failed_step: {} error: {} data_mutated: true",
             self.plan.plan_id,
+            failed_step.unwrap_or("none"),
             error_kind(error)
         );
-        if let Err(audit_error) = self.db.record_provision_event(
-            self.actor,
+        if let Err(audit_error) = self.event(
             "provision_apply_failed",
             Resource::System,
             AuditOutcome::Failed,
             &detail,
         ) {
+            self.audit_recorded = false;
             self.warnings.push(failure_not_recorded(&format!(
                 "provision_apply_failed could not be audited: {audit_error}"
             )));
         }
-        let message = format!(
-            "{failed_step} failed: {error}; the steps before it stay applied; plan again to see \
-             what remains"
-        );
+        let message = match failed_step {
+            Some(step) if wrote => format!(
+                "{step} failed after it wrote to the database: {error}; what it wrote and the \
+                 steps before it stay applied; plan again to see what remains"
+            ),
+            Some(step) => format!(
+                "{step} failed: {error}; the steps before it stay applied; plan again to see what \
+                 remains"
+            ),
+            None => format!(
+                "the apply stopped before its next step: {error}; the steps before it stay \
+                 applied; plan again to see what remains"
+            ),
+        };
         self.report(ProvisionOutcome::PartiallyApplied, &message)
     }
 
@@ -1016,7 +1237,7 @@ impl Run<'_> {
                 status: ApplyStatus::Confirmed,
                 valid: true,
                 confirmation_matched: true,
-                audit_recorded: true,
+                audit_recorded: self.audit_recorded,
                 data_mutated: true,
                 message: message.to_owned(),
             },
@@ -1096,8 +1317,7 @@ impl Run<'_> {
         self.create_object(&object, principal.as_ref())?;
         self.manage(&object, false);
         if principal.is_none() {
-            self.db.record_provision_event(
-                self.actor,
+            self.event(
                 "provision_create_object",
                 object_resource(&object.name, &object.kind),
                 AuditOutcome::Succeeded,
@@ -1350,8 +1570,7 @@ impl Run<'_> {
         }
         self.db
             .write_profile_manifest(&self.manifest, schema_version)?;
-        self.db.record_provision_event(
-            self.actor,
+        self.event(
             "provision_write_profile_manifest",
             Resource::System,
             AuditOutcome::Succeeded,
@@ -1392,8 +1611,7 @@ impl Run<'_> {
                 }
                 ProvisionActor::LocalOperator { .. } => {
                     self.db.set_security_state(policy, principals)?;
-                    self.db.record_provision_event(
-                        self.actor,
+                    self.event(
                         "set_security_state",
                         Resource::System,
                         AuditOutcome::Succeeded,
@@ -1433,8 +1651,7 @@ impl Run<'_> {
         if live {
             self.record.released_objects.insert(name.clone());
         }
-        self.db.record_provision_event(
-            self.actor,
+        self.event(
             "provision_release_object",
             managed_resource(&name, kind),
             AuditOutcome::Succeeded,
@@ -1458,6 +1675,20 @@ fn same_manifest(live: &PersistedProfileManifest, desired: &PersistedProfileMani
 
 const fn on_off(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
+}
+
+fn completion_not_audited(error: &DbError) -> ValidationIssue {
+    issue(
+        "PROVISION_COMPLETION_NOT_AUDITED",
+        ValidationSeverity::Warning,
+        "guarantees.audit.enabled",
+        format!(
+            "every step was applied and the record says applied, but provision_apply_completed \
+             could not be audited: {error}"
+        ),
+        "Check the audit log and its storage; the apply itself is complete, and a further plan \
+         is a noop.",
+    )
 }
 
 fn failure_not_recorded(message: &str) -> ValidationIssue {

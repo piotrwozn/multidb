@@ -41,7 +41,10 @@ pub use execute::{
     ProvisionRecordSummary, StepOutcome, apply_provision, provision_new_database,
 };
 #[cfg(test)]
-pub(crate) use execute::{fail_provision_step_for_tests, perturb_new_database_for_tests};
+pub(crate) use execute::{
+    fail_provision_event_for_tests, fail_provision_step_after_write_for_tests,
+    fail_provision_step_for_tests, perturb_new_database_for_tests,
+};
 pub use export::{ExportSource, ExportedSpec, export_spec};
 pub use guarantees::{EnforcementStatus, GuaranteeEnforcement};
 pub use live::live_fingerprint;

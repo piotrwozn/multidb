@@ -7781,3 +7781,131 @@ fn edit_raw_manifest(
         &serde_json::to_vec(&manifest)?,
     )
 }
+
+/// Provisioning writes are system writes: the catalog entries, index entries, temporal metadata,
+/// RBAC state, audit events and journal an apply commits bypass the write pipeline. They are not
+/// charged to the tenant storage quota and never run triggers, also on the table an apply adopts
+/// and versions; user writes afterwards are charged and run triggers as before.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provisioning_writes_bypass_triggers_and_the_tenant_quota()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::provision::{
+        Confirmation, ProvisionEnvironment, ProvisionOptions, ProvisionOutcome, ProvisionSurface,
+        ProvisionTargetRef, apply_provision, plan_provision,
+    };
+
+    let ops = OperationalConfig::new().with_tenant(TenantConfig::new(
+        "tenant-a",
+        TenantQuota::storage_bytes(1 << 20),
+    ));
+    let mut database = create_database_with_ops(DbConfig::new(Profile::InMemory), ops)?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    database
+        .table("accounts")?
+        .insert(account_row(1, "Ada", 37))?;
+    for (name, timing, event) in [
+        (
+            "reject_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+        ),
+        (
+            "reject_after_accounts_update",
+            TriggerTiming::After,
+            TriggerEvent::Update,
+        ),
+    ] {
+        register_accounts_trigger(
+            &database,
+            name,
+            timing,
+            event,
+            &trigger_response("reject", None),
+        )?;
+    }
+    let used = |database: &Database| {
+        database
+            .tenant
+            .as_ref()
+            .map(crate::cloud::TenantRuntime::used_storage_bytes)
+    };
+    let before = used(&database);
+    assert!(before.is_some());
+
+    let mut spec = DatabaseSpec::from_db_config("app", &DbConfig::new(Profile::InMemory));
+    spec.version = crate::config_spec::DATABASE_SPEC_VERSION_V2;
+    spec.profile = "in_memory".to_owned();
+    spec.deployment.mode = DeploymentMode::Embedded;
+    spec.deployment.storage_path = None;
+    spec.collections = serde_json::from_value(json!([
+        {
+            "name": "accounts", "role": "event_log", "domain": "primary", "indexes": ["primary"],
+            "physical": {
+                "kind": "table",
+                "columns": [
+                    { "name": "id", "type": "int" },
+                    { "name": "name", "type": "str" },
+                    { "name": "age", "type": "int" }
+                ],
+                "primary_key": "id",
+                "system_versioning": true
+            }
+        },
+        {
+            "name": "notes", "role": "document_entity", "domain": "primary",
+            "indexes": ["primary", "full_text"],
+            "physical": { "full_text": [{ "path": "body" }] }
+        }
+    ]))?;
+    spec.security = Some(serde_json::from_value(json!({
+        "roles": [{
+            "name": "accountant",
+            "grants": [{ "object": "accounts", "permissions": ["read", "write"] }]
+        }],
+        "principals": [{ "user": "books", "roles": ["accountant"] }]
+    }))?);
+    let env = ProvisionEnvironment::new(ProvisionSurface::RustApi);
+    let options = ProvisionOptions::default();
+    let plan = plan_provision(&spec, ProvisionTargetRef::Open(&database), &options, &env)?;
+    assert!(
+        plan.steps
+            .iter()
+            .any(|step| step.kind == crate::provision::ProvisionStepKind::EnableSystemVersioning),
+        "{:#?}",
+        plan.steps
+    );
+    let report = apply_provision(
+        &mut database,
+        &ProvisionActor::local_operator("local:embedded"),
+        &spec,
+        &Confirmation::PlanId(plan.plan_id.clone()),
+        &options,
+        &env,
+    )?;
+    assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+    assert!(database.catalog().contains_key("notes"));
+    assert!(database.catalog().contains_key("accounts_history"));
+    assert!(database.authz_policy().roles().contains_key("accountant"));
+    // No trigger ran, and nothing was charged to the tenant.
+    assert!(database.post_commit_failures()?.is_empty());
+    assert_eq!(used(&database), before);
+    assert_eq!(database.table("accounts")?.scan()?.len(), 1);
+
+    // User writes still run the pipeline: triggers and the quota.
+    assert_rejected(
+        "a user insert after provisioning",
+        database
+            .table("accounts")?
+            .insert(account_row(2, "Lin", 29)),
+        "reject_accounts_insert",
+    );
+    database
+        .collection("notes")?
+        .insert(&Value::Object(BTreeMap::from([(
+            "body".to_owned(),
+            Value::Str("x".repeat(512)),
+        )])))?;
+    assert!(used(&database) > before);
+    Ok(())
+}

@@ -596,27 +596,44 @@ a spec to an open single-node database under exclusive `&mut Database`:
    spec are written with the final record.
 8. **The record becomes `applied`**, a history entry with the flags is
    appended, and `provision_apply_completed` is audited with
-   `data_mutated: true`.
+   `data_mutated: true`. When that event cannot be written, the apply is
+   still `applied`: the report carries the Warning
+   `PROVISION_COMPLETION_NOT_AUDITED` and `audit_recorded: false`.
 9. **Audit is disabled last**, after the completion event, when the spec asks
    for it and `--allow-weakening guarantees.audit.enabled` was given.
 
 The `ProvisionApplyReport` has the `status` (`applied`, `noop`, `rejected`,
 `partially_applied`; `blocked` and `plan_changed` exist for surfaces that
-answer with a report), the confirmation `check` (`data_mutated` is true only
-for `applied` and `partially_applied`), the confirmed `plan_id`, one
+answer with a report, and `plan_changed` is also the report of a new
+database whose recomputed plan differs), the confirmation `check`
+(`data_mutated` is true only for `applied`, `partially_applied` and that
+`plan_changed`), the confirmed `plan_id`, one
 `applied_steps` entry per step (`applied`, `already_satisfied` or `failed`,
 with an `error_kind` such as `catalog_object_exists` for a failed one), the
 `failed_step`, a summary of the record, the plan's Warnings and
 `session_pending_restart`.
 
+Every write an apply makes is a system write, like the builder creates: the
+catalog entries, index entries, temporal metadata, profile manifest, RBAC
+state, audit events and the record bypass the write pipeline, so they run no
+triggers and are not charged to a tenant quota.
+
 ### Partial applies and recovery
 
-Applying is not atomic across objects: each create is its own batch. A step
-that fails leaves the steps before it applied: the record says `failed` with
-its `failed_step` and `completed_steps`, a history entry is written,
-`provision_apply_failed` is audited, and the report is `partially_applied`.
-The next plan reports `DRIFT_INTERRUPTED_APPLY` and holds only what remains:
-objects the failed apply created are already managed, so they are satisfied.
+Applying is not atomic across objects: each create is its own batch. Once
+anything changed the database, an apply answers with a report, never an
+error. A step that fails leaves the steps before it applied: the record says
+`failed` with its `failed_step` and `completed_steps`, a history entry is
+written, `provision_apply_failed` is audited, and the report is
+`partially_applied`. A step that fails after its write committed, such as a
+create whose audit event cannot be written, says so in its `detail` and in
+the message ("failed after it wrote to the database"), and an object its
+create committed is managed by the failed record. When the intent event or
+the first journal write fails after audit was turned on by the first step,
+the report is `partially_applied` with no `failed_step`; before anything
+changed, it is an error. The next plan reports `DRIFT_INTERRUPTED_APPLY` and
+holds only what remains: objects the failed apply created are already
+managed, so they are satisfied.
 Declared guarantees and metadata count only once an apply finishes: the plan
 compares them with the spec the last finished apply converged to (the
 record's `last_applied_spec`; `ProvisionRecord::last_applied()`), so a
@@ -626,8 +643,7 @@ again. Applying that plan converges, and a further plan is a
 `noop`. When the failure itself cannot be recorded, the report carries the
 Warning `PROVISION_FAILURE_NOT_RECORDED` and the record still says
 `in_progress`, which the next plan treats the same way. Batching every
-container of a plan into one write is a follow-up of the single write
-pipeline.
+container of a plan into one write is a follow-up.
 
 ### Releasing objects
 
@@ -671,12 +687,18 @@ in-memory database (Rust API only).
    existing database, since it would overwrite its security state.
 3. The plan is recomputed against the new database. Its steps must equal the
    confirmed ones minus `create_database` (kinds, paths, objects, safety
-   classes and flags), otherwise the apply stops with `PlanChanged` and the
-   new database is kept as it is. `auto_approvable` is not compared: RBAC
-   steps on an existing database are never auto-approvable, but a new
+   classes and flags), otherwise the apply stops with a `plan_changed` report
+   and the new database is kept as it is. `auto_approvable` is not compared:
+   RBAC steps on an existing database are never auto-approvable, but a new
    database with roles may be auto-approved.
 4. The steps run as the local operator of the surface, under the confirmed
    plan id. The Control Plane never creates databases.
+
+Once the database exists, every outcome is a report with `data_mutated: true`
+and the applied `create_database` step, never an error: `plan_changed` when
+the recomputed plan differs, `partially_applied` when it cannot be recomputed
+or the apply stops before its first step. Plan the new database through its
+open handle to see what remains.
 
 ## CLI
 
@@ -1012,6 +1034,7 @@ Plans add their own issues, whatever the spec version:
 | `DRIFT_ORPHAN`, `DRIFT_INTERRUPTED_APPLY` | Warning | a managed object is missing; the last apply did not finish |
 | `STEP_REQUIRES_FLAG` | Error | a step needs a flag the options do not give |
 | `PROVISION_FAILURE_NOT_RECORDED` | Warning | in an apply report: a failed apply could not write its `failed` record or audit event |
+| `PROVISION_COMPLETION_NOT_AUDITED` | Warning | in an apply report: every step was applied and the record says `applied`, but `provision_apply_completed` could not be audited |
 | `PROVISION_STORAGE_PATH_IGNORED` | Advice | on the Control Plane: the spec `deployment.storage_path` is not used, since the served database is provisioned |
 
 Version 1 issues keep their order: the new version 1 Warnings come after every

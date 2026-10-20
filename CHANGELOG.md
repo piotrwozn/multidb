@@ -486,9 +486,15 @@ All notable public changes will be recorded here.
   provision record is journaled after every step and gets a history entry
   (`Database::provision_history`, at most 100); a failed step gives a
   `partially_applied` report and a `failed` record, and the next plan holds
-  only what remains; its declared guarantees and metadata are compared with
-  the last finished apply (`ProvisionRecord::last_applied`), so a confirmed
-  weakening needs its flag again. Objects are only created or adopted,
+  only what remains. Once anything changed the database, an apply answers
+  with a report, never an error: a step that fails after its write committed
+  says so and the record manages the object it created, and a completion
+  event that cannot be written leaves the apply `applied` with the Warning
+  `PROVISION_COMPLETION_NOT_AUDITED`. Provisioning writes are system writes:
+  they run no triggers and are not charged to a tenant quota. The next plan
+  compares declared guarantees and metadata with the last finished apply
+  (`ProvisionRecord::last_applied`), so a confirmed weakening needs its flag
+  again. Objects are only created or adopted,
   releases keep the data, RBAC changes touch managed names only and commit in
   one batch, and the storage format upgrade writes the value-framing manifest
   and `schema_version` 2 together, taking effect at the next open. See
@@ -497,8 +503,10 @@ All notable public changes will be recorded here.
   a spec at an absent target with `create_database_with_profile` (audit on,
   the environment's audit key and, on the Rust API, a `LocalEnvelope`
   encryption config, whose keyring is created with the new file unless one
-  already exists at its path), checks that the plan recomputed against it equals the
-  confirmed one and applies it under the confirmed plan id. An encryption
+  already exists at its path), checks that the plan recomputed against it
+  equals the confirmed one and applies it under the confirmed plan id; once
+  the database exists, a plan that differs is a `plan_changed` report with
+  `data_mutated: true`, not an error. An encryption
   config for a spec with `at_rest: false` is refused before anything is
   created (`PROVISION_ENCRYPTION_MISMATCH`).
 - `Database::set_security_state_as`, which replaces the RBAC policy and the

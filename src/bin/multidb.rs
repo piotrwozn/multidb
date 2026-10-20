@@ -1356,13 +1356,23 @@ fn format_provision_report(report: &ProvisionApplyReport, command: &SpecCommand)
                 .to_owned(),
         );
     }
-    if report.status == ProvisionOutcome::PartiallyApplied {
-        lines.push(format!(
-            "step {} failed; the steps before it stay applied and the record says failed: \
+    match (report.status, report.failed_step.as_deref()) {
+        (ProvisionOutcome::PartiallyApplied, Some(step)) => lines.push(format!(
+            "step {step} failed; what was applied stays applied and the record says failed: \
              re-run plan ({}) to see the remaining steps, and apply that plan",
-            report.failed_step.as_deref().unwrap_or("(unknown)"),
             plan_command(command, &command.options, None)
-        ));
+        )),
+        (ProvisionOutcome::PartiallyApplied, None) => lines.push(format!(
+            "the apply stopped between steps; what was applied stays applied: re-run plan ({}) \
+             to see the remaining steps, and apply that plan",
+            plan_command(command, &command.options, None)
+        )),
+        (ProvisionOutcome::PlanChanged, _) => lines.push(format!(
+            "the database was created, but nothing else was applied: re-run plan ({}) and \
+             confirm the new plan id",
+            plan_command(command, &command.options, None)
+        )),
+        _ => {}
     }
     lines.join("\n")
 }

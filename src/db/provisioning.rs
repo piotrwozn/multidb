@@ -9,8 +9,9 @@
 use super::{
     AuditConfig, CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, KEY_PROFILE_MANIFEST,
     KEY_SCHEMA_VERSION, PROVISION_TABLE, PersistedProfileManifest, ProbedMetadata, SCHEMA_VERSION,
-    SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op, meta_put_op, parse_audit_key_file,
-    read_metadata_from_repl, read_security_from_repl, unmet_profile_floors, validate_manifest,
+    SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op, current_lsn_from_repl, meta_put_op,
+    parse_audit_key_file, read_metadata_from_repl, read_security_from_repl, unmet_profile_floors,
+    validate_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{
@@ -27,6 +28,7 @@ use crate::security::{
     Resource,
 };
 use crate::storage::StorageError;
+use crate::txn::TxnId;
 use crate::vector::{HnswParams, VectorCollectionConfig, VectorMetric};
 
 /// Documents read per batch by `Database::document_count`.
@@ -69,6 +71,14 @@ impl Database {
     /// This handle was opened with an encryption config, so values are encrypted at rest.
     pub(crate) const fn encryption_configured(&self) -> bool {
         self.encryption.is_some()
+    }
+
+    /// The LSN of the newest commit, 0 before the first one. An apply reads it around a step
+    /// to tell whether the step committed anything before it failed.
+    /// # Errors
+    /// Fails when `__txn_meta` cannot be read or decoded.
+    pub(crate) fn commit_lsn(&self) -> Result<TxnId, DbError> {
+        Ok(current_lsn_from_repl(self.replication_ref())?)
     }
 
     /// `set_query_governor` set this handle's query governor, as `multidb serve` does for

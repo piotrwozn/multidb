@@ -106,8 +106,9 @@ pub struct StartupRefusal {
     pub reason: String,
     /// The plan the decision was made on.
     pub plan: ProvisionPlan,
-    /// The report of a startup apply that failed part-way: the steps before the failed one
-    /// stay applied, and the provision record says `failed`. `None` when nothing was applied.
+    /// The report of a startup apply that failed part-way: what it applied stays applied, and
+    /// the provision record says `failed` when it could be written. `None` when nothing was
+    /// applied.
     pub applied: Option<ProvisionApplyReport>,
 }
 
@@ -343,14 +344,15 @@ fn started(
         return Ok((db, report));
     }
     drop(db);
+    let stopped = applied.failed_step.as_deref().map_or_else(
+        || "it stopped between steps".to_owned(),
+        |step| format!("step {step} failed"),
+    );
     let reason = format!(
-        "the startup apply of plan {} did not finish: step {} failed ({}); the steps before it \
-         stay applied and the provision record says failed: review what remains with multidb \
-         config plan --spec, and apply it (a start in additive mode applies it when it is all \
-         additive)",
-        applied.plan_id,
-        applied.failed_step.as_deref().unwrap_or("(unknown)"),
-        applied.check.message
+        "the startup apply of plan {} did not finish: {stopped} ({}); what it applied stays \
+         applied: review what remains with multidb config plan --spec, and apply it (a start in \
+         additive mode applies it when it is all additive)",
+        applied.plan_id, applied.check.message
     );
     Err(refused(mode, reason, plan, Some(applied)))
 }

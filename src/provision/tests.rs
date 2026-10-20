@@ -16,6 +16,7 @@ use super::{
     ProvisionRecord, ProvisionRecordStatus, ProvisionStep, ProvisionStepKind, ProvisionSurface,
     ProvisionTargetRef, RECORD_VERSION, StartupDecision, StartupMode, StartupRefusal,
     StartupReport, StepOutcome, StepSafety, TargetKind, apply_provision, drift, export_spec,
+    fail_provision_event_for_tests, fail_provision_step_after_write_for_tests,
     fail_provision_step_for_tests, open_from_spec, perturb_new_database_for_tests, plan_provision,
     provision_new_database, serve_startup_decision,
 };
@@ -2791,12 +2792,25 @@ fn destructive(paths: &[&str]) -> ProvisionOptions {
     }
 }
 
-/// Turns the step failure injection off when dropped.
+/// Turns the step and event failure injections off when dropped.
 struct InjectedFailure;
 
 impl InjectedFailure {
+    /// The step with this index fails before it changes anything.
     fn at(index: usize) -> Self {
         fail_provision_step_for_tests(Some(index));
+        Self
+    }
+
+    /// The step with this index fails after everything it writes committed.
+    fn after_write(index: usize) -> Self {
+        fail_provision_step_after_write_for_tests(Some(index));
+        Self
+    }
+
+    /// The provisioning audit event `action` cannot be written.
+    fn event(action: &'static str) -> Self {
+        fail_provision_event_for_tests(Some(action));
         Self
     }
 }
@@ -2804,6 +2818,8 @@ impl InjectedFailure {
 impl Drop for InjectedFailure {
     fn drop(&mut self) {
         fail_provision_step_for_tests(None);
+        fail_provision_step_after_write_for_tests(None);
+        fail_provision_event_for_tests(None);
     }
 }
 
@@ -3374,6 +3390,252 @@ fn a_failed_step_leaves_a_failed_record_and_applying_again_converges() -> TestRe
     Ok(())
 }
 
+/// The step kinds that create an object.
+const fn creates_an_object(kind: ProvisionStepKind) -> bool {
+    matches!(
+        kind,
+        ProvisionStepKind::CreateCollection
+            | ProvisionStepKind::CreateVectorCollection
+            | ProvisionStepKind::CreateTable
+            | ProvisionStepKind::CreateTimeSeries
+            | ProvisionStepKind::CreateGraph
+            | ProvisionStepKind::CreateFullTextIndex
+            | ProvisionStepKind::CreateGeoIndex
+            | ProvisionStepKind::EnableSystemVersioning
+    )
+}
+
+/// A step that fails after its write committed, as a create whose audit event fails does, is
+/// still a report, never an error: the failed step says it wrote, an object its create committed
+/// is managed by the failed record, and the next plan neither creates it again nor needs a flag
+/// to adopt it, so applying again converges.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_step_that_fails_after_its_write_says_so_and_applying_again_converges() -> TestResult {
+    let spec = in_memory(full_spec()?);
+    let rust = env(ProvisionSurface::RustApi);
+    let embedded = ProvisionActor::local_operator("local:embedded");
+    let defaults = ProvisionOptions::default();
+    let step_count = {
+        let db = create_in_memory(&spec)?;
+        plan_rust_api(&spec, &db)?.steps.len()
+    };
+    for index in 0..step_count {
+        let mut db = create_in_memory(&spec)?;
+        let plan = plan_rust_api(&spec, &db)?;
+        let step = plan.steps[index].clone();
+        let report = {
+            let _failure = InjectedFailure::after_write(index);
+            apply_provision(
+                &mut db,
+                &embedded,
+                &spec,
+                &Confirmation::PlanId(plan.plan_id.clone()),
+                &defaults,
+                &rust,
+            )?
+        };
+        assert_eq!(report.status, ProvisionOutcome::PartiallyApplied, "{index}");
+        assert!(report.check.data_mutated && report.check.audit_recorded);
+        assert_eq!(report.failed_step.as_ref(), Some(&step.step_id));
+        let failed = report.applied_steps.last().ok_or("the failed step")?;
+        assert_eq!(failed.outcome, StepOutcome::Failed);
+        if creates_an_object(step.kind) {
+            let name = step.object.clone().ok_or("the created object")?;
+            assert!(db.catalog().contains_key(&name), "{index}: {name}");
+            assert!(
+                failed
+                    .detail
+                    .ends_with("the step wrote to the database before it failed"),
+                "{index}: {}",
+                failed.detail
+            );
+            assert!(
+                report
+                    .check
+                    .message
+                    .contains("failed after it wrote to the database"),
+                "{index}: {}",
+                report.check.message
+            );
+            let record = db.provision_state()?.ok_or("the failed record")?;
+            assert_eq!(record.status, ProvisionRecordStatus::Failed);
+            assert!(record.objects.contains_key(&name), "{index}: {name}");
+        }
+
+        let remaining = plan_rust_api(&spec, &db)?;
+        assert_eq!(remaining.outcome, PlanOutcome::Ready, "{index}");
+        assert!(remaining.required_flags.is_empty(), "{index}");
+        if creates_an_object(step.kind) {
+            assert!(
+                !remaining.steps.iter().any(|planned| {
+                    planned.object == step.object
+                        && (planned.kind == step.kind
+                            || planned.kind == ProvisionStepKind::AdoptObject)
+                }),
+                "{index}: {:#?}",
+                remaining.steps
+            );
+        }
+        let again = apply_provision(
+            &mut db,
+            &embedded,
+            &spec,
+            &Confirmation::PlanId(remaining.plan_id.clone()),
+            &defaults,
+            &rust,
+        )?;
+        assert_applied(&again);
+        assert_eq!(
+            plan_rust_api(&spec, &db)?.outcome,
+            PlanOutcome::Noop,
+            "{index}"
+        );
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        assert_eq!(record.objects.len(), 9);
+        assert!(record.objects.values().all(|object| !object.adopted));
+        db.verify_audit_chain()?;
+    }
+
+    // A real case: the audit event of a local operator's create fails after the create.
+    let mut db = create_in_memory(&spec)?;
+    let report = {
+        let _failure = InjectedFailure::event("provision_create_object");
+        apply_as(&mut db, &embedded, &spec, &defaults, &rust)?
+    };
+    assert_eq!(report.status, ProvisionOutcome::PartiallyApplied);
+    let failed = report.applied_steps.last().ok_or("the failed step")?;
+    assert!(creates_an_object(failed.kind), "{failed:?}");
+    assert_eq!(failed.error_kind.as_deref(), Some("audit_integrity"));
+    let name = failed.object.clone().ok_or("the created object")?;
+    assert!(db.catalog().contains_key(&name));
+    assert!(
+        db.provision_state()?
+            .ok_or("the failed record")?
+            .objects
+            .contains_key(&name)
+    );
+    assert_applied(&apply_as(&mut db, &embedded, &spec, &defaults, &rust)?);
+    assert_eq!(plan_rust_api(&spec, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+/// Once a step changed the database, the provisioning audit events cannot turn the apply into
+/// an error: a completion event that cannot be written leaves an `applied` apply with a Warning,
+/// and an intent event that fails after the first step turned audit on is a partial apply. An
+/// intent event that fails before anything changed is still an error.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provisioning_audit_events_never_fail_an_apply_that_changed_the_database() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let spec = orders_spec()?;
+    let defaults = ProvisionOptions::default();
+
+    // The completion event.
+    let mut db = create_with_profile(&temp_dir.path().join("completed.redb"), &spec)?;
+    let report = {
+        let _failure = InjectedFailure::event("provision_apply_completed");
+        apply_cli(&mut db, &spec, &defaults)?
+    };
+    assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+    assert!(report.check.data_mutated && !report.check.audit_recorded);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "PROVISION_COMPLETION_NOT_AUDITED"
+                && warning.severity == ValidationSeverity::Warning)
+    );
+    assert_eq!(
+        db.provision_state()?.map(|record| record.status),
+        Some(ProvisionRecordStatus::Applied)
+    );
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    let events = db.audit_events()?;
+    assert_eq!(
+        actions(&events).last().copied(),
+        Some("provision_create_object")
+    );
+    db.verify_audit_chain()?;
+
+    // The intent event, with nothing changed yet: an error, and nothing is applied.
+    let mut db = create_with_profile(&temp_dir.path().join("intent.redb"), &spec)?;
+    let result = {
+        let _failure = InjectedFailure::event("provision_apply_started");
+        apply_cli(&mut db, &spec, &defaults)
+    };
+    assert!(
+        matches!(&result, Err(ProvisionError::Db(DbError::AuditIntegrity(_)))),
+        "{result:?}"
+    );
+    assert!(db.catalog().is_empty());
+    assert_eq!(db.provision_state()?, None);
+
+    // The intent event after the first step turned audit on: a partial apply.
+    db.set_audit_enabled_by_provisioning("local:cli", false)?;
+    let report = {
+        let _failure = InjectedFailure::event("provision_apply_started");
+        apply_cli(&mut db, &spec, &defaults)?
+    };
+    assert_eq!(
+        report.status,
+        ProvisionOutcome::PartiallyApplied,
+        "{report:#?}"
+    );
+    assert!(report.failed_step.is_none());
+    assert!(
+        report
+            .check
+            .message
+            .starts_with("the apply stopped before its next step"),
+        "{}",
+        report.check.message
+    );
+    assert_eq!(
+        report
+            .applied_steps
+            .iter()
+            .map(|step| (step.kind, step.outcome))
+            .collect::<Vec<_>>(),
+        vec![(ProvisionStepKind::EnableAudit, StepOutcome::Applied)]
+    );
+    assert!(db.audit_enabled());
+    assert!(db.catalog().is_empty());
+    let record = db.provision_state()?.ok_or("the failed record")?;
+    assert_eq!(record.status, ProvisionRecordStatus::Failed);
+    assert_eq!(record.failed_step, None);
+    assert_applied(&apply_cli(&mut db, &spec, &defaults)?);
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+
+    // Turning audit on, failing after the flag committed: a partial apply that says so.
+    let mut db = create_with_profile(&temp_dir.path().join("enable.redb"), &spec)?;
+    db.set_audit_enabled_by_provisioning("local:cli", false)?;
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(
+        plan.steps.first().map(|step| step.kind),
+        Some(ProvisionStepKind::EnableAudit)
+    );
+    let report = {
+        let _failure = InjectedFailure::after_write(0);
+        apply_cli(&mut db, &spec, &defaults)?
+    };
+    assert_eq!(report.status, ProvisionOutcome::PartiallyApplied);
+    assert_eq!(report.failed_step.as_deref(), Some("pstep-001"));
+    assert!(
+        report
+            .check
+            .message
+            .starts_with("pstep-001 failed after it wrote to the database"),
+        "{}",
+        report.check.message
+    );
+    assert!(db.audit_enabled());
+    assert_applied(&apply_cli(&mut db, &spec, &defaults)?);
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    db.verify_audit_chain()?;
+    Ok(())
+}
+
 #[test]
 fn an_unfinished_apply_does_not_carry_its_weakened_guarantees() -> TestResult {
     let mut strict = in_memory(orders_spec()?);
@@ -3705,14 +3967,30 @@ fn new_databases_are_created_only_at_absent_targets() -> TestResult {
             &cli,
         )
     };
-    match result {
-        Err(ProvisionError::PlanChanged { confirmed, current }) => {
-            assert_eq!(confirmed, plan.plan_id);
-            assert_ne!(current, plan.plan_id);
-        }
-        Err(other) => return Err(format!("expected PlanChanged, got {other:?}").into()),
-        Ok((_, report)) => return Err(format!("expected PlanChanged, got {report:?}").into()),
-    }
+    // The database exists, so the answer is a report that says so, not an error.
+    let (db, report) = result?;
+    assert_eq!(report.status, ProvisionOutcome::PlanChanged, "{report:#?}");
+    assert_eq!(report.plan_id, plan.plan_id);
+    assert!(report.check.data_mutated && report.check.confirmation_matched);
+    assert!(!report.check.audit_recorded);
+    assert!(
+        report
+            .check
+            .message
+            .starts_with("the database was created, but the plan recomputed against it"),
+        "{}",
+        report.check.message
+    );
+    assert_eq!(
+        report
+            .applied_steps
+            .iter()
+            .map(|step| (step.kind, step.outcome))
+            .collect::<Vec<_>>(),
+        vec![(ProvisionStepKind::CreateDatabase, StepOutcome::Applied)]
+    );
+    assert!(report.failed_step.is_none() && report.record.is_none());
+    drop(db);
     // The created database is kept, empty but for the perturbation, and has no record.
     let db = open_database_with_ops(
         DbConfig::on_disk(Profile::Balanced, &perturbed),
