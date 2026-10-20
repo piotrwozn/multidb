@@ -1,0 +1,54 @@
+version: 1
+name: Metrics Lake
+profile: analytics_columnar
+deployment:
+  mode: single_node
+  storage_path: metrics_lake.redb
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: false
+    pitr: false
+  encryption:
+    at_rest: false
+  audit:
+    enabled: true
+  sensitive_data: false
+  strict_cross_domain_transactions: false
+domains:
+- name: primary
+  mode: local_snapshot
+collections:
+- name: events
+  role: event_log
+  domain: primary
+  indexes:
+  - primary
+- name: metrics
+  role: time_series
+  domain: primary
+  indexes:
+  - time_series
+- name: aggregates
+  role: analytics
+  domain: primary
+  indexes:
+  - columnar
+extensions:
+- name: cdc
+  version: 1.0.0
+  stability: stable
+- name: columnar_layout
+  version: 1.0.0
+  stability: experimental
+- name: time_series
+  version: 1.0.0
+  stability: stable
+overrides: {}
+operation_hints:
+  template.profile_reason: Uses the stable analytics profile to make event logs, time-series and columnar aggregate intent explicit in DatabaseSpec.
+  template.slug: analytics

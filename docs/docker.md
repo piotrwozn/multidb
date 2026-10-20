@@ -49,7 +49,7 @@ Environment:
 | --- | --- | --- | --- |
 | `MULTIDB_RUNTIME_MODE` | no | `production` | Use `local-dev` only for local plaintext PG smoke. |
 | `MULTIDB_DB_PATH` | no | `/var/lib/multidb/multidb.redb` | Must live on the mounted volume. |
-| `MULTIDB_PROFILE` | no | `transactional` | Any existing CLI profile name. |
+| `MULTIDB_PROFILE` | no | `transactional` | Storage profile name, product slug, alias, or `auto` (probe the existing database; required for manifest databases built with a non-default profile). `auto` fails when the database does not exist yet, so the first start of a fresh volume needs an explicit profile. A database left by a stopped or killed container gets redb's crash recovery before `auto` reads it, as with a named profile. |
 | `MULTIDB_BIND` | no | `0.0.0.0:8080` | HTTP API and Studio bind. |
 | `MULTIDB_PG_BIND` | no | `0.0.0.0:5432` | PostgreSQL wire bind. |
 | `MULTIDB_STUDIO_DIR` | no | `/usr/share/multidb/studio` | Built Studio asset directory. |
@@ -71,7 +71,10 @@ Environment:
 `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` must be
 whole numbers in their range; any other non-empty value stops `multidb serve`
 at startup instead of falling back to the default. An empty value counts as
-unset and uses the default.
+unset and uses the default. For a database created with a custom profile the
+default is its profile manifest's `query.max_concurrent_queries` and
+`query.queue_timeout_ms` (see [Profiles](profiles.md)); a set value applies to
+that `serve` process only and is never written to the database.
 
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.

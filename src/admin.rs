@@ -35,8 +35,10 @@ use crate::{
     compat::SERVER_VERSION,
     config_spec::{
         ApplyCheckReport, ApplyStatus, DatabaseSpec, GuaranteeValidator, MigrationPlan,
-        MigrationPlanner, built_in_profiles, collection_role_definitions,
-        consistency_domain_definition, consistency_domain_definitions, extension_catalog_entries,
+        MigrationPlanner, ProfileKnobOverrides, ProfileKnobs, ValidationReport, built_in_profiles,
+        collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
+        extension_catalog_entries, profile_variants, resolve_named_profile,
+        spec_io::{self, SpecIoError},
     },
     db::{
         AdminCredentialRecord, CatalogEntry, Database, DbError, Profile, ReplicationKind,
@@ -2742,14 +2744,23 @@ async fn audit_handler(State(state): State<AdminState>, headers: HeaderMap) -> R
 async fn config_validate_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<DatabaseSpec>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let Json(spec) = match body {
+    let Json(value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
+    };
+    let spec = match spec_io::decode_spec_value(value) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return match error.validation_report() {
+                Some(report) => api_ok(StatusCode::UNPROCESSABLE_ENTITY, report),
+                None => invalid_spec_json(&error),
+            };
+        }
     };
     let report = GuaranteeValidator::validate(&spec);
     let status = if report.valid {
@@ -2763,16 +2774,25 @@ async fn config_validate_handler(
 async fn config_plan_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<ConfigPlanRequest>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let Json(request) = match body {
+    let Json(mut value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let plan = MigrationPlanner::plan(&request.current, &request.desired);
+    // The body is a ConfigPlanRequest; each side is decoded through spec_io.
+    let current = match decode_plan_side(&mut value, "current") {
+        Ok(spec) => spec,
+        Err(error) => return plan_side_error("current", error),
+    };
+    let desired = match decode_plan_side(&mut value, "desired") {
+        Ok(spec) => spec,
+        Err(error) => return plan_side_error("desired", error),
+    };
+    let plan = MigrationPlanner::plan(&current, &desired);
     let status = if plan.valid {
         StatusCode::OK
     } else {
@@ -2831,10 +2851,29 @@ async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -
                             .map(|definition| definition.slug)
                     })
                     .collect::<Vec<_>>(),
+                "variants": profile_variants()
+                    .iter()
+                    .filter(|variant| variant.product == profile.slug)
+                    .map(|variant| {
+                        json!({
+                            "name": variant.name,
+                            "storage_profile": variant.storage_profile,
+                            "canonical": variant.canonical,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "knobs": canonical_profile_knobs(profile.slug),
             })
         })
         .collect::<Vec<_>>();
     api_ok(StatusCode::OK, profiles)
+}
+
+/// The preset knobs of a product profile's canonical variant, as `GET /profiles` lists them.
+fn canonical_profile_knobs(slug: &str) -> Option<ProfileKnobs> {
+    resolve_named_profile(slug, &ProfileKnobOverrides::default())
+        .resolved()
+        .map(|resolved| resolved.knobs.clone())
 }
 
 async fn roles_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
@@ -3474,6 +3513,53 @@ fn invalid_json(error: &JsonRejection) -> Response {
     )
 }
 
+/// A spec body that is valid JSON but not a `DatabaseSpec` keeps today's 400 `invalid_json`.
+fn invalid_spec_json(error: &SpecIoError) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+        format!("invalid JSON request body: {error}"),
+    )
+}
+
+/// Decodes one side of a `ConfigPlanRequest`; the error is `None` when the field is missing.
+fn decode_plan_side(
+    value: &mut JsonValue,
+    side: &str,
+) -> Result<DatabaseSpec, Option<SpecIoError>> {
+    let spec = value.get_mut(side).map(JsonValue::take).ok_or(None)?;
+    spec_io::decode_spec_value(spec).map_err(Some)
+}
+
+/// A missing side or a decode error is 400 `invalid_json`; a version error cannot become a
+/// `MigrationPlan`, so it is 422 `invalid_spec_version` carrying the report.
+fn plan_side_error(side: &str, error: Option<SpecIoError>) -> Response {
+    let Some(error) = error else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            format!("invalid JSON request body: missing field `{side}`"),
+        );
+    };
+    match error.validation_report() {
+        Some(report) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_spec_version",
+            format!("{side}: {}", describe_report(&report)),
+        ),
+        None => invalid_spec_json(&error),
+    }
+}
+
+fn describe_report(report: &ValidationReport) -> String {
+    report
+        .issues
+        .iter()
+        .map(|issue| format!("{} at {}: {}", issue.code, issue.path, issue.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn invalid_json_value(message: impl Into<String>) -> Response {
     api_error(StatusCode::BAD_REQUEST, "invalid_value", message)
 }
@@ -3665,8 +3751,14 @@ mod tests {
         ConfigApplyRequest, ConfigPlanRequest, local_insecure_admin_allowed, login_client_label,
     };
     use crate::{
-        config_spec::{ApplyStatus, DatabaseSpec, MigrationPlanner},
-        db::{DbConfig, DbError, Profile, create_database, open_database},
+        config_spec::{
+            ApplyStatus, DatabaseSpec, MigrationPlanner, ProfileKnobOverrides,
+            resolve_named_profile,
+        },
+        db::{
+            DbConfig, DbError, OperationalConfig, Profile, ReplicationKind, create_database,
+            create_database_with_profile, open_database,
+        },
         query::{QueryError, SqlOutput},
         repl::ReplError,
         runtime_advisor::{
@@ -4906,6 +4998,78 @@ mod tests {
         Ok(())
     }
 
+    /// Every 422 body that `/config/validate` and `/config/plan` send has an envelope shape the
+    /// `OpenAPI` snapshot documents for that status.
+    #[tokio::test]
+    async fn phase52_config_unprocessable_bodies_match_openapi()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let openapi: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        let current = DatabaseSpec::from_db_config(
+            "current",
+            &DbConfig::on_disk(Profile::Balanced, "current.redb"),
+        );
+        let mut invalid = current.clone();
+        invalid.guarantees.write_ack = crate::config_spec::WriteAck::Local;
+        let mut version_3 = serde_json::to_value(&current)?;
+        version_3["version"] = serde_json::json!(3);
+
+        let cases = [
+            ("/config/validate", serde_json::to_value(&invalid)?, true),
+            ("/config/validate", version_3.clone(), true),
+            (
+                "/config/plan",
+                serde_json::json!({ "current": current, "desired": invalid }),
+                true,
+            ),
+            (
+                "/config/plan",
+                serde_json::json!({ "current": current, "desired": version_3 }),
+                false,
+            ),
+        ];
+        for (path, request, ok) in cases {
+            let response = super::router(test_state()?)
+                .oneshot(authed_request(Method::POST, path, Some(&request))?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], ok, "{path}: {body}");
+            assert!(
+                openapi_documents_envelope(&openapi, path, "422", ok)?,
+                "OpenAPI {path} 422 does not document an ok={ok} envelope"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the documented `status` response of `POST path` admits an envelope with this
+    /// `ok` value: its schema, or one of its `oneOf` alternatives, fixes `ok` to it.
+    fn openapi_documents_envelope(
+        openapi: &Value,
+        path: &str,
+        status: &str,
+        ok: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let operation = resolve_openapi_operation(openapi, &openapi["paths"][path]["post"])?;
+        let response = resolve_openapi_operation(openapi, &operation["responses"][status])?;
+        let schema = &response["content"]["application/json"]["schema"];
+        let alternatives = match schema.get("oneOf").and_then(Value::as_array) {
+            Some(alternatives) => alternatives.iter().collect::<Vec<_>>(),
+            None => vec![schema],
+        };
+        for alternative in alternatives {
+            let resolved = resolve_openapi_operation(openapi, alternative)?;
+            if resolved["properties"]["ok"]["const"] == ok {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[tokio::test]
     async fn phase52_openapi_is_public_and_available_with_api_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5149,6 +5313,32 @@ mod tests {
         Ok(())
     }
 
+    /// A spec body over the 1 MiB router body limit never reaches `spec_io`: it is HTTP 400
+    /// `invalid_json`, not a `SPEC_TOO_LARGE` report (docs/profiles.md, "Reading specs").
+    #[tokio::test]
+    async fn oversized_spec_bodies_are_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let padding = "x".repeat(super::MAX_CONTROL_PLANE_BODY_BYTES);
+        for uri in ["/config/validate", "/config/plan"] {
+            let body = serde_json::to_vec(&serde_json::json!({ "version": 1, "pad": padding }))?;
+            let response = super::router(test_state()?)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .header("x-multidb-principal", "root")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "invalid_json", "{uri}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn catalog_endpoints_return_enveloped_json() -> Result<(), Box<dyn std::error::Error>> {
         for path in [
@@ -5168,6 +5358,66 @@ mod tests {
             assert_eq!(body["ok"], true, "{path}");
             assert!(body.get("data").is_some(), "{path}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profiles_endpoint_lists_variants_and_canonical_knobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = super::router(test_state()?)
+            .oneshot(authed_request(Method::GET, "/profiles", None::<&()>)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let profiles = body["data"].as_array().ok_or("profiles is not an array")?;
+        assert_eq!(profiles.len(), 6);
+        for profile in profiles {
+            let variants = profile["variants"]
+                .as_array()
+                .ok_or("variants is not an array")?;
+            assert_eq!(
+                variants
+                    .iter()
+                    .filter(|variant| variant["canonical"] == true)
+                    .count(),
+                1,
+                "{}",
+                profile["slug"]
+            );
+            assert!(profile["knobs"].is_object(), "{}", profile["slug"]);
+        }
+
+        let find = |slug: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile["slug"] == slug)
+                .ok_or(format!("missing profile {slug}"))
+        };
+        let game = find("game_local_balanced")?;
+        assert_eq!(
+            game["variants"],
+            serde_json::json!([
+                { "name": "balanced", "storage_profile": "Balanced", "canonical": true },
+                { "name": "in_memory", "storage_profile": "InMemory", "canonical": false },
+            ])
+        );
+        assert_eq!(game["knobs"]["durability"]["commit"], "immediate");
+        assert_eq!(game["knobs"]["storage"]["medium"], "durable");
+        assert_eq!(game["knobs"]["limits"]["max_value_bytes"], "unlimited");
+
+        let secure = find("secure_app")?;
+        let high_durability = secure["variants"]
+            .as_array()
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find(|variant| variant["name"] == "high_durability")
+            })
+            .ok_or("missing high_durability variant")?;
+        assert_eq!(high_durability["storage_profile"], "HighDurability");
+        assert_eq!(high_durability["canonical"], false);
+        // The listed knobs are the canonical variant's: transactional commits immediately.
+        assert_eq!(secure["knobs"]["durability"]["commit"], "immediate");
         Ok(())
     }
 
@@ -5326,6 +5576,205 @@ mod tests {
             )?)
             .await?;
         assert_eq!(plan.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_v2_and_reports_version_problems_as_422()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        let mut custom = serde_json::to_value(&base)?;
+        custom["version"] = serde_json::json!(2);
+        custom["profile"] = serde_json::json!("orders_durable");
+        custom["custom_profile"] = serde_json::json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        });
+        let mut version_3 = serde_json::to_value(&base)?;
+        version_3["version"] = serde_json::json!(3);
+        let mut missing = serde_json::to_value(&base)?;
+        missing
+            .as_object_mut()
+            .ok_or("spec must be an object")?
+            .remove("version");
+        let mut unknown_field = serde_json::to_value(&base)?;
+        unknown_field["unexpected"] = serde_json::json!(true);
+
+        let post = |body: serde_json::Value| async move {
+            super::router(test_state()?)
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/config/validate",
+                    Some(&body),
+                )?)
+                .await
+                .map_err(Box::<dyn std::error::Error>::from)
+        };
+
+        let accepted = post(custom).await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = json_body(accepted).await?;
+        assert_eq!(body["data"]["valid"], true);
+        assert_eq!(body["data"]["status"], "custom");
+
+        for (body, code) in [
+            (version_3, "UNSUPPORTED_VERSION"),
+            (missing, "MISSING_VERSION"),
+        ] {
+            let response = post(body).await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["data"]["valid"], false);
+            assert_eq!(body["data"]["issues"][0]["code"], code);
+        }
+
+        let rejected = post(unknown_field).await?;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(rejected).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_json");
+        Ok(())
+    }
+
+    /// The spec shape Studio's custom-profile builder posts (`studio/src/App.tsx`).
+    fn studio_custom_profile_spec(
+        extends: &str,
+        deployment: &serde_json::Value,
+        knobs: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut custom_profile = serde_json::json!({
+            "extends": extends,
+            "description": "Custom operator-managed profile for this environment.",
+        });
+        if let Some(knobs) = knobs {
+            custom_profile["knobs"] = knobs;
+        }
+        serde_json::json!({
+            "version": 2,
+            "name": "ops_custom_profile_example",
+            "profile": "ops_custom_profile",
+            "deployment": deployment,
+            "topology": { "replica_count": 1, "shard_count": 1 },
+            "defaults": { "consistency_domain": "primary", "replication": "cp" },
+            "guarantees": {
+                "write_ack": "quorum",
+                "conflict_resolution": "none",
+                "backup": { "enabled": false, "pitr": false },
+                "encryption": { "at_rest": false },
+                "audit": { "enabled": true },
+                "sensitive_data": false,
+                "strict_cross_domain_transactions": true
+            },
+            "domains": [{ "name": "primary", "mode": "strong_cp" }],
+            "collections": [],
+            "extensions": [],
+            "overrides": {},
+            "operation_hints": { "studio.builder": "custom_profile" },
+            "custom_profile": custom_profile
+        })
+    }
+
+    #[tokio::test]
+    async fn studio_custom_profile_builder_specs_validate() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let durable = studio_custom_profile_spec(
+            "balanced",
+            &serde_json::json!({ "mode": "single_node", "storage_path": "target/new-database.redb" }),
+            Some(serde_json::json!({
+                "durability": { "commit": "immediate" },
+                "compression": { "algorithm": "zstd" },
+                "cache": { "max_entries": 8192 }
+            })),
+        );
+        let in_memory = studio_custom_profile_spec(
+            "in_memory",
+            &serde_json::json!({ "mode": "embedded", "storage_path": null }),
+            None,
+        );
+        for spec in [durable, in_memory] {
+            let response = super::router(test_state()?)
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/config/validate",
+                    Some(&spec),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "{spec}");
+            let body = json_body(response).await?;
+            assert_eq!(body["data"]["valid"], true, "{body}");
+            assert_eq!(body["data"]["status"], "custom", "{body}");
+            let issues = body["data"]["issues"]
+                .as_array()
+                .ok_or("issues is not an array")?;
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue["code"] == "CUSTOM_PROFILE_DEFINED"),
+                "{body}"
+            );
+            assert!(
+                !issues.iter().any(|issue| issue["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("OVERRIDE_"))),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_reports_unsupported_versions_and_missing_sides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = DatabaseSpec::from_db_config(
+            "current",
+            &DbConfig::on_disk(Profile::Balanced, "current.redb"),
+        );
+        let mut desired = serde_json::to_value(&current)?;
+        desired["version"] = serde_json::json!(3);
+
+        let response = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&serde_json::json!({ "current": current, "desired": desired })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_spec_version");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("desired: UNSUPPORTED_VERSION"),
+            "{message}"
+        );
+
+        let missing = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&serde_json::json!({ "current": current })),
+            )?)
+            .await?;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(missing).await?;
+        assert_eq!(body["error"]["code"], "invalid_json");
+
+        let same = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&ConfigPlanRequest {
+                    current: current.clone(),
+                    desired: current,
+                }),
+            )?)
+            .await?;
+        assert_eq!(same.status(), StatusCode::OK);
         Ok(())
     }
 
@@ -6185,6 +6634,104 @@ mod tests {
                 .as_array()
                 .is_some_and(|objects| objects.iter().any(|object| object["name"] == "later"))
         );
+        Ok(())
+    }
+
+    /// A database created with a custom profile and reopened through the manifest openers, as
+    /// `serve` opens it, keeps the manifest's runtime performance behind the shared lock: `/sql`
+    /// compatibility queries, writes and SELECTs run under the shared guard with the manifest's
+    /// `query.max_sql_bytes`. `/profiles` and `/config/validate` never touch the database, so
+    /// they answer while a writer holds the lock.
+    #[tokio::test]
+    async fn control_plane_sql_keeps_the_profile_manifest_parser_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let overrides: ProfileKnobOverrides = serde_json::from_value(serde_json::json!({
+            "query": { "max_sql_bytes": 1024 }
+        }))?;
+        let resolution = resolve_named_profile("high_durability", &overrides);
+        let resolved = resolution
+            .resolved()
+            .ok_or_else(|| format!("high_durability did not resolve: {:?}", resolution.issues()))?;
+        let binding =
+            resolved.bind(ReplicationKind::Cp, Some(temp.path().join("manifest.redb")))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::new(),
+        )?);
+        let mut database = open_database(binding.db_config.clone())?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.performance_config().query.max_sql_bytes, 1_024);
+        database.set_authz_policy(AuthzPolicy::new([Role::new("admin")
+            .grant(Resource::System, Permission::Admin)
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Database, Permission::Write)
+            .grant(Resource::Database, Permission::Admin)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin")),
+        );
+        let database = Arc::new(RwLock::new(database));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        create_users_table(&app).await?;
+
+        let padding = " ".repeat(1_024);
+        for (sql, within_limit) in [
+            ("SELECT version()".to_owned(), true),
+            (format!("SELECT version(){padding}"), false),
+            (
+                "INSERT INTO users (id, name) VALUES (1, 'Ada')".to_owned(),
+                true,
+            ),
+            (
+                format!("INSERT INTO users (id, name) VALUES (2, 'Lin'){padding}"),
+                false,
+            ),
+            ("SELECT name FROM users".to_owned(), true),
+            (format!("SELECT name FROM users{padding}"), false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/sql",
+                    Some(&serde_json::json!({ "sql": sql })),
+                )?)
+                .await?;
+            let status = response.status();
+            let body = json_body(response).await?;
+            if within_limit {
+                assert_eq!(status, StatusCode::OK, "{body}");
+            } else {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("limit is 1024 bytes")),
+                    "{body}"
+                );
+            }
+        }
+        assert_eq!(sql_ids(&app, "SELECT name FROM users").await?, ["Ada"]);
+
+        let writer = database.write().await;
+        let spec = studio_custom_profile_spec(
+            "balanced",
+            &serde_json::json!({ "mode": "single_node", "storage_path": "target/new-database.redb" }),
+            None,
+        );
+        for request in [
+            authed_request(Method::GET, "/profiles", None::<&()>)?,
+            authed_request(Method::POST, "/config/validate", Some(&spec))?,
+        ] {
+            let response =
+                tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(request))
+                    .await??;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        drop(writer);
         Ok(())
     }
 

@@ -1,0 +1,14 @@
+{
+  "valid": true,
+  "status": "experimental",
+  "issues": [
+    {
+      "code": "EXPERIMENTAL_EXTENSION",
+      "severity": "warning",
+      "path": "extensions[1].stability",
+      "message": "extension columnar_layout is marked experimental",
+      "suggestion": "Use a stable extension for certified configurations, or accept Experimental support status.",
+      "certification_impact": "downgrades_to_experimental"
+    }
+  ]
+}

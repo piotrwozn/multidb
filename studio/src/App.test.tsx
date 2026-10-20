@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
+import type { DatabaseSpec } from "./types";
 import {
   auditFixture,
   authFixture,
@@ -497,6 +498,101 @@ describe("App", () => {
     };
     expect(body.desired.name).toBe("tenant_a");
     expect(body.desired.topology.replica_count).toBe(1);
+  });
+
+  it("builds a version 2 custom_profile spec from the custom-profile builder", async () => {
+    const fetchMock = installFetch();
+    const user = await connect();
+
+    await user.click(screen.getByRole("button", { name: /builder/i }));
+    await user.click(screen.getByRole("button", { name: /^custom_profile$/i }));
+    await user.clear(screen.getByLabelText("Profile slug"));
+    await user.type(screen.getByLabelText("Profile slug"), "orders_durable");
+    await user.selectOptions(screen.getByLabelText("Extends"), "game_local_balanced");
+    await user.selectOptions(screen.getByLabelText(/durability\.commit/), "immediate");
+    await user.selectOptions(screen.getByLabelText(/compression\.algorithm/), "zstd");
+    await user.type(screen.getByLabelText(/cache\.max_entries/), "8192");
+    await user.click(screen.getByRole("button", { name: /^create$/i }));
+
+    expect(
+      await screen.findByText(/databases are created from custom profiles by provisioning/i),
+    ).toBeInTheDocument();
+    const bodyOf = (endpoint: string): unknown => {
+      const call = fetchMock.mock.calls.find(([input, init]) => {
+        const path = new URL(String(input), "http://studio.test").pathname;
+        return path === endpoint && init?.method === "POST";
+      });
+      if (call === undefined) {
+        throw new Error(`missing ${endpoint} call`);
+      }
+      return JSON.parse(String(call[1]?.body));
+    };
+    const validated = bodyOf("/api/config/validate") as DatabaseSpec;
+    const planned = bodyOf("/api/config/plan") as { current: unknown; desired: DatabaseSpec };
+    expect(planned.current).toEqual(configFixture);
+    expect(planned.desired).toEqual(validated);
+    expect(planned.desired.version).toBe(2);
+    expect(planned.desired.profile).toBe("orders_durable");
+    expect(planned.desired.custom_profile).toEqual({
+      extends: "game_local_balanced",
+      description: "Custom operator-managed profile for this environment.",
+      knobs: {
+        durability: { commit: "immediate" },
+        compression: { algorithm: "zstd" },
+        cache: { max_entries: 8192 },
+      },
+    });
+    expect(planned.desired.deployment.storage_path).not.toBeNull();
+    expect(planned.desired.overrides).toEqual({});
+    expect(planned.desired.operation_hints).toEqual({ "studio.builder": "custom_profile" });
+    expect(JSON.stringify(planned.desired)).not.toContain("profile.custom.");
+  });
+
+  it("clears the storage path when a custom profile extends an in-memory variant", async () => {
+    const fetchMock = installFetch();
+    const user = await connect();
+
+    await user.click(screen.getByRole("button", { name: /builder/i }));
+    await user.click(screen.getByRole("button", { name: /^custom_profile$/i }));
+    await user.selectOptions(screen.getByLabelText("Extends"), "in_memory");
+    expect(screen.getByText(/in-memory profiles keep no files/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^create$/i }));
+
+    await screen.findByText(/databases are created from custom profiles by provisioning/i);
+    const planCall = fetchMock.mock.calls.find(([input, init]) => {
+      const path = new URL(String(input), "http://studio.test").pathname;
+      return path === "/api/config/plan" && init?.method === "POST";
+    });
+    if (planCall === undefined) {
+      throw new Error("missing /config/plan call");
+    }
+    const body = JSON.parse(String(planCall[1]?.body)) as { desired: DatabaseSpec };
+    expect(body.desired.version).toBe(2);
+    expect(body.desired.custom_profile?.extends).toBe("in_memory");
+    expect(body.desired.custom_profile?.knobs).toBeUndefined();
+    expect(body.desired.deployment).toEqual({ mode: "embedded", storage_path: null });
+  });
+
+  it("falls back to the balanced profile when the desired spec has none", async () => {
+    const { profile: _omitted, ...withoutProfile } = configFixture;
+    const fetchMock = installFetch((_input, _init, path, method) =>
+      method === "GET" && path === "/config" ? envelope(withoutProfile) : undefined,
+    );
+    const user = await connect();
+
+    await user.click(screen.getByRole("button", { name: /^config$/i }));
+    await user.click(screen.getByRole("button", { name: /^validate$/i }));
+
+    await screen.findByText("Validation failed");
+    const validateCall = fetchMock.mock.calls.find(([input, init]) => {
+      const path = new URL(String(input), "http://studio.test").pathname;
+      return path === "/api/config/validate" && init?.method === "POST";
+    });
+    if (validateCall === undefined) {
+      throw new Error("missing /config/validate call");
+    }
+    const body = JSON.parse(String(validateCall[1]?.body)) as DatabaseSpec;
+    expect(body.profile).toBe("balanced");
   });
 
   it("toggles dark mode from the command bar", async () => {
