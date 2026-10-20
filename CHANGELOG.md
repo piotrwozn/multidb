@@ -679,7 +679,11 @@ All notable public changes will be recorded here.
 - The `history.system_versioning`, `history.keep_history`,
   `time_series.default_chunk_millis` and `time_series.default_retention_millis`
   knobs are `enforced` in `KNOB_REGISTRY`: provisioning applies them to the
-  tables and series it creates. Explain says that every-open knobs apply to
+  tables and series it creates. A provisioned table that keeps its history
+  does so from LSN 0, so history GC keeps every `AS OF` result and, while the
+  table exists, prunes and truncates nothing; the provision record lives
+  outside the commit log, so GC and truncation change no plan, drift or
+  export. Explain says that every-open knobs apply to
   databases created with `db::create_database_with_profile` or by
   provisioning, that provisioning-timing knobs are applied by provisioning to
   the objects it creates, and that enabling compression on an existing

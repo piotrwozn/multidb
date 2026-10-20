@@ -5726,3 +5726,159 @@ fn a_process_query_governor_is_not_a_session_pending_restart() -> TestResult {
     );
     Ok(())
 }
+
+/// A typed `ledger` table with system versioning that keeps its history or not, and a document
+/// collection `notes`, with a full-text index on `body` when `indexed`.
+fn versioned_spec(keep_history: bool, indexed: bool) -> Result<DatabaseSpec, Error> {
+    let notes = if indexed {
+        json!({
+            "name": "notes", "role": "document_entity", "domain": "primary",
+            "indexes": ["primary", "full_text"],
+            "physical": { "full_text": [{ "path": "body" }] }
+        })
+    } else {
+        json!({ "name": "notes", "role": "document_entity", "domain": "primary", "indexes": ["primary"] })
+    };
+    spec(
+        "balanced",
+        &json!([
+            {
+                "name": "ledger", "role": "event_log", "domain": "primary", "indexes": ["primary"],
+                "physical": {
+                    "kind": "table",
+                    "columns": [
+                        { "name": "entry_id", "type": "int" },
+                        { "name": "amount", "type": "float" }
+                    ],
+                    "primary_key": "entry_id",
+                    "system_versioning": true,
+                    "keep_history": keep_history
+                }
+            },
+            notes
+        ]),
+    )
+}
+
+/// Writes ten versions of two ledger rows and returns the commit LSN after each version.
+fn write_ledger(db: &Database) -> Result<Vec<u64>, Error> {
+    let ledger = db.table("ledger")?;
+    let mut lsns = Vec::new();
+    for version in 0..10_i32 {
+        for entry in [1, 2] {
+            let row = vec![Value::Int(entry), Value::Float(f64::from(version))];
+            if version == 0 {
+                ledger.insert(row)?;
+            } else {
+                ledger.update(row)?;
+            }
+        }
+        lsns.push(db.commit_lsn()?);
+    }
+    Ok(lsns)
+}
+
+const LEDGER_SQL: &str = "SELECT entry_id, amount FROM ledger ORDER BY entry_id";
+
+/// History GC honours the history provisioning builds: a versioned table that keeps its history
+/// (`TemporalRetention { min_lsn: 0, keep_history: true }`) holds the GC watermark at 0, so every
+/// `AS OF` result survives and no commit-log record is truncated.
+#[tokio::test]
+async fn history_gc_keeps_the_as_of_history_of_provisioned_tables_that_keep_it() -> TestResult {
+    use crate::temporal::TemporalPoint;
+    use crate::txn::history::{HistoryGcOptions, HistoryWatermarkSource};
+
+    let temp_dir = tempfile::tempdir()?;
+    let spec = versioned_spec(true, false)?;
+    let mut db = create_with_profile(&temp_dir.path().join("kept.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let lsns = write_ledger(&db)?;
+    let mut before = Vec::new();
+    for lsn in &lsns {
+        before.push(db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?);
+    }
+
+    let report = db.gc_history(&HistoryGcOptions {
+        commit_log_retain_lsns: Some(1),
+        ..HistoryGcOptions::default()
+    })?;
+    assert_eq!(report.watermark, 0);
+    assert_eq!(
+        report.limited_by,
+        HistoryWatermarkSource::TemporalRetention {
+            table: "ledger".to_owned()
+        }
+    );
+    assert_eq!(report.mvcc_versions_pruned, 0);
+    assert_eq!(report.commit_log_records_pruned, 0);
+    assert!(report.complete);
+    for (lsn, expected) in lsns.iter().zip(&before) {
+        let output = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?;
+        assert_eq!(&output, expected, "AS OF {lsn}");
+    }
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+/// A provisioned table that does not keep its history has no `AS OF` history and holds no GC
+/// watermark back, and nothing provisioning relies on is in what GC removes: the record and its
+/// history live in `__provision`, so after MVCC pruning and commit-log truncation the plan id is
+/// unchanged, the plan a noop, drift in sync and the export still comes from the record; a
+/// full-text index provisioned afterwards on a populated collection starts from its rows.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn history_gc_and_commit_log_truncation_leave_provisioning_intact() -> TestResult {
+    use crate::temporal::{TemporalError, TemporalPoint};
+    use crate::txn::history::HistoryGcOptions;
+
+    let temp_dir = tempfile::tempdir()?;
+    let spec = versioned_spec(false, false)?;
+    let mut db = create_with_profile(&temp_dir.path().join("pruned.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let lsns = write_ledger(&db)?;
+    let first = *lsns.first().ok_or("an LSN")?;
+    // Without keep_history the table has no AS OF history to keep, so GC holds nothing back.
+    let unsupported = |result: &Result<SqlOutput, DbError>| {
+        matches!(
+            result,
+            Err(DbError::Temporal(TemporalError::Unsupported(reason)))
+                if reason.contains("history retention is disabled")
+        )
+    };
+    let early = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(first)).await;
+    assert!(unsupported(&early), "{early:?}");
+    db.collection("notes")?.insert(&Value::Object(
+        [("body".to_owned(), Value::Str("kept before gc".to_owned()))].into(),
+    ))?;
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Noop);
+    let record = db.provision_state()?.ok_or("a provision record")?;
+    let history = db.provision_history()?;
+
+    let report = db.gc_history(&HistoryGcOptions {
+        commit_log_retain_lsns: Some(1),
+        ..HistoryGcOptions::default()
+    })?;
+    assert!(report.mvcc_versions_pruned > 0, "{report:?}");
+    assert!(report.commit_log_records_pruned > 0, "{report:?}");
+    assert!(report.complete);
+    let late = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(first)).await;
+    assert!(unsupported(&late), "{late:?}");
+
+    assert_eq!(db.provision_state()?, Some(record));
+    assert_eq!(db.provision_history()?, history);
+    let after = plan_open(&spec, &db)?;
+    assert_eq!(after.plan_id, plan.plan_id);
+    assert_eq!(after.outcome, PlanOutcome::Noop);
+    assert!(drift(&db, &spec, &ProvisionOptions::default())?.in_sync);
+    assert_eq!(export_spec(&db)?.source, ExportSource::AppliedRecord);
+
+    let indexed = versioned_spec(false, true)?;
+    let report = apply_cli(&mut db, &indexed, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    let hits = db.full_text_index("notes_body_fts")?.search("kept", 10)?;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(plan_open(&indexed, &db)?.outcome, PlanOutcome::Noop);
+    db.verify_audit_chain()?;
+    Ok(())
+}

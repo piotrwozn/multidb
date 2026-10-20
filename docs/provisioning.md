@@ -123,6 +123,17 @@ A typed row table with system versioning derives `<table>_history`
 `history.system_versioning: typed_tables`, which applies to every typed row
 table; `keep_history` defaults to `history.keep_history`.
 
+History GC (`multidb maintenance gc`, `Database::gc_history`) honours that
+retention. A table with `keep_history: true` keeps its history from LSN 0
+(`TemporalRetention { min_lsn: 0, keep_history: true }`), which holds the GC
+watermark at 0: while it exists, GC keeps every `AS OF` result of every table
+and truncates no commit-log record. With `keep_history: false` the table has
+no `AS OF` history (such a read is refused as unsupported) and holds nothing
+back. The provision record and its history live in `__provision`, outside the
+commit log, so GC and commit-log truncation change no plan id, drift or
+export, and an index provisioned after a truncation starts from the current
+rows.
+
 Field types are `int`, `float`, `str`, `bool` and `bytes`. The full-text
 `language` accepts only `simple`, because this build tokenizes every language
 the same way.

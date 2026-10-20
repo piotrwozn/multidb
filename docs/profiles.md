@@ -503,7 +503,9 @@ is pruned. No profile knob sets its retention: `history.system_versioning` and
 `history.keep_history` describe the typed tables provisioning creates, and
 `history.mvcc_retention_millis` is reserved, so GC keeps only what
 `--history-retain-lsns` (`mvcc_retain_lsns`), `AS OF` pins and the temporal
-`keep_history` retentions of existing tables require.
+`keep_history` retentions of existing tables require. A table provisioning
+creates with `keep_history: true` keeps its history from LSN 0, so GC prunes
+nothing while it exists (see [provisioning.md](provisioning.md)).
 
 ### Evolving the manifest
 
