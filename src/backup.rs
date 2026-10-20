@@ -15,7 +15,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::{
-    cloud::{CLOUD_HIBERNATION_TABLE, CLOUD_SEGMENTS_TABLE},
+    cloud::{
+        CLOUD_HIBERNATION_TABLE, CLOUD_SEGMENTS_TABLE, decode_tiered_segment_pointer,
+        resolve_tiered_segment_payload,
+    },
     db::{
         ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode,
         PersistedProfileManifest, Profile, create_restore_target, decode_profile_manifest,
@@ -37,7 +40,7 @@ use crate::{
         Bytes, ConfiguredKeyProvider, KeyProvider, ReadTransaction, StorageEngine, StorageError,
         WriteTransaction,
     },
-    txn::{self, CommitLogRecord, TxnId},
+    txn::{self, CommitLogRecord, MvccRecord, TxnId},
     vector::VECTOR_TABLE,
 };
 
@@ -174,6 +177,16 @@ pub enum BackupError {
     #[error("missing commit log range: {start}..={end}")]
     MissingLogRange { start: Lsn, end: Lsn },
 
+    /// History GC truncated commit-log records an incremental backup needs.
+    /// Take a new full backup to start a new chain.
+    #[error(
+        "commit log truncated: parent backup ends at lsn {parent_end_lsn} but the earliest retained commit is lsn {earliest_retained_lsn}; take a new full backup"
+    )]
+    CommitLogTruncated {
+        parent_end_lsn: Lsn,
+        earliest_retained_lsn: Lsn,
+    },
+
     #[error("missing parent backup: {0}")]
     MissingParent(BackupId),
 
@@ -250,8 +263,13 @@ struct CommitLogPayload {
 
 /// Takes a consistent full logical backup into a new directory under `dest_root`.
 ///
+/// Tiered columnar segments are fetched from their object store and inlined, so
+/// restoring the backup does not need the object store for current data.
+///
 /// # Errors
-/// Fails when the database has no local storage, storage reads fail, or the backup files cannot be written.
+/// Fails when the database has no local storage, storage reads fail, a tiered
+/// segment object is missing, corrupt, or unreachable, or the backup files cannot
+/// be written.
 pub fn full_backup(
     database: &Database,
     dest_root: impl AsRef<Path>,
@@ -322,7 +340,8 @@ pub(crate) fn ensure_incremental_backup_supported(database: &Database) -> Result
 ///
 /// # Errors
 /// Fails when the database uses AP replication (its writes are not recorded in the commit log),
-/// the parent manifest is invalid, commit logs are missing, or files cannot be written.
+/// the parent manifest is invalid, commit logs are missing or were truncated by history GC
+/// ([`BackupError::CommitLogTruncated`]), or files cannot be written.
 pub fn incremental_backup(
     database: &Database,
     dest_root: impl AsRef<Path>,
@@ -342,6 +361,15 @@ pub fn incremental_backup(
             "database lsn {end_lsn} is older than parent backup {}",
             parent.end_lsn
         )));
+    }
+    if let Some(floor) = txn::history::read_history_meta(&read, txn::history::COMMIT_LOG_FLOOR_KEY)?
+        && parent.end_lsn < end_lsn
+        && parent.end_lsn.saturating_add(1) < floor
+    {
+        return Err(BackupError::CommitLogTruncated {
+            parent_end_lsn: parent.end_lsn,
+            earliest_retained_lsn: floor,
+        });
     }
 
     let records = read_commit_logs_from(&read, parent.end_lsn, end_lsn)?;
@@ -706,19 +734,62 @@ fn default_keyspaces() -> BTreeSet<String> {
     .collect()
 }
 
+/// Reads every keyspace into a full backup payload.
+///
+/// Full backups are self-contained for the current state of tiered columnar
+/// segments: each pointer is resolved (CRC-checked) and its bytes are inlined, and
+/// so are the matching `__txn_mvcc` versions that still hold that pointer. A
+/// missing or corrupt object fails the backup. Commit-log records, other
+/// historical versions, and incremental backups keep referencing the immutable,
+/// retained objects.
 fn read_full_payload(
     txn: &impl ReadTransaction,
     keyspaces: &BTreeSet<String>,
 ) -> Result<BackupDataPayload, BackupError> {
     let mut records = Vec::new();
+    // Segment key -> (encoded MVCC record holding the pointer, encoded MVCC record
+    // holding the resolved bytes).
+    let mut inlined = BTreeMap::<Bytes, (Bytes, Bytes)>::new();
     for table in keyspaces {
         for row in txn.range(table, &[], &[])? {
-            let (key, value) = row?;
+            let (key, mut value) = row?;
+            if table == REL_COLUMNAR_SEGMENTS_TABLE
+                && decode_tiered_segment_pointer(&value)?.is_some()
+            {
+                let resolved = resolve_tiered_segment_payload(&value)?;
+                inlined.insert(
+                    key.clone(),
+                    (
+                        txn::encode_mvcc_record(&MvccRecord { value: Some(value) })?,
+                        txn::encode_mvcc_record(&MvccRecord {
+                            value: Some(resolved.clone()),
+                        })?,
+                    ),
+                );
+                value = resolved;
+            }
             records.push(BackupDataRecord {
                 table: table.clone(),
                 key,
                 value,
             });
+        }
+    }
+    if !inlined.is_empty() {
+        let segment_prefix = txn::version_key(REL_COLUMNAR_SEGMENTS_TABLE, &[])?;
+        for record in &mut records {
+            if record.table != txn::TXN_MVCC_TABLE
+                || record.key.len() < segment_prefix.len() + 8
+                || !record.key.starts_with(&segment_prefix)
+            {
+                continue;
+            }
+            let segment_key = &record.key[segment_prefix.len()..record.key.len() - 8];
+            if let Some((pointer_record, resolved_record)) = inlined.get(segment_key)
+                && record.value == *pointer_record
+            {
+                record.value.clone_from(resolved_record);
+            }
         }
     }
     records.sort_by(|left, right| {
@@ -1744,6 +1815,112 @@ mod tests {
 
         let verified = verify_backup(&backup.path)?;
         assert_eq!(verified.restored_lsn, backup.manifest.end_lsn);
+        Ok(())
+    }
+
+    /// History GC composes with profile manifests and backups. On a zstd-framed manifest
+    /// database GC prunes the framed MVCC versions and commit records it decodes, an
+    /// incremental backup whose parent predates the truncated commit log fails with
+    /// `CommitLogTruncated`, and a new full backup verifies and restores into a framed manifest
+    /// database that keeps the latest row and the history horizon.
+    #[tokio::test]
+    async fn history_gc_composes_with_profile_manifest_backups() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        let binding = profile_binding(
+            "high_durability",
+            json!({ "compression": { "algorithm": "zstd", "min_bytes": 64 } }),
+            &db_path,
+        )?;
+        let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        let schema = TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("note", ColumnType::Str, false),
+            ],
+            0,
+        );
+        let notes = database.create_table("notes", Some(schema), Vec::new())?;
+        let note = |version: i64| {
+            vec![
+                Value::Int(1),
+                Value::Str(format!("{version}:{}", "n".repeat(256))),
+            ]
+        };
+        notes.insert(note(0))?;
+        let root = temp.path().join("backups");
+        let parent = full_backup(&database, &root, &BackupConfig::default())?;
+        for version in 1..=4 {
+            notes.update(note(version))?;
+        }
+
+        let report = database.gc_history(&txn::history::HistoryGcOptions {
+            mvcc_retain_lsns: Some(1),
+            commit_log_retain_lsns: Some(1),
+            ..txn::history::HistoryGcOptions::default()
+        })?;
+        assert!(report.complete, "{report:?}");
+        assert!(report.mvcc_versions_pruned >= 4, "{report:?}");
+        assert!(report.commit_log_records_pruned > 0, "{report:?}");
+        let horizon = report.history_horizon;
+        assert!(horizon > parent.manifest.end_lsn + 1, "{report:?}");
+        let truncated =
+            incremental_backup(&database, &root, &parent.path, &BackupConfig::default());
+        assert!(
+            matches!(
+                truncated,
+                Err(BackupError::CommitLogTruncated { parent_end_lsn, .. })
+                    if parent_end_lsn == parent.manifest.end_lsn
+            ),
+            "{truncated:?}"
+        );
+
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        drop(notes);
+        drop(database);
+        assert_eq!(
+            verify_backup(&full.path)?.restored_lsn,
+            full.manifest.end_lsn
+        );
+        let restore_path = temp.path().join("restored.redb");
+        restore_backup(
+            &full.path,
+            DbConfig::on_disk(Profile::HighDurability, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        let engine = RedbEngine::open(&restore_path)?;
+        let rows = engine
+            .begin_read()?
+            .range(REL_ROWS_TABLE, &[], &[])?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(engine);
+        assert!(!rows.is_empty(), "the restored database holds no rows");
+        assert!(rows.iter().all(|(_, value)| value.starts_with(b"MDBC1")));
+
+        let restored = open_database(DbConfig::on_disk(Profile::HighDurability, &restore_path))?;
+        assert_eq!(restored.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(restored.performance_config(), &binding.performance);
+        assert_eq!(restored.table("notes")?.get(&Value::Int(1))?, Some(note(4)));
+        let sql = "SELECT id, note FROM notes";
+        let below = restored
+            .query_as_of(sql, TemporalPoint::Lsn(horizon - 1))
+            .await;
+        assert!(
+            matches!(
+                below,
+                Err(DbError::Temporal(
+                    crate::temporal::TemporalError::RetentionExpired { .. }
+                ))
+            ),
+            "{below:?}"
+        );
+        let SqlOutput::Rows(at_horizon) = restored
+            .query_as_of(sql, TemporalPoint::Lsn(horizon))
+            .await?
+        else {
+            return Err("AS OF at the history horizon must return rows".into());
+        };
+        assert_eq!(at_horizon.rows, vec![note(4)]);
         Ok(())
     }
 

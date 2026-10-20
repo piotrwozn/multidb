@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::ConfigError;
 use crate::extension::WasmRuntime;
 
@@ -9,7 +11,7 @@ thread_local! {
     static FORCE_WASM_RUNTIME_INIT_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) fn wasm_runtime_for_database() -> Result<WasmRuntime, ConfigError> {
+pub(super) fn wasm_runtime_for_database() -> Result<Arc<WasmRuntime>, ConfigError> {
     #[cfg(test)]
     if FORCE_WASM_RUNTIME_INIT_FAILURE.with(Cell::get) {
         return Err(ConfigError::RuntimeInitialization(
@@ -17,7 +19,9 @@ pub(super) fn wasm_runtime_for_database() -> Result<WasmRuntime, ConfigError> {
         ));
     }
 
-    WasmRuntime::new().map_err(|error| ConfigError::RuntimeInitialization(error.to_string()))
+    WasmRuntime::new()
+        .map(Arc::new)
+        .map_err(|error| ConfigError::RuntimeInitialization(error.to_string()))
 }
 
 #[cfg(test)]

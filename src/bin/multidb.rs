@@ -54,6 +54,7 @@ use multidb::{
         TEMPLATE_SPEC_VERSION, TemplateMaterialization, TemplateOutputFormat, built_in_template,
         built_in_templates, materialize_template,
     },
+    txn::history::HistoryGcOptions,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -125,6 +126,7 @@ struct ServeConfig {
     pg_password: String,
     pg_tls: ServePgTls,
     studio_dir: PathBuf,
+    query_governor: ServeQueryGovernor,
     /// Spec mode, when `MULTIDB_SPEC_PATH` is set.
     spec: Option<ServeSpecConfig>,
 }
@@ -152,6 +154,19 @@ enum ProfileSelection {
     Fixed(Profile),
     Auto,
 }
+
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`; an
+/// unset value keeps the profile default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ServeQueryGovernor {
+    max_concurrent_queries: Option<usize>,
+    queue_timeout_ms: Option<u64>,
+}
+
+/// Upper bound for `MULTIDB_MAX_CONCURRENT_QUERIES`.
+const MAX_SERVE_CONCURRENT_QUERIES: usize = 4_096;
+/// Upper bound for `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`.
+const MAX_SERVE_QUERY_QUEUE_TIMEOUT_MS: u64 = 60_000;
 
 impl CliRun {
     fn success(message: impl Into<String>) -> Self {
@@ -232,6 +247,7 @@ fn run_command(args: &[String]) -> Result<String, CliError> {
         "import" => run_import(&args[1..]),
         "export" => run_export(&args[1..]),
         "migrate" => run_migrate(&args[1..]),
+        "maintenance" => run_maintenance(&args[1..]),
         "admin" => run_admin(&args[1..]),
         "config" => run_config(&args[1..]).map(|outcome| outcome.message),
         "template" => run_template(&args[1..]).map(|outcome| outcome.message),
@@ -3163,6 +3179,104 @@ fn run_migrate(args: &[String]) -> Result<String, CliError> {
     }
 }
 
+fn run_maintenance(args: &[String]) -> Result<String, CliError> {
+    let Some(command) = args.first() else {
+        return Err(maintenance_usage());
+    };
+    if command != "gc" {
+        return Err(CliError::Usage(format!(
+            "unsupported maintenance command {command}\n{MAINTENANCE_USAGE}"
+        )));
+    }
+    let options = history_gc_options(args)?;
+    let database = open_cli_database(args)?;
+    let report = database.gc_history(&options)?;
+    serde_json::to_string_pretty(&report).map_err(Into::into)
+}
+
+const MAINTENANCE_USAGE: &str = "multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]\n\
+     Runs offline and needs exclusive access to the database file: stop `multidb serve` first; serve does not run history GC in the background.\n\
+     Without --history-retain-lsns <n>, AS OF history below the GC watermark (the current LSN unless a temporal keep_history retention or an AS OF pin is older) is removed for every table without a temporal keep_history retention; with it the last <n> LSNs stay queryable unless an earlier run already pruned them.\n\
+     --commit-log-retain-lsns <n> truncates the commit log and breaks the incremental backup chain: take a new full backup afterwards.";
+
+fn maintenance_usage() -> CliError {
+    CliError::Usage(MAINTENANCE_USAGE.to_owned())
+}
+
+/// Flags `maintenance gc` accepts with a value. GC removes history, so a typo or
+/// a missing value must not fall back to the defaults.
+const MAINTENANCE_GC_VALUE_FLAGS: [&str; 6] = [
+    "--db",
+    "--profile",
+    "--batch-size",
+    "--max-batches",
+    "--history-retain-lsns",
+    "--commit-log-retain-lsns",
+];
+
+fn ensure_known_gc_args(args: &[String]) -> Result<(), CliError> {
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        if arg == "--dry-run" {
+            index += 1;
+        } else if MAINTENANCE_GC_VALUE_FLAGS.contains(&arg.as_str()) {
+            match args.get(index + 1) {
+                Some(value) if !value.starts_with("--") => index += 2,
+                _ => return Err(CliError::Usage(format!("{arg} requires a value"))),
+            }
+        } else {
+            return Err(CliError::Usage(format!(
+                "unknown maintenance gc argument {arg}\n{MAINTENANCE_USAGE}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn history_gc_options(args: &[String]) -> Result<HistoryGcOptions, CliError> {
+    ensure_known_gc_args(args)?;
+    let defaults = HistoryGcOptions::default();
+    let batch_size = optional_value(args, "--batch-size")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --batch-size: {error}")))?
+        .unwrap_or(defaults.batch_size);
+    let max_batches = optional_value(args, "--max-batches")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --max-batches: {error}")))?;
+    if max_batches == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --max-batches: must be at least 1".to_owned(),
+        ));
+    }
+    let mvcc_retain_lsns = optional_value(args, "--history-retain-lsns")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --history-retain-lsns: {error}")))?;
+    if mvcc_retain_lsns == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --history-retain-lsns: must be at least 1".to_owned(),
+        ));
+    }
+    let commit_log_retain_lsns = optional_value(args, "--commit-log-retain-lsns")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --commit-log-retain-lsns: {error}")))?;
+    if commit_log_retain_lsns == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --commit-log-retain-lsns: must be at least 1".to_owned(),
+        ));
+    }
+    Ok(HistoryGcOptions {
+        dry_run: has_flag(args, "--dry-run"),
+        batch_size,
+        max_batches,
+        mvcc_retain_lsns,
+        commit_log_retain_lsns,
+    })
+}
+
 fn run_serve(args: &[String]) -> Result<String, CliError> {
     if !args.is_empty() {
         return Err(CliError::Usage(
@@ -3171,8 +3285,10 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     }
 
     let config = serve_config_from_env()?;
-    let (database, spec_mode) = serve_database_with_spec_mode(&config)?;
-    let database = Arc::new(tokio::sync::Mutex::new(database));
+    let (mut database, spec_mode) = serve_database_with_spec_mode(&config)?;
+    apply_query_governor(&mut database, config.query_governor)?;
+    let max_concurrent_queries = database.performance_config().query.max_concurrent_queries;
+    let database = Arc::new(tokio::sync::RwLock::new(database));
 
     let mut admin_state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
         .with_admin_session_ttl_seconds(config.admin_session_ttl_seconds)
@@ -3198,7 +3314,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         4096,
         ScramCredential::from_password(&config.pg_password, 4096)?,
     );
-    let pg_config = NetworkConfig::new(tls, pg_auth);
+    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries);
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -3208,7 +3324,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
                 .await
                 .map_err(CliError::Runtime)?;
         }
-        if !admin_state.is_admin_auth_configured() {
+        if !admin_state.is_admin_auth_configured().await {
             return Err(CliError::Usage(
                 "multidb serve requires MULTIDB_ADMIN_PASSWORD(_FILE), \
                  MULTIDB_ADMIN_TOKEN(_FILE), or an existing stored admin credential"
@@ -3591,7 +3707,7 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     "pass --insecure-local-admin only for loopback development binds".to_owned(),
                 ));
             }
-            let database = Arc::new(tokio::sync::Mutex::new(database));
+            let database = Arc::new(tokio::sync::RwLock::new(database));
             let mut state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
                 .with_admin_session_ttl_seconds(admin_session_ttl_seconds)
                 .with_admin_login_rate_limit(admin_login_rate_limit);
@@ -3612,7 +3728,7 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                             std::io::Error::other(format!("admin password: {error}"))
                         })?;
                 }
-                if !state.is_admin_auth_configured() {
+                if !state.is_admin_auth_configured().await {
                     return Err(std::io::Error::other(
                         "admin serve requires --admin-password, \
                          MULTIDB_ADMIN_PASSWORD(_FILE), --admin-token, \
@@ -4480,6 +4596,14 @@ fn flatten_serve_task(
     }
 }
 
+/// Runs at most as many `PostgreSQL` wire statements as the query governor admits,
+/// so a burst waits for a free statement slot instead of failing the governor queue timeout.
+fn serve_pg_config(tls: TlsMode, auth: AuthConfig, max_concurrent_queries: usize) -> NetworkConfig {
+    let config = NetworkConfig::new(tls, auth);
+    let max_blocking_tasks = config.max_blocking_tasks.min(max_concurrent_queries.max(1));
+    config.with_max_blocking_tasks(max_blocking_tasks)
+}
+
 fn serve_config_from_env() -> Result<ServeConfig, CliError> {
     serve_config_from_sources(|name| env::var(name).ok())
 }
@@ -4528,6 +4652,18 @@ where
     ));
     let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
     let spec = serve_spec_from_sources(&get_env)?;
+    let query_governor = ServeQueryGovernor {
+        max_concurrent_queries: bounded_positive_from_sources(
+            &get_env,
+            "MULTIDB_MAX_CONCURRENT_QUERIES",
+            MAX_SERVE_CONCURRENT_QUERIES,
+        )?,
+        queue_timeout_ms: bounded_positive_from_sources(
+            &get_env,
+            "MULTIDB_QUERY_QUEUE_TIMEOUT_MS",
+            MAX_SERVE_QUERY_QUEUE_TIMEOUT_MS,
+        )?,
+    };
 
     Ok(ServeConfig {
         admin_bind,
@@ -4544,7 +4680,48 @@ where
         pg_tls,
         studio_dir,
         spec,
+        query_governor,
     })
+}
+
+/// Reads an optional integer from 1 to `max`; any other set value fails startup.
+fn bounded_positive_from_sources<F, T>(
+    get_env: &F,
+    name: &str,
+    max: T,
+) -> Result<Option<T>, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+    T: Copy + PartialOrd + From<u8> + std::str::FromStr + std::fmt::Display,
+{
+    let Some(value) = get_env(name).filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match value.trim().parse::<T>() {
+        Ok(parsed) if parsed >= T::from(1) && parsed <= max => Ok(Some(parsed)),
+        _ => Err(CliError::Usage(format!(
+            "invalid {name} {value}; expected an integer from 1 to {max}"
+        ))),
+    }
+}
+
+/// Applies the `multidb serve` query governor overrides before the database is shared.
+fn apply_query_governor(
+    database: &mut multidb::db::Database,
+    governor: ServeQueryGovernor,
+) -> Result<(), CliError> {
+    if governor == ServeQueryGovernor::default() {
+        return Ok(());
+    }
+    let defaults = &database.performance_config().query;
+    let max_concurrent_queries = governor
+        .max_concurrent_queries
+        .unwrap_or(defaults.max_concurrent_queries);
+    let queue_timeout_ms = governor
+        .queue_timeout_ms
+        .unwrap_or(defaults.queue_timeout_ms);
+    database.set_query_governor(max_concurrent_queries, queue_timeout_ms)?;
+    Ok(())
 }
 
 /// Spec mode: `MULTIDB_SPEC_PATH`, `MULTIDB_SPEC_APPLY` (`verify` by default, `create` or
@@ -5065,6 +5242,7 @@ fn usage() -> CliError {
          multidb admin status --db <path> --profile <profile>\n\
          multidb admin serve --db <path> --profile <profile> [--bind <addr>] [--admin-password <password>|--admin-password-file <path>|--admin-token <token>|--insecure-local-admin]\n\
          multidb migrate value-codec --db <path> --profile <profile>\n\
+         multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]\n\
          <profile> on --profile and MULTIDB_PROFILE: a storage profile (InMemory, Transactional, Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product slug or alias from multidb profile list (snake or kebab case), or auto to read an existing database (not accepted by restore)\n\
          --override takes a knob path from multidb profile knobs; repeat it or separate assignments with commas\n\
          config plan|apply|drift --spec provision the database at --db, else at the spec storage_path relative to the spec file; exit 0 ready, applied or in sync, 1 runtime error, locked database or partial apply, 2 invalid, blocked, flags or confirmation missing, 3 drift, 4 plan changed"
@@ -5079,9 +5257,9 @@ mod tests {
     #[cfg(unix)]
     use super::write_through_temp_file;
     use super::{
-        CliError, ProfileSelection, ServePgTls, ServeSpecConfig, cli_db_config,
-        format_metadata_probe, parse_profile_selection, run, serve_config_from_sources,
-        serve_database, values,
+        CliError, ProfileSelection, ServePgTls, ServeQueryGovernor, ServeSpecConfig,
+        apply_query_governor, cli_db_config, format_metadata_probe, parse_profile_selection, run,
+        serve_config_from_sources, serve_database, serve_pg_config, values,
     };
     use multidb::{
         backup::{
@@ -5099,6 +5277,7 @@ mod tests {
             ReplicationKind, create_database, create_database_with_profile,
             inspect_database_metadata, open_database,
         },
+        network::{AuthConfig, NetworkConfig, ScramCredential, TlsMode},
         tuning::WorkloadSample,
     };
     use serde_json::{Value, json};
@@ -5225,6 +5404,189 @@ mod tests {
         assert_eq!(config.admin_login_rate_limit.max_failures, 1);
         assert_eq!(config.admin_login_rate_limit.window_seconds, 2);
         assert_eq!(config.admin_login_rate_limit.lockout_seconds, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_config_caps_statements_at_the_query_governor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let default_tasks =
+            NetworkConfig::new(TlsMode::DisabledForTests, auth.clone()).max_blocking_tasks;
+
+        let small = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 4);
+        assert_eq!(small.max_blocking_tasks, 4);
+        let zero = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 0);
+        assert_eq!(zero.max_blocking_tasks, 1);
+        let large = serve_pg_config(TlsMode::DisabledForTests, auth, default_tasks + 64);
+        assert_eq!(large.max_blocking_tasks, default_tasks);
+        Ok(())
+    }
+
+    fn local_dev_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+        ]);
+        env.extend(env_map(extra));
+        env
+    }
+
+    #[test]
+    fn serve_config_parses_query_governor_limits() -> Result<(), Box<dyn std::error::Error>> {
+        let env = local_dev_env(&[]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(config.query_governor, ServeQueryGovernor::default());
+
+        let env = local_dev_env(&[
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "8"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", " 2500 "),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(
+            config.query_governor,
+            ServeQueryGovernor {
+                max_concurrent_queries: Some(8),
+                queue_timeout_ms: Some(2_500),
+            }
+        );
+
+        let env = local_dev_env(&[
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "4096"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "60000"),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(config.query_governor.max_concurrent_queries, Some(4_096));
+        assert_eq!(config.query_governor.queue_timeout_ms, Some(60_000));
+        Ok(())
+    }
+
+    #[test]
+    fn serve_config_rejects_invalid_query_governor_limits() {
+        for (name, value) in [
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "0"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "-1"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "4097"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "many"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "0"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "60001"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "1.5"),
+        ] {
+            let env = local_dev_env(&[(name, value)]);
+            let error = serve_config_from_sources(|name| env.get(name).cloned());
+            assert!(
+                matches!(error, Err(CliError::Usage(ref message)) if message.contains(name)),
+                "{name}={value}: unexpected result {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_governor_overrides_apply_to_database_and_pg_wire_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let defaults = database.performance_config().query.clone();
+
+        apply_query_governor(&mut database, ServeQueryGovernor::default())?;
+        assert_eq!(database.performance_config().query, defaults);
+
+        apply_query_governor(
+            &mut database,
+            ServeQueryGovernor {
+                max_concurrent_queries: None,
+                queue_timeout_ms: Some(250),
+            },
+        )?;
+        let query = &database.performance_config().query;
+        assert_eq!(
+            query.max_concurrent_queries,
+            defaults.max_concurrent_queries
+        );
+        assert_eq!(query.queue_timeout_ms, 250);
+
+        apply_query_governor(
+            &mut database,
+            ServeQueryGovernor {
+                max_concurrent_queries: Some(3),
+                queue_timeout_ms: None,
+            },
+        )?;
+        let query = &database.performance_config().query;
+        assert_eq!(query.max_concurrent_queries, 3);
+        assert_eq!(query.queue_timeout_ms, 250);
+
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let pg_config = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth,
+            database.performance_config().query.max_concurrent_queries,
+        );
+        assert_eq!(pg_config.max_blocking_tasks, 3);
+        Ok(())
+    }
+
+    /// `serve` opens a profile-manifest database through the manifest openers and applies the
+    /// query governor overrides on top: unset, the manifest's governor knobs stay; set, only
+    /// those two change, for the process only, and the manifest's parser limits stay.
+    #[test]
+    fn serve_query_governor_overrides_a_profile_manifest_for_the_process_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("serve.redb");
+        let overrides = serde_json::from_value(json!({
+            "query": {
+                "max_concurrent_queries": 6,
+                "queue_timeout_ms": 900,
+                "max_sql_bytes": 2048
+            }
+        }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with query overrides must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(db_path.clone()))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::default(),
+        )?);
+
+        let db_arg = path_arg(&db_path);
+        let serve_env = |extra: &[(&str, &str)]| {
+            let mut env =
+                local_dev_env(&[("MULTIDB_PROFILE", "auto"), ("MULTIDB_DB_PATH", &db_arg)]);
+            env.extend(env_map(extra));
+            env
+        };
+        let env = serve_env(&[]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        drop(database);
+
+        let env = serve_env(&[("MULTIDB_MAX_CONCURRENT_QUERIES", "3")]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        let mut expected = binding.performance.clone();
+        expected.query.max_concurrent_queries = 3;
+        assert_eq!(database.performance_config(), &expected);
+        assert_eq!(database.performance_config().query.queue_timeout_ms, 900);
+        assert_eq!(database.performance_config().query.max_sql_bytes, 2_048);
+        drop(database);
+
+        let reopened = open_database(binding.db_config.clone())?;
+        assert_eq!(reopened.performance_config(), &binding.performance);
         Ok(())
     }
 
@@ -6659,7 +7021,7 @@ mod tests {
         assert_eq!(commit["timing"], "creation");
         assert_eq!(
             knob_row(&report, "limits.max_value_bytes")?["enforcement"]["planned"]["tracking"],
-            "single write pipeline"
+            "write pipeline limit check"
         );
 
         let text = run(strings(&["profile", "show", "high_durability"]))?;
@@ -8404,6 +8766,89 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_gc_dry_run_and_prune_report_json() -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::{
+            db::open_database,
+            repl::{Op, ReadConsistency, Replication},
+        };
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("maintenance.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        for value in 0..5_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: vec![value],
+            })?;
+        }
+        drop(database);
+        let gc_args = |extra: &[&str]| {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "gc".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let dry_run = run(gc_args(&["--dry-run"]))?;
+        assert_eq!(dry_run.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&dry_run.message)?;
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["mvcc_versions_pruned"], 0);
+        assert!(
+            report["pending_commits"]
+                .as_u64()
+                .is_some_and(|pending| pending > 0)
+        );
+
+        let pruned = run(gc_args(&["--batch-size", "2"]))?;
+        assert_eq!(pruned.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&pruned.message)?;
+        assert_eq!(report["dry_run"], false);
+        assert!(
+            report["mvcc_versions_pruned"]
+                .as_u64()
+                .is_some_and(|count| count >= 4)
+        );
+        assert_eq!(report["complete"], true);
+
+        let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        assert_eq!(
+            reopened.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(vec![4])
+        );
+        drop(reopened);
+
+        let mut bogus = gc_args(&[]);
+        bogus[1] = "bogus".to_owned();
+        for args in [
+            gc_args(&["--commit-log-retain-lsns", "0"]),
+            gc_args(&["--history-retain-lsns", "0"]),
+            gc_args(&["--history-retain-lsns", "-1"]),
+            gc_args(&["--max-batches", "0"]),
+            gc_args(&["--batch-size", "abc"]),
+            gc_args(&["--history-retain-lsns"]),
+            gc_args(&["--history-retain-lsns", "--dry-run"]),
+            gc_args(&["--history-retain-lsn", "100"]),
+            gc_args(&["--dryrun"]),
+            bogus,
+        ] {
+            let result = run(args);
+            assert!(
+                matches!(result, Err(CliError::Usage(_))),
+                "unexpected result: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn config_spec_flags_parse_and_never_mix_with_the_v1_plan_flow()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -9244,6 +9689,146 @@ mod tests {
         let (database, spec_mode) = super::serve_database_with_spec_mode(&plain)?;
         drop(database);
         assert_eq!(spec_mode, None);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_gc_history_retain_lsns_keeps_recent_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::repl::{Op, Replication};
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("retain.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        for value in 0..6_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: vec![value],
+            })?;
+        }
+        drop(database);
+        let gc_args = |extra: &[&str]| {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "gc".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let retained = run(gc_args(&["--history-retain-lsns", "3"]))?;
+        assert_eq!(retained.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&retained.message)?;
+        let current = report["current_lsn"]
+            .as_u64()
+            .ok_or("missing current_lsn")?;
+        assert_eq!(report["watermark"].as_u64(), Some(current - 2));
+        assert_eq!(report["history_horizon"].as_u64(), Some(current - 2));
+        assert_eq!(report["limited_by"], "MvccRetainLsns");
+        assert!(report["note"].is_null());
+
+        let default = run(gc_args(&["--dry-run"]))?;
+        let report = serde_json::from_str::<serde_json::Value>(&default.message)?;
+        assert_eq!(report["limited_by"], "CurrentLsn");
+        assert!(
+            report["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("--history-retain-lsns"))
+        );
+
+        let Err(CliError::Usage(help)) = run(vec!["maintenance".to_owned()]) else {
+            return Err("maintenance without a command should print its usage".into());
+        };
+        for expected in [
+            "--history-retain-lsns",
+            "AS OF history",
+            "new full backup",
+            "serve",
+        ] {
+            assert!(help.contains(expected), "{expected} missing from {help}");
+        }
+        Ok(())
+    }
+
+    /// `maintenance gc` opens a profile-manifest database like every other opener: a
+    /// `--profile` whose storage profile differs from the database is refused before anything
+    /// is pruned, `auto` and a product slug open it with the persisted manifest, and GC prunes
+    /// the zstd-framed MVCC history it decodes without breaking the framed values.
+    #[test]
+    fn maintenance_gc_opens_profile_manifest_databases_like_every_opener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::repl::{Op, ReadConsistency, Replication};
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("framed.redb");
+        let overrides = serde_json::from_value(
+            json!({ "compression": { "algorithm": "zstd", "min_bytes": 64 } }),
+        )?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with zstd must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(db_path.clone()))?;
+        assert!(binding.manifest.storage_format.value_framing);
+        let value = |version: u8| vec![version; 512];
+        let database = create_database_with_profile(&binding, OperationalConfig::default())?;
+        for version in 0..5_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: value(version),
+            })?;
+        }
+        drop(database);
+        let gc = |profile: &str, extra: &[&str]| {
+            let mut args = strings(&["maintenance", "gc", "--db"]);
+            args.push(path_arg(&db_path));
+            args.extend(strings(&["--profile", profile]));
+            args.extend(strings(extra));
+            run(args)
+        };
+
+        let refused = gc("balanced", &["--history-retain-lsns", "1"]);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::Config(ConfigError::ProfileMismatch {
+                    expected: Profile::Balanced,
+                    found: Profile::HighDurability,
+                }))
+            ),
+            "{refused:?}"
+        );
+        let pending = json_message(&gc("auto", &["--dry-run"])?)?;
+        assert_eq!(pending["history_horizon"], 0);
+        assert!(
+            pending["pending_commits"]
+                .as_u64()
+                .is_some_and(|pending| pending > 0)
+        );
+
+        let pruned = json_message(&gc("high_durability", &["--history-retain-lsns", "1"])?)?;
+        assert!(
+            pruned["mvcc_versions_pruned"]
+                .as_u64()
+                .is_some_and(|count| count >= 4),
+            "{pruned}"
+        );
+        assert_eq!(pruned["complete"], true);
+        assert_eq!(pruned["history_horizon"], pruned["current_lsn"]);
+
+        let reopened = open_database(DbConfig::on_disk(Profile::HighDurability, &db_path))?;
+        assert_eq!(reopened.performance_config(), &binding.performance);
+        assert_eq!(
+            reopened.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(value(4))
+        );
         Ok(())
     }
 }

@@ -765,6 +765,47 @@ pub fn record_backup_verify(outcome: &str, latency: Duration) {
     }
 }
 
+pub fn record_history_gc(
+    outcome: &str,
+    latency: Duration,
+    batches: u64,
+    mvcc_versions_pruned: u64,
+    commit_log_records_pruned: u64,
+) {
+    let registry = global_registry();
+    if registry
+        .increment_counter("multidb_history_gc_runs_total", &[("outcome", outcome)], 1)
+        .is_err()
+    {
+        tracing::debug!("failed to record history gc run");
+    }
+    for (name, value) in [
+        ("multidb_history_gc_batches_total", batches),
+        (
+            "multidb_history_gc_mvcc_versions_pruned_total",
+            mvcc_versions_pruned,
+        ),
+        (
+            "multidb_history_gc_commit_log_records_pruned_total",
+            commit_log_records_pruned,
+        ),
+    ] {
+        if registry.increment_counter(name, &[], value).is_err() {
+            tracing::debug!("failed to record history gc counter");
+        }
+    }
+    if registry
+        .observe_histogram(
+            "multidb_history_gc_latency_seconds",
+            &[("outcome", outcome)],
+            duration_seconds(latency),
+        )
+        .is_err()
+    {
+        tracing::debug!("failed to record history gc latency");
+    }
+}
+
 pub fn record_cdc_events(count: usize) {
     if global_registry()
         .increment_counter(
@@ -880,6 +921,17 @@ pub fn record_hook_failure(kind: &str) {
     }
 }
 
+/// Counts an after-commit hook or after-trigger failure that happened after a
+/// durable commit (`stage` is `after_hook`, `after_trigger` or `unrecorded`).
+pub fn record_post_commit_failure(stage: &str) {
+    if global_registry()
+        .increment_counter("multidb_post_commit_failures_total", &[("stage", stage)], 1)
+        .is_err()
+    {
+        tracing::debug!("failed to record post-commit failure");
+    }
+}
+
 fn duration_seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
@@ -968,7 +1020,8 @@ mod tests {
     use super::{
         MetricsRegistry, record_audit_write, record_authz_denied, record_backup,
         record_backup_verify, record_cache_access, record_compression, record_group_commit,
-        record_network_query, record_parallel_scan, record_replication_operation, record_restore,
+        record_network_query, record_parallel_scan, record_post_commit_failure,
+        record_replication_operation, record_restore,
     };
     use crate::security::{Permission, Resource};
 
@@ -1039,6 +1092,7 @@ mod tests {
         );
         record_audit_write("ok");
         record_replication_operation("read", "ok");
+        record_post_commit_failure("after_hook");
 
         let output = super::global_registry()
             .render()
@@ -1048,6 +1102,7 @@ mod tests {
         assert!(output.contains("multidb_authz_denied_total"));
         assert!(output.contains("multidb_audit_writes_total"));
         assert!(output.contains("multidb_replication_operations_total"));
+        assert!(output.contains("multidb_post_commit_failures_total"));
     }
 
     #[test]
@@ -1080,5 +1135,20 @@ mod tests {
         assert!(output.contains("multidb_backup_total"));
         assert!(output.contains("multidb_restore_total"));
         assert!(output.contains("multidb_backup_verify_total"));
+    }
+
+    #[test]
+    fn history_gc_recorder_emits_expected_metric_names() {
+        super::record_history_gc("ok", std::time::Duration::from_millis(5), 2, 7, 3);
+
+        let output = super::global_registry()
+            .render()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(output.contains("multidb_history_gc_runs_total{outcome=\"ok\"}"));
+        assert!(output.contains("multidb_history_gc_batches_total"));
+        assert!(output.contains("multidb_history_gc_mvcc_versions_pruned_total"));
+        assert!(output.contains("multidb_history_gc_commit_log_records_pruned_total"));
+        assert!(output.contains("multidb_history_gc_latency_seconds"));
     }
 }

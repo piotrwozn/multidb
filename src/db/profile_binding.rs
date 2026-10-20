@@ -215,8 +215,11 @@ impl CompiledPolicy {
 /// Fails with `AlreadyInitialized` when the target already holds database metadata, with
 /// `Unsupported` when `ops.performance` is set, with `ProfileFloorNotMet` when `ops` does not
 /// meet a floor, with `ProfileManifestInvalid` when the binding is inconsistent, and as
-/// `create_database_with_ops` otherwise. Nothing is created when it fails before the metadata
-/// write.
+/// `create_database_with_ops` otherwise. No database metadata is written when it fails before
+/// the metadata write, but the database file itself may already exist: the checks of `ops` and
+/// the binding run before the engine is built and create nothing, while the engine creates the
+/// redb file before it loads encryption key material, so a missing KEK or key file fails after
+/// the file exists.
 pub fn create_database_with_profile(
     binding: &RuntimeProfileBinding,
     ops: OperationalConfig,

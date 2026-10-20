@@ -249,6 +249,23 @@ Consistency status:
   cloud KMS/HSM and enterprise SLA are outside preview scope.
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
+- Workload-profiler statistics (`system.workload`, index advice and the Runtime
+  Advisor) are advisory. They are buffered in memory and flushed in batches;
+  the 10-second age trigger is checked on the next statement, not by a
+  background task. Samples buffered since the last flush are lost on crash or
+  when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
+  AP and sharded databases do not flush on drop.
+- `multidb serve` runs statements concurrently, but catalog changes and
+  security updates take an exclusive database lock, so a long statement or
+  `/catalog` scan delays them and the requests queued behind them. The query
+  governor defaults to 4 x CPUs concurrent statements and a 100 ms queue;
+  `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` change
+  it for `multidb serve` but not for `multidb admin serve`. `/catalog` row
+  counts still read every row. Under steady commit traffic, filtered columnar
+  scans often skip zone-map pruning and decode every segment. Each columnar
+  `INSERT` rewrites the whole table, so
+  concurrent inserts into one columnar table retry and effectively run one at
+  a time.
 - Time-series retention follows the server wall clock and is enforced at chunk
   granularity only when a series receives a write, so idle series keep expired
   chunks until their next write. Points more than `max_future_skew_millis`
@@ -260,6 +277,9 @@ Consistency status:
   background task. Samples buffered since the last flush are lost on crash or
   when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
   AP and sharded databases do not flush on drop.
+- History GC (`multidb maintenance gc`) is manual and offline; `multidb serve`
+  does not run it online or in the background yet. Commit-log truncation
+  requires a new full backup afterwards.
 
 ## Migration Guide
 

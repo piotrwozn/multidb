@@ -328,7 +328,8 @@ pub struct HistoryOverrides {
     pub system_versioning: Option<SystemVersioningKnob>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_history: Option<bool>,
-    /// Reserved until MVCC and commit-log GC give it a runtime sink.
+    /// Reserved: history GC is manual (`multidb maintenance gc`) and retains a number of LSNs,
+    /// not a duration, so this duration knob has no runtime sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mvcc_retention_millis: Option<u64>,
 }
@@ -1085,8 +1086,8 @@ fn limit_not_enforced(path: &str) -> ValidationIssue {
         ValidationSeverity::Error,
         format!("{KNOB_PATH_PREFIX}.{path}"),
         format!(
-            "{path} is planned but not enforced: no user write path checks it until the single \
-             write pipeline lands"
+            "{path} is planned but not enforced: only unlimited is accepted because the write \
+             pipeline does not check it yet"
         ),
         format!("Remove {path} or set it to unlimited."),
         CertificationImpact::BlocksCertified,

@@ -2617,8 +2617,10 @@ const EVERY_OPEN_OUTCOME: &str = "persisted in __meta.profile_manifest and appli
 const NOT_CONFIGURABLE: &[(&str, &str)] = &[
     (
         "mvcc_retention",
-        "MVCC and commit-log retention are not profile knobs; history.mvcc_retention_millis is \
-         reserved until MVCC and commit-log GC lands.",
+        "MVCC and commit-log retention are not profile knobs: history GC runs only through \
+         multidb maintenance gc (Database::gc_history), which takes its retention per run \
+         (--history-retain-lsns, --commit-log-retain-lsns); history.mvcc_retention_millis is \
+         reserved.",
     ),
     (
         "cache_ttl",

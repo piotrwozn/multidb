@@ -68,6 +68,16 @@ Environment:
 | `MULTIDB_SPEC_PATH` | no | unset | Spec mode (preview): the `DatabaseSpec` the database is built from and checked against at every start; see [Spec mode](#spec-mode). |
 | `MULTIDB_SPEC_APPLY` | no | `verify` | Spec mode only: `verify`, `create` or `additive`. Set without `MULTIDB_SPEC_PATH`, it is a usage error. |
 | `MULTIDB_REPLICATION` | no | unset | Read in spec mode only (`cp` or `ap`), where it must agree with the spec; ignored otherwise. |
+| `MULTIDB_MAX_CONCURRENT_QUERIES` | no | 4 x available CPUs | Statements the query governor runs at once, `1` to `4096`. PostgreSQL wire admits at most this many statements, and never more than 32, at a time. |
+| `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` | no | `100` | How long a statement waits for a free governor slot before it fails as busy, `1` to `60000`. |
+
+`MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` must be
+whole numbers in their range; any other non-empty value stops `multidb serve`
+at startup instead of falling back to the default. An empty value counts as
+unset and uses the default. For a database created with a custom profile the
+default is its profile manifest's `query.max_concurrent_queries` and
+`query.queue_timeout_ms` (see [Profiles](profiles.md)); a set value applies to
+that `serve` process only and is never written to the database.
 
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.
@@ -205,6 +215,49 @@ Control Plane login limits:
   logins for other usernames are recorded up to 20x
   `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` per window, followed by one
   `login_audit_coalesced` event.
+
+## Concurrency
+
+- One database is shared between PostgreSQL wire and the Control Plane
+  through a reader-writer lock. Statements and Control Plane data, catalog,
+  audit and advice reads run concurrently.
+- `/builder/*` and `/security` updates take an exclusive lock. They wait for
+  running statements, and new requests wait behind them. Admin login and
+  password change take it only when the bootstrap `admin` role or principal
+  is missing or was changed, for example by a `/security` update.
+- Admin login and password change read the stored credential under the
+  shared lock and release it before the Argon2id password check, which runs on
+  the blocking pool, so a check in progress never delays `/builder/*` or
+  `/security` updates. Password checks have their own concurrency limit,
+  separate from the query governor; see the login limits above.
+- By default at most 4 x available CPUs statements execute at once; a
+  container CPU limit lowers that number. `MULTIDB_MAX_CONCURRENT_QUERIES`
+  overrides it. PostgreSQL wire admits up to that many statements, and never
+  more than 32, and queues the rest. A statement that still finds no free
+  slot, for example because Control Plane `/sql` requests hold them, waits
+  `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` (100 ms by default) and then fails with
+  SQLSTATE 53200. Nothing ran, so it can be retried as is. The Control Plane
+  returns such failures as HTTP 503 with error code `busy` and
+  `Retry-After: 1`.
+- A plain `INSERT` that races another insert of the same primary key fails
+  with SQLSTATE 23505. `INSERT ... ON CONFLICT` and inserts into columnar
+  tables (the `analytical` profile) retry internally when another statement
+  commits first, and fail with SQLSTATE 40001 if 64 retries also conflict;
+  retry those. A columnar insert rewrites the whole table, so inserts into one
+  columnar table effectively run one at a time. Control Plane single-row,
+  single-document and time-series point writes also retry conflicts
+  internally. The Control Plane returns a conflict that outlasts the retries
+  as HTTP 409 with error code `conflict`. Retry single-statement requests; a
+  multi-statement `/sql` body runs its statements one after another without a
+  transaction, so statements before the conflicting one have already
+  committed.
+- A statement keeps running after its client disconnects, over PostgreSQL wire
+  and Control Plane `/sql` alike, until it finishes. Exclusive requests queued
+  behind it wait until then. The 30 s query timeout applies only to `SELECT`s
+  that DataFusion executes, and cannot interrupt a storage scan in progress.
+  Single-table `SELECT`s with an equality filter and writes have no time
+  limit.
+- `/catalog` row counts still scan every table and collection.
 
 ## Smoke Test
 

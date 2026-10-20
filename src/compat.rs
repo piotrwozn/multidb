@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use sqlparser::ast::{Expr, ObjectName, Query, SelectItem, SetExpr, Statement};
 
 use crate::{
+    cdc::HookError,
     db::{CatalogEntry, DbConfig, DbError},
     model::Value,
     performance::QueryExecutionConfig,
@@ -216,7 +217,9 @@ pub fn sqlstate_for_db_error(error: &DbError) -> &'static str {
         DbError::CatalogObjectExists(_) => "42710",
         DbError::CatalogKindMismatch { .. } => "42809",
         DbError::Storage(error) => sqlstate_for_storage(error),
-        DbError::Repl(error) => sqlstate_for_repl(error),
+        DbError::Repl(error) | DbError::Hook(HookError::Repl(error)) => sqlstate_for_repl(error),
+        DbError::Hook(HookError::Rejected(_) | HookError::Timeout(_)) => "P0001",
+        DbError::Hook(HookError::InvalidTarget(_)) => "42704",
         DbError::Query(error) => sqlstate_for_query(error),
         DbError::Config(_) => "08004",
         _ => "XX000",
@@ -228,7 +231,7 @@ pub fn sqlstate_for_query(error: &QueryError) -> &'static str {
     match error {
         QueryError::Parse(_) | QueryError::InputLimit(_) => "42601",
         QueryError::Timeout(_) | QueryError::Cancelled(_) => "57014",
-        QueryError::ResourceLimit(_) => "53200",
+        QueryError::ResourceLimit(_) | QueryError::Busy(_) => "53200",
         QueryError::Unsupported(_) => "0A000",
         QueryError::InvalidSchema(_) | QueryError::InvalidRow(_) | QueryError::InvalidValue(_) => {
             "22023"
@@ -248,6 +251,7 @@ pub fn sqlstate_for_repl(error: &ReplError) -> &'static str {
         ReplError::Conflict | ReplError::Storage(StorageError::Conflict) => "40001",
         ReplError::NoQuorum | ReplError::Transport(_) => "08006",
         ReplError::Unsupported(_) => "0A000",
+        ReplError::Rejected(_) => "P0001",
         ReplError::QuotaExceeded { .. } => "53100",
         ReplError::Storage(error) => sqlstate_for_storage(error),
     }
@@ -578,13 +582,16 @@ fn stable_oid(name: &str) -> i64 {
 mod tests {
     use super::{
         CatalogObject, CatalogObjectKind, PgCatalogSnapshot, SERVER_VERSION,
-        compat_sql_requirements, execute_compat_sql, sqlstate_for_query,
+        compat_sql_requirements, execute_compat_sql, sqlstate_for_db_error, sqlstate_for_query,
+        sqlstate_for_repl,
     };
     use crate::{
-        db::{DbConfig, Profile},
+        cdc::HookError,
+        db::{DbConfig, DbError, Profile},
         model::Value,
         performance::QueryExecutionConfig,
         query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
+        repl::ReplError,
     };
 
     #[test]
@@ -646,6 +653,27 @@ mod tests {
             sqlstate_for_query(&QueryError::MissingTable("users".to_owned())),
             "42P01"
         );
+        // Governor saturation keeps the SQLSTATE it had as a resource limit.
+        assert_eq!(
+            sqlstate_for_query(&QueryError::Busy("queue".to_owned())),
+            "53200"
+        );
+    }
+
+    #[test]
+    fn write_rejections_do_not_map_to_connection_failures() {
+        let rejected = ReplError::Rejected("before trigger audit rejected write".to_owned());
+        assert_eq!(sqlstate_for_repl(&rejected), "P0001");
+        assert_eq!(sqlstate_for_query(&QueryError::Repl(rejected)), "P0001");
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Hook(HookError::Rejected("denied".to_owned()))),
+            "P0001"
+        );
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Hook(HookError::Timeout("slow".to_owned()))),
+            "P0001"
+        );
+        assert_eq!(sqlstate_for_repl(&ReplError::NoQuorum), "08006");
     }
 
     #[test]

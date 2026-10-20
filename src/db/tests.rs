@@ -23,17 +23,18 @@ use super::{
 };
 use crate::cdc::{
     AggregateKind, AggregateSpec, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
-    HOOK_DELIVERIES_TABLE, HookAction, HookSpec, HookTarget, MaterializedViewError,
-    MaterializedViewSpec, ResumeToken, SubscriptionConfig,
+    FAIL_AFTER_HOOK_FOR_TESTS, HOOK_DELIVERIES_TABLE, HookAction, HookError, HookSpec, HookTarget,
+    MaterializedViewError, MaterializedViewSpec, PostCommitStage, ResumeToken, SubscriptionConfig,
 };
-use crate::cloud::ObjectStoreUri;
+use crate::cloud::{ObjectStoreUri, TenantConfig, TenantQuota};
 use crate::config_spec::{
     ApplyStatus, ConsistencyMode, DatabaseSpec, DeploymentMode, MigrationPlanner, PolicyCompiler,
     ProfileKnobOverrides, ResolvedProfileKind, resolve_named_profile,
     spec_io::{SpecFormat, decode_spec_bytes},
 };
 use crate::continuous::{
-    ContinuousQuerySpec, OutboxConnectorSpec, OutboxSink, TriggerEvent, TriggerSpec, TriggerTiming,
+    ContinuousQuerySpec, OutboxConnectorSpec, OutboxSink, ProcedureSpec, TriggerEvent, TriggerSpec,
+    TriggerTiming,
 };
 use crate::extension::{
     AbiVersion, ExtensionError, LimitPolicy, MaskingPolicy, PolicyConfig, UdfBudget,
@@ -53,7 +54,8 @@ use crate::provision::{
     ProvisionActor, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus, RECORD_VERSION,
 };
 use crate::query::{
-    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint, REL_ROWS_TABLE,
+    ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint,
+    REL_COLUMNAR_SEGMENT_META_TABLE, REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE,
     RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
@@ -66,7 +68,7 @@ use crate::security::{
     PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{
-    EngineKind, ReadTransaction, RedbEngine, StorageEngine, StorageError, WriteTransaction,
+    Bytes, EngineKind, ReadTransaction, RedbEngine, StorageEngine, StorageError, WriteTransaction,
     decode_stored_value,
 };
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
@@ -4183,6 +4185,294 @@ fn transaction_with_retry_does_not_lose_concurrent_increments()
 }
 
 #[test]
+fn concurrent_vector_inserts_stay_in_the_in_memory_index() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_vector_collection(
+        "embeddings",
+        VectorCollectionConfig::new(CollectionId::new(93), 2).with_metric(VectorMetric::L2),
+    )?;
+
+    let database = Arc::new(database);
+    let mut handles = Vec::new();
+    for worker in 0..8_u16 {
+        let database = Arc::clone(&database);
+        handles.push(thread::spawn(move || {
+            let mut ids = Vec::new();
+            for index in 0..32_u16 {
+                // Reopening per insert exercises first-open and resize rebuilds.
+                let vectors = database
+                    .vector_collection("embeddings")
+                    .map_err(|error| error.to_string())?;
+                let id = vectors
+                    .insert_vector(
+                        &Value::Int(i64::from(index)),
+                        vec![f32::from(worker) + 1.0, f32::from(index) + 1.0],
+                    )
+                    .map_err(|error| error.to_string())?;
+                ids.push(id);
+            }
+            Ok::<_, String>(ids)
+        }));
+    }
+
+    let mut inserted = BTreeSet::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => inserted.extend(result.map_err(io::Error::other)?),
+            Err(_) => return Err(io::Error::other("vector insert thread panicked").into()),
+        }
+    }
+    assert_eq!(inserted.len(), 256);
+
+    let hits = database
+        .vector_collection("embeddings")?
+        .knn(&[0.0, 0.0], 256)?;
+    let found = hits.iter().map(|hit| hit.id).collect::<BTreeSet<_>>();
+    assert_eq!(hits.len(), 256);
+    assert_eq!(found, inserted);
+
+    Ok(())
+}
+
+/// Runs `sql` from several threads at once, each on its own runtime, as `PostgreSQL`
+/// wire does. Returns, per thread, the indexes of the statements that completed;
+/// statements that still conflict after every retry are skipped.
+fn run_concurrent_statements(
+    database: &Arc<Database>,
+    workers: i64,
+    statements: i64,
+    sql: impl Fn(i64, i64) -> String + Send + Sync + 'static,
+) -> Result<Vec<Vec<i64>>, Box<dyn std::error::Error>> {
+    let sql = Arc::new(sql);
+    let mut handles = Vec::new();
+    for worker in 0..workers {
+        let database = Arc::clone(database);
+        let sql = Arc::clone(&sql);
+        handles.push(thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let mut completed = Vec::new();
+            for index in 0..statements {
+                let statement = sql(worker, index);
+                match runtime.block_on(database.query(&statement)) {
+                    Ok(_) => completed.push(index),
+                    Err(error) if error.is_conflict() => {}
+                    Err(error) => return Err(format!("{statement}: {error}")),
+                }
+            }
+            Ok::<_, String>(completed)
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => results.push(result.map_err(io::Error::other)?),
+            Err(_) => return Err(io::Error::other("statement thread panicked").into()),
+        }
+    }
+    Ok(results)
+}
+
+#[test]
+fn concurrent_columnar_sql_inserts_keep_every_acknowledged_row()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("analytical-concurrent.redb");
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, path))?;
+    let sales = database.create_table("sales", Some(sales_schema()), Vec::new())?;
+    assert_eq!(sales.layout(), TableLayout::Columnar);
+
+    let database = Arc::new(database);
+    let results = run_concurrent_statements(&database, 4, 16, |worker, index| {
+        let id = worker * 100 + index;
+        format!("INSERT INTO sales VALUES ({id}, 'c{worker}', 1.5)")
+    })?;
+
+    let mut acknowledged = BTreeSet::new();
+    for (worker, completed) in (0_i64..).zip(&results) {
+        acknowledged.extend(completed.iter().map(|index| worker * 100 + index));
+    }
+    let stored = database
+        .table("sales")?
+        .scan()?
+        .into_iter()
+        .filter_map(|row| match row.first() {
+            Some(Value::Int(id)) => Some(*id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    // Every insert commits within its retries, and none is lost.
+    assert_eq!(acknowledged.len(), 64);
+    assert_eq!(stored, acknowledged);
+
+    Ok(())
+}
+
+#[test]
+fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let counters = database.create_table("counters", Some(counter_schema()), Vec::new())?;
+    counters.insert(vec![Value::Int(1), Value::Int(-1)])?;
+
+    let database = Arc::new(database);
+    let results = run_concurrent_statements(&database, 4, 16, |worker, index| {
+        if index % 2 == 0 {
+            format!(
+                "INSERT INTO counters (id, value) VALUES (1, {worker}) \
+                 ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value"
+            )
+        } else {
+            format!(
+                "INSERT INTO counters (id, value) VALUES ({}, {worker}) \
+                 ON CONFLICT (id) DO NOTHING",
+                100 + index
+            )
+        }
+    })?;
+
+    // DO NOTHING succeeds once it sees the row the winning statement inserted.
+    for completed in &results {
+        assert!((1..16).step_by(2).all(|index| completed.contains(&index)));
+    }
+    let rows = database.table("counters")?.scan()?;
+    assert_eq!(rows.len(), 9);
+    assert!(matches!(
+        rows.first().and_then(|row| row.get(1)),
+        Some(Value::Int(0..=3))
+    ));
+
+    // Plain INSERTs of one new key from several threads: all but one report the
+    // duplicate primary key. query::tests covers the lost-race path
+    // deterministically.
+    let results = run_concurrent_statements(&database, 4, 1, |worker, _| {
+        format!("INSERT INTO counters (id, value) VALUES (500, {worker})")
+    });
+    let message = match results {
+        Ok(_) => String::new(),
+        Err(error) => error.to_string(),
+    };
+    assert!(message.contains("duplicate primary key"), "{message}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_governor_limits_are_settable_and_a_full_queue_is_busy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("counters", Some(counter_schema()), Vec::new())?;
+    let defaults = database.performance_config().query.clone();
+    assert!(matches!(
+        database.set_query_governor(0, 10),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert!(matches!(
+        database.set_query_governor(1, 0),
+        Err(ConfigError::Unsupported(_))
+    ));
+    assert_eq!(database.performance_config().query, defaults);
+
+    database.set_query_governor(1, 10)?;
+    assert_eq!(
+        database.performance_config().query.max_concurrent_queries,
+        1
+    );
+    assert_eq!(database.performance_config().query.queue_timeout_ms, 10);
+
+    // Hold the only slot, as a running statement would.
+    let slot = Arc::clone(&database.query_permits).acquire_owned().await?;
+    let error = match database.query("SELECT id FROM counters").await {
+        Ok(output) => return Err(format!("expected a busy governor, got {output:?}").into()),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, DbError::Query(QueryError::Busy(_))),
+        "{error}"
+    );
+    assert!(!error.is_conflict());
+    assert_eq!(crate::compat::sqlstate_for_db_error(&error), "53200");
+
+    drop(slot);
+    database.query("SELECT id FROM counters").await?;
+    Ok(())
+}
+
+#[test]
+fn bootstrap_admin_check_agrees_with_ensure() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let reader = Role::new("reader").grant(Resource::Database, Permission::Read);
+    database.set_authz_policy(AuthzPolicy::new([reader.clone()]));
+    database.set_principal_registry(
+        PrincipalRegistry::new().with_principal("ada", Principal::new("ada").with_role("reader")),
+    );
+    assert!(!database.has_bootstrap_admin_principal());
+
+    database.ensure_bootstrap_admin_principal()?;
+    assert!(database.has_bootstrap_admin_principal());
+    // Other roles and principals are kept.
+    assert_eq!(database.authz_policy().roles().get("reader"), Some(&reader));
+    assert!(
+        database
+            .principal_registry()
+            .principals()
+            .contains_key("ada")
+    );
+
+    // A narrowed admin role or a changed admin principal is not the bootstrap
+    // definition, and ensure() restores it.
+    let narrowed = Role::new("admin").grant(Resource::System, Permission::Admin);
+    database.set_authz_policy(database.authz_policy().clone().allow(narrowed));
+    assert!(!database.has_bootstrap_admin_principal());
+    database.ensure_bootstrap_admin_principal()?;
+    assert!(database.has_bootstrap_admin_principal());
+
+    let mut principals = database.principal_registry().clone();
+    principals.insert("admin", Principal::new("admin").with_role("reader"));
+    database.set_principal_registry(principals);
+    assert!(!database.has_bootstrap_admin_principal());
+    database.ensure_bootstrap_admin_principal()?;
+    assert!(database.has_bootstrap_admin_principal());
+
+    let (role, principal) = super::bootstrap_admin_identity();
+    assert!(
+        database
+            .authz_policy()
+            .authorize(&principal, &Resource::System, Permission::Admin)
+            .is_ok()
+    );
+    assert_eq!(
+        principal.roles().iter().collect::<Vec<_>>(),
+        vec![role.name()]
+    );
+    Ok(())
+}
+
+#[test]
+fn bootstrap_admin_principal_is_recognized_after_reopen() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = DbConfig::on_disk(
+        Profile::Transactional,
+        temp_dir.path().join("bootstrap-admin.redb"),
+    );
+    {
+        let mut database = create_database(config.clone())?;
+        database.ensure_bootstrap_admin_principal()?;
+    }
+    // The stored definition reads back equal, so once stored security state is
+    // loaded, login and change-password keep to the read guard instead of
+    // rewriting it.
+    let database = open_database_with_ops(config, &OperationalConfig::default())?;
+    assert!(database.has_bootstrap_admin_principal());
+    Ok(())
+}
+
+#[test]
 fn redb_committed_transaction_survives_reopen_and_rollback_does_not()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -4247,6 +4537,190 @@ fn analytical_transaction_rollback_does_not_write_columnar_segment()
     txn.rollback();
 
     assert_eq!(database.table("sales")?.scan()?, Vec::<Row>::new());
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_row_crud_keeps_rows_beyond_first_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-segments.redb"), 2_500)?;
+
+    let txn = database.begin_transaction()?;
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(1_500))?,
+        Some(sales_row(1_500))
+    );
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(2_400))?,
+        Some(sales_row(2_400))
+    );
+    txn.rollback();
+
+    database.transaction(|txn| txn.insert_row("sales", sales_row(2_500)))?;
+    assert_eq!(database.table("sales")?.scan()?.len(), 2_501);
+
+    let updated = vec![
+        Value::Int(1_500),
+        Value::Str("updated".to_owned()),
+        Value::Float(99.0),
+    ];
+    database.transaction(|txn| txn.update_row("sales", updated.clone()))?;
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(2_400)))?;
+    database.transaction_with_options(
+        txn::TxnOptions {
+            isolation: txn::IsolationLevel::Serializable,
+            ..txn::TxnOptions::default()
+        },
+        |txn| {
+            txn.get_row("sales", &Value::Int(2_499))?;
+            txn.update_row("sales", sales_row(2_499))
+        },
+    )?;
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_500);
+    assert_eq!(sales.get(&Value::Int(1_500))?, Some(updated));
+    assert_eq!(sales.get(&Value::Int(2_400))?, None);
+    for id in [1_100, 2_499, 2_500] {
+        assert_eq!(sales.get(&Value::Int(id))?, Some(sales_row(id)));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_rewrites_pending_columnar_segments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-pending.redb"), 2_048)?;
+
+    let mut txn = database.begin_transaction()?;
+    txn.insert_row("sales", sales_row(2_048))?;
+    assert_eq!(
+        txn.get_row("sales", &Value::Int(2_048))?,
+        Some(sales_row(2_048))
+    );
+    assert!(txn.get_row("sales", &Value::Int(1_500))?.is_some());
+    txn.delete_row("sales", &Value::Int(0))?;
+    txn.delete_row("sales", &Value::Int(1))?;
+    txn.commit()?;
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_047);
+    assert_eq!(sales.get(&Value::Int(0))?, None);
+    assert_eq!(sales.get(&Value::Int(1))?, None);
+    for id in [2_047, 2_048] {
+        assert_eq!(sales.get(&Value::Int(id))?, Some(sales_row(id)));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_conflicts_with_concurrent_columnar_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-conflict.redb"), 2_500)?;
+
+    let mut txn = database.begin_transaction()?;
+    assert!(txn.get_row("sales", &Value::Int(2_100))?.is_some());
+    database.table("sales")?.insert(sales_row(5_000))?;
+    txn.update_row(
+        "sales",
+        vec![
+            Value::Int(2_100),
+            Value::Str("changed".to_owned()),
+            Value::Float(1.0),
+        ],
+    )?;
+    assert!(matches!(
+        txn.commit(),
+        Err(DbError::Storage(StorageError::Conflict))
+    ));
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_501);
+    assert!(sales.get(&Value::Int(5_000))?.is_some());
+    assert_eq!(sales.get(&Value::Int(2_100))?, Some(sales_row(2_100)));
+
+    Ok(())
+}
+
+#[test]
+fn analytical_read_committed_transaction_keeps_rows_beyond_first_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = analytical_sales_database(
+        temp_dir.path().join("analytical-read-committed.redb"),
+        2_500,
+    )?;
+    let read_committed = || {
+        database.begin_transaction_with_options(txn::TxnOptions {
+            isolation: txn::IsolationLevel::ReadCommitted,
+            ..txn::TxnOptions::default()
+        })
+    };
+
+    let mut txn = read_committed()?;
+    assert!(txn.get_row("sales", &Value::Int(2_200))?.is_some());
+    txn.insert_row("sales", sales_row(5_001))?;
+    txn.commit()?;
+    assert_eq!(database.table("sales")?.scan()?.len(), 2_501);
+
+    // Read committed sees a concurrent commit in every segment, but rewriting
+    // segments that changed after the transaction began still conflicts.
+    let mut txn = read_committed()?;
+    database.table("sales")?.insert(sales_row(5_000))?;
+    assert!(txn.get_row("sales", &Value::Int(5_000))?.is_some());
+    txn.insert_row("sales", sales_row(5_002))?;
+    assert!(matches!(
+        txn.commit(),
+        Err(DbError::Storage(StorageError::Conflict))
+    ));
+
+    let sales = database.table("sales")?;
+    assert_eq!(sales.scan()?.len(), 2_502);
+    for id in [1_100, 2_200, 2_499, 5_000, 5_001] {
+        assert!(sales.get(&Value::Int(id))?.is_some(), "row {id} is missing");
+    }
+    assert_eq!(sales.get(&Value::Int(5_002))?, None);
+
+    Ok(())
+}
+
+#[test]
+fn analytical_transaction_deletes_committed_segments_it_no_longer_needs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database =
+        analytical_sales_database(temp_dir.path().join("analytical-shrink.redb"), 1_025)?;
+    let (start, end) = database.table("sales")?.columnar_segment_bounds();
+    let stored_keys = |table: &str| -> Result<Vec<Vec<u8>>, ReplError> {
+        Ok(database
+            .range(table, &start, &end, ReadConsistency::Strong)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    };
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?.len(), 2);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?.len(), 2);
+
+    // 1,024 rows fit one segment, so the committed second segment must go.
+    database.transaction(|txn| txn.delete_row("sales", &Value::Int(7)))?;
+
+    let expected = (0..1_025)
+        .filter(|id| *id != 7)
+        .map(sales_row)
+        .collect::<Vec<_>>();
+    assert_eq!(database.table("sales")?.scan()?, expected);
+    let segments = stored_keys(REL_COLUMNAR_SEGMENTS_TABLE)?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(stored_keys(REL_COLUMNAR_SEGMENT_META_TABLE)?, segments);
 
     Ok(())
 }
@@ -4673,6 +5147,622 @@ fn phase32_before_wasm_trigger_can_replace_transaction_row()
     Ok(())
 }
 
+#[tokio::test]
+async fn phase32_before_wasm_trigger_rejects_sql_and_table_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let created = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_insert",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("writer")
+        .grant(Resource::Table("accounts".to_owned()), Permission::Read)
+        .grant(Resource::Table("accounts".to_owned()), Permission::Write)]));
+    let writer = Principal::new("alice").with_role("writer");
+    let sql = "INSERT INTO accounts (id, name, age) VALUES (1, 'Ada', 37)";
+
+    assert_rejected("SQL INSERT", database.query(sql).await, "rejected write");
+    match database.query_as(&writer, sql).await {
+        Err(DbError::AuthzDenied(error)) => panic!("writer must be authorized: {error}"),
+        result => assert_rejected("SQL INSERT as writer", result, "rejected write"),
+    }
+    assert_rejected(
+        "catalog table handle",
+        database
+            .table("accounts")?
+            .insert(account_row(1, "Ada", 37)),
+        "rejected write",
+    );
+    assert_rejected(
+        "create_table handle",
+        created.insert(account_row(1, "Ada", 37)),
+        "rejected write",
+    );
+
+    assert!(
+        database.table("accounts")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.table("accounts")?.scan()?
+    );
+    let SqlOutput::Rows(rows) = database.query("SELECT id FROM accounts").await? else {
+        panic!("SELECT must return rows");
+    };
+    assert!(
+        rows.rows.is_empty(),
+        "expected an empty value, got {:?}",
+        rows.rows
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_is_validated_against_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            "wrong column type",
+            vec![Value::Int(1), Value::Int(5), Value::Int(99)],
+            "replacement is invalid",
+        ),
+        ("wrong arity", vec![Value::Int(1)], "replacement is invalid"),
+        (
+            "changed primary key",
+            account_row(2, "Grace", 99),
+            "must keep the primary key",
+        ),
+    ];
+
+    for (case, replacement, expected) in cases {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_table("accounts", Some(account_schema()), Vec::new())?;
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            &trigger_response("replace", Some(Value::Array(replacement))),
+        )?;
+
+        assert_rejected(
+            &format!("{case}: transaction"),
+            database.transaction(|txn| txn.insert_row("accounts", account_row(1, "Ada", 37))),
+            expected,
+        );
+        assert_rejected(
+            &format!("{case}: table handle"),
+            database
+                .table("accounts")?
+                .insert(account_row(1, "Ada", 37)),
+            expected,
+        );
+        assert_rejected(
+            &format!("{case}: SQL INSERT"),
+            database
+                .query("INSERT INTO accounts (id, name, age) VALUES (1, 'Ada', 37)")
+                .await,
+            expected,
+        );
+
+        let accounts = database.table("accounts")?;
+        assert_eq!(accounts.get(&Value::Int(1))?, None, "{case}");
+        assert_eq!(accounts.get(&Value::Int(2))?, None, "{case}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_maintains_secondary_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    // One database per entry path: the constant replacement always has primary key 1.
+    for path in ["table handle", "SQL INSERT", "transaction"] {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_table(
+            "accounts",
+            Some(account_schema()),
+            vec![RelIndexSpec::new(1, 1)],
+        )?;
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+            &trigger_response("replace", Some(Value::Array(account_row(1, "Grace", 99)))),
+        )?;
+
+        match path {
+            "table handle" => {
+                database
+                    .table("accounts")?
+                    .insert(account_row(1, "Ada", 37))?;
+            }
+            "SQL INSERT" => {
+                database
+                    .query("INSERT INTO accounts (id, name, age) VALUES (1, 'Ada', 37)")
+                    .await?;
+            }
+            _ => {
+                database
+                    .transaction(|txn| txn.insert_row("accounts", account_row(1, "Ada", 37)))?;
+            }
+        }
+
+        let entries = rel_index_entries(&database)?;
+        assert_eq!(entries.len(), 1, "{path}: {entries:?}");
+        assert!(contains_bytes(&entries[0].0, b"Grace"), "{path}");
+        let accounts = database.table("accounts")?;
+        assert_eq!(
+            accounts.get(&Value::Int(1))?,
+            Some(account_row(1, "Grace", 99)),
+            "{path}"
+        );
+        assert_eq!(
+            accounts.query_eq(1, &Value::Str("Grace".to_owned()))?.rows,
+            vec![account_row(1, "Grace", 99)],
+            "{path}"
+        );
+        assert!(
+            accounts
+                .query_eq(1, &Value::Str("Ada".to_owned()))?
+                .rows
+                .is_empty(),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_on_update_rewrites_stale_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        ("table handle", account_row(1, "Grace", 99)),
+        ("transaction", account_row(1, "Grace", 99)),
+        ("SQL ON CONFLICT", account_row(1, "Grace", 99)),
+        (
+            "table handle keeps indexed value",
+            account_row(1, "Bob", 99),
+        ),
+        ("transaction keeps indexed value", account_row(1, "Bob", 99)),
+    ];
+
+    for (case, replacement) in cases {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_table(
+            "accounts",
+            Some(account_schema()),
+            vec![RelIndexSpec::new(1, 1).with_include(vec![2])],
+        )?;
+        database
+            .table("accounts")?
+            .insert(account_row(1, "Ada", 37))?;
+        register_accounts_trigger(
+            &database,
+            "replace_accounts_update",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+            &trigger_response("replace", Some(Value::Array(replacement.clone()))),
+        )?;
+
+        if case.starts_with("table handle") {
+            database
+                .table("accounts")?
+                .update(account_row(1, "Bob", 40))?;
+        } else if case.starts_with("transaction") {
+            database.transaction(|txn| txn.update_row("accounts", account_row(1, "Bob", 40)))?;
+        } else {
+            database
+                .query(
+                    "INSERT INTO accounts (id, name, age) VALUES (1, 'Bob', 40) \
+                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                )
+                .await?;
+        }
+
+        let Value::Str(indexed) = &replacement[1] else {
+            panic!("{case}: replacement name must be a string");
+        };
+        let entries = rel_index_entries(&database)?;
+        assert_eq!(entries.len(), 1, "{case}: {entries:?}");
+        let (key, payload) = &entries[0];
+        assert!(contains_bytes(key, indexed.as_bytes()), "{case}: {key:?}");
+        assert_eq!(
+            decode_value(payload)?,
+            Value::Array(vec![Value::Int(99)]),
+            "{case}"
+        );
+        assert_eq!(
+            database.table("accounts")?.get(&Value::Int(1))?,
+            Some(replacement),
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_before_wasm_trigger_replace_rejects_repeated_row_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "replace_accounts_insert",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+        &trigger_response("replace", Some(Value::Array(account_row(1, "Grace", 99)))),
+    )?;
+
+    assert_rejected(
+        "repeated row key",
+        database
+            .query(
+                "INSERT INTO accounts (id, name, age) VALUES (1, 'A', 1), (1, 'B', 2) \
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+            )
+            .await,
+        "more than once",
+    );
+    assert_eq!(database.table("accounts")?.get(&Value::Int(1))?, None);
+    Ok(())
+}
+
+#[test]
+fn phase32_wasm_triggers_are_refused_on_columnar_tables() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("columnar.redb");
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, &path))?;
+    let table = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    assert_eq!(table.layout(), TableLayout::Columnar);
+    let wasm = constant_value_wasm(&trigger_response(
+        "replace",
+        Some(Value::Array(account_row(1, "Grace", 99))),
+    ))?;
+    let spec = wasm_trigger(
+        "replace_accounts_insert",
+        "accounts",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+    );
+
+    match database.register_wasm_trigger(spec.clone(), &wasm) {
+        Err(DbError::Query(QueryError::Unsupported(message))) => {
+            assert!(message.contains("columnar table accounts"), "{message}");
+        }
+        other => panic!("columnar trigger registration must be refused, got {other:?}"),
+    }
+
+    // A trigger stored before registration refused columnar tables still cannot
+    // replace a whole segment.
+    let mut legacy = spec;
+    legacy.module_hash = crate::extension::register_wasm_module(
+        database.replication_ref(),
+        &database.wasm_runtime,
+        &wasm,
+    )?
+    .hash;
+    crate::continuous::register_trigger(database.replication_ref(), &legacy)?;
+    assert_rejected(
+        "columnar insert",
+        table.insert(account_row(1, "Ada", 37)),
+        "cannot replace columnar table segments",
+    );
+    assert!(
+        database.table("accounts")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.table("accounts")?.scan()?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase32_after_wasm_trigger_failure_keeps_committed_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_after_accounts_insert",
+        TriggerTiming::After,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+
+    database
+        .table("accounts")?
+        .insert(account_row(1, "Ada", 37))?;
+    database.transaction(|txn| txn.insert_row("accounts", account_row(2, "Grace", 41)))?;
+    database
+        .query("INSERT INTO accounts (id, name, age) VALUES (3, 'Lin', 29)")
+        .await?;
+    let ops = database
+        .table("accounts")?
+        .insert_ops(account_row(4, "Bo", 51))?;
+    database.propose_batch(ops)?;
+
+    assert_eq!(database.table("accounts")?.scan()?.len(), 4);
+    assert!(matches!(
+        database
+            .table("accounts")?
+            .insert(account_row(1, "Ada", 37)),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    let failures = database.post_commit_failures()?;
+    assert_eq!(failures.len(), 4, "{failures:?}");
+    assert!(failures.iter().all(|failure| {
+        failure.stage == PostCommitStage::AfterTrigger
+            && failure.name == "reject_after_accounts_insert"
+            && failure.error.contains("must return accept")
+    }));
+    let metrics = crate::observability::global_registry().render()?;
+    assert!(metrics.contains("multidb_post_commit_failures_total"));
+    Ok(())
+}
+
+#[test]
+fn after_trigger_failure_keeps_tenant_reservation() -> Result<(), Box<dyn std::error::Error>> {
+    let ops = OperationalConfig::new().with_tenant(TenantConfig::new(
+        "tenant-a",
+        TenantQuota::storage_bytes(1_500),
+    ));
+    let mut database = create_database_with_ops(DbConfig::new(Profile::InMemory), ops)?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_after_accounts_insert",
+        TriggerTiming::After,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+    let accounts = database.table("accounts")?;
+
+    accounts.insert(account_row(1, &"x".repeat(900), 1))?;
+    match accounts.insert(account_row(2, &"y".repeat(900), 2)) {
+        Err(QueryError::Repl(ReplError::QuotaExceeded { .. })) => {}
+        other => panic!("committed write must keep its quota reservation, got {other:?}"),
+    }
+    assert_eq!(accounts.scan()?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_commit_hook_failure_is_recorded_not_returned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    database.create_collection(
+        "events",
+        CollectionId::new(7),
+        user_doc_fields(),
+        Vec::new(),
+    )?;
+    database.register_hook(&HookSpec::after(
+        FAIL_AFTER_HOOK_FOR_TESTS,
+        HookTarget::AnyUser,
+        HookAction::RecordAfterCommit,
+        1_000,
+    ))?;
+
+    database
+        .table("accounts")?
+        .insert(account_row(1, "Ada", 37))?;
+    database.transaction(|txn| txn.insert_row("accounts", account_row(2, "Grace", 41)))?;
+    database
+        .query("INSERT INTO accounts (id, name, age) VALUES (3, 'Lin', 29)")
+        .await?;
+    database
+        .collection("events")?
+        .insert(&user_document(1, Some(Value::Str("Paris".to_owned()))))?;
+
+    assert_eq!(database.collection("events")?.scan()?.len(), 1);
+    let (events, _) = database.poll_changefeed(
+        &ResumeToken::default(),
+        &ChangefeedFilter {
+            target: ChangefeedTarget::Table("accounts".to_owned()),
+        },
+        &ChangefeedOptions::default(),
+        100,
+    )?;
+    let upserts = events
+        .iter()
+        .filter(|event| matches!(event.op, ChangeOp::Upsert { .. }))
+        .count();
+    assert_eq!(
+        upserts, 3,
+        "every committed row must be written exactly once"
+    );
+    let failures = database.post_commit_failures()?;
+    assert_eq!(failures.len(), 4, "{failures:?}");
+    assert!(failures.iter().all(|failure| {
+        failure.stage == PostCommitStage::AfterHook
+            && failure.error.contains(FAIL_AFTER_HOOK_FOR_TESTS)
+    }));
+    assert!(
+        database
+            .range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+            .is_empty(),
+        "expected an empty value, got {:?}",
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+    );
+    Ok(())
+}
+
+#[test]
+fn hook_targets_are_scoped_to_named_objects() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_collection("a", CollectionId::new(1), user_doc_fields(), Vec::new())?;
+    database.create_collection("b", CollectionId::new(2), user_doc_fields(), Vec::new())?;
+    database
+        .create_vector_collection("v1", VectorCollectionConfig::new(CollectionId::new(70), 3))?;
+    database
+        .create_vector_collection("v2", VectorCollectionConfig::new(CollectionId::new(71), 3))?;
+    database.create_graph("g1", GraphId::new(5))?;
+    database.create_graph("g2", GraphId::new(6))?;
+    for (name, target) in [
+        (
+            "small-missing",
+            HookTarget::Collection("missing".to_owned()),
+        ),
+        ("small-wrong-kind", HookTarget::Collection("v1".to_owned())),
+        ("graph-wrong-kind", HookTarget::Graph("a".to_owned())),
+    ] {
+        match database.register_hook(&HookSpec::before(
+            name,
+            target,
+            HookAction::MaxValueBytes(1),
+            1_000,
+        )) {
+            Err(DbError::Hook(HookError::InvalidTarget(_))) => {}
+            other => panic!("hook {name} with an unknown target must be refused, got {other:?}"),
+        }
+    }
+    for (name, target) in [
+        ("small-a", HookTarget::Collection("a".to_owned())),
+        ("small-v1", HookTarget::VectorCollection("v1".to_owned())),
+    ] {
+        database.register_hook(&HookSpec::before(
+            name,
+            target,
+            HookAction::MaxValueBytes(1),
+            1_000,
+        ))?;
+    }
+    database.register_hook(&HookSpec::after(
+        "g1-after",
+        HookTarget::Graph("g1".to_owned()),
+        HookAction::RecordAfterCommit,
+        1_000,
+    ))?;
+
+    let document = user_document(1, Some(Value::Str("Paris".to_owned())));
+    database.collection("b")?.insert(&document)?;
+    assert!(database.collection("a")?.insert(&document).is_err());
+    database
+        .vector_collection("v2")?
+        .insert_vector(&Value::Null, vec![1.0, 0.0, 0.0])?;
+    assert!(
+        database
+            .vector_collection("v1")?
+            .insert_vector(&Value::Null, vec![1.0, 0.0, 0.0])
+            .is_err()
+    );
+    assert_eq!(database.collection("b")?.scan()?.len(), 1);
+    assert!(
+        database.collection("a")?.scan()?.is_empty(),
+        "expected an empty value, got {:?}",
+        database.collection("a")?.scan()?
+    );
+
+    let edge = |graph: &str| -> Result<(), Box<dyn std::error::Error>> {
+        database.graph(graph)?.add_edge(
+            GraphNodeId::from_str_id("alice"),
+            "knows",
+            GraphNodeId::from_str_id("bob"),
+            &Value::Null,
+        )?;
+        Ok(())
+    };
+    edge("g2")?;
+    assert!(
+        database
+            .range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+            .is_empty(),
+        "expected an empty value, got {:?}",
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?
+    );
+    edge("g1")?;
+    let deliveries =
+        database.range(HOOK_DELIVERIES_TABLE, &[], &[0xFF], ReadConsistency::Strong)?;
+    assert_eq!(deliveries.len(), 1);
+    assert!(String::from_utf8_lossy(&deliveries[0].1).contains("g1-after"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn procedure_writes_run_through_write_pipeline() -> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.register_hook(&HookSpec::before(
+        "non-empty-kv",
+        HookTarget::Keyspace("kv".to_owned()),
+        HookAction::RejectEmptyValue,
+        1_000,
+    ))?;
+    let command = Value::Object(BTreeMap::from([
+        ("action".to_owned(), Value::Str("put".to_owned())),
+        ("table".to_owned(), Value::Str("kv".to_owned())),
+        ("key".to_owned(), Value::Str("k".to_owned())),
+        ("value".to_owned(), Value::Str(String::new())),
+    ]));
+    let wasm = constant_value_wasm(&Value::Array(vec![command]))?;
+    database.register_wasm_procedure(
+        ProcedureSpec {
+            name: "put_empty".to_owned(),
+            module_hash: String::new(),
+            entry: "udf_call".to_owned(),
+            budget: UdfBudget::default(),
+            abi: AbiVersion::V1,
+        },
+        &wasm,
+    )?;
+
+    assert_rejected(
+        "call_procedure",
+        database.call_procedure("put_empty", &[]),
+        "hook rejected write",
+    );
+    assert_rejected(
+        "SQL CALL",
+        database.query("CALL put_empty()").await,
+        "hook rejected write",
+    );
+    assert_eq!(database.read("kv", b"k", ReadConsistency::Strong)?, None);
+    Ok(())
+}
+
+fn account_row(id: i64, name: &str, age: i64) -> Row {
+    vec![Value::Int(id), Value::Str(name.to_owned()), Value::Int(age)]
+}
+
+fn register_accounts_trigger(
+    database: &Database,
+    name: &str,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    response: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let wasm = constant_value_wasm(response)?;
+    database.register_wasm_trigger(wasm_trigger(name, "accounts", timing, event), &wasm)?;
+    Ok(())
+}
+
+fn assert_rejected<T: std::fmt::Debug, E: std::fmt::Display>(
+    context: &str,
+    result: Result<T, E>,
+    expected: &str,
+) {
+    match result {
+        Ok(value) => panic!("{context}: expected an error containing {expected:?}, got {value:?}"),
+        Err(error) => assert!(
+            error.to_string().contains(expected),
+            "{context}: expected an error containing {expected:?}, got {error}"
+        ),
+    }
+}
+
+fn rel_index_entries(database: &Database) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+    database.range(REL_INDEX_TABLE, &[], &[0xFF], ReadConsistency::Strong)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 fn order_schema() -> TableSchema {
     TableSchema::new(
         vec![
@@ -4714,6 +5804,24 @@ fn sales_schema() -> TableSchema {
         ],
         0,
     )
+}
+
+fn sales_row(id: i64) -> Row {
+    vec![
+        Value::Int(id),
+        Value::Str(format!("cat{}", id % 4)),
+        Value::Float(10.0),
+    ]
+}
+
+fn analytical_sales_database(
+    path: std::path::PathBuf,
+    rows: i64,
+) -> Result<Database, Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::on_disk(Profile::Analytical, path))?;
+    let sales = database.create_table("sales", Some(sales_schema()), Vec::new())?;
+    database.propose_batch(sales.columnar_replace_ops((0..rows).map(sales_row).collect())?)?;
+    Ok(database)
 }
 
 fn user_doc_fields() -> Vec<DocField> {
@@ -5255,6 +6363,191 @@ fn profile_manifest_framing_without_compression_writes_raw_frames()
         database.read("t", b"k", ReadConsistency::Strong)?,
         Some(b"v".to_vec())
     );
+    Ok(())
+}
+
+/// A profile-manifest database (the example custom profile: `HighDurability`, zstd and
+/// `floors.audit`) with a tenant quota runs every user write through the write pipeline. Table
+/// handles, transactions, SQL, `query_as` and before-trigger replacements store compressed
+/// frames and read back decoded, also through the changefeed; after-trigger failures and audit
+/// events are recorded framed; and the tenant quota charges the decoded bytes, also after a
+/// reopen in which the persisted manifest supplies the performance.
+#[tokio::test]
+async fn profile_manifest_database_runs_user_writes_through_the_write_pipeline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("orders.redb");
+    let spec = decode_spec_bytes(
+        include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+        SpecFormat::Yaml,
+    )?;
+    let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+    let binding = compiled.binding(&spec.deployment, Some(path.clone()))?;
+    assert_eq!(binding.db_config.profile, Profile::HighDurability);
+    assert!(binding.manifest.storage_format.value_framing);
+    assert!(binding.manifest.knobs.floors.audit);
+    let tenant = || {
+        OperationalConfig::new().with_tenant(TenantConfig::new(
+            "tenant-a",
+            TenantQuota::storage_bytes(16_384),
+        ))
+    };
+    let name = "n".repeat(600);
+    let large = "x".repeat(32_768);
+
+    let mut database = create_database_with_profile(&binding, tenant())?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    write_accounts_through_every_pipeline_path(&mut database, &name, &large).await?;
+    drop(database);
+    assert_pipeline_values_framed(&path, &name)?;
+
+    let reopened =
+        open_database_with_ops(DbConfig::on_disk(Profile::HighDurability, &path), &tenant())?;
+    assert_eq!(reopened.performance_config(), &binding.performance);
+    assert!(reopened.audit_enabled());
+    assert_eq!(
+        reopened.table("accounts")?.get(&Value::Int(5))?,
+        Some(account_row(5, &name, 55))
+    );
+    let (events, _) = reopened.poll_changefeed(
+        &ResumeToken::default(),
+        &ChangefeedFilter {
+            target: ChangefeedTarget::Table("accounts".to_owned()),
+        },
+        &ChangefeedOptions::default(),
+        100,
+    )?;
+    let upserts = events
+        .iter()
+        .filter_map(|event| match &event.op {
+            ChangeOp::Upsert { value_after, .. } => Some(value_after),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(upserts.len(), 5);
+    assert!(
+        upserts
+            .iter()
+            .all(|value| contains_bytes(value, name.as_bytes()))
+    );
+    assert_eq!(reopened.post_commit_failures()?.len(), 5);
+    assert!(matches!(
+        reopened.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"large".to_vec(),
+            value: large.into_bytes(),
+        }),
+        Err(ReplError::QuotaExceeded { .. })
+    ));
+    Ok(())
+}
+
+/// Writes accounts 1 to 5 through a table handle, a transaction, SQL, `query_as` and a SQL
+/// insert that a before trigger replaces, with an after trigger that fails on every insert;
+/// a transaction and a SQL insert of `large` exceed the tenant quota and write nothing.
+async fn write_accounts_through_every_pipeline_path(
+    database: &mut Database,
+    name: &str,
+    large: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("writer").grant(Resource::Table("accounts".to_owned()), Permission::Write)
+    ]));
+    register_accounts_trigger(
+        database,
+        "reject_after_accounts_insert",
+        TriggerTiming::After,
+        TriggerEvent::Insert,
+        &trigger_response("reject", None),
+    )?;
+
+    database
+        .table("accounts")?
+        .insert(account_row(1, name, 1))?;
+    database.transaction(|txn| txn.insert_row("accounts", account_row(2, name, 2)))?;
+    database
+        .query(&format!(
+            "INSERT INTO accounts (id, name, age) VALUES (3, '{name}', 3)"
+        ))
+        .await?;
+    database
+        .query_as(
+            &Principal::new("writer").with_role("writer"),
+            &format!("INSERT INTO accounts (id, name, age) VALUES (4, '{name}', 4)"),
+        )
+        .await?;
+
+    match database.transaction(|txn| txn.insert_row("accounts", account_row(6, large, 6))) {
+        Err(DbError::Repl(ReplError::QuotaExceeded { .. })) => {}
+        other => panic!("transactions must charge the tenant quota, got {other:?}"),
+    }
+    assert_rejected(
+        "SQL over the tenant quota",
+        database
+            .query(&format!(
+                "INSERT INTO accounts (id, name, age) VALUES (7, '{large}', 7)"
+            ))
+            .await,
+        "quota exceeded for tenant",
+    );
+
+    register_accounts_trigger(
+        database,
+        "replace_accounts_insert",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+        &trigger_response("replace", Some(Value::Array(account_row(5, name, 55)))),
+    )?;
+    database
+        .query("INSERT INTO accounts (id, name, age) VALUES (5, 'short', 5)")
+        .await?;
+
+    assert_eq!(database.table("accounts")?.scan()?.len(), 5);
+    let failures = database.post_commit_failures()?;
+    assert_eq!(failures.len(), 5, "{failures:?}");
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.stage == PostCommitStage::AfterTrigger)
+    );
+    assert!(
+        database
+            .audit_events()?
+            .iter()
+            .any(|event| { event.action == "query" && event.outcome == AuditOutcome::Succeeded })
+    );
+    Ok(())
+}
+
+/// Every value the write pipeline stored at `path` is a compression frame, and rows and commit
+/// records holding `name` are compressed.
+fn assert_pipeline_values_framed(
+    path: &Path,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for table in [
+        REL_ROWS_TABLE,
+        txn::TXN_MVCC_TABLE,
+        txn::COMMIT_LOG_TABLE,
+        crate::cdc::POST_COMMIT_FAILURES_TABLE,
+        AUDIT_TABLE,
+    ] {
+        let rows = raw_rows(path, table)?;
+        assert!(!rows.is_empty(), "{table} is empty");
+        assert!(
+            rows.iter().all(|(_, value)| value.starts_with(b"MDBC1")),
+            "{table} holds an unframed value"
+        );
+    }
+    for table in [REL_ROWS_TABLE, txn::COMMIT_LOG_TABLE] {
+        assert!(
+            raw_rows(path, table)?
+                .iter()
+                .all(|(_, value)| !contains_bytes(value, name.as_bytes())),
+            "{table} holds an uncompressed row"
+        );
+    }
     Ok(())
 }
 

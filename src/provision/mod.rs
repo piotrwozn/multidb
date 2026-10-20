@@ -35,6 +35,7 @@ mod startup;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use execute::carry_test_injections;
 pub use execute::{
     AppliedStep, Confirmation, ProvisionActor, ProvisionApplyReport, ProvisionOutcome,
     ProvisionRecordSummary, StepOutcome, apply_provision, provision_new_database,

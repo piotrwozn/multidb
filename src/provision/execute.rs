@@ -69,6 +69,39 @@ pub(crate) fn perturb_new_database_for_tests(hook: Option<fn(&mut Database)>) {
     NEW_DATABASE_HOOK.with(|perturb| perturb.set(hook));
 }
 
+/// Carries the test injections set on this thread into `work`, for an apply that runs on
+/// another thread, such as the blocking pool of the Control Plane. `work` restores the
+/// injections of the thread it runs on when it returns or unwinds.
+#[cfg(test)]
+pub(crate) fn carry_test_injections<T>(
+    work: impl FnOnce() -> T + Send,
+) -> impl FnOnce() -> T + Send {
+    struct Restore(Option<usize>, Option<fn(&mut Database)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAIL_STEP.with(|fail| fail.set(self.0));
+            NEW_DATABASE_HOOK.with(|perturb| perturb.set(self.1));
+        }
+    }
+    let fail = FAIL_STEP.with(Cell::get);
+    let hook = NEW_DATABASE_HOOK.with(Cell::get);
+    move || {
+        let _restore = Restore(
+            FAIL_STEP.with(|current| current.replace(fail)),
+            NEW_DATABASE_HOOK.with(|current| current.replace(hook)),
+        );
+        work()
+    }
+}
+
+/// Outside tests there are no injections to carry, so `work` is returned unchanged.
+#[cfg(not(test))]
+pub(crate) fn carry_test_injections<T>(
+    work: impl FnOnce() -> T + Send,
+) -> impl FnOnce() -> T + Send {
+    work
+}
+
 /// How an apply is confirmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirmation {

@@ -141,8 +141,8 @@ profile.
 | `query.max_statements` | 1..=1024 | every open | SQL parser limits | enforced | retune |
 | `query.max_values_rows` | 1..=1000000 | every open | SQL parser limits | enforced | retune |
 | `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits; DataFusion parses the SELECTs it plans again, with its own fixed limit of 50 | enforced | retune |
-| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
-| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (no user write path checks it yet) | planned (single write pipeline): only `unlimited` is accepted | provisioning |
+| `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
+| `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
 | `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | enforced: applied by provisioning to the objects it creates | provisioning |
 | `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | enforced: applied by provisioning to the objects it creates | provisioning |
 | `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
@@ -160,10 +160,14 @@ benchmark settings are deliberately not knobs, because nothing reads them at
 runtime; they always come from `PerformanceConfig::for_profile`.
 
 The four SQL parser limits (`query.max_sql_bytes`, `max_statements`,
-`max_values_rows`, `parser_recursion_limit`) bind the engine's parse and the
+`max_values_rows`, `parser_recursion_limit`) bind the engine's parse and these
 pre-parses in front of it: the compatibility-query check of `Database::query`,
 the RBAC check of `query_as` and `query_as_of_as` and the retention check of
-`query_as_of`. The size limit counts the whole SQL text, trailing whitespace
+`query_as_of`. They do not bind the tuning system view check
+(`tuning::parse_system_view`), the `match`, `time_bucket`, `within_radius` and
+`graph_neighbors` call check (`parse_phase19_call`) or the pgwire
+extended-protocol Describe pre-parse, which keep sqlparser's defaults (see
+below). The size limit counts the whole SQL text, trailing whitespace
 and semicolons included; for the inline `... AS OF LSN n` / `AS OF TIMESTAMP n`
 form of `Database::query` it counts the query left after the `AS OF` clause
 is removed. DataFusion parses the SELECTs it plans (every SELECT
@@ -176,10 +180,11 @@ with a parse error (SQLSTATE 42601). The pgwire extended-protocol Describe
 pre-parse still uses sqlparser's defaults (recursion depth 50, no size or
 statement limits); moving it to these limits is left to the pgwire work.
 Best-effort internal parses also keep sqlparser's defaults: the tuning system
-views, workload sampling and the optimizer fingerprint, which leave the
-statement to the engine when they fail, and the `match`, `time_bucket`,
-`within_radius` and `graph_neighbors` calls, which multidb runs itself when
-they parse and otherwise leave to the engine.
+views (`tuning::parse_system_view`), workload sampling and the optimizer
+fingerprint, which leave the statement to the engine when they fail, and the
+`match`, `time_bucket`, `within_radius` and `graph_neighbors` calls
+(`parse_phase19_call`), which multidb runs itself when they parse and
+otherwise leave to the engine.
 
 `multidb::config_spec::parse_knob_assignment("cache.max_entries=8192")`
 parses one `path=value` against the registry: enum names, integers, `auto`,
@@ -195,7 +200,7 @@ them and any value is refused with `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME`:
 
 | path | reason |
 | --- | --- |
-| `history.mvcc_retention_millis` | waits for MVCC and commit-log GC |
+| `history.mvcc_retention_millis` | history GC is manual and retains a number of LSNs (`multidb maintenance gc --history-retain-lsns`), not a duration |
 | `cache.ttl_millis` | no runtime implementation |
 
 ## Resolution and status rules
@@ -469,6 +474,13 @@ these openers, so they honour the manifest too; their `--profile` or
 `MULTIDB_PROFILE` must name the database's storage class, or be `auto` to read
 it from the database (see [CLI](#cli)). An explicit
 `OperationalConfig.performance` wins for that session and logs one warning.
+`multidb serve` then applies `MULTIDB_MAX_CONCURRENT_QUERIES` and
+`MULTIDB_QUERY_QUEUE_TIMEOUT_MS` when they are set: they replace
+`query.max_concurrent_queries` and `query.queue_timeout_ms` for that process
+only (`Database::set_query_governor`), the manifest and every other knob stay,
+and unset they keep the manifest values. PostgreSQL wire and the Control Plane
+share that one database, so statements from either run with the manifest's
+runtime performance, SQL parser limits included.
 Every one of these openers also logs a warning (`tracing::warn!`, naming the
 floor) for each manifest floor the opened database does not meet: an engine
 without encryption misses `floors.encryption_at_rest`, and audit switched off
@@ -482,6 +494,16 @@ floors with `profile show --db` and in the output of `restore
 --allow-unmet-floors`. No opener writes security because of a manifest.
 Databases without a manifest open exactly as before; plain `create_database`
 and `serve` never write one.
+
+History GC (`multidb maintenance gc`, `Database::gc_history`) opens the
+database through the same openers, so it reads and rewrites the MVCC
+versions and commit records of a framed database through its value framing,
+and a `--profile` that names another storage class is refused before anything
+is pruned. No profile knob sets its retention: `history.system_versioning` and
+`history.keep_history` describe the typed tables provisioning creates, and
+`history.mvcc_retention_millis` is reserved, so GC keeps only what
+`--history-retain-lsns` (`mvcc_retain_lsns`), `AS OF` pins and the temporal
+`keep_history` retentions of existing tables require.
 
 ### Evolving the manifest
 

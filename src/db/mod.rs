@@ -23,13 +23,11 @@ use tokio::sync::Semaphore;
 use crate::autoscale::ResourcePolicy;
 use crate::cdc::{
     self, ChangeEvent, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedPage, FeedError,
-    HookError, HookSpec, HookedReplication, LogicalTarget, MaterializedViewError,
-    MaterializedViewRows, MaterializedViewSpec, ResumeToken, SubscriptionConfig, SubscriptionError,
-    SubscriptionState,
+    HookError, HookSpec, LogicalTarget, MaterializedViewError, MaterializedViewRows,
+    MaterializedViewSpec, PostCommitFailure, PostCommitStage, ResumeToken, SubscriptionConfig,
+    SubscriptionError, SubscriptionState,
 };
-use crate::cloud::{
-    CloudConfig, QuotaReplication, TenantConfig, TenantId, TenantRuntime, repl_quota_error,
-};
+use crate::cloud::{CloudConfig, TenantConfig, TenantId, TenantRuntime, repl_quota_error};
 use crate::compat::{self, PgCatalogSnapshot};
 use crate::config_spec::{
     ApplyCheckReport, ApplyStatus, DatabaseSpec, MigrationPlan, MigrationPlanner,
@@ -62,8 +60,9 @@ use crate::performance::{
 use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
-    REL_COLUMNAR_SEGMENTS_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row, SqlEngine, SqlOutput,
-    SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes, parse_with_limits,
+    REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
+    SqlEngine, SqlOutput, SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
+    parse_with_limits,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -99,6 +98,7 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod history;
 mod profile_binding;
 mod provisioning;
 mod runtime;
@@ -651,13 +651,14 @@ pub struct Database {
     audit_enabled: bool,
     audit_config: AuditConfig,
     audit_lock: Arc<Mutex<()>>,
+    history_pins: Arc<Mutex<txn::ActiveSnapshotRegistry>>,
     encryption: Option<EncryptionConfig>,
     plan_cache: Arc<Mutex<PlanCache>>,
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
     tenant: Option<TenantRuntime>,
-    wasm_runtime: WasmRuntime,
+    wasm_runtime: Arc<WasmRuntime>,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
     workload: WorkloadBuffer,
 }
@@ -1125,6 +1126,18 @@ impl Database {
         self.repl.storage()
     }
 
+    /// Proposes a crate-internal conditional maintenance batch.
+    ///
+    /// This is the conditional counterpart of the system batch path: it runs no
+    /// user WASM triggers, CDC hooks, or tenant quota accounting. Conditions and
+    /// ops must still target public keyspaces.
+    pub(crate) fn propose_maintenance_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+    ) -> Result<(), ReplError> {
+        self.repl.propose_conditional_batch(batch)
+    }
+
     pub(crate) const fn uses_ap_replication(&self) -> bool {
         self.repl.is_ap()
     }
@@ -1141,6 +1154,37 @@ impl Database {
     #[must_use]
     pub const fn performance_config(&self) -> &PerformanceConfig {
         &self.performance
+    }
+
+    /// Sets the query governor: at most `max_concurrent_queries` statements run
+    /// at once, and a statement that finds no free slot waits up to
+    /// `queue_timeout_ms` before it fails with [`QueryError::Busy`]
+    /// (SQLSTATE 53200).
+    ///
+    /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// # Errors
+    /// Fails when either limit is zero or `max_concurrent_queries` is more than
+    /// the governor can count.
+    pub fn set_query_governor(
+        &mut self,
+        max_concurrent_queries: usize,
+        queue_timeout_ms: u64,
+    ) -> Result<(), ConfigError> {
+        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Unsupported(format!(
+                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if queue_timeout_ms == 0 {
+            return Err(ConfigError::Unsupported(
+                "query governor queue timeout must be at least 1 ms".to_owned(),
+            ));
+        }
+        self.performance.query.max_concurrent_queries = max_concurrent_queries;
+        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        self.query_permits = query_permits_for(&self.performance);
+        Ok(())
     }
 
     #[must_use]
@@ -1343,6 +1387,40 @@ impl Database {
         self.principals = registry;
     }
 
+    /// Reports whether `ensure_bootstrap_admin_principal` would leave the
+    /// security state unchanged, so that callers can skip it and the exclusive
+    /// access it needs.
+    #[must_use]
+    pub(crate) fn has_bootstrap_admin_principal(&self) -> bool {
+        let (role, principal) = self.bootstrap_admin_updates();
+        role.is_none() && principal.is_none()
+    }
+
+    /// The bootstrap admin role and principal merged into the loaded security
+    /// state, keeping grants and roles they already hold. Each is `None` when
+    /// the merge would not change it.
+    fn bootstrap_admin_updates(&self) -> (Option<Role>, Option<Principal>) {
+        let (bootstrap_role, bootstrap_principal) = bootstrap_admin_identity();
+        let current_role = self.authz.roles().get(bootstrap_role.name());
+        let mut role = current_role
+            .cloned()
+            .unwrap_or_else(|| Role::new(bootstrap_role.name()));
+        for (resource, permissions) in bootstrap_role.grants() {
+            for permission in permissions {
+                role = role.grant(resource.clone(), *permission);
+            }
+        }
+        let current_principal = self.principals.principals().get(bootstrap_principal.name());
+        let principal = current_principal
+            .cloned()
+            .unwrap_or_else(|| Principal::new(bootstrap_principal.name()))
+            .with_role(bootstrap_role.name());
+        (
+            (current_role != Some(&role)).then_some(role),
+            (current_principal != Some(&principal)).then_some(principal),
+        )
+    }
+
     /// Ensures the bootstrap admin identity can use password-backed sessions.
     ///
     /// Merges the bootstrap admin role and principal into the loaded security
@@ -1351,30 +1429,16 @@ impl Database {
     /// # Errors
     /// Fails when the updated security metadata cannot be persisted.
     pub fn ensure_bootstrap_admin_principal(&mut self) -> Result<(), DbError> {
-        let current_role = self.authz.roles().get("admin");
-        let admin_role = current_role
-            .cloned()
-            .unwrap_or_else(|| Role::new("admin"))
-            .grant(Resource::System, Permission::Admin)
-            .grant(Resource::Database, Permission::Read)
-            .grant(Resource::Database, Permission::Write)
-            .grant(Resource::Database, Permission::Admin);
-        let role_changed = current_role != Some(&admin_role);
-        let current_principal = self.principals.principals().get("admin");
-        let admin_principal = current_principal
-            .cloned()
-            .unwrap_or_else(|| Principal::new("admin"))
-            .with_role("admin");
-        let principal_changed = current_principal != Some(&admin_principal);
-        if !role_changed && !principal_changed {
+        let (role, principal) = self.bootstrap_admin_updates();
+        if role.is_none() && principal.is_none() {
             return Ok(());
         }
-
-        if role_changed {
-            self.authz = self.authz.clone().allow(admin_role);
+        if let Some(role) = role {
+            self.authz = self.authz.clone().allow(role);
         }
-        if principal_changed {
-            self.principals.insert("admin", admin_principal);
+        if let Some(principal) = principal {
+            self.principals
+                .insert(principal.name().to_owned(), principal);
         }
         self.persist_security_state()
     }
@@ -1915,7 +1979,8 @@ impl Database {
     /// Enables MVCC-backed system versioning for a table and registers its history object.
     /// # Errors
     /// Fails when the database uses AP replication, the base table is missing, untyped, or the
-    /// history name collides.
+    /// history name collides, and with `RetentionExpired` when `retention.min_lsn` is below the
+    /// history GC horizon.
     pub fn enable_system_versioning(
         &mut self,
         table: &str,
@@ -1935,6 +2000,7 @@ impl Database {
         })?;
         let history_name = format!("{table}_history");
         self.ensure_name_available(&history_name)?;
+        self.ensure_retention_above_history_horizon(retention.min_lsn)?;
         let entry = CatalogEntry::TemporalTable {
             base_table: table.to_owned(),
             schema,
@@ -3159,6 +3225,17 @@ impl Database {
         Ok(cdc::unregister_hook(self.replication_ref(), name)?)
     }
 
+    /// Lists after-commit hook and after-trigger failures, oldest first.
+    ///
+    /// A write whose backend commit succeeded is never reported as failed. When an
+    /// after-commit hook or an after trigger fails afterwards, the failure is logged,
+    /// counted in `multidb_post_commit_failures_total`, and recorded here instead.
+    /// # Errors
+    /// Fails when the failure records cannot be read or decoded.
+    pub fn post_commit_failures(&self) -> Result<Vec<PostCommitFailure>, DbError> {
+        Ok(cdc::read_post_commit_failures(self.replication_ref())?)
+    }
+
     #[must_use]
     pub fn plan_cache_metrics(&self) -> PlanCacheMetrics {
         self.plan_cache
@@ -3230,14 +3307,30 @@ impl Database {
     }
 
     /// Registers a WASM trigger from trusted embedded/admin code.
+    ///
+    /// Triggers run for every user write to the target: `Database` writes, table
+    /// handles, SQL `INSERT`, transactions and stored procedures. A before trigger
+    /// returns `accept`, `reject` or `replace`. A `replace` value must be a row that
+    /// matches the table schema and keeps the primary key, and the row's
+    /// secondary-index entries are rebuilt. After triggers must return `accept`;
+    /// anything else is recorded as a post-commit failure and does not fail the
+    /// committed write. Triggers are supported on row-layout tables only.
     /// # Errors
-    /// Fails when the table is missing, WASM validation fails, or metadata cannot be written.
+    /// Fails when the table is missing or columnar, WASM validation fails, or
+    /// metadata cannot be written.
     pub fn register_wasm_trigger(
         &self,
         mut spec: TriggerSpec,
         wasm: &[u8],
     ) -> Result<TriggerSpec, DbError> {
-        let _ = self.table(&spec.table)?;
+        // A columnar write replaces a whole segment, so row events cannot be told
+        // apart; refuse triggers there instead of firing them with the wrong event.
+        if self.table(&spec.table)?.layout() == TableLayout::Columnar {
+            return Err(DbError::Query(QueryError::Unsupported(format!(
+                "WASM triggers on columnar table {}",
+                spec.table
+            ))));
+        }
         let module =
             extension::register_wasm_module(self.replication_ref(), &self.wasm_runtime, wasm)?;
         spec.module_hash = module.hash;
@@ -3324,7 +3417,9 @@ impl Database {
         udf.budget = spec.budget.clone();
         let value = self.wasm_runtime.call_udf(&udf, &wasm, args)?;
         let commands = continuous::procedure_commands_from_value(value)?;
-        apply_procedure_commands(self.replication_ref(), commands)
+        // Procedure writes are user writes: route them through the write pipeline.
+        let repl: &dyn Replication = self;
+        apply_procedure_commands(repl, commands)
     }
 
     /// Calls a registered WASM procedure after checking database write permission.
@@ -3492,6 +3587,7 @@ impl Database {
         }
         let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
+        let _history_pin = self.pin_history_lsn(lsn)?;
         let engine = self.sql_engine()?.with_snapshot_lsn(lsn);
         Ok(engine.execute(sql).await?)
     }
@@ -3969,7 +4065,10 @@ impl Database {
 
     /// Runs one transactional attempt over relational tables and document collections.
     /// # Errors
-    /// Returns the closure error without writing anything, or a storage error on commit.
+    /// Returns the closure error without writing anything, or a commit error: a
+    /// conflict or storage failure, a before trigger or before-commit hook
+    /// rejection, or an exceeded tenant quota. Nothing is written in any of these
+    /// cases; after-commit failures are recorded instead of returned.
     pub fn transaction<T>(
         &self,
         f: impl FnOnce(&mut MultiModelTxn<'_>) -> Result<T, DbError>,
@@ -3979,7 +4078,10 @@ impl Database {
 
     /// Runs one transactional attempt with explicit isolation options.
     /// # Errors
-    /// Returns the closure error without writing anything, or a storage error on commit.
+    /// Returns the closure error without writing anything, or a commit error: a
+    /// conflict or storage failure, a before trigger or before-commit hook
+    /// rejection, or an exceeded tenant quota. Nothing is written in any of these
+    /// cases; after-commit failures are recorded instead of returned.
     pub fn transaction_with_options<T>(
         &self,
         options: TxnOptions,
@@ -4050,6 +4152,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4081,6 +4184,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4112,6 +4216,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4142,6 +4247,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -4161,7 +4267,7 @@ impl Database {
         )
         .await
         .map_err(|_| {
-            QueryError::ResourceLimit(format!(
+            QueryError::Busy(format!(
                 "query queue exceeded {} ms",
                 self.performance.query.queue_timeout_ms
             ))
@@ -4169,12 +4275,18 @@ impl Database {
         .map_err(|_| QueryError::ResourceLimit("query governor closed".to_owned()))
     }
 
+    /// Returns the handle given to `RelTable` and `SqlEngine`. Its writes run the
+    /// same write pipeline as `Database` writes (triggers, hooks, tenant quotas).
     fn replication_handle(&self) -> Arc<dyn Replication> {
-        let handle: Arc<dyn Replication> =
-            Arc::new(HookedReplication::new(self.repl.replication_handle()));
-        self.tenant.as_ref().map_or(handle.clone(), |tenant| {
-            Arc::new(QuotaReplication::new(handle, tenant.clone())) as Arc<dyn Replication>
-        })
+        Arc::new(self.write_pipeline())
+    }
+
+    fn write_pipeline(&self) -> WritePipeline {
+        WritePipeline {
+            backend: self.repl.replication_handle(),
+            tenant: self.tenant.clone(),
+            wasm_runtime: Arc::clone(&self.wasm_runtime),
+        }
     }
 
     fn replication_ref(&self) -> &dyn Replication {
@@ -4833,11 +4945,14 @@ impl MultiModelTxn<'_> {
     pub fn get_row(&self, table: &str, primary_key: &Value) -> Result<Option<Row>, DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            return Ok(self.columnar_rows(&table)?.into_iter().find(|row| {
-                table
-                    .primary_key_value_for_row(row)
-                    .is_ok_and(|key| key == *primary_key)
-            }));
+            let segments = self.columnar_segments(&table)?;
+            return Ok(Self::columnar_rows(&table, &segments)?
+                .into_iter()
+                .find(|row| {
+                    table
+                        .primary_key_value_for_row(row)
+                        .is_ok_and(|key| key == *primary_key)
+                }));
         }
 
         let row_key = table.row_key_for_primary_key(primary_key)?;
@@ -4851,7 +4966,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if rows.iter().any(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4861,7 +4977,7 @@ impl MultiModelTxn<'_> {
             }
 
             rows.push(row);
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4881,7 +4997,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if let Some(index) = rows.iter().position(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4892,7 +5009,7 @@ impl MultiModelTxn<'_> {
                 rows.push(row);
             }
 
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4912,7 +5029,8 @@ impl MultiModelTxn<'_> {
     pub fn delete_row(&mut self, table: &str, primary_key: &Value) -> Result<(), DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             let before = rows.len();
             rows.retain(|row| {
                 !table
@@ -4921,7 +5039,7 @@ impl MultiModelTxn<'_> {
             });
 
             if rows.len() != before {
-                self.queue_ops(table.columnar_replace_ops(rows)?);
+                self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             }
 
             return Ok(());
@@ -4992,19 +5110,18 @@ impl MultiModelTxn<'_> {
         Ok(())
     }
 
-    /// Commits the transaction.
+    /// Commits the transaction through the database write pipeline (triggers, hooks,
+    /// tenant quotas). After-commit hook and after-trigger failures are recorded in
+    /// [`Database::post_commit_failures`]; they never fail a committed transaction.
     /// # Errors
-    /// Fails with conflict when a written key changed after this transaction snapshot.
+    /// Fails with conflict when a written key changed after this transaction snapshot,
+    /// when a before trigger or before hook rejects the write, or when the tenant
+    /// storage quota or write concurrency limit is exceeded.
     pub fn commit(self) -> Result<(), DbError> {
         let database = self.database;
         let snapshot_id = self.snapshot_id;
         let isolation = self.options.isolation;
         let write_set = self.write_set;
-        let initial_ops = ops_from_write_set(&write_set);
-        let final_ops = database.apply_before_wasm_triggers(initial_ops)?;
-        let after_triggers = database.after_wasm_trigger_invocations(&final_ops)?;
-        let write_set = txn::ops_to_write_set(final_ops.clone());
-        let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
         let read_keys = self.read_keys.into_inner();
         let read_ranges = self.read_ranges.into_inner();
 
@@ -5020,33 +5137,36 @@ impl MultiModelTxn<'_> {
                     snapshot_id,
                     &read_keys,
                     &read_ranges,
-                    &write_keys,
+                    &BTreeSet::new(),
                 )?;
             }
             return Ok(());
         }
 
-        cdc::validate_write_set_hooks(database.replication_ref(), &write_set)?;
-        let before = txn::current_txn_id(storage)?;
-        if isolation == IsolationLevel::Serializable {
-            database
-                .repl
-                .commit_write_set_with_preflight(snapshot_id, write_set, |write| {
-                    validate_serializable_reads(
-                        write,
+        database
+            .write_pipeline()
+            .execute(ops_from_write_set(&write_set), |final_ops| {
+                let write_set = txn::ops_to_write_set(final_ops);
+                let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
+                if isolation == IsolationLevel::Serializable {
+                    database.repl.commit_write_set_with_preflight(
                         snapshot_id,
-                        &read_keys,
-                        &read_ranges,
-                        &write_keys,
-                    )
-                })?;
-        } else {
-            database.repl.commit_write_set(snapshot_id, write_set)?;
-        }
-        let after = txn::current_txn_id(storage)?;
-        cdc::deliver_after_commit_hooks(database.replication_ref(), before, after)?;
-        database.deliver_after_wasm_triggers(after_triggers)?;
-        Ok(())
+                        write_set,
+                        |write| {
+                            validate_serializable_reads(
+                                write,
+                                snapshot_id,
+                                &read_keys,
+                                &read_ranges,
+                                &write_keys,
+                            )
+                        },
+                    )?;
+                } else {
+                    database.repl.commit_write_set(snapshot_id, write_set)?;
+                }
+                Ok(())
+            })
     }
 
     pub fn rollback(self) {}
@@ -5059,10 +5179,17 @@ impl MultiModelTxn<'_> {
         Ok(decode_row_bytes(&bytes)?)
     }
 
-    fn columnar_rows(&self, table: &RelTable) -> Result<Vec<Row>, DbError> {
-        let key = table.columnar_segment_key();
-        let bytes = self.read_raw(REL_COLUMNAR_SEGMENTS_TABLE, &key)?;
-        Ok(table.decode_columnar_rows(bytes.as_deref())?)
+    fn columnar_segments(&self, table: &RelTable) -> Result<Vec<(Bytes, Bytes)>, DbError> {
+        let (start, end) = table.columnar_segment_bounds();
+        self.range_raw(REL_COLUMNAR_SEGMENTS_TABLE, &start, &end)
+    }
+
+    fn columnar_rows(table: &RelTable, segments: &[(Bytes, Bytes)]) -> Result<Vec<Row>, DbError> {
+        let mut rows = Vec::new();
+        for (_, bytes) in segments {
+            rows.extend(table.decode_columnar_rows(Some(bytes))?);
+        }
+        Ok(rows)
     }
 
     fn queue_ops(&mut self, ops: Vec<Op>) {
@@ -5112,6 +5239,57 @@ fn validate_serializable_reads(
     Ok(())
 }
 
+/// The one write pipeline every user write goes through: `Database` writes,
+/// `MultiModelTxn` commits, stored procedures, and the `RelTable`/`SqlEngine`
+/// handles built from [`Database::replication_handle`].
+///
+/// Stages run in this order:
+/// 1. before triggers, which may reject the write or replace a row;
+/// 2. the after-trigger snapshot (old values are read before the commit);
+/// 3. before-commit hooks;
+/// 4. the tenant write permit and storage reservation;
+/// 5. the backend commit;
+/// 6. tenant settlement;
+/// 7. after-commit hooks and after triggers.
+///
+/// Once the backend commit returns `Ok`, the pipeline never returns `Err`: an
+/// after-commit hook or after trigger failure is logged, counted in
+/// `multidb_post_commit_failures_total` and recorded in
+/// [`cdc::POST_COMMIT_FAILURES_TABLE`]. System writes (`propose_authorized_batch`)
+/// bypass every stage.
+#[derive(Clone)]
+struct WritePipeline {
+    backend: Arc<dyn Replication>,
+    tenant: Option<TenantRuntime>,
+    wasm_runtime: Arc<WasmRuntime>,
+}
+
+/// Maps rejections raised before the commit into the caller's error type.
+trait PipelineError: From<ReplError> {
+    fn trigger(error: DbError) -> Self;
+    fn hook(error: HookError) -> Self;
+}
+
+impl PipelineError for ReplError {
+    fn trigger(error: DbError) -> Self {
+        db_trigger_to_repl(&error)
+    }
+
+    fn hook(error: HookError) -> Self {
+        db_hook_to_repl(error)
+    }
+}
+
+impl PipelineError for DbError {
+    fn trigger(error: DbError) -> Self {
+        error
+    }
+
+    fn hook(error: HookError) -> Self {
+        Self::Hook(error)
+    }
+}
+
 #[derive(Clone)]
 struct WasmTriggerInvocation {
     spec: TriggerSpec,
@@ -5120,28 +5298,188 @@ struct WasmTriggerInvocation {
     old: Option<Bytes>,
 }
 
-impl Database {
-    fn apply_before_wasm_triggers(&self, ops: Vec<Op>) -> Result<Vec<Op>, DbError> {
-        let triggers = self.enabled_wasm_triggers(TriggerTiming::Before)?;
+/// An enabled trigger with the catalog entry of its target, read once per write.
+struct ResolvedTrigger {
+    spec: TriggerSpec,
+    target: Option<CatalogEntry>,
+}
+
+#[derive(Default)]
+struct ResolvedTriggers {
+    before: Vec<ResolvedTrigger>,
+    after: Vec<ResolvedTrigger>,
+}
+
+/// A relational row replaced by a before trigger. Its index entries are rebuilt.
+struct ReplacedRow {
+    trigger: String,
+    table: RelTable,
+    row_key: Bytes,
+    original: Row,
+    replacement: Row,
+}
+
+const AFTER_COMMIT_HOOKS_FAILURE_NAME: &str = "after_commit_hooks";
+
+impl WritePipeline {
+    fn execute<E: PipelineError>(
+        &self,
+        ops: Vec<Op>,
+        commit: impl FnOnce(Vec<Op>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let triggers = self.resolved_triggers(&ops).map_err(E::trigger)?;
+        let ops = self
+            .apply_before_triggers(&triggers.before, ops)
+            .map_err(E::trigger)?;
+        let invocations = self
+            .after_trigger_invocations(&triggers.after, &ops)
+            .map_err(E::trigger)?;
+        cdc::validate_before_hooks(self.backend.as_ref(), &ops).map_err(E::hook)?;
+        let start_lsn = current_lsn_from_repl(self.backend.as_ref())?;
+        let write_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_write().map_err(repl_quota_error))
+            .transpose()?;
+        let reservation = match &self.tenant {
+            Some(tenant) => Some((
+                tenant,
+                tenant.reserve_ops(&ops).map_err(repl_quota_error)?,
+                ops.clone(),
+            )),
+            None => None,
+        };
+        if let Err(error) = commit(ops) {
+            if let Some((tenant, reservation, _)) = &reservation {
+                tenant.release(reservation);
+            }
+            return Err(error);
+        }
+
+        // The write is durable from here on: nothing below may return an error.
+        if let Some((tenant, reservation, committed)) = &reservation {
+            tenant.commit_successful_ops(committed, reservation);
+        }
+        drop(write_permit);
+        self.after_commit(start_lsn, invocations);
+        Ok(())
+    }
+
+    /// Runs after-commit hooks and after triggers. The write is already durable, so
+    /// every failure is recorded and none is returned.
+    fn after_commit(&self, start_lsn: TxnId, invocations: Vec<WasmTriggerInvocation>) {
+        let mut failures = Vec::new();
+        let end_lsn = match current_lsn_from_repl(self.backend.as_ref()) {
+            Ok(end_lsn) => {
+                if let Err(error) =
+                    cdc::deliver_after_commit_hooks(self.backend.as_ref(), start_lsn, end_lsn)
+                {
+                    observability::record_hook_failure(hook_failure_kind(&error));
+                    failures.push(PostCommitFailure::new(
+                        PostCommitStage::AfterHook,
+                        AFTER_COMMIT_HOOKS_FAILURE_NAME,
+                        start_lsn,
+                        end_lsn,
+                        error.to_string(),
+                    ));
+                }
+                end_lsn
+            }
+            Err(error) => {
+                // Only a missed delivery is a failure; record it unless no after-commit
+                // hook is registered. An unreadable hook list counts as a missed delivery.
+                if cdc::has_enabled_after_commit_hooks(self.backend.as_ref()).unwrap_or(true) {
+                    failures.push(PostCommitFailure::new(
+                        PostCommitStage::AfterHook,
+                        AFTER_COMMIT_HOOKS_FAILURE_NAME,
+                        start_lsn,
+                        start_lsn,
+                        format!("cannot read the commit LSN for after-commit hooks: {error}"),
+                    ));
+                }
+                start_lsn
+            }
+        };
+
+        for invocation in invocations {
+            let error = match self.run_wasm_trigger(
+                &invocation.spec,
+                TriggerTiming::After,
+                invocation.event,
+                &invocation.op,
+                invocation.old.as_deref(),
+            ) {
+                Ok(TriggerOutcome::Accept) => continue,
+                Ok(_) => format!("after trigger {} must return accept", invocation.spec.name),
+                Err(error) => error.to_string(),
+            };
+            failures.push(PostCommitFailure::new(
+                PostCommitStage::AfterTrigger,
+                invocation.spec.name,
+                start_lsn,
+                end_lsn,
+                error,
+            ));
+        }
+
+        cdc::record_post_commit_failures(self.backend.as_ref(), &failures);
+    }
+
+    /// Reads the enabled triggers once and resolves each target catalog entry.
+    fn resolved_triggers(&self, ops: &[Op]) -> Result<ResolvedTriggers, DbError> {
+        let mut triggers = ResolvedTriggers::default();
+        if ops.is_empty() {
+            return Ok(triggers);
+        }
+
+        for spec in continuous::read_triggers(self.backend.as_ref())? {
+            if !spec.enabled {
+                continue;
+            }
+            let target = read_catalog_entry_from_repl(self.backend.as_ref(), &spec.table)?;
+            let timing = spec.timing;
+            let resolved = ResolvedTrigger { spec, target };
+            match timing {
+                TriggerTiming::Before => triggers.before.push(resolved),
+                TriggerTiming::After => triggers.after.push(resolved),
+            }
+        }
+        Ok(triggers)
+    }
+
+    fn apply_before_triggers(
+        &self,
+        triggers: &[ResolvedTrigger],
+        ops: Vec<Op>,
+    ) -> Result<Vec<Op>, DbError> {
         if triggers.is_empty() || ops.is_empty() {
             return Ok(ops);
         }
 
         let mut transformed = Vec::with_capacity(ops.len());
+        let mut replaced = Vec::new();
         for op in ops {
+            if !triggers
+                .iter()
+                .any(|trigger| trigger_targets_op(trigger, &op))
+            {
+                transformed.push(op);
+                continue;
+            }
             let mut current = op;
             let old = self.old_value_for_op(&current)?;
-            let Some(event) = Self::event_for_op(&current, old.as_deref()) else {
+            let Some(event) = event_for_op(&current, old.as_deref()) else {
                 transformed.push(current);
                 continue;
             };
 
-            for spec in &triggers {
-                if !self.trigger_matches_op(spec, &current, event) {
+            let mut replacement = None;
+            for trigger in triggers {
+                if !trigger_matches_op(trigger, &current, event) {
                     continue;
                 }
                 match self.run_wasm_trigger(
-                    spec,
+                    &trigger.spec,
                     TriggerTiming::Before,
                     event,
                     &current,
@@ -5151,44 +5489,149 @@ impl Database {
                     TriggerOutcome::Reject(message) => {
                         return Err(ContinuousError::Invalid(format!(
                             "before trigger {} rejected write: {message}",
-                            spec.name
+                            trigger.spec.name
                         ))
                         .into());
                     }
                     TriggerOutcome::Replace(value) => {
-                        current = replace_trigger_op_value(current, &value)?;
+                        let (op, row) =
+                            self.replace_trigger_row(trigger, current, value, replacement.take())?;
+                        current = op;
+                        replacement = Some(row);
                     }
                 }
             }
 
+            replaced.extend(replacement);
             transformed.push(current);
         }
 
-        Ok(transformed)
+        if replaced.is_empty() {
+            return Ok(transformed);
+        }
+        reject_repeated_replaced_rows(&transformed, &replaced)?;
+        rebuild_replaced_row_indexes(transformed, replaced)
     }
 
-    fn after_wasm_trigger_invocations(
+    /// Validates a before-trigger `replace` value and builds the replacement op.
+    ///
+    /// Only rows of row-layout tables can be replaced. The replacement must match
+    /// the table schema and keep the primary key; anything else fails closed.
+    fn replace_trigger_row(
         &self,
+        trigger: &ResolvedTrigger,
+        op: Op,
+        value: Value,
+        previous: Option<ReplacedRow>,
+    ) -> Result<(Op, ReplacedRow), DbError> {
+        let name = &trigger.spec.name;
+        let (storage_table, key, current_value) = match op {
+            Op::Put { table, key, value } => (table, key, value),
+            Op::Delete { .. } => {
+                return Err(ContinuousError::Invalid(
+                    "delete triggers cannot replace a deleted value".to_owned(),
+                )
+                .into());
+            }
+        };
+        if storage_table != REL_ROWS_TABLE {
+            let target = match storage_table.as_str() {
+                REL_COLUMNAR_SEGMENTS_TABLE => "columnar table segments".to_owned(),
+                DOCUMENT_TABLE => "documents".to_owned(),
+                other => format!("writes to {other}"),
+            };
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {name} cannot replace {target}; only rows of row-layout tables can be replaced"
+            ))
+            .into());
+        }
+        let Some(CatalogEntry::Table {
+            indexes,
+            layout: TableLayout::Row,
+        }) = &trigger.target
+        else {
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {name} can only replace rows of row-layout tables"
+            ))
+            .into());
+        };
+        let Value::Array(row) = value else {
+            return Err(ContinuousError::Invalid(
+                "relational trigger replacement must be a row array".to_owned(),
+            )
+            .into());
+        };
+
+        let table = RelTable::open_with_layout(
+            Arc::clone(&self.backend),
+            &trigger.spec.table,
+            indexes.clone(),
+            TableLayout::Row,
+        )?;
+        let row_key = table.row_key_for_row(&row).map_err(|error| {
+            ContinuousError::Invalid(format!(
+                "before trigger {name} replacement is invalid: {error}"
+            ))
+        })?;
+        if row_key != key {
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {name} replacement must keep the primary key"
+            ))
+            .into());
+        }
+        let original = match previous {
+            Some(previous) => previous.original,
+            None => decode_row_bytes(&current_value)?.ok_or_else(|| {
+                QueryError::Storage(StorageError::Corruption(
+                    "trigger row payload is missing".to_owned(),
+                ))
+            })?,
+        };
+
+        let op = Op::Put {
+            table: storage_table,
+            key,
+            value: encode_value(&Value::Array(row.clone()))?,
+        };
+        Ok((
+            op,
+            ReplacedRow {
+                trigger: name.clone(),
+                table,
+                row_key,
+                original,
+                replacement: row,
+            },
+        ))
+    }
+
+    fn after_trigger_invocations(
+        &self,
+        triggers: &[ResolvedTrigger],
         ops: &[Op],
     ) -> Result<Vec<WasmTriggerInvocation>, DbError> {
-        let triggers = self.enabled_wasm_triggers(TriggerTiming::After)?;
         if triggers.is_empty() || ops.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut invocations = Vec::new();
         for op in ops {
+            if !triggers
+                .iter()
+                .any(|trigger| trigger_targets_op(trigger, op))
+            {
+                continue;
+            }
             let old = self.old_value_for_op(op)?;
-            let Some(event) = Self::event_for_op(op, old.as_deref()) else {
+            let Some(event) = event_for_op(op, old.as_deref()) else {
                 continue;
             };
             invocations.extend(
                 triggers
                     .iter()
-                    .filter(|spec| self.trigger_matches_op(spec, op, event))
-                    .cloned()
-                    .map(|spec| WasmTriggerInvocation {
-                        spec,
+                    .filter(|trigger| trigger_matches_op(trigger, op, event))
+                    .map(|trigger| WasmTriggerInvocation {
+                        spec: trigger.spec.clone(),
                         event,
                         op: op.clone(),
                         old: old.clone(),
@@ -5199,67 +5642,9 @@ impl Database {
         Ok(invocations)
     }
 
-    fn deliver_after_wasm_triggers(
-        &self,
-        invocations: Vec<WasmTriggerInvocation>,
-    ) -> Result<(), DbError> {
-        for invocation in invocations {
-            let outcome = self.run_wasm_trigger(
-                &invocation.spec,
-                TriggerTiming::After,
-                invocation.event,
-                &invocation.op,
-                invocation.old.as_deref(),
-            )?;
-            if !matches!(outcome, TriggerOutcome::Accept) {
-                return Err(ContinuousError::Invalid(format!(
-                    "after trigger {} must return accept",
-                    invocation.spec.name
-                ))
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    fn enabled_wasm_triggers(&self, timing: TriggerTiming) -> Result<Vec<TriggerSpec>, DbError> {
-        Ok(continuous::read_triggers(self.replication_ref())?
-            .into_iter()
-            .filter(|spec| spec.enabled && spec.timing == timing)
-            .collect())
-    }
-
     fn old_value_for_op(&self, op: &Op) -> Result<Option<Bytes>, DbError> {
         let (table, key) = op_table_key(op);
-        Ok(self.repl.read(table, key, ReadConsistency::Strong)?)
-    }
-
-    fn event_for_op(op: &Op, old: Option<&[u8]>) -> Option<TriggerEvent> {
-        match op {
-            Op::Put { .. } if old.is_some() => Some(TriggerEvent::Update),
-            Op::Put { .. } => Some(TriggerEvent::Insert),
-            Op::Delete { .. } if old.is_some() => Some(TriggerEvent::Delete),
-            Op::Delete { .. } => None,
-        }
-    }
-
-    fn trigger_matches_op(&self, spec: &TriggerSpec, op: &Op, event: TriggerEvent) -> bool {
-        if spec.event != event {
-            return false;
-        }
-
-        let (storage_table, key) = op_table_key(op);
-        match self.catalog.get(&spec.table) {
-            Some(CatalogEntry::Table { .. }) => {
-                (storage_table == REL_ROWS_TABLE || storage_table == REL_COLUMNAR_SEGMENTS_TABLE)
-                    && key_has_rel_table_prefix(key, &spec.table)
-            }
-            Some(CatalogEntry::Collection { collection_id, .. }) => {
-                storage_table == DOCUMENT_TABLE
-                    && key_in_bounds(key, &collection_range_bounds(*collection_id))
-            }
-            _ => false,
-        }
+        Ok(self.backend.read(table, key, ReadConsistency::Strong)?)
     }
 
     fn run_wasm_trigger(
@@ -5270,7 +5655,7 @@ impl Database {
         op: &Op,
         old: Option<&[u8]>,
     ) -> Result<TriggerOutcome, DbError> {
-        let (_, wasm) = extension::read_wasm_module(self.replication_ref(), &spec.module_hash)?;
+        let (_, wasm) = extension::read_wasm_module(self.backend.as_ref(), &spec.module_hash)?;
         let mut udf = UdfSpec::scalar(&spec.name, &spec.module_hash);
         udf.entry.clone_from(&spec.entry);
         udf.abi = spec.abi;
@@ -5282,6 +5667,186 @@ impl Database {
         )?;
         Ok(continuous::trigger_outcome_from_value(value)?)
     }
+}
+
+impl Replication for WritePipeline {
+    fn propose(&self, op: Op) -> Result<(), ReplError> {
+        self.propose_batch(vec![op])
+    }
+
+    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        self.execute(ops, |ops| self.backend.propose_batch(ops))
+    }
+
+    fn propose_authorized_batch(
+        &self,
+        ops: Vec<Op>,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.backend.propose_authorized_batch(ops, authorization)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        let ConditionalBatch { conditions, ops } = batch;
+        self.execute(ops, |ops| {
+            self.backend
+                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        })
+    }
+
+    fn read(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Option<Bytes>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.read(table, key, consistency)
+    }
+
+    fn range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.range(table, start, end, consistency)
+    }
+
+    fn scan_range_batches(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        batch_rows: usize,
+        cancelled: &dyn Fn() -> bool,
+        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.scan_range_batches(
+            table,
+            start,
+            end,
+            consistency,
+            batch_rows,
+            cancelled,
+            on_batch,
+        )
+    }
+}
+
+fn event_for_op(op: &Op, old: Option<&[u8]>) -> Option<TriggerEvent> {
+    match op {
+        Op::Put { .. } if old.is_some() => Some(TriggerEvent::Update),
+        Op::Put { .. } => Some(TriggerEvent::Insert),
+        Op::Delete { .. } if old.is_some() => Some(TriggerEvent::Delete),
+        Op::Delete { .. } => None,
+    }
+}
+
+/// Whether `op` writes the object a trigger is defined on, for any event.
+fn trigger_targets_op(trigger: &ResolvedTrigger, op: &Op) -> bool {
+    let (storage_table, key) = op_table_key(op);
+    match &trigger.target {
+        Some(CatalogEntry::Table { .. }) => {
+            (storage_table == REL_ROWS_TABLE || storage_table == REL_COLUMNAR_SEGMENTS_TABLE)
+                && key_has_rel_table_prefix(key, &trigger.spec.table)
+        }
+        Some(CatalogEntry::Collection { collection_id, .. }) => {
+            storage_table == DOCUMENT_TABLE
+                && key_in_bounds(key, &collection_range_bounds(*collection_id))
+        }
+        _ => false,
+    }
+}
+
+fn trigger_matches_op(trigger: &ResolvedTrigger, op: &Op, event: TriggerEvent) -> bool {
+    trigger.spec.event == event && trigger_targets_op(trigger, op)
+}
+
+/// Fails closed when a replaced row is written more than once in one batch (for
+/// example `INSERT .. VALUES (1, ..), (1, ..) ON CONFLICT DO UPDATE`): the index
+/// entries of the earlier write could not be rebuilt reliably.
+fn reject_repeated_replaced_rows(ops: &[Op], replaced: &[ReplacedRow]) -> Result<(), DbError> {
+    let mut row_writes = BTreeMap::<&[u8], usize>::new();
+    for op in ops {
+        let (table, key) = op_table_key(op);
+        if table == REL_ROWS_TABLE {
+            *row_writes.entry(key).or_default() += 1;
+        }
+    }
+    for row in replaced {
+        if row_writes
+            .get(row.row_key.as_slice())
+            .copied()
+            .unwrap_or_default()
+            > 1
+        {
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {} cannot replace a row that the same batch writes more than once",
+                row.trigger
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Rebuilds the secondary-index entries of rows replaced by before triggers.
+///
+/// The writer built index puts for the original row. Those puts become deletes in
+/// place: in a transaction write set such a put may also stand for the delete of
+/// the previous row's entry with the same key. The replacement row's index puts are
+/// appended at the end, so last-write-wins ordering keeps exactly its entries.
+fn rebuild_replaced_row_indexes(
+    ops: Vec<Op>,
+    replaced: Vec<ReplacedRow>,
+) -> Result<Vec<Op>, DbError> {
+    let mut stale = BTreeSet::new();
+    let mut fresh = Vec::new();
+    for row in replaced {
+        stale.extend(
+            row.table
+                .index_delete_ops_for_key(&row.original, &row.row_key)?
+                .into_iter()
+                .map(|op| match op {
+                    Op::Put { key, .. } | Op::Delete { key, .. } => key,
+                }),
+        );
+        fresh.extend(
+            row.table
+                .put_ops_for_key(row.replacement, &row.row_key)?
+                .into_iter()
+                .filter(|op| op_table_key(op).0 == REL_INDEX_TABLE),
+        );
+    }
+
+    let mut ops = ops
+        .into_iter()
+        .map(|op| match op {
+            Op::Put { table, key, .. } if table == REL_INDEX_TABLE && stale.contains(&key) => {
+                Op::Delete { table, key }
+            }
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    ops.extend(fresh);
+    Ok(ops)
 }
 
 fn op_table_key(op: &Op) -> (&str, &[u8]) {
@@ -5308,7 +5873,7 @@ fn ops_from_write_set(write_set: &WriteSet) -> Vec<Op> {
 }
 
 fn db_trigger_to_repl(error: &DbError) -> ReplError {
-    ReplError::Transport(format!("WASM trigger failed: {error}"))
+    ReplError::Rejected(format!("WASM trigger failed: {error}"))
 }
 
 fn key_has_rel_table_prefix(key: &[u8], table: &str) -> bool {
@@ -5374,28 +5939,6 @@ fn trigger_payload_value(storage_table: &str, bytes: &[u8]) -> Result<Value, DbE
     Ok(Value::Bytes(bytes.to_vec()))
 }
 
-fn replace_trigger_op_value(op: Op, value: &Value) -> Result<Op, DbError> {
-    match op {
-        Op::Put { table, key, .. } => {
-            if table == REL_ROWS_TABLE && !matches!(value, Value::Array(_)) {
-                return Err(ContinuousError::Invalid(
-                    "relational trigger replacement must be a row array".to_owned(),
-                )
-                .into());
-            }
-            Ok(Op::Put {
-                table,
-                key,
-                value: encode_value(value)?,
-            })
-        }
-        Op::Delete { .. } => Err(ContinuousError::Invalid(
-            "delete triggers cannot replace a deleted value".to_owned(),
-        )
-        .into()),
-    }
-}
-
 fn trigger_timing_name(timing: TriggerTiming) -> &'static str {
     match timing {
         TriggerTiming::Before => "before",
@@ -5430,40 +5973,8 @@ impl Replication for Database {
     }
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
-        let ops = self
-            .apply_before_wasm_triggers(ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        let after_triggers = self
-            .after_wasm_trigger_invocations(&ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        cdc::validate_before_hooks(self.repl.replication_ref(), &ops).map_err(db_hook_to_repl)?;
-        let before = current_lsn_from_repl(self.repl.replication_ref())?;
-        let quota_ops = ops.clone();
-        let _write_permit = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.try_begin_write().map_err(repl_quota_error))
-            .transpose()?;
-        let reservation = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.reserve_ops(&ops).map_err(repl_quota_error))
-            .transpose()?;
-        if let Err(error) = self.repl.propose_batch(ops) {
-            if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-                tenant.release(reservation);
-            }
-            return Err(error);
-        }
-        if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-            tenant.commit_successful_ops(&quota_ops, reservation);
-        }
-        let after = current_lsn_from_repl(self.repl.replication_ref())?;
-        cdc::deliver_after_commit_hooks(self.repl.replication_ref(), before, after)
-            .map_err(db_hook_to_repl)?;
-        self.deliver_after_wasm_triggers(after_triggers)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        Ok(())
+        self.write_pipeline()
+            .execute(ops, |ops| self.repl.propose_batch(ops))
     }
 
     fn propose_authorized_batch(
@@ -5475,42 +5986,11 @@ impl Replication for Database {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let mut batch = batch;
-        batch.ops = self
-            .apply_before_wasm_triggers(batch.ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        let after_triggers = self
-            .after_wasm_trigger_invocations(&batch.ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        cdc::validate_before_hooks(self.repl.replication_ref(), &batch.ops)
-            .map_err(db_hook_to_repl)?;
-        let before = current_lsn_from_repl(self.repl.replication_ref())?;
-        let quota_ops = batch.ops.clone();
-        let _write_permit = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.try_begin_write().map_err(repl_quota_error))
-            .transpose()?;
-        let reservation = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.reserve_ops(&batch.ops).map_err(repl_quota_error))
-            .transpose()?;
-        if let Err(error) = self.repl.propose_conditional_batch(batch) {
-            if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-                tenant.release(reservation);
-            }
-            return Err(error);
-        }
-        if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-            tenant.commit_successful_ops(&quota_ops, reservation);
-        }
-        let after = current_lsn_from_repl(self.repl.replication_ref())?;
-        cdc::deliver_after_commit_hooks(self.repl.replication_ref(), before, after)
-            .map_err(db_hook_to_repl)?;
-        self.deliver_after_wasm_triggers(after_triggers)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        Ok(())
+        let ConditionalBatch { conditions, ops } = batch;
+        self.write_pipeline().execute(ops, |ops| {
+            self.repl
+                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        })
     }
 
     fn read(
@@ -5581,15 +6061,31 @@ fn current_lsn_from_repl(repl: &dyn Replication) -> Result<TxnId, ReplError> {
     Ok(txn::decode_txn_id(&bytes)?)
 }
 
+fn hook_failure_kind(error: &HookError) -> &'static str {
+    match error {
+        HookError::Rejected(_) => "rejected",
+        HookError::Timeout(_) => "timeout",
+        HookError::InvalidTarget(_) => "invalid_target",
+        HookError::Repl(_) => "replication",
+        HookError::Serde(_) => "serde",
+    }
+}
+
 fn db_hook_to_repl(error: HookError) -> ReplError {
-    let (kind, message) = match error {
-        HookError::Rejected(message) => ("rejected", format!("hook rejected write: {message}")),
-        HookError::Timeout(message) => ("timeout", format!("hook timed out: {message}")),
-        HookError::Serde(message) => ("serde", message),
-        HookError::Repl(error) => return error,
-    };
-    observability::record_hook_failure(kind);
-    ReplError::Transport(message)
+    if !matches!(error, HookError::Repl(_)) {
+        observability::record_hook_failure(hook_failure_kind(&error));
+    }
+    match error {
+        HookError::Rejected(message) => {
+            ReplError::Rejected(format!("hook rejected write: {message}"))
+        }
+        HookError::Timeout(message) => ReplError::Rejected(format!("hook timed out: {message}")),
+        HookError::InvalidTarget(message) => {
+            ReplError::Rejected(format!("invalid hook target: {message}"))
+        }
+        HookError::Serde(message) => ReplError::Transport(message),
+        HookError::Repl(error) => error,
+    }
 }
 
 /// Creates a database and initializes metadata when it is missing.
@@ -6300,6 +6796,23 @@ fn query_permits_for(performance: &PerformanceConfig) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(
         performance.query.max_concurrent_queries.max(1),
     ))
+}
+
+/// The bootstrap `admin` role and the `admin` principal that holds it.
+///
+/// Password-backed Control Plane sessions and the insecure local admin act as
+/// this principal. `Database::ensure_bootstrap_admin_principal` merges this
+/// definition into the stored `admin` role and principal, and
+/// `Database::has_bootstrap_admin_principal` reports whether that merge would
+/// change anything, so a grant change here applies to both.
+pub(crate) fn bootstrap_admin_identity() -> (Role, Principal) {
+    let role = Role::new("admin")
+        .grant(Resource::System, Permission::Admin)
+        .grant(Resource::Database, Permission::Read)
+        .grant(Resource::Database, Permission::Write)
+        .grant(Resource::Database, Permission::Admin);
+    let principal = Principal::new("admin").with_role(role.name());
+    (role, principal)
 }
 
 #[cfg(test)]
@@ -7717,6 +8230,20 @@ fn write_metadata_to_repl(repl: &dyn Replication, config: &DbConfig) -> Result<(
 
 fn read_metadata_from_repl(repl: &dyn Replication) -> Result<MetadataRead, ConfigError> {
     decode_metadata(|key| Ok(repl.read(META_TABLE, key, ReadConsistency::Strong)?))
+}
+
+/// Reads one catalog entry straight from `__catalog__`.
+/// # Errors
+/// Fails when the read fails or the entry cannot be decoded.
+pub(crate) fn read_catalog_entry_from_repl(
+    repl: &dyn Replication,
+    name: &str,
+) -> Result<Option<CatalogEntry>, ConfigError> {
+    repl.read(CATALOG_TABLE, name.as_bytes(), ReadConsistency::Strong)?
+        .map(|value| {
+            serde_json::from_slice(&value).map_err(|error| ConfigError::Serde(error.to_string()))
+        })
+        .transpose()
 }
 
 fn read_catalog_from_repl(
