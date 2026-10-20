@@ -225,6 +225,12 @@ table. A table whose effective layout is columnar:
 - keeps no system-versioned history (history is kept for row tables only), so
   `system_versioning: true` is `PHYSICAL_FIELD_NOT_APPLICABLE`.
 
+Its segments behave like those of any columnar table:
+`cloud::tier_columnar_segments` tiers them with conditional pointer installs,
+transactions read and rewrite every segment, tiered or not, and a full backup
+inlines tiered segments, so a restore keeps the provision record and plans as
+a noop without the object store.
+
 Schemaless tables are row tables. System versioning or `keep_history` on a
 table without `columns` is `PHYSICAL_PARAMETER_REQUIRED`.
 
@@ -1009,8 +1015,9 @@ collection or graph id each one got), roles and principals, released
 objects, guarantee statuses, completed and failed steps, flags, actor and
 binary version; `history/{seq:020}` keys hold one entry per finished or
 failed apply, at most 100 (`Database::provision_history()`). Backup and
-restore carry the table like every registered keyspace, and older binaries
-ignore it. `record_version` is read before the typed decode: a record of a
+restore carry the table like every registered keyspace (a full backup with
+tiered columnar segments inlines them), history GC and commit-log truncation
+never touch it, and older binaries ignore it. `record_version` is read before the typed decode: a record of a
 newer build, or a corrupt one, is `PROVISION_RECORD_UNREADABLE` and blocks
 every plan. `Database::provision_state()` returns the record.
 

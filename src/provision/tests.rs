@@ -5882,3 +5882,107 @@ async fn history_gc_and_commit_log_truncation_leave_provisioning_intact() -> Tes
     db.verify_audit_chain()?;
     Ok(())
 }
+
+/// A `balanced` spec with one analytics table, `rollups`, which provisioning builds columnar
+/// inside the row-class database.
+fn rollups_spec() -> Result<DatabaseSpec, Error> {
+    spec(
+        "balanced",
+        &json!([{
+            "name": "rollups", "role": "analytics", "domain": "primary", "indexes": ["columnar"],
+            "physical": {
+                "columns": [{ "name": "id", "type": "int" }, { "name": "revenue", "type": "float" }],
+                "primary_key": "id"
+            }
+        }]),
+    )
+}
+
+fn rollup(id: i64, revenue: f64) -> Vec<Value> {
+    vec![Value::Int(id), Value::Float(revenue)]
+}
+
+/// A columnar table provisioning builds inside a row-class database works with tiering (#27)
+/// and multi-segment transactional writes (#31): its segments tier through conditional pointer
+/// installs, transactions read and rewrite every segment, tiered or not, and a full backup
+/// inlines the tiered segments, so the restored database keeps its provision record, history
+/// and manifest, plans as a noop and takes transactions without the object store.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_provisioned_columnar_table_tiers_takes_transactions_and_restores_with_its_record() -> TestResult
+{
+    use crate::cloud::{ObjectStoreConfig, TieringPolicy, tier_columnar_segments};
+
+    let temp_dir = tempfile::tempdir()?;
+    let spec = rollups_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("rollups.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    assert!(matches!(
+        db.catalog().get("rollups"),
+        Some(CatalogEntry::Table {
+            layout: TableLayout::Columnar,
+            ..
+        })
+    ));
+    let rollups = db.table("rollups")?;
+    let rows = (0..2_500).map(|id| rollup(id, 1.0)).collect::<Vec<_>>();
+    Replication::propose_batch(&db, rollups.columnar_replace_ops(rows)?)?;
+
+    let objects = temp_dir.path().join("objects");
+    let store = ObjectStoreConfig::local_dir(&objects);
+    let report = tier_columnar_segments(&db, &store, &TieringPolicy::default())?;
+    assert!(report.uploaded_segments >= 3, "{report:?}");
+    assert_eq!(report.conflicted_segments, 0);
+
+    // Transactions read every segment, tiered ones included, and rewrite the ones they touch.
+    db.transaction(|txn| txn.insert_row("rollups", rollup(2_500, 2.0)))?;
+    db.transaction(|txn| txn.update_row("rollups", rollup(1_500, 3.0)))?;
+    db.transaction(|txn| txn.delete_row("rollups", &Value::Int(2_400)))?;
+    let txn = db.begin_transaction()?;
+    assert_eq!(
+        txn.get_row("rollups", &Value::Int(2_499))?,
+        Some(rollup(2_499, 1.0))
+    );
+    txn.rollback();
+    assert_eq!(rollups.scan()?.len(), 2_500);
+    assert_eq!(rollups.get(&Value::Int(1_500))?, Some(rollup(1_500, 3.0)));
+    assert_eq!(rollups.get(&Value::Int(2_400))?, None);
+    // The rewritten segments tier again; the others stay tiered.
+    let report = tier_columnar_segments(&db, &store, &TieringPolicy::default())?;
+    assert!(report.uploaded_segments >= 1, "{report:?}");
+    assert_eq!(report.conflicted_segments, 0);
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    let record = db.provision_state()?;
+    let history = db.provision_history()?;
+    let manifest = db.probed_metadata()?.manifest;
+
+    let backup = full_backup(
+        &db,
+        temp_dir.path().join("backups"),
+        &BackupConfig::default(),
+    )?;
+    drop(db);
+    std::fs::remove_dir_all(&objects)?;
+    verify_backup(&backup.path)?;
+    let restored_path = temp_dir.path().join("restored.redb");
+    restore_backup(
+        &backup.path,
+        DbConfig::on_disk(Profile::Balanced, &restored_path),
+        RestoreTarget::Latest,
+    )?;
+    let restored = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &restored_path),
+        &OperationalConfig::new(),
+    )?;
+    assert_eq!(restored.provision_state()?, record);
+    assert_eq!(restored.provision_history()?, history);
+    assert_eq!(restored.probed_metadata()?.manifest, manifest);
+    assert_eq!(plan_open(&spec, &restored)?.outcome, PlanOutcome::Noop);
+    let rollups = restored.table("rollups")?;
+    assert_eq!(rollups.scan()?.len(), 2_500);
+    assert_eq!(rollups.get(&Value::Int(1_500))?, Some(rollup(1_500, 3.0)));
+    restored.transaction(|txn| txn.update_row("rollups", rollup(10, 4.0)))?;
+    assert_eq!(rollups.get(&Value::Int(10))?, Some(rollup(10, 4.0)));
+    assert_eq!(rollups.scan()?.len(), 2_500);
+    Ok(())
+}
