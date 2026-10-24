@@ -824,7 +824,7 @@ fn required_extensions_from_collections(spec: &DatabaseSpec) -> BTreeSet<String>
                 CollectionIndexKind::TimeSeries => {
                     required.insert("time_series".to_owned());
                 }
-                CollectionIndexKind::Primary => {}
+                CollectionIndexKind::Primary | CollectionIndexKind::Geo => {}
             }
         }
     }

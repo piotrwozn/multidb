@@ -1,9 +1,12 @@
-version: 1
+version: 2
 name: Metrics Lake
 profile: analytics_columnar
 deployment:
   mode: single_node
   storage_path: metrics_lake.redb
+topology:
+  replica_count: 1
+  shard_count: 1
 defaults:
   consistency_domain: primary
   replication: cp
@@ -33,11 +36,25 @@ collections:
   domain: primary
   indexes:
   - time_series
+  physical:
+    chunk_millis: 3600000
 - name: aggregates
   role: analytics
   domain: primary
   indexes:
   - columnar
+  physical:
+    kind: table
+    columns:
+    - name: id
+      type: str
+    - name: bucket
+      type: str
+    - name: metric
+      type: str
+    - name: value
+      type: float
+    primary_key: id
 extensions:
 - name: cdc
   version: 1.0.0

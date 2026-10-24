@@ -51,6 +51,47 @@ multidb config validate --spec .\agent-memory\multidb.yaml
 multidb config explain --spec .\agent-memory\multidb.yaml
 ```
 
+To build the database a spec describes (preview, see
+[provisioning.md](provisioning.md)):
+
+```powershell
+multidb init --guided --template ai-memory --name "Agent Memory" --out .\agent-memory --apply --force
+multidb config drift --spec .\agent-memory\multidb.yaml
+multidb config apply --spec .\agent-memory\multidb.yaml --auto-approve
+multidb init --guided --profile secure_app --name Shop --out .\shop.yaml --apply
+multidb config export --db .\shop.redb --out .\exported.yaml
+```
+
+`init --apply` writes the spec, then creates a new database from it at
+`--db`, the spec `storage_path` or `<out dir>/<name>.redb` when the plan only
+creates, adopts or records. After editing a spec, `config plan --spec`
+prints the plan and its `prov_` id, `config apply --spec --confirm <prov_id>`
+applies it, `config drift` exits 3 when the database no longer matches and
+`config status --db` prints the provision record and history. Built-in
+templates emit version 2 specs with the physical parameters provisioning
+needs (document index paths, the 1536-dimension ai-memory vectors, time-series
+chunks and the analytics table columns), so `init --template <t> --apply`
+builds every template on the CLI except `secure-saas`: it asks for
+encryption at rest, which is provisioned through the Rust API only, so its
+plan is blocked with `GUARANTEE_NOT_ENFORCEABLE` (exit 2) and the files are
+kept. Values fixed at creation, such as the vector `dim`, are edited before
+`--apply`. A CLI plan reports audit as `enforced_with_development_key` and
+backup and PITR as `operator_managed` only when the spec asks for them.
+Version 1 specs, including the frozen copies of the earlier templates under
+`tests/fixtures/spec-v1`, leave out the physical parameters (a document index
+path, a vector dimension), so their plan is blocked with
+`PHYSICAL_PARAMETER_REQUIRED`; `config upgrade` lists what to add.
+`examples/provisioning` is a full version 2 spec to plan and apply.
+`multidb serve` starts from a spec too: with `MULTIDB_SPEC_PATH` it checks the
+database against the spec at every start, refuses to start when they differ
+(`MULTIDB_SPEC_APPLY=verify`, the default) and creates or extends it with
+`create` or `additive` (see [docker.md](docker.md#spec-mode)). A running server
+provisions the database it serves through the preview Control Plane endpoints
+`POST /provision/plan`, `POST /provision/apply` (confirmed with the plan's
+`prov_` id), `POST /provision/drift`, `GET /provision/state` and
+`GET /config/live`, which the SDKs wrap (see
+[provisioning.md](provisioning.md#control-plane)).
+
 For a repository smoke test, run:
 
 ```powershell
@@ -123,9 +164,12 @@ multidb profile knobs
   `auto` as with a named profile. `restore` does not accept `auto`, because
   its target must be empty.
 
-Only the Rust API (`db::create_database_with_profile`) creates databases from
-profile knobs in this build; the CLI writes and inspects specs and opens
-existing databases with their persisted profile.
+Databases are created from profile knobs by the Rust API
+(`db::create_database_with_profile`, `provision::provision_new_database` and
+`provision::apply_provision`) and by the CLI provisioning commands
+(`config apply --spec`, `init --apply`, see [provisioning.md](provisioning.md)).
+Every other CLI command opens existing databases with their persisted
+profile.
 
 ## Docker Quickstart
 
@@ -191,8 +235,15 @@ Consistency status:
   queries, materialized views, after-commit hooks, system versioning and
   incremental full-text/geo refresh with `Unsupported`. Full backups and
   `refresh_full` remain available.
-- `config apply` is confirm/audit-only and does not perform physical data
-  migrations.
+- `config apply --plan` is confirm/audit-only and does not perform physical
+  data migrations. Provisioning (`config apply --spec`, `init --apply`,
+  `multidb serve` spec mode and the `/provision/*` Control Plane endpoints) is
+  a preview for embedded and single-node CP databases: it creates and adopts
+  objects, roles and the profile, never drops or alters them, and refuses
+  encryption at rest outside the Rust API. The built-in templates are
+  provisionable on the CLI except `secure-saas`, which asks for encryption at
+  rest; a vector `dim` or table columns are fixed at creation, so edit them
+  before `init --apply`.
 - Studio v1 is read-only plus validation, catalog, advice and migration dry-run.
 - Mongo wire protocol, full PostgreSQL compatibility, public marketplace,
   cloud KMS/HSM and enterprise SLA are outside preview scope.
@@ -246,7 +297,8 @@ Consistency status:
 
 - From SQLite-style local apps: start with `desktop-embedded` or
   `game-save`, model durable entities as `document_entity` or `key_value`, then
-  validate and explain the generated `multidb.yaml`.
+  validate and explain the generated `multidb.yaml` and build the database
+  with `init --apply` or `config apply --spec`.
 - From PostgreSQL-style data: use the PostgreSQL wire-compatible surface where
   it fits, or import CSV/JSONL/pg COPY text through the CLI. Unsupported DDL
   and catalog features fail closed.

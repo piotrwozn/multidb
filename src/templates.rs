@@ -6,15 +6,26 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::config_spec::{
-    CollectionIndexKind, CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseDefaults,
-    DatabaseSpec, DeploymentMode, DeploymentSpec, ExtensionManifestRef, ExtensionStability,
-    GuaranteeSpec, GuaranteeValidator, ReplicationMode, SupportStatus, TopologySpec,
-    ValidationReport, built_in_extension_manifest, built_in_profile, collection_role_definition,
-    consistency_domain_definition,
+    CollectionIndexKind, CollectionRole, CollectionRoleSpec, ColumnSpec, ColumnTypeSpec,
+    ConsistencyMode, DATABASE_SPEC_VERSION_V2, DatabaseDefaults, DatabaseSpec, DeploymentMode,
+    DeploymentSpec, DocIndexSpec, ExtensionManifestRef, ExtensionStability, GuaranteeSpec,
+    GuaranteeValidator, PhysicalKind, PhysicalObjectSpec, ReplicationMode, SupportStatus,
+    TopologySpec, ValidationReport, VectorMetricSpec, built_in_extension_manifest,
+    built_in_profile, collection_role_definition, consistency_domain_definition,
+    index_required_extensions, role_required_extensions,
 };
 
 const DEFAULT_DOMAIN: &str = "primary";
-const TEMPLATE_SPEC_VERSION: u32 = crate::config_spec::DATABASE_SPEC_VERSION;
+/// The spec version built-in templates emit: version 2, because they carry the `physical`
+/// parameters provisioning needs. The version 1 documents they emitted before are frozen under
+/// `tests/fixtures/spec-v1`.
+pub const TEMPLATE_SPEC_VERSION: u32 = DATABASE_SPEC_VERSION_V2;
+/// One hour, the chunk width of the built-in time series.
+const HOUR_MILLIS: i64 = 3_600_000;
+/// Thirty days, the retention of the desktop usage metrics.
+const THIRTY_DAYS_MILLIS: i64 = 2_592_000_000;
+/// The embedding dimension of the AI memory template. It is fixed at creation.
+const AI_MEMORY_DIM: u32 = 1_536;
 
 const PRIMARY_INDEX: &[CollectionIndexKind] = &[CollectionIndexKind::Primary];
 const DOCUMENT_INDEX: &[CollectionIndexKind] = &[CollectionIndexKind::Document];
@@ -163,6 +174,7 @@ const BUILT_IN_TEMPLATES: &[TemplateSpec] = &[
             "No cross-device sync is configured by default.",
             "Cache data must be safe to rebuild.",
             "Use the generated event log as an integration boundary rather than as a remote replication claim.",
+            "The app chooses the database path; init --apply creates <out dir>/<name>.redb unless --db is given.",
         ],
         collections: GAME_COLLECTIONS,
     },
@@ -189,6 +201,7 @@ const BUILT_IN_TEMPLATES: &[TemplateSpec] = &[
         known_limits: &[
             "Embedding generation is intentionally outside the database.",
             "Vector indexing can lag writes; inspect explain config before treating results as strongly fresh.",
+            "dim is fixed at creation; edit physical.dim to match your embedding model before --apply.",
         ],
         collections: AI_COLLECTIONS,
     },
@@ -201,7 +214,8 @@ const BUILT_IN_TEMPLATES: &[TemplateSpec] = &[
         why_profile: "Uses the stable secure_app profile with strong CP intent, backup, PITR, encryption and audit enabled while keeping enterprise SLA concerns explicit.",
         known_limits: &[
             "The template does not configure Kubernetes automation, multi-region placement or enterprise SLA.",
-            "Physical config apply remains confirm/audit-only in v1.",
+            "Encryption at rest is provisioned through the Rust API only: init --apply, config apply --spec, multidb serve spec mode and the Control Plane refuse this spec with GUARANTEE_NOT_ENFORCEABLE.",
+            "Provisioning creates and adopts objects but never drops, alters or re-encrypts them; config apply --plan stays confirm/audit-only.",
         ],
         collections: SECURE_COLLECTIONS,
     },
@@ -215,6 +229,7 @@ const BUILT_IN_TEMPLATES: &[TemplateSpec] = &[
         known_limits: &[
             "columnar_layout is currently Experimental in the extension catalog.",
             "This starter is optimized for read-heavy analytical paths, not OLTP writes.",
+            "Table columns are fixed at creation; edit aggregates physical.columns before --apply.",
         ],
         collections: ANALYTICS_COLLECTIONS,
     },
@@ -230,6 +245,16 @@ pub struct TemplateSpec {
     pub why_profile: &'static str,
     pub known_limits: &'static [&'static str],
     pub collections: &'static [TemplateCollection],
+}
+
+impl TemplateSpec {
+    /// The `physical` parameters the template gives `collection`, so provisioning can build it;
+    /// `None` for a collection that needs none (a document collection with only the `primary`
+    /// index) and for unknown names.
+    #[must_use]
+    pub fn physical(&self, collection: &str) -> Option<PhysicalObjectSpec> {
+        template_physical(self.slug, collection)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -329,7 +354,7 @@ pub fn materialize_template(
         },
         TemplateFile {
             path: "README.md".to_owned(),
-            contents: template_readme(template, &spec, &validation),
+            contents: template_readme(template, &spec, &validation)?,
         },
         TemplateFile {
             path: "seed.json".to_owned(),
@@ -391,6 +416,8 @@ fn template_database_spec(
         overrides: BTreeMap::new(),
         operation_hints: template_operation_hints(template),
         custom_profile: None,
+        security: None,
+        provisioning: None,
     })
 }
 
@@ -414,8 +441,60 @@ fn template_collections(template: &TemplateSpec) -> Vec<CollectionRoleSpec> {
             role: collection.role,
             domain: DEFAULT_DOMAIN.to_owned(),
             indexes: collection.indexes.to_vec(),
+            physical: template_physical(template.slug, collection.name),
         })
         .collect()
+}
+
+/// The physical parameters of the built-in templates: a document index path for every
+/// `document` index kind, the vector dimension and metric, the time-series chunk width and
+/// retention, and the columns of the analytics table. Everything else takes the documented
+/// defaults (`docs/provisioning.md`).
+fn template_physical(template_slug: &str, collection: &str) -> Option<PhysicalObjectSpec> {
+    let document_index = |path: &str| PhysicalObjectSpec {
+        document_indexes: vec![DocIndexSpec {
+            path: path.to_owned(),
+            id: None,
+        }],
+        ..PhysicalObjectSpec::default()
+    };
+    let column = |name: &str, ty: ColumnTypeSpec| ColumnSpec {
+        name: name.to_owned(),
+        ty,
+        nullable: false,
+    };
+    match (template_slug, collection) {
+        ("game-save", "saves") => Some(document_index("slot")),
+        ("desktop-embedded", "documents") => Some(document_index("title")),
+        ("desktop-embedded", "usage_metrics") => Some(PhysicalObjectSpec {
+            chunk_millis: Some(HOUR_MILLIS),
+            retention_millis: Some(THIRTY_DAYS_MILLIS),
+            ..PhysicalObjectSpec::default()
+        }),
+        ("ai-memory", "memories") => Some(PhysicalObjectSpec {
+            dim: Some(AI_MEMORY_DIM),
+            metric: Some(VectorMetricSpec::Cosine),
+            ..PhysicalObjectSpec::default()
+        }),
+        ("ai-memory", "facts") => Some(document_index("subject")),
+        ("secure-saas", "tenants") => Some(document_index("tenant_id")),
+        ("analytics", "metrics") => Some(PhysicalObjectSpec {
+            chunk_millis: Some(HOUR_MILLIS),
+            ..PhysicalObjectSpec::default()
+        }),
+        ("analytics", "aggregates") => Some(PhysicalObjectSpec {
+            kind: Some(PhysicalKind::Table),
+            columns: vec![
+                column("id", ColumnTypeSpec::Str),
+                column("bucket", ColumnTypeSpec::Str),
+                column("metric", ColumnTypeSpec::Str),
+                column("value", ColumnTypeSpec::Float),
+            ],
+            primary_key: Some("id".to_owned()),
+            ..PhysicalObjectSpec::default()
+        }),
+        _ => None,
+    }
 }
 
 fn template_extensions(
@@ -450,46 +529,6 @@ fn template_extensions(
         });
     }
     Ok(extensions)
-}
-
-fn role_required_extensions(role: CollectionRole) -> &'static [&'static str] {
-    match role {
-        CollectionRole::EventLog => &["cdc"],
-        CollectionRole::VectorMemory => &["vector_hnsw"],
-        CollectionRole::Audit => &["audit"],
-        CollectionRole::Graph => &["graph_index"],
-        CollectionRole::Analytics => &["columnar_layout"],
-        CollectionRole::TimeSeries => &["time_series"],
-        CollectionRole::DocumentEntity | CollectionRole::KeyValue | CollectionRole::Cache => &[],
-    }
-}
-
-fn index_required_extensions(indexes: &[CollectionIndexKind]) -> Vec<String> {
-    let mut required = BTreeSet::new();
-    for index in indexes {
-        match index {
-            CollectionIndexKind::Document => {
-                required.insert("document_index");
-            }
-            CollectionIndexKind::Vector => {
-                required.insert("vector_hnsw");
-            }
-            CollectionIndexKind::Graph => {
-                required.insert("graph_index");
-            }
-            CollectionIndexKind::FullText => {
-                required.insert("full_text");
-            }
-            CollectionIndexKind::Columnar => {
-                required.insert("columnar_layout");
-            }
-            CollectionIndexKind::TimeSeries => {
-                required.insert("time_series");
-            }
-            CollectionIndexKind::Primary => {}
-        }
-    }
-    required.into_iter().map(str::to_owned).collect()
 }
 
 fn template_operation_hints(template: &TemplateSpec) -> BTreeMap<String, String> {
@@ -529,7 +568,7 @@ fn template_readme(
     template: &TemplateSpec,
     spec: &DatabaseSpec,
     validation: &ValidationReport,
-) -> String {
+) -> Result<String, TemplateError> {
     let mut lines = vec![
         format!("# {} Template", template.title),
         String::new(),
@@ -542,6 +581,7 @@ fn template_readme(
         "## Generated Contract".to_owned(),
         String::new(),
         format!("- template: {}", template.slug),
+        format!("- spec_version: {}", spec.version),
         format!("- profile: {}", spec.profile),
         format!("- validation_status: {:?}", validation.status),
         format!("- validation_valid: {}", validation.valid),
@@ -569,6 +609,12 @@ fn template_readme(
                 .join(","),
             collection.description
         ));
+        if let Some(physical) = template.physical(collection.name) {
+            lines.push(format!(
+                "  - physical: `{}`",
+                serde_json::to_string(&physical)?
+            ));
+        }
     }
 
     lines.extend([
@@ -581,9 +627,9 @@ fn template_readme(
         "multidb config explain --spec .\\multidb.yaml".to_owned(),
         "```".to_owned(),
         String::new(),
-        "## Known Limits".to_owned(),
-        String::new(),
     ]);
+    lines.extend(template_provisioning_section(template, spec));
+    lines.extend(["## Known Limits".to_owned(), String::new()]);
     lines.extend(
         template
             .known_limits
@@ -596,7 +642,99 @@ fn template_readme(
             .to_owned(),
     );
     lines.push(String::new());
-    lines.join("\n")
+    Ok(lines.join("\n"))
+}
+
+/// The README section on building the database the spec describes, with the guarantee statuses
+/// a CLI plan reports for it.
+fn template_provisioning_section(template: &TemplateSpec, spec: &DatabaseSpec) -> Vec<String> {
+    let db_file = spec
+        .deployment
+        .storage_path
+        .clone()
+        .unwrap_or_else(|| storage_file_name(&spec.name));
+    let mut lines = vec![
+        "## Provision".to_owned(),
+        String::new(),
+        "This spec is version 2: it carries the physical parameters provisioning needs to build"
+            .to_owned(),
+        "every collection (see `docs/provisioning.md`).".to_owned(),
+        String::new(),
+    ];
+    if spec.guarantees.encryption.at_rest {
+        lines.extend([
+            "It requests encryption at rest, which this build provisions through the Rust API"
+                .to_owned(),
+            "only: `config plan --spec` on the CLI is blocked with `GUARANTEE_NOT_ENFORCEABLE`,"
+                .to_owned(),
+            "and `init --apply`, `config apply --spec`, `multidb serve` spec mode and the Control"
+                .to_owned(),
+            "Plane refuse it. Create the database with `provision::provision_new_database` on the"
+                .to_owned(),
+            "`rust_api` surface, with `ProvisionEnvironment.encryption` set to".to_owned(),
+            "`EncryptionConfig::local_envelope(<keyring>, <kek>)`. The dry run shows the reason:"
+                .to_owned(),
+            String::new(),
+            "```powershell".to_owned(),
+            format!("multidb config plan --spec .\\multidb.yaml --db .\\{db_file}"),
+            "```".to_owned(),
+        ]);
+    } else {
+        lines.extend([
+            format!(
+                "`multidb init --guided --template {} --name <name> --out <dir> --apply` writes",
+                template.slug
+            ),
+            "these files and creates the database in one step. From this directory:".to_owned(),
+            String::new(),
+            "```powershell".to_owned(),
+            format!("multidb config plan --spec .\\multidb.yaml --db .\\{db_file}"),
+            format!("multidb config apply --spec .\\multidb.yaml --db .\\{db_file} --auto-approve"),
+            format!("multidb config drift --spec .\\multidb.yaml --db .\\{db_file}"),
+            "```".to_owned(),
+            String::new(),
+            "`config plan` is a dry run. `config apply --auto-approve` applies a plan that only"
+                .to_owned(),
+            "creates, adopts or records, and a second apply is a noop. `config drift` exits 3"
+                .to_owned(),
+            "when the database no longer matches the spec.".to_owned(),
+        ]);
+    }
+    lines.extend([
+        String::new(),
+        "Guarantee statuses a CLI plan reports for this spec:".to_owned(),
+        String::new(),
+        "- `guarantees.audit.enabled`: `enforced_with_development_key`. Audit is on, but the"
+            .to_owned(),
+        "  CLI, `multidb serve` and the Control Plane chain audit events with the built-in"
+            .to_owned(),
+        "  development key (`AUDIT_DEVELOPMENT_KEY`); only the Rust API takes an audit key."
+            .to_owned(),
+    ]);
+    if spec.guarantees.backup.enabled || spec.guarantees.backup.pitr {
+        lines.extend([
+            "- `guarantees.backup.enabled` and `guarantees.backup.pitr`: `operator_managed`. This"
+                .to_owned(),
+            "  build has no backup scheduler, so the plan prints the backup and restore runbook"
+                .to_owned(),
+            "  (`GUARANTEE_OPERATOR_MANAGED`).".to_owned(),
+        ]);
+    } else {
+        lines.push(
+            "- `guarantees.backup.enabled` and `guarantees.backup.pitr`: `not_requested`."
+                .to_owned(),
+        );
+    }
+    if spec.guarantees.encryption.at_rest {
+        lines.push(
+            "- `guarantees.encryption.at_rest`: `not_enforceable` on the CLI, `enforced` on the Rust API with a `LocalEnvelope` key."
+                .to_owned(),
+        );
+    } else {
+        lines.push("- `guarantees.encryption.at_rest`: `not_requested`.".to_owned());
+    }
+    lines.push(String::new());
+    lines
 }
 
 fn template_seed_json(template: &TemplateSpec) -> Result<String, TemplateError> {
@@ -689,6 +827,7 @@ const fn index_slug(index: CollectionIndexKind) -> &'static str {
         CollectionIndexKind::FullText => "full_text",
         CollectionIndexKind::Columnar => "columnar",
         CollectionIndexKind::TimeSeries => "time_series",
+        CollectionIndexKind::Geo => "geo",
     }
 }
 
@@ -698,10 +837,51 @@ fn normalize_template_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
     use super::{
-        TemplateOutputFormat, built_in_template, built_in_templates, materialize_template,
+        TEMPLATE_SPEC_VERSION, TemplateOutputFormat, built_in_template, built_in_templates,
+        materialize_template, storage_file_name,
     };
-    use crate::config_spec::{ConfigExplainer, ExtensionStability, GuaranteeValidator};
+    use crate::config_spec::{
+        ConfigExplainer, DATABASE_SPEC_VERSION_V2, DatabaseSpec, ExtensionStability,
+        GuaranteeValidator, ValidationSeverity, VectorMetricSpec, resolve_profile,
+        spec_io::{SpecFormat, decode_spec_bytes},
+    };
+    use crate::db::EncryptionConfig;
+    use crate::provision::{
+        Confirmation, EnforcementStatus, PlanOutcome, ProvisionEnvironment, ProvisionOptions,
+        ProvisionOutcome, ProvisionPlan, ProvisionSurface, ProvisionTargetRef, StartupDecision,
+        StartupMode, open_from_spec, physical::project, plan_provision, provision_new_database,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn repo_file(relative: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    fn error_codes(plan: &ProvisionPlan) -> BTreeSet<&str> {
+        plan.issues
+            .iter()
+            .filter(|issue| issue.severity == ValidationSeverity::Error)
+            .map(|issue| issue.code.as_str())
+            .collect()
+    }
+
+    fn plan_new(
+        spec: &DatabaseSpec,
+        path: &Path,
+        env: &ProvisionEnvironment,
+    ) -> Result<ProvisionPlan, Box<dyn std::error::Error>> {
+        Ok(plan_provision(
+            spec,
+            ProvisionTargetRef::Path(path),
+            &ProvisionOptions::default(),
+            env,
+        )?)
+    }
 
     #[test]
     fn catalog_contains_phase_forty_seven_templates() {
@@ -736,15 +916,44 @@ mod tests {
     }
 
     #[test]
-    fn generated_specs_validate_and_explain() -> Result<(), Box<dyn std::error::Error>> {
+    fn generated_specs_validate_and_explain() -> TestResult {
+        assert_eq!(TEMPLATE_SPEC_VERSION, DATABASE_SPEC_VERSION_V2);
         for template in built_in_templates() {
             let materialized =
                 materialize_template(template.slug, "Template Smoke", TemplateOutputFormat::Yaml)?;
+            assert_eq!(materialized.spec.version, DATABASE_SPEC_VERSION_V2);
             let report = GuaranteeValidator::validate(&materialized.spec);
             assert!(
                 report.valid,
                 "{} should validate: {:?}",
                 template.slug, report
+            );
+            assert_eq!(report, materialized.validation);
+            // The physical parameters are complete: version 2 validation has no Advice that a
+            // parameter is missing, and the YAML round-trips through the bounded reader.
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .all(|issue| issue.code != "PHYSICAL_PARAMETER_REQUIRED"),
+                "{}: {:?}",
+                template.slug,
+                report.issues
+            );
+            let decoded =
+                decode_spec_bytes(materialized.files[0].contents.as_bytes(), SpecFormat::Yaml)?;
+            assert_eq!(decoded, materialized.spec);
+            let resolved = resolve_profile(&materialized.spec)
+                .resolved()
+                .cloned()
+                .ok_or("the template profile resolves")?;
+            let objects = project(&materialized.spec, &resolved)
+                .map_err(|issues| format!("{}: {issues:#?}", template.slug))?;
+            assert_eq!(
+                objects.len(),
+                template.collections.len(),
+                "{}",
+                template.slug
             );
             let explain = ConfigExplainer::explain(&materialized.spec);
             assert!(explain.validation.valid);
@@ -762,7 +971,65 @@ mod tests {
     }
 
     #[test]
-    fn required_extensions_are_explicit() -> Result<(), Box<dyn std::error::Error>> {
+    fn templates_carry_the_physical_parameters_provisioning_needs() -> TestResult {
+        let ai = materialize_template("ai-memory", "Agent", TemplateOutputFormat::Yaml)?;
+        let memories = ai.spec.collections[0]
+            .physical
+            .as_ref()
+            .ok_or("memories physical")?;
+        assert_eq!(memories.dim, Some(1_536));
+        assert_eq!(memories.metric, Some(VectorMetricSpec::Cosine));
+        let Some(template) = built_in_template("ai-memory") else {
+            panic!("ai-memory must resolve");
+        };
+        assert_eq!(template.physical("memories").as_ref(), Some(memories));
+        assert_eq!(template.physical("scratch_cache"), None);
+        assert_eq!(template.physical("unknown"), None);
+
+        let analytics = materialize_template("analytics", "Metrics", TemplateOutputFormat::Yaml)?;
+        let aggregates = analytics.spec.collections[2]
+            .physical
+            .as_ref()
+            .ok_or("aggregates physical")?;
+        assert_eq!(aggregates.primary_key.as_deref(), Some("id"));
+        assert_eq!(
+            aggregates
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "bucket", "metric", "value"]
+        );
+        assert!(
+            aggregates.table_indexes.is_empty(),
+            "expected an empty value, got {:?}",
+            aggregates.table_indexes
+        );
+
+        let desktop = materialize_template("desktop-embedded", "Desk", TemplateOutputFormat::Yaml)?;
+        let usage = desktop.spec.collections[3]
+            .physical
+            .as_ref()
+            .ok_or("usage_metrics physical")?;
+        assert_eq!(usage.chunk_millis, Some(3_600_000));
+        assert_eq!(usage.retention_millis, Some(2_592_000_000));
+
+        // Only collections with a parameter-bearing index kind carry `physical`.
+        let game = materialize_template("game-save", "Game", TemplateOutputFormat::Yaml)?;
+        assert_eq!(
+            game.spec
+                .collections
+                .iter()
+                .map(|collection| collection.physical.is_some())
+                .collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
+        assert_eq!(game.spec.deployment.storage_path, None);
+        Ok(())
+    }
+
+    #[test]
+    fn required_extensions_are_explicit() -> TestResult {
         let ai = materialize_template("ai-memory", "Agent", TemplateOutputFormat::Yaml)?;
         let extension_names = ai
             .spec
@@ -784,11 +1051,279 @@ mod tests {
             panic!("analytics template must reference columnar_layout");
         };
         assert_eq!(columnar.stability, ExtensionStability::Experimental);
+
+        // The physical parameters add no extension: every template requires exactly the
+        // extensions its frozen version 1 spec did.
+        for template in built_in_templates() {
+            let frozen = decode_spec_bytes(
+                &std::fs::read(repo_file(&format!(
+                    "tests/fixtures/spec-v1/{}.yaml",
+                    template.slug
+                )))?,
+                SpecFormat::Yaml,
+            )?;
+            let materialized =
+                materialize_template(template.slug, &frozen.name, TemplateOutputFormat::Yaml)?;
+            assert_eq!(
+                materialized.spec.extensions, frozen.extensions,
+                "{}",
+                template.slug
+            );
+        }
         Ok(())
     }
 
     #[test]
-    fn materialized_files_have_expected_names() -> Result<(), Box<dyn std::error::Error>> {
+    fn templates_plan_ready_on_the_cli_except_secure_saas() -> TestResult {
+        let temp_dir = tempfile::tempdir()?;
+        let cli = ProvisionEnvironment::new(ProvisionSurface::Cli);
+        for slug in ["game-save", "desktop-embedded", "ai-memory", "analytics"] {
+            let materialized = materialize_template(slug, "Plan Me", TemplateOutputFormat::Yaml)?;
+            let path = temp_dir.path().join(format!("{slug}.redb"));
+            let plan = plan_new(&materialized.spec, &path, &cli)?;
+            assert_eq!(
+                plan.outcome,
+                PlanOutcome::Ready,
+                "{slug}: {:#?}",
+                plan.issues
+            );
+            assert!(plan.auto_approvable, "{slug}");
+            assert!(!path.exists(), "{slug}: a dry run creates no file");
+        }
+
+        // secure-saas asks for encryption at rest: the CLI cannot enforce it, and that is the
+        // only blocker. The Rust API with a LocalEnvelope key can.
+        let secure = materialize_template("secure-saas", "Secure", TemplateOutputFormat::Yaml)?;
+        let path = temp_dir.path().join("secure.redb");
+        let blocked = plan_new(&secure.spec, &path, &cli)?;
+        assert_eq!(blocked.outcome, PlanOutcome::Blocked);
+        assert!(blocked.validation.valid);
+        assert_eq!(
+            error_codes(&blocked),
+            BTreeSet::from(["GUARANTEE_NOT_ENFORCEABLE"]),
+            "{:#?}",
+            blocked.issues
+        );
+        for surface in [ProvisionSurface::Serve, ProvisionSurface::ControlPlane] {
+            let plan = plan_new(&secure.spec, &path, &ProvisionEnvironment::new(surface))?;
+            assert_eq!(
+                error_codes(&plan),
+                BTreeSet::from(["GUARANTEE_NOT_ENFORCEABLE"]),
+                "{surface:?}"
+            );
+        }
+        let rust_api = ProvisionEnvironment {
+            encryption: Some(EncryptionConfig::local_envelope(
+                temp_dir.path().join("keyring.json"),
+                temp_dir.path().join("kek.bin"),
+            )),
+            ..ProvisionEnvironment::new(ProvisionSurface::RustApi)
+        };
+        let ready = plan_new(&secure.spec, &path, &rust_api)?;
+        assert_eq!(ready.outcome, PlanOutcome::Ready, "{:#?}", ready.issues);
+        assert!(error_codes(&ready).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn templates_provision_and_converge_to_a_noop() -> TestResult {
+        let temp_dir = tempfile::tempdir()?;
+        let cli = ProvisionEnvironment::new(ProvisionSurface::Cli);
+        for slug in ["game-save", "desktop-embedded", "ai-memory", "analytics"] {
+            let materialized =
+                materialize_template(slug, "Converge Me", TemplateOutputFormat::Yaml)?;
+            let path = temp_dir.path().join(storage_file_name(slug));
+            let (db, report) = provision_new_database(
+                &materialized.spec,
+                Some(&path),
+                &Confirmation::AutoApproveAdditive,
+                &ProvisionOptions::default(),
+                &cli,
+            )?;
+            assert_eq!(
+                report.status,
+                ProvisionOutcome::Applied,
+                "{slug}: {report:#?}"
+            );
+            for collection in &materialized.spec.collections {
+                assert!(
+                    db.catalog().contains_key(&collection.name),
+                    "{slug}: {}",
+                    collection.name
+                );
+            }
+            let again = plan_provision(
+                &materialized.spec,
+                ProvisionTargetRef::Open(&db),
+                &ProvisionOptions::default(),
+                &cli,
+            )?;
+            assert_eq!(
+                again.outcome,
+                PlanOutcome::Noop,
+                "{slug}: {:#?}",
+                again.steps
+            );
+        }
+
+        let secure = materialize_template("secure-saas", "Secure", TemplateOutputFormat::Yaml)?;
+        let kek_path = temp_dir.path().join("kek.bin");
+        std::fs::write(&kek_path, [7_u8; 32])?;
+        let rust_api = ProvisionEnvironment {
+            encryption: Some(EncryptionConfig::local_envelope(
+                temp_dir.path().join("keyring.json"),
+                &kek_path,
+            )),
+            ..ProvisionEnvironment::new(ProvisionSurface::RustApi)
+        };
+        let secure_path = temp_dir.path().join("secure.redb");
+        let (db, report) = provision_new_database(
+            &secure.spec,
+            Some(&secure_path),
+            &Confirmation::AutoApproveAdditive,
+            &ProvisionOptions::default(),
+            &rust_api,
+        )?;
+        assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+        assert!(db.catalog().contains_key("tenants"));
+        let again = plan_provision(
+            &secure.spec,
+            ProvisionTargetRef::Open(&db),
+            &ProvisionOptions::default(),
+            &rust_api,
+        )?;
+        assert_eq!(again.outcome, PlanOutcome::Noop, "{:#?}", again.steps);
+        assert!(again.guarantees.iter().any(|entry| {
+            entry.path == "guarantees.encryption.at_rest"
+                && entry.status == EnforcementStatus::Enforced
+        }));
+        drop(db);
+
+        // The documented embedded route: open_from_spec opens it with the key and starts it.
+        let (db, started) = open_from_spec(
+            &secure.spec,
+            Some(&secure_path),
+            StartupMode::Verify,
+            &ProvisionOptions::default(),
+            &rust_api,
+        )?;
+        assert_eq!(started.decision, StartupDecision::Start);
+        assert!(db.catalog().contains_key("tenants"));
+        Ok(())
+    }
+
+    #[test]
+    fn checked_in_examples_equal_the_materialized_templates() -> TestResult {
+        for template in built_in_templates() {
+            let path = repo_file(&format!("examples/{}/multidb.yaml", template.slug));
+            let checked_in = std::fs::read_to_string(&path)?;
+            let spec = decode_spec_bytes(checked_in.as_bytes(), SpecFormat::Yaml)?;
+            let materialized =
+                materialize_template(template.slug, &spec.name, TemplateOutputFormat::Yaml)?;
+            assert_eq!(
+                checked_in,
+                materialized.files[0].contents,
+                "{} is stale; regenerate it with multidb init --guided --template {} --name \"{}\"",
+                path.display(),
+                template.slug,
+                spec.name
+            );
+            // The seed and smoke generators did not change with spec version 2. The checked-in
+            // seeds end with a newline, so they are compared as JSON.
+            let read_example = |file: &str| {
+                std::fs::read_to_string(repo_file(&format!("examples/{}/{file}", template.slug)))
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&read_example("seed.json")?)?,
+                serde_json::from_str::<serde_json::Value>(&materialized.files[2].contents)?,
+                "{} seed.json",
+                template.slug
+            );
+            assert_eq!(
+                read_example("smoke.ps1")?,
+                materialized.files[3].contents,
+                "{} smoke.ps1",
+                template.slug
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provisioning_example_validates_projects_and_plans() -> TestResult {
+        let spec = decode_spec_bytes(
+            include_bytes!("../examples/provisioning/multidb.yaml"),
+            SpecFormat::Yaml,
+        )?;
+        assert_eq!(spec.version, DATABASE_SPEC_VERSION_V2);
+        let report = GuaranteeValidator::validate(&spec);
+        assert!(report.valid, "{report:#?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.severity != ValidationSeverity::Error),
+            "{report:#?}"
+        );
+        let resolved = resolve_profile(&spec)
+            .resolved()
+            .cloned()
+            .ok_or("the example profile resolves")?;
+        let objects = project(&spec, &resolved).map_err(|issues| format!("{issues:#?}"))?;
+        let names = objects
+            .iter()
+            .map(|object| (object.name.as_str(), object.kind.slug()))
+            .collect::<Vec<_>>();
+        for expected in [
+            ("orders", "document"),
+            ("orders_notes_fts", "full_text"),
+            ("orders_shipping_location_geo", "geo"),
+            ("ledger", "table"),
+            ("ledger_history", "history"),
+            ("memories", "vector"),
+            ("daily_rollups", "table"),
+        ] {
+            assert!(names.contains(&expected), "{expected:?} in {names:?}");
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let plan = plan_new(
+            &spec,
+            &temp_dir.path().join("orders.redb"),
+            &ProvisionEnvironment::new(ProvisionSurface::Cli),
+        )?;
+        assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+        Ok(())
+    }
+
+    #[test]
+    fn readme_describes_provisioning_and_guarantee_statuses() -> TestResult {
+        let game = materialize_template("game-save", "Arcade Save", TemplateOutputFormat::Yaml)?;
+        let readme = &game.files[1].contents;
+        assert!(readme.contains("- spec_version: 2"), "{readme}");
+        assert!(readme.contains("## Provision"), "{readme}");
+        assert!(
+            readme.contains("multidb config drift --spec .\\multidb.yaml --db .\\arcade_save.redb"),
+            "{readme}"
+        );
+        assert!(
+            readme.contains("`enforced_with_development_key`"),
+            "{readme}"
+        );
+        assert!(readme.contains("pitr`: `not_requested`"), "{readme}");
+        assert!(readme.contains(r#"physical: `{"document_indexes":[{"path":"slot"}]}`"#));
+
+        let secure =
+            materialize_template("secure-saas", "Secure SaaS", TemplateOutputFormat::Yaml)?;
+        let readme = &secure.files[1].contents;
+        assert!(readme.contains("GUARANTEE_NOT_ENFORCEABLE"), "{readme}");
+        assert!(readme.contains("`operator_managed`"), "{readme}");
+        assert!(!readme.contains("--auto-approve"), "{readme}");
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_files_have_expected_names() -> TestResult {
         let yaml = materialize_template("secure-saas", "Secure", TemplateOutputFormat::Yaml)?;
         let yaml_paths = yaml
             .files

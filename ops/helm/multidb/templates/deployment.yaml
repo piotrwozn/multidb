@@ -75,6 +75,11 @@ spec:
             - name: pg-tls
               mountPath: {{ .Values.secrets.pgTls.mountPath | quote }}
               readOnly: true
+            {{- if .Values.spec.enabled }}
+            - name: spec
+              mountPath: {{ .Values.spec.mountPath | quote }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -88,3 +93,11 @@ spec:
         - name: pg-tls
           secret:
             secretName: {{ .Values.secrets.pgTls.name | quote }}
+        {{- if .Values.spec.enabled }}
+        - name: spec
+          configMap:
+            name: {{ .Values.spec.configMap | quote }}
+            items:
+              - key: {{ .Values.spec.key | quote }}
+                path: {{ .Values.spec.key | quote }}
+        {{- end }}

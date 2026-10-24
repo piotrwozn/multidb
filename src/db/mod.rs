@@ -63,14 +63,14 @@ use crate::query::{
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
     SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, SqlRows, StatsCatalog, TableLayout,
-    TableSchema, decode_row_bytes, parse_with_limits, schema_put_op,
+    TableSchema, decode_row_bytes, parse_with_limits,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
     HealingBackend, HealingMode, HealingPolicy, HealthConfig, HealthProbe, HealthView,
     ManualHealthProbe, NodeId, Op, PartitionStrategy, RaftNode, ReadConsistency, ReplError,
     Replication, SelfHealingController, ShardId, ShardMap, ShardedReplication, SingleNode,
-    VectorClock, VersionedBytes, propose_system_batch, validate_ap_cluster_config,
+    VectorClock, VersionedBytes, WriteCondition, propose_system_batch, validate_ap_cluster_config,
     validate_cp_cluster_config,
 };
 use crate::runtime_advisor::{
@@ -101,11 +101,12 @@ use crate::vector::{
 
 mod history;
 mod profile_binding;
+mod provisioning;
 mod runtime;
 
 pub(crate) use profile_binding::{
-    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, unmet_profile_floors,
-    validate_manifest,
+    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
+    unmet_profile_floors, validate_manifest,
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
@@ -141,6 +142,30 @@ const KEY_AUTHZ_POLICY: &[u8] = b"policy";
 const KEY_PRINCIPAL_REGISTRY: &[u8] = b"principals";
 const KEY_AUDIT_ENABLED: &[u8] = b"audit_enabled";
 const ADMIN_AUTH_TABLE: &str = "__admin_auth";
+/// The system table of spec provisioning: the provision record (key `record`) and its history
+/// (keys `history/{seq:020}`). Backup and restore carry it like every registered keyspace.
+pub(crate) const PROVISION_TABLE: &str = "__provision";
+/// The characters of a config apply plan id its audit detail keeps; real `plan_` ids have 37.
+const CONFIG_APPLY_DETAIL_PLAN_ID_CHARS: usize = 48;
+
+/// Where the plan a config apply confirms comes from, recorded as `plan_source` in its audit
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigPlanSource {
+    /// The caller sent the plan: `POST /config/apply` with `plan`, or the Rust API.
+    Client,
+    /// The Control Plane recomputed the plan from the `current` and `desired` specs it was sent.
+    Recomputed,
+}
+
+impl ConfigPlanSource {
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Recomputed => "recomputed",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Profile {
@@ -642,10 +667,22 @@ pub struct Database {
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
+    /// The query governor knobs `override_query_governor` set for this handle: their limits are
+    /// the caller's, not the profile's.
+    query_governor_overrides: QueryGovernorOverrides,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
     workload: WorkloadBuffer,
+}
+
+/// The query governor knobs `Database::override_query_governor` set for a handle, one flag per
+/// knob: a set knob is the caller's for the process, and a restart sets it again; an unset one
+/// is the profile's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct QueryGovernorOverrides {
+    pub(crate) max_concurrent_queries: bool,
+    pub(crate) queue_timeout_ms: bool,
 }
 
 pub type DatabaseSelfHealingController =
@@ -1147,6 +1184,9 @@ impl Database {
     /// (SQLSTATE 53200).
     ///
     /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// The limits belong to this handle: they are never written to the database,
+    /// and provisioning plans do not report them as a session pending a restart.
+    /// [`Database::override_query_governor`] sets one limit and keeps the other.
     /// # Errors
     /// Fails when either limit is zero or `max_concurrent_queries` is more than
     /// the governor can count.
@@ -1155,19 +1195,50 @@ impl Database {
         max_concurrent_queries: usize,
         queue_timeout_ms: u64,
     ) -> Result<(), ConfigError> {
-        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+        self.override_query_governor(Some(max_concurrent_queries), Some(queue_timeout_ms))
+    }
+
+    /// Sets the query governor limits that are `Some`, as [`Database::set_query_governor`]
+    /// does, and keeps the others; `None` for both changes nothing. `multidb serve` passes
+    /// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, each when it is
+    /// set.
+    ///
+    /// A limit set here belongs to this handle: it is never written to the database, and
+    /// provisioning plans do not report it as a session pending a restart. A limit never set
+    /// here stays the profile's: plans compare it with the profile manifest, so a retune of it
+    /// waits for the next open.
+    /// # Errors
+    /// Fails, and changes nothing, when a given limit is zero or `max_concurrent_queries` is
+    /// more than the governor can count.
+    pub fn override_query_governor(
+        &mut self,
+        max_concurrent_queries: Option<usize>,
+        queue_timeout_ms: Option<u64>,
+    ) -> Result<(), ConfigError> {
+        if let Some(max) = max_concurrent_queries
+            && (max == 0 || max > Semaphore::MAX_PERMITS)
+        {
             return Err(ConfigError::Unsupported(format!(
-                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                "query governor max concurrent queries must be 1 to {}, got {max}",
                 Semaphore::MAX_PERMITS
             )));
         }
-        if queue_timeout_ms == 0 {
+        if queue_timeout_ms == Some(0) {
             return Err(ConfigError::Unsupported(
                 "query governor queue timeout must be at least 1 ms".to_owned(),
             ));
         }
-        self.performance.query.max_concurrent_queries = max_concurrent_queries;
-        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        if max_concurrent_queries.is_none() && queue_timeout_ms.is_none() {
+            return Ok(());
+        }
+        if let Some(max) = max_concurrent_queries {
+            self.performance.query.max_concurrent_queries = max;
+            self.query_governor_overrides.max_concurrent_queries = true;
+        }
+        if let Some(timeout) = queue_timeout_ms {
+            self.performance.query.queue_timeout_ms = timeout;
+            self.query_governor_overrides.queue_timeout_ms = true;
+        }
         self.query_permits = query_permits_for(&self.performance);
         Ok(())
     }
@@ -1450,7 +1521,8 @@ impl Database {
     /// Confirms a configuration apply plan after checking system admin permission.
     ///
     /// This is an audited control-plane confirmation only. It never mutates user
-    /// data, catalog state, indexes, extensions, or runtime configuration.
+    /// data, catalog state, indexes, extensions, or runtime configuration. The audit
+    /// event records `plan_source: client`: the caller supplied the plan.
     /// # Errors
     /// Fails when authorization fails, audit is disabled, or the audit write fails.
     pub fn confirm_config_apply_as(
@@ -1458,6 +1530,20 @@ impl Database {
         principal: &Principal,
         plan: &MigrationPlan,
         confirm: &str,
+    ) -> Result<ApplyCheckReport, DbError> {
+        self.confirm_config_apply_with_source_as(principal, plan, confirm, ConfigPlanSource::Client)
+    }
+
+    /// [`Database::confirm_config_apply_as`], recording where the plan comes from: a plan the
+    /// client sent, or one the Control Plane recomputed from `current` and `desired` specs.
+    /// # Errors
+    /// Fails when authorization fails, audit is disabled, or the audit write fails.
+    pub(crate) fn confirm_config_apply_with_source_as(
+        &self,
+        principal: &Principal,
+        plan: &MigrationPlan,
+        confirm: &str,
+        source: ConfigPlanSource,
     ) -> Result<ApplyCheckReport, DbError> {
         self.authorize_or_audit(
             principal,
@@ -1477,9 +1563,19 @@ impl Database {
         } else {
             AuditOutcome::Failed
         };
+        // A client plan id is not checked, so only its start is recorded: the detail is cut at
+        // 160 characters, and `plan_source` must survive a forged, overlong id.
+        let plan_id = report
+            .plan_id
+            .chars()
+            .take(CONFIG_APPLY_DETAIL_PLAN_ID_CHARS)
+            .collect::<String>();
         let detail = format!(
-            "plan_id: {}; status: {:?}; confirmation_matched: {}; data_mutated: false",
-            report.plan_id, report.status, report.confirmation_matched
+            "plan_id: {plan_id}; status: {:?}; confirmation_matched: {}; data_mutated: false; \
+             plan_source: {}",
+            report.status,
+            report.confirmation_matched,
+            source.slug()
         );
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -1563,6 +1659,17 @@ impl Database {
             Permission::Admin,
             "set_audit_enabled",
         )?;
+        self.change_audit_enabled(principal, enabled)
+    }
+
+    /// The body of [`Database::set_audit_enabled_as`] after authorization, shared with
+    /// provisioning's local operators: the `floors.audit` refusal, the disable event before the
+    /// flag and the enable event after it.
+    fn change_audit_enabled(
+        &mut self,
+        principal: &Principal,
+        enabled: bool,
+    ) -> Result<(), DbError> {
         if !enabled {
             // Only single-node openers accept a profile manifest: CP, AP and sharded openers
             // refuse one (`refuse_profile_manifest`), and an AP database keeps `__meta` outside
@@ -1883,32 +1990,8 @@ impl Database {
         schema: Option<TableSchema>,
         indexes: Vec<RelIndexSpec>,
     ) -> Result<RelTable, DbError> {
-        let name = name.into();
-        self.ensure_name_available(&name)?;
         let layout = self.layout();
-        let table = RelTable::handle_with_layout(
-            self.replication_handle(),
-            name.clone(),
-            schema,
-            indexes,
-            layout,
-        )?;
-
-        let mut ops = Vec::new();
-        if let Some(schema) = table.schema() {
-            ops.push(schema_put_op(table.name(), schema)?);
-        }
-
-        let entry = CatalogEntry::Table {
-            indexes: table.indexes().to_vec(),
-            layout,
-        };
-        ops.push(catalog_put_op(&name, &entry)?);
-        propose_system_batch(&self.repl, ops)?;
-        self.catalog.insert(name, entry);
-        self.invalidate_plan_cache();
-
-        Ok(table)
+        self.create_table_with_layout(name, schema, indexes, layout)
     }
 
     /// Creates a foreign table backed by a local object-store file or remote PG-compatible source.
@@ -4157,6 +4240,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4189,6 +4273,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4221,6 +4306,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4252,6 +4338,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -5134,6 +5221,7 @@ impl MultiModelTxn<'_> {
         let write_set = self.write_set;
         let read_keys = self.read_keys.into_inner();
         let read_ranges = self.read_ranges.into_inner();
+        let snapshot_read = self.read;
 
         let storage = database.repl.storage().ok_or_else(|| {
             ConfigError::Unsupported("replication backend has no local snapshot storage".to_owned())
@@ -5153,10 +5241,20 @@ impl MultiModelTxn<'_> {
             return Ok(());
         }
 
+        // The commit fails if a written key changed after the snapshot. When
+        // triggers fire, the pipeline checks that before any of them runs, so they
+        // take each key's old value from the snapshot, which then holds what the
+        // transaction read at every isolation level.
+        let batch = ConditionalBatch::new(Vec::new(), ops_from_write_set(&write_set));
+        let snapshot = TxnSnapshot {
+            id: snapshot_id,
+            read: &snapshot_read,
+            storage,
+        };
         database
             .write_pipeline()
-            .execute(ops_from_write_set(&write_set), |final_ops| {
-                let write_set = txn::ops_to_write_set(final_ops);
+            .execute(batch, Some(snapshot), |batch| {
+                let write_set = txn::ops_to_write_set(batch.ops);
                 let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
                 if isolation == IsolationLevel::Serializable {
                     database.repl.commit_write_set_with_preflight(
@@ -5255,7 +5353,7 @@ fn validate_serializable_reads(
 ///
 /// Stages run in this order:
 /// 1. before triggers, which may reject the write or replace a row;
-/// 2. the after-trigger snapshot (old values are read before the commit);
+/// 2. the after-trigger snapshot (old values are taken before the commit);
 /// 3. before-commit hooks;
 /// 4. the tenant write permit and storage reservation;
 /// 5. the backend commit;
@@ -5308,6 +5406,85 @@ struct WasmTriggerInvocation {
     old: Option<Bytes>,
 }
 
+/// The old values a write's commit asserts. Triggers take a written key's event
+/// and `old` value from here, so they see the row the commit checks.
+///
+/// A conditional batch asserts the value of each key it has a condition on, and a
+/// `MultiModelTxn` commit asserts that no key it writes changed after the
+/// transaction's snapshot. When another writer changes such a row after the
+/// caller read it, or before a read-committed transaction read it, the write
+/// fails with a conflict, which callers retry, instead of a before trigger running
+/// for an event the write does not have. A key without an assertion is read when
+/// the pipeline runs, so the events of unconditional writes are best effort under
+/// concurrent writes.
+struct AssertedOldValues<'a> {
+    conditions: BTreeMap<(&'a str, &'a [u8]), Option<&'a [u8]>>,
+    snapshot: Option<TxnSnapshot<'a>>,
+}
+
+impl<'a> AssertedOldValues<'a> {
+    /// Fails with the conflict the commit would report when `snapshot` is set and a
+    /// key `ops` writes changed after it, so no trigger runs for such a commit.
+    fn new(
+        conditions: &'a [WriteCondition],
+        snapshot: Option<TxnSnapshot<'a>>,
+        ops: &[Op],
+    ) -> Result<Self, DbError> {
+        if let Some(snapshot) = &snapshot {
+            snapshot.check_unchanged(ops)?;
+        }
+        let conditions = conditions
+            .iter()
+            .map(|condition| match condition {
+                WriteCondition::KeyMissing { table, key } => {
+                    ((table.as_str(), key.as_slice()), None)
+                }
+                WriteCondition::ValueEquals {
+                    table,
+                    key,
+                    expected,
+                } => ((table.as_str(), key.as_slice()), expected.as_deref()),
+            })
+            .collect();
+        Ok(Self {
+            conditions,
+            snapshot,
+        })
+    }
+}
+
+/// The storage snapshot a `MultiModelTxn` began with. Its commit fails with a
+/// conflict when a key it writes changed after `id`, at every isolation level.
+struct TxnSnapshot<'a> {
+    id: TxnId,
+    read: &'a AnyReadTxn,
+    storage: &'a AnyEngine,
+}
+
+impl TxnSnapshot<'_> {
+    /// Fails with the conflict the commit would report when a key `ops` writes
+    /// changed after the snapshot. A read-committed transaction reads current
+    /// values, so it may have read a later value of such a key than the snapshot
+    /// holds.
+    fn check_unchanged(&self, ops: &[Op]) -> Result<(), DbError> {
+        let current = self.storage.begin_read()?;
+        for op in ops {
+            let (table, key) = op_table_key(op);
+            if txn::last_key_version_from(&current, table, key)? > self.id {
+                return Err(StorageError::Conflict.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The value `key` held at the snapshot. Once `check_unchanged` passed for the
+    /// written keys, each of them held that value at every read the transaction
+    /// made, at every isolation level.
+    fn old_value(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
+        Ok(self.read.get(table, key)?)
+    }
+}
+
 /// An enabled trigger with the catalog entry of its target, read once per write.
 struct ResolvedTrigger {
     spec: TriggerSpec,
@@ -5318,6 +5495,12 @@ struct ResolvedTrigger {
 struct ResolvedTriggers {
     before: Vec<ResolvedTrigger>,
     after: Vec<ResolvedTrigger>,
+}
+
+impl ResolvedTriggers {
+    fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
+    }
 }
 
 /// A relational row replaced by a before trigger. Its index entries are rebuilt.
@@ -5332,18 +5515,32 @@ struct ReplacedRow {
 const AFTER_COMMIT_HOOKS_FAILURE_NAME: &str = "after_commit_hooks";
 
 impl WritePipeline {
+    /// Runs `batch` through every stage; `commit` writes it to the backend. The
+    /// before triggers may change `batch.ops`, never its conditions. `snapshot` is
+    /// the snapshot of a `MultiModelTxn`, whose commit asserts that no written key
+    /// changed after it; when triggers fire, that is checked before any of them
+    /// runs.
     fn execute<E: PipelineError>(
         &self,
-        ops: Vec<Op>,
-        commit: impl FnOnce(Vec<Op>) -> Result<(), E>,
+        batch: ConditionalBatch,
+        snapshot: Option<TxnSnapshot<'_>>,
+        commit: impl FnOnce(ConditionalBatch) -> Result<(), E>,
     ) -> Result<(), E> {
+        let ConditionalBatch { conditions, ops } = batch;
         let triggers = self.resolved_triggers(&ops).map_err(E::trigger)?;
-        let ops = self
-            .apply_before_triggers(&triggers.before, ops)
-            .map_err(E::trigger)?;
-        let invocations = self
-            .after_trigger_invocations(&triggers.after, &ops)
-            .map_err(E::trigger)?;
+        let (ops, invocations) = if triggers.is_empty() {
+            (ops, Vec::new())
+        } else {
+            let asserted =
+                AssertedOldValues::new(&conditions, snapshot, &ops).map_err(E::trigger)?;
+            let ops = self
+                .apply_before_triggers(&triggers.before, ops, &asserted)
+                .map_err(E::trigger)?;
+            let invocations = self
+                .after_trigger_invocations(&triggers.after, &ops, &asserted)
+                .map_err(E::trigger)?;
+            (ops, invocations)
+        };
         cdc::validate_before_hooks(self.backend.as_ref(), &ops).map_err(E::hook)?;
         let start_lsn = current_lsn_from_repl(self.backend.as_ref())?;
         let write_permit = self
@@ -5359,7 +5556,7 @@ impl WritePipeline {
             )),
             None => None,
         };
-        if let Err(error) = commit(ops) {
+        if let Err(error) = commit(ConditionalBatch::new(conditions, ops)) {
             if let Some((tenant, reservation, _)) = &reservation {
                 tenant.release(reservation);
             }
@@ -5461,6 +5658,7 @@ impl WritePipeline {
         &self,
         triggers: &[ResolvedTrigger],
         ops: Vec<Op>,
+        asserted: &AssertedOldValues<'_>,
     ) -> Result<Vec<Op>, DbError> {
         if triggers.is_empty() || ops.is_empty() {
             return Ok(ops);
@@ -5477,7 +5675,7 @@ impl WritePipeline {
                 continue;
             }
             let mut current = op;
-            let old = self.old_value_for_op(&current)?;
+            let old = self.old_value_for_op(&current, asserted)?;
             let Some(event) = event_for_op(&current, old.as_deref()) else {
                 transformed.push(current);
                 continue;
@@ -5619,6 +5817,7 @@ impl WritePipeline {
         &self,
         triggers: &[ResolvedTrigger],
         ops: &[Op],
+        asserted: &AssertedOldValues<'_>,
     ) -> Result<Vec<WasmTriggerInvocation>, DbError> {
         if triggers.is_empty() || ops.is_empty() {
             return Ok(Vec::new());
@@ -5632,7 +5831,7 @@ impl WritePipeline {
             {
                 continue;
             }
-            let old = self.old_value_for_op(op)?;
+            let old = self.old_value_for_op(op, asserted)?;
             let Some(event) = event_for_op(op, old.as_deref()) else {
                 continue;
             };
@@ -5652,8 +5851,20 @@ impl WritePipeline {
         Ok(invocations)
     }
 
-    fn old_value_for_op(&self, op: &Op) -> Result<Option<Bytes>, DbError> {
+    /// The value `op`'s key holds before the write: the value the commit asserts,
+    /// or the current value when the commit asserts none.
+    fn old_value_for_op(
+        &self,
+        op: &Op,
+        asserted: &AssertedOldValues<'_>,
+    ) -> Result<Option<Bytes>, DbError> {
         let (table, key) = op_table_key(op);
+        if let Some(value) = asserted.conditions.get(&(table, key)) {
+            return Ok(value.map(<[u8]>::to_vec));
+        }
+        if let Some(snapshot) = &asserted.snapshot {
+            return snapshot.old_value(table, key);
+        }
         Ok(self.backend.read(table, key, ReadConsistency::Strong)?)
     }
 
@@ -5685,7 +5896,9 @@ impl Replication for WritePipeline {
     }
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
-        self.execute(ops, |ops| self.backend.propose_batch(ops))
+        self.execute(ConditionalBatch::new(Vec::new(), ops), None, |batch| {
+            self.backend.propose_batch(batch.ops)
+        })
     }
 
     fn propose_authorized_batch(
@@ -5697,10 +5910,8 @@ impl Replication for WritePipeline {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let ConditionalBatch { conditions, ops } = batch;
-        self.execute(ops, |ops| {
-            self.backend
-                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        self.execute(batch, None, |batch| {
+            self.backend.propose_conditional_batch(batch)
         })
     }
 
@@ -5984,7 +6195,9 @@ impl Replication for Database {
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
         self.write_pipeline()
-            .execute(ops, |ops| self.repl.propose_batch(ops))
+            .execute(ConditionalBatch::new(Vec::new(), ops), None, |batch| {
+                self.repl.propose_batch(batch.ops)
+            })
     }
 
     fn propose_authorized_batch(
@@ -5996,10 +6209,8 @@ impl Replication for Database {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let ConditionalBatch { conditions, ops } = batch;
-        self.write_pipeline().execute(ops, |ops| {
-            self.repl
-                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        self.write_pipeline().execute(batch, None, |batch| {
+            self.repl.propose_conditional_batch(batch)
         })
     }
 
@@ -8374,17 +8585,25 @@ fn next_graph_id_op(next: u32) -> Result<Op, DbError> {
 }
 
 fn validate_catalog_name(name: &str) -> Result<(), DbError> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
+    if name.is_empty() {
         return Err(DbError::InvalidCatalogName("empty name".to_owned()));
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(DbError::InvalidCatalogName(name.to_owned()));
     }
-    if name.len() > 128 || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+    if !is_valid_catalog_name(name) {
         return Err(DbError::InvalidCatalogName(name.to_owned()));
     }
     Ok(())
+}
+
+/// The catalog naming rule every `create_*` call enforces: an ASCII letter or `_`, then ASCII
+/// letters, digits or `_`, at most 128 bytes. Spec validation applies the same rule.
+pub(crate) fn is_valid_catalog_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && name.len() <= 128
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn kind_mismatch(name: &str, expected: &'static str, entry: &CatalogEntry) -> DbError {

@@ -183,7 +183,8 @@ All notable public changes will be recorded here.
   rest, so wire clients see 53200 only while Control Plane `/sql` requests
   hold slots. A plain `INSERT` that races another
   insert of the same primary key fails with SQLSTATE 23505, as it would if the
-  statements ran one after another. `INSERT ... ON CONFLICT` and inserts into
+  statements ran one after another (or with P0001 if a before trigger rejects
+  the insert itself). `INSERT ... ON CONFLICT` and inserts into
   columnar tables read again and retry when another statement commits first,
   and fail with retryable SQLSTATE 40001 only if 64 retries also conflict.
   Control Plane single-row, single-document and time-series point writes also
@@ -232,6 +233,40 @@ All notable public changes will be recorded here.
   columnar segment of the table: from their snapshot under snapshot and
   serializable isolation, and from current committed data under read
   committed.
+- WASM triggers no longer see the wrong event when writes race. Since
+  statements and Control Plane requests run concurrently, an `INSERT` whose key
+  another statement inserted after the `INSERT` read it was seen as an update
+  (and a write whose row was deleted in between as an insert). A before
+  trigger for that event could then reject it with SQLSTATE P0001 before the
+  commit reported the conflict, so `INSERT ... ON CONFLICT` failed instead of
+  retrying, and a plain `INSERT` failed with P0001 instead of 23505.
+  Conditional writes (SQL `INSERT`, `RelTable` handles) now take each
+  trigger's event and `old` value from the row values their commit checks, and
+  `MultiModelTxn` commits (including Control Plane row and document writes)
+  take them from the transaction snapshot, so triggers see each row as the
+  write read it. A write whose row another writer changed after that read
+  fails with the commit's conflict, which is handled as before, unless a
+  before trigger rejects it for the event it has. At every isolation level, a
+  transaction commit that writes a key another writer changed after the
+  transaction began fails with that conflict before any trigger runs, or, if
+  the change is made once the commit has started running triggers, after
+  them, as before. Stored procedure (`CALL`) writes and direct
+  `Database::propose` and `propose_batch` writes check nothing at commit: they
+  are last-writer-wins, and under concurrent writes the event and `old` value
+  their triggers see are best effort.
+- Breaking for embedders: with a tenant set (`OperationalConfig::with_tenant`)
+  whose `max_concurrent_writes` or `max_concurrent_queries` is limited, Control
+  Plane requests (including row and document writes) and PostgreSQL wire
+  statements can now exceed those limits, because they run concurrently.
+  Tenant write and query slots are taken without waiting, so the extra
+  requests fail. Writes and single-table equality `SELECT`s fail with
+  `ReplError::QuotaExceeded { requested: 1, remaining: 0, .. }`, which
+  PostgreSQL wire reports as SQLSTATE 53100. Other `SELECT`s, which DataFusion
+  executes, can instead fail with a `QueryError::DataFusion` whose message
+  contains the quota error, which PostgreSQL wire reports as SQLSTATE XX000.
+  The Control Plane returns HTTP 500 `internal_error` in both cases. Size the
+  limits for the concurrent load or retry such failures. `multidb serve` sets
+  no tenant.
 - SQL read authorization (`query_as`, `query_as_of_as`, pgwire and the
   Control Plane `/sql`) is now checked against every table the planned query
   reads, including subqueries in any position, and the plan that was
@@ -371,15 +406,356 @@ All notable public changes will be recorded here.
 - TypeScript SDK types: `DatabaseSpec.custom_profile` (`CustomProfileSpec`),
   `ProfileVariantSummary`, and optional `variants` and `knobs` on
   `ProfileSummary`. `DatabaseSpec.version` stays `number` (1 or 2).
+- Spec version 2 provisioning fields (preview): `collections[].physical`
+  (`PhysicalObjectSpec`, one flat struct for every kind: `kind`, pinned ids,
+  document `fields`, `document_indexes`, `full_text` and `geo` entries, table
+  `layout`, `columns`, `primary_key`, `table_indexes`, `system_versioning` and
+  `keep_history`, vector `dim`, `metric` and `hnsw`, time-series
+  `chunk_millis` and `retention_millis`), `security` (`SecuritySpec`: managed
+  roles whose grants name spec objects or the whole database, and principals
+  mapping users to roles; no secrets and no system scope) and `provisioning`
+  (`ProvisioningPolicySpec.unmanaged`: `ignore`, `report` or `fail`). A
+  version 1 document that sets one fails with `FIELD_REQUIRES_SPEC_V2` at its
+  path. Defaults are pinned (HNSW 16/200/48, full-text language `simple` with
+  refresh lag 1, geo precision 6, index ids at position + 1, chunk and
+  retention from the profile knobs), as are the derived names
+  `<collection>_<path>_fts`, `<collection>_<path>_geo` and `<table>_history`.
+  An explicit `physical.retention_millis: null` is refused when the spec is
+  decoded, since it could mean the profile knob or no retention.
+  See `docs/provisioning.md`.
+- `CollectionIndexKind::Geo` (`geo`), a version 2 index kind that needs
+  `physical.geo` and no extension.
+- New validation codes: `COLLECTION_NAME_INVALID`,
+  `COLLECTION_NAME_RESERVED`, `OBJECT_NAME_COLLISION` and
+  `SPEC_LIMIT_EXCEEDED` (Warnings in version 1, Errors in version 2);
+  `PHYSICAL_PARAMETER_REQUIRED` (Advice in version 2); the version 2 Errors
+  `PHYSICAL_KIND_INCOMPATIBLE_WITH_ROLE`, `PHYSICAL_FIELD_NOT_APPLICABLE`,
+  `PHYSICAL_NAME_INVALID`, `PROVISION_INDEX_KIND_MISSING`,
+  `INDEX_SOURCE_NOT_DOCUMENT`, `PROVISION_PATH_INVALID`, `ID_CONFLICT`,
+  `VECTOR_DIM_OUT_OF_RANGE`, `VECTOR_PARAMS_OUT_OF_RANGE`,
+  `GEO_PARAMS_OUT_OF_RANGE`, `TIME_SERIES_PARAMS_INVALID`,
+  `TABLE_PRIMARY_KEY_UNKNOWN`, `TABLE_COLUMN_DUPLICATE`,
+  `TABLE_INDEX_COLUMN_UNKNOWN`, `SECURITY_NAME_INVALID`,
+  `SECURITY_RESERVED_NAME`, `SECURITY_SYSTEM_GRANT_FORBIDDEN`,
+  `SECURITY_GRANT_TARGET_INVALID`, `SECURITY_GRANT_UNKNOWN_OBJECT`,
+  `SECURITY_PRINCIPAL_UNKNOWN_ROLE` and `SECURITY_DUPLICATE`; and the version
+  2 Warnings `SECURITY_BROAD_GRANT` (every grant on the whole database,
+  which in this build also covers system reads, writes or administration) and
+  `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ`.
+  `PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME` also covers full-text languages
+  other than `simple`. `TIME_SERIES_PARAMS_INVALID` follows the runtime's
+  time-series rules: a positive `retention_millis` of at least one chunk and
+  a `physical.max_future_skew_millis` of at least 0. The future-skew bound
+  defaults to the runtime default for new series (300000 ms) when it is left
+  out, and an explicit `null` means no bound; it is set at creation, compared
+  by every plan and pinned by `export_spec`. A series created before the
+  bound existed, which the runtime reads back as `i64::MAX`, exports as
+  `null` with a note, and plans show its bound as `null`, since JavaScript
+  clients cannot represent `i64::MAX`; plan and apply read `null` as no
+  bound, so the exported spec round-trips. A spec that spells the bound out
+  as `i64::MAX` is read as `null`, and specs, plans, apply reports, provision
+  records and drift reports always write no bound as `null`.
+- `database_spec_v2_schema()` and `docs/schemas/database-spec-v2.schema.json`
+  describe `physical`, `security`, `provisioning` and `geo`.
+- `multidb::provision::physical::project`, which projects a spec onto the
+  catalog objects provisioning would build (`DesiredObject`, `DesiredKind`
+  with runtime types, `DesiredObject::params_json`,
+  `physical::time_series_config`). It is always strict and never touches a
+  database: a version 1 collection whose index kinds lack parameters (for
+  example a `document` index without `physical.document_indexes`) fails with
+  `PHYSICAL_PARAMETER_REQUIRED`.
+- `Database::create_table_with_layout` and `create_table_with_layout_as`
+  create a table with an explicit layout, so a columnar table can live in a
+  row-class database; the layout is persisted with the table and kept across
+  reopens. `create_table` delegates with the database layout.
+- `config plan` (the version 1 migration planner) reports changes of
+  `collections[].physical`, `security` and `provisioning` as unsupported
+  steps; specs without them plan exactly as before, with the same plan ids.
+- `multidb::provision::plan_provision`, a read-only provisioning planner
+  (preview). It computes a `ProvisionPlan` for a spec against an absent
+  target (`ProvisionTargetRef::Path` of a missing or empty file, or
+  `Volatile`) or an open single-node CP database (`Open`): steps in a fixed
+  phase order with a safety class each (`additive`, `metadata`, `retune`,
+  `strengthening`, `weakening`, `destructive`, `format_upgrade`,
+  `unsupported`), the per-path `allow_weakening` and `allow_destructive`
+  flags and `allow_format_upgrade` they need (`ProvisionOptions`), an
+  outcome (`noop`, `ready`, `needs_flags`, `blocked`), `auto_approvable`, the
+  planned objects with field diffs, how every guarantee is enforced on the
+  calling surface (`GuaranteeEnforcement`, for example `operator_managed`
+  backups, `enforced_with_development_key` audit, `not_enforceable` encryption
+  at rest outside the Rust API) and a `prov_` plan id over the canonical
+  spec, a live fingerprint, the options, the surface
+  (`ProvisionSurface`), the canonical target path and the crate version.
+  Objects that already match are adopted; differing ones are conflicts,
+  since there is no alter API; managed objects the spec drops are released
+  with their data kept; RBAC is managed-only and never touches the bootstrap
+  administrator. Enabling system versioning on a table the plan adopts is
+  never auto-approvable, and `deployment.storage_path` is not part of what
+  counts as the applied spec. Planning never creates a file or writes a
+  database. New plan issue codes include `PROVISION_ENGINE_MISMATCH`,
+  `PROVISION_FORMAT_MISMATCH`, `PROVISION_OBJECT_CONFLICT`,
+  `PROVISION_SECURITY_STATE_STALE` (RBAC or the audit flag changed in memory
+  only, with `set_authz_policy` or by a change whose persist failed, which an
+  apply would persist), `RBAC_SELF_LOCKOUT`,
+  `AUDIT_REQUIRED_FOR_APPLY`, `PROVISION_AUDIT_KEY_MISMATCH` (a plan with
+  steps whose appended audit events would not verify against the existing
+  chain), `GUARANTEE_NOT_ENFORCEABLE` and `STEP_REQUIRES_FLAG`, and the
+  Warning `SECURITY_ROLE_ALREADY_ASSIGNED` (a created or widened role that
+  users the spec does not manage already hold). See `docs/provisioning.md`.
+- `provision::drift`, which reports how an open database differs from a spec
+  (`DriftReport` with `in_sync` and typed items), and `provision::export_spec`,
+  which describes an open database as a version 2 spec: the applied spec of
+  its provision record, or one inferred from the catalog, profile manifest,
+  RBAC and audit state with every id pinned and what a spec cannot express
+  listed in `operation_hints["export.unsupported_objects"]`.
+- `Database::provision_state`, which reads the provision record
+  (`ProvisionRecord`) from the new system table `__provision`; a record of a
+  newer `record_version` or a corrupt one is refused. The persistent format
+  registry lists it as `provision record` (`__provision/record_version` 1).
+- `config_spec::canonical_spec_json` and `config_spec::spec_digest` (`spec_`
+  and 32 hex characters of blake3 over the canonical JSON).
+- `multidb::provision::apply_provision`, which applies a spec to an open
+  single-node database (preview, Rust API). It recomputes the plan, accepts
+  only the current `prov_` id (`Confirmation::PlanId`; another `prov_` id is
+  `PlanChanged`, anything else a `rejected` report) or
+  `Confirmation::AutoApproveAdditive` for an `auto_approvable` plan, and runs
+  as a `ProvisionActor`: a principal with `System:Admin` and `Database:Admin`,
+  whose objects are created through the audited `*_as` APIs, or a local
+  operator (`local:cli`, `local:serve`, `local:embedded`) audited with
+  `provision_create_object`. Audit comes first: it is turned on as the first
+  step or the apply is refused (`AuditRequired`), `provision_apply_started` is
+  audited before any change and `provision_apply_completed` (or
+  `provision_apply_failed`) after it, and turning audit off runs last. The
+  provision record is journaled after every step and gets a history entry
+  (`Database::provision_history`, at most 100); a failed step gives a
+  `partially_applied` report and a `failed` record, and the next plan holds
+  only what remains. Once anything changed the database, an apply answers
+  with a report, never an error: a step that fails after its write committed
+  says so and the record manages the object it created, and a completion
+  event that cannot be written leaves the apply `applied` with the Warning
+  `PROVISION_COMPLETION_NOT_AUDITED`. Provisioning writes are system writes:
+  they run no triggers and are not charged to a tenant quota. The next plan
+  compares declared guarantees and metadata with the last finished apply
+  (`ProvisionRecord::last_applied`), so a confirmed weakening needs its flag
+  again. Objects are only created or adopted,
+  releases keep the data, RBAC changes touch managed names only and commit in
+  one batch, and the storage format upgrade writes the value-framing manifest
+  and `schema_version` 2 together, taking effect at the next open. See
+  `docs/provisioning.md`.
+- `multidb::provision::provision_new_database`, which creates a database from
+  a spec at an absent target with `create_database_with_profile` (audit on,
+  the environment's audit key and, on the Rust API, a `LocalEnvelope`
+  encryption config, whose keyring is created with the new file unless one
+  already exists at its path), checks that the plan recomputed against it
+  equals the confirmed one and applies it under the confirmed plan id; once
+  the database exists, a plan that differs is a `plan_changed` report with
+  `data_mutated: true`, not an error. An encryption
+  config for a spec with `at_rest: false` is refused before anything is
+  created (`PROVISION_ENCRYPTION_MISMATCH`).
+- `Database::set_security_state_as`, which replaces the RBAC policy and the
+  principal registry in one persisted batch after checking `System:Admin`,
+  audited as `set_security_state`.
+- `Database::override_query_governor`, which sets the query governor limits
+  that are `Some` and keeps the others. `multidb serve` uses it for each of
+  `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that
+  is set, where it used to fill the unset limit from the profile.
+- CLI provisioning (preview), as the local operator `local:cli`:
+  `multidb config plan --spec <file> [--db <path>] [--out <plan.json>
+  [--force]]` (a dry run that never creates the database file; text output
+  lists every step with its safety class and flag, every guarantee status and
+  the exact `config apply ... --confirm prov_...` command; `--out` never
+  replaces an existing file without `--force`, and never the spec or the
+  database), `config apply --spec <file>
+  [--db <path>] (--confirm <prov_id> | --auto-approve)` (recomputes the plan,
+  creates a missing database with `provision_new_database` or converges an
+  existing one with `apply_provision`), `config drift --spec <file>`,
+  `config status --db <path>` (the provision record with its guarantee
+  statuses, the last 20 history entries, the profile manifest and the drift
+  against the applied spec) and
+  `config export --db <path> [--format yaml|json] [--out <file>] [--force]`
+  (the exported `deployment.storage_path` points at the database relative to
+  the directory of `--out`, or is its absolute path on stdout; `--out` never
+  names the database or another multidb database, even with `--force`; a
+  spec over 1 MiB, which `--spec` could not read back, exits 2 with
+  `SPEC_TOO_LARGE` and is written nowhere, as in `config upgrade`).
+  `--allow-weakening` and `--allow-destructive` (repeatable or
+  comma-separated), `--allow-format-upgrade` and `--unmanaged
+  ignore|report|fail` are part of the `prov_` id. The target is `--db`, else
+  the spec `storage_path` resolved against the spec file's directory; an AP
+  database is refused with `PROVISION_REPLICATION_UNSUPPORTED`, and a
+  database another process holds open with "database is in use (is multidb
+  serve running?)". Exit codes: 0 ready, applied, noop or in sync; 1 a
+  partial apply, a runtime error or a locked database; 2 invalid, blocked,
+  flags or confirmation missing, or rejected; 3 drift (`config drift` only);
+  4 the confirmed plan changed. `--spec` cannot be combined with `--plan`,
+  `--current` or `--desired`; the version 1 `config plan --current --desired`
+  and `config apply --plan --confirm` flows are unchanged and stay
+  audit-only. See `docs/provisioning.md`.
+- `multidb init --guided (--profile | --template) ... --apply [--db <path>]
+  [--confirm <prov_id>]` writes the files as before and then provisions a new
+  database from the spec at `--db`, the spec `storage_path` relative to the
+  output directory, or `<out dir>/<name>.redb`, auto-approving a plan that
+  only creates, adopts or records. An existing database is refused, and a
+  blocked or not auto-approvable plan keeps the written files and exits 2;
+  `--json` adds `database` and `provision` to the summary.
+- `multidb serve` spec mode (preview), as the local operator `local:serve`:
+  `MULTIDB_SPEC_PATH` names the spec the database is built from and checked
+  against at every start, and `MULTIDB_SPEC_APPLY` what a start may change:
+  `verify` (the default; starts only when the database exists and matches),
+  `create` (also creates a missing database from an auto-approvable plan) or
+  `additive` (also applies auto-approvable additive plans, including the rest
+  of an interrupted apply). The database path is an explicit
+  `MULTIDB_DB_PATH`, else the spec `storage_path` relative to the spec file,
+  else the default path. An explicit `MULTIDB_PROFILE` that selects another
+  storage profile, an explicit `MULTIDB_REPLICATION` (read in spec mode only)
+  that contradicts the spec, `encryption.at_rest` and volatile profiles are
+  refused. Every refusal comes before a port is bound and prints the plan and
+  the exact `multidb config apply ... --confirm prov_...` command (with the
+  flags the plan needs) that confirms it, or the `config plan` command for a
+  blocked plan. Without `MULTIDB_SPEC_PATH`, `serve` is unchanged. See
+  `docs/docker.md` and `docs/provisioning.md`.
+- `multidb::provision::open_from_spec`, which opens or creates the database of
+  a spec at startup on the Rust API or serve surface: it probes the target
+  (with crash recovery), opens an existing database with
+  `open_database_with_ops` (with `ProvisionEnvironment.encryption`, also for
+  an encrypted database whose metadata cannot be probed without the key, and
+  never creating a keyring for it, so a missing keyring fails the start; and
+  re-applying `ProvisionEnvironment.audit`, so the audit chain stays on the
+  caller's key) and applies an auto-approvable plan
+  as `local:embedded` or `local:serve` when the `StartupMode` allows it. The
+  pure `serve_startup_decision(plan, mode)` returns the `StartupDecision`
+  (`start`, `apply_then_start` or `refuse` with the reason); a refusal is
+  `ProvisionError::StartupRefused` (`StartupRefusal`), a start returns a
+  `StartupReport`.
+- Helm chart spec mode: `spec.enabled` (off by default), `spec.configMap`,
+  `spec.key`, `spec.mountPath` and `spec.apply` (`verify` by default) mount
+  the spec read-only, set `MULTIDB_SPEC_PATH` and `MULTIDB_SPEC_APPLY`, and
+  set `MULTIDB_PROFILE` and `MULTIDB_REPLICATION` to empty values, which
+  override the image's `MULTIDB_PROFILE=transactional` and leave the profile to
+  the spec;
+  `docker-compose.yml` has a commented example.
+- Control Plane provisioning (preview) of the served database, as the calling
+  principal: `POST /provision/plan` (`{spec, options?}`; a dry run on the
+  `control_plane` surface, 200 for ready, noop and needs-flags plans, 422 with
+  the plan in `data` when blocked), `POST /provision/apply` (`{spec, confirm,
+  options?}`; the server recomputes the plan and applies it only when
+  `confirm` is its current `prov_` id: 409 `plan_changed` or
+  `object_conflict`, 422 `confirmation_required`, `flags_required`,
+  `provision_blocked`, `invalid_spec`, `audit_required` or
+  `rbac_self_lockout`, 500 `provision_partially_applied` with the report),
+  `POST /provision/drift`, `GET /provision/state` (the provision record,
+  history, profile manifest, live fingerprint and the spec mode of `serve`)
+  and `GET /config/live` (the served database as a spec, from its record or
+  inferred). Plans, drift, state and `/config/live` run under the shared
+  `serve` lock next to statements, and an apply holds the exclusive lock from
+  its recomputed plan through its last step; a wrapped busy query governor
+  stays 503 `busy` and a write conflict 409 `conflict`. A query governor knob
+  set for the process (each of `MULTIDB_MAX_CONCURRENT_QUERIES` and
+  `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that is set, through
+  `Database::override_query_governor`, or both with
+  `Database::set_query_governor`) is not reported as
+  `session_pending_restart`; a retune of a governor knob the process did not
+  set is, in the apply report and in later plans. Every endpoint needs
+  `System:Admin`, and applying also `Database:Admin`; a spec `storage_path` is
+  the Advice `PROVISION_STORAGE_PATH_IGNORED`, since the Control Plane never
+  creates databases or opens paths. The `OpenAPI` snapshot documents the five
+  operations (`x-multidb-stability: preview`, request bodies pointing at the
+  version 2 spec schema, error envelopes that carry `data`), and
+  `StudioManifest` gains `provisioning_supported: true` and the capability
+  `provision_apply`. See `docs/provisioning.md`.
+- SDK provisioning methods: TypeScript `provisionState`, `provisionPlan`,
+  `provisionApply`, `provisionDrift` and `liveConfig` with the types
+  `ProvisionPlan`, `ProvisionStep`, `ProvisionApplyReport`, `DriftReport`,
+  `GuaranteeEnforcement`, `ProvisionState`, `ProvisionOptions` and
+  `LiveConfig`; Go `ProvisionState`, `ProvisionPlan`, `ProvisionApply`,
+  `ProvisionDrift` and `LiveConfig`; Python and Rust `provision_state`,
+  `provision_plan`, `provision_apply`, `provision_drift` and `live_config`.
+  The TypeScript and Studio `DatabaseSpec` types gain the optional `security`,
+  `provisioning` and `collections[].physical` fields and the `geo` index kind,
+  and `StudioManifest` the optional `provisioning_supported`.
+- `provision::live_fingerprint`, the fingerprint of the live state plans are
+  computed against, and `admin::AdminState::with_spec_mode`, which `multidb
+  serve` uses in spec mode so `GET /provision/state` reports the spec digest
+  and `MULTIDB_SPEC_APPLY` mode it started with.
+- `examples/provisioning`: a full version 2 spec that provisioning builds end
+  to end (a document collection with fields, document, full-text and geo
+  indexes, a system-versioned ledger table, a vector collection, a columnar
+  table in a `HighDurability` row-class database, a managed role and
+  principal), validated, explained and dry-run planned by
+  `scripts/templates-smoke.ps1`.
+- `templates::TemplateSpec::physical(collection)` returns the `physical`
+  parameters a built-in template gives a collection, and
+  `templates::TEMPLATE_SPEC_VERSION` the spec version templates emit.
+  `multidb template list --json` adds `spec_version` and each collection's
+  `physical`, and the `template explain` text header adds `spec_version`.
 
 ### Changed
 
+- Built-in templates emit spec version 2 with the `physical` parameters
+  provisioning needs, so `multidb init --guided --template <t> --apply` builds
+  `game-save` (document index on `slot`), `desktop-embedded` (`title`, and
+  one-hour chunks with 30-day retention for `usage_metrics`), `ai-memory`
+  (1536-dimension cosine `memories`, `subject`) and `analytics` (one-hour
+  `metrics` chunks, a typed columnar `aggregates` table) on the CLI.
+  `secure-saas` (`tenant_id`) keeps `encryption.at_rest: true`, so its plan
+  is blocked on the CLI, `serve` and the Control Plane with
+  `GUARANTEE_NOT_ENFORCEABLE` and is provisioned through the Rust API with a
+  `LocalEnvelope` key. The generated README gains a Provision section with
+  the plan, apply and drift commands and the guarantee statuses a CLI plan
+  reports, and the known limits name the values fixed at creation. The
+  checked-in `examples/<template>/multidb.yaml` and `README.md` are
+  regenerated (`seed.json` and `smoke.ps1` are unchanged); the version 1
+  originals stay frozen under `tests/fixtures/spec-v1`, still validate, and
+  are blocked for provisioning with `PHYSICAL_PARAMETER_REQUIRED`.
+- `scripts/templates-smoke.ps1` also validates and explains the frozen
+  version 1 specs and `examples/provisioning`, dry-runs the provisioning
+  plan of the example, and runs `init --apply`, `config drift` (exit 0) and
+  a re-apply (a noop) for every template, with `secure-saas` exiting 2.
+  `scripts/preview-smoke.ps1` adds a `config plan --spec --db` dry run of the
+  generated ai-memory spec and records its outcome in the summary.
+- `POST /config/apply` also accepts `{current, desired, confirm}`: the server
+  recomputes the plan with `MigrationPlanner::plan`, decoding each side as
+  `/config/plan` does. The `config_apply` audit detail ends with
+  `plan_source: recomputed`, or `plan_source: client` for the `{plan,
+  confirm}` body (and for `Database::confirm_config_apply_as`), and keeps at
+  most 48 characters of a client plan id. The endpoint stays audit-only
+  (`data_mutated: false`), and its `OpenAPI` 422 response is documented as a
+  success or an error envelope, since a version error in a recomputed side is
+  `invalid_spec_version`. `GET /config` is documented as legacy, replaced by
+  `GET /config/live`.
+- `multidb config upgrade` adds a note for every physical parameter
+  provisioning still needs (`PHYSICAL_PARAMETER_REQUIRED`), so an upgraded
+  version 1 spec lists what to add before `config apply --spec`.
+- The `history.system_versioning`, `history.keep_history`,
+  `time_series.default_chunk_millis` and `time_series.default_retention_millis`
+  knobs are `enforced` in `KNOB_REGISTRY`: provisioning applies them to the
+  tables and series it creates. Provisioned history starts where versioning
+  is enabled, never below the history GC horizon, so a plan that adds
+  versioning also applies after GC pruned: a table the apply creates starts
+  at the newest commit after its creation, and an existing table at the
+  horizon (LSN 0 when GC never pruned), keeping the `AS OF` history it still
+  has. A table that keeps its history holds the GC watermark at that start,
+  so GC keeps every `AS OF` result from there and, while the table exists,
+  prunes and truncates only below it; the provision record lives outside the
+  commit log, so GC and truncation change no plan, drift or export.
+  Explain says that every-open knobs apply to databases created with
+  `db::create_database_with_profile` or by provisioning, that
+  provisioning-timing knobs are applied by provisioning to the objects it
+  creates, and that enabling compression on an existing database is the
+  provisioning format upgrade (`allow_format_upgrade`).
 - Explain wording: `$.compiled_policy.storage_profile` names the storage class
   and engine instead of "storage profile selected", encryption at rest reads
   "requested; enforced only on the Rust API with an encryption config in this
   build" instead of "encrypted storage required", and `RuntimeLimits` is
   labelled advisory catalog guidance that this build does not enforce (its
   values are unchanged).
+- Version 1 specs also gain the Warnings `COLLECTION_NAME_INVALID`,
+  `COLLECTION_NAME_RESERVED`, `OBJECT_NAME_COLLISION` and
+  `SPEC_LIMIT_EXCEEDED` after every existing issue, for collection names the
+  runtime would refuse, duplicate collection names and oversized `overrides`,
+  `operation_hints` and collection lists.
+- `multidb init` refuses `--db` and `--confirm` without `--apply` as a usage
+  error; they were ignored before.
 - Version 1 specs gain only Advice and Warnings, no new Errors:
   `PROFILE_NOT_PROVISIONABLE` after `CUSTOM_PROFILE` for unknown profiles,
   `OVERRIDE_IS_METADATA_ONLY` for `overrides` keys in a knob namespace
@@ -468,8 +844,13 @@ All notable public changes will be recorded here.
 
 ### Breaking
 
-- `DatabaseSpec` struct literals must set the new `custom_profile` field;
-  `None` keeps today's behaviour.
+- `DatabaseSpec` struct literals must set the new `custom_profile`,
+  `security` and `provisioning` fields, and `CollectionRoleSpec` literals the
+  new `physical` field; `None` keeps today's behaviour.
+- `CollectionIndexKind` gains `Geo`; exhaustive matches outside the crate must
+  handle it.
+- `admin::StudioManifest` struct literals must set the new
+  `provisioning_supported` field.
 - `ConfigSpecError::UnsupportedVersion` gains a `supported` range field.
 - `CompiledPolicy` struct literals must set the new `resolved_profile` field.
 - `ConfigError` gains `AlreadyInitialized`, `StorageFormatMismatch`,

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -50,10 +50,13 @@ use crate::performance::{
     BenchmarkReport, CompressionAlgorithm, PerformanceConfig, RegressionGate,
 };
 use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
+use crate::provision::{
+    ProvisionActor, ProvisionHistoryEntry, ProvisionRecord, ProvisionRecordStatus, RECORD_VERSION,
+};
 use crate::query::{
     ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint,
     REL_COLUMNAR_SEGMENT_META_TABLE, REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE,
-    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    RelIndexSpec, RelPlanKind, Row, SqlEngine, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -2323,6 +2326,715 @@ fn analytical_layout_persists_and_reopens() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Gates per-table layout for provisioning: a columnar table inside a row-class database takes
+/// SQL writes and reads and keeps its layout across a reopen. A handful of rows keeps the table
+/// within one columnar segment.
+#[tokio::test]
+async fn create_table_with_layout_columnar_in_balanced_database_supports_sql_and_survives_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("balanced-columnar.redb");
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    let expected = SqlOutput::Rows(SqlRows {
+        columns: vec!["id".to_owned(), "category".to_owned(), "price".to_owned()],
+        rows: vec![
+            vec![
+                Value::Int(1),
+                Value::Str("a".to_owned()),
+                Value::Float(10.0),
+            ],
+            vec![
+                Value::Int(2),
+                Value::Str("b".to_owned()),
+                Value::Float(20.5),
+            ],
+        ],
+    });
+
+    {
+        let mut database = create_database(config.clone())?;
+        assert_eq!(database.layout(), TableLayout::Row);
+        let rollups = database.create_table_with_layout(
+            "rollups",
+            Some(sales_schema()),
+            Vec::new(),
+            TableLayout::Columnar,
+        )?;
+        assert_eq!(rollups.layout(), TableLayout::Columnar);
+        let orders = database.create_table("orders", Some(sales_schema()), Vec::new())?;
+        assert_eq!(orders.layout(), TableLayout::Row);
+
+        assert_eq!(
+            database
+                .query(
+                    "INSERT INTO rollups (id, category, price) VALUES (1, 'a', 10.0), (2, 'b', 20.5)"
+                )
+                .await?,
+            SqlOutput::AffectedRows(2)
+        );
+        database
+            .query("INSERT INTO orders (id, category, price) VALUES (7, 'row', 1.0)")
+            .await?;
+        assert_eq!(
+            database
+                .query("SELECT id, category, price FROM rollups ORDER BY id")
+                .await?,
+            expected
+        );
+    }
+
+    let database = open_database(config)?;
+    assert_eq!(database.layout(), TableLayout::Row);
+    assert!(matches!(
+        database.catalog.get("rollups"),
+        Some(super::CatalogEntry::Table {
+            layout: TableLayout::Columnar,
+            ..
+        })
+    ));
+    assert!(matches!(
+        database.catalog.get("orders"),
+        Some(super::CatalogEntry::Table {
+            layout: TableLayout::Row,
+            ..
+        })
+    ));
+    assert_eq!(database.table("rollups")?.layout(), TableLayout::Columnar);
+    assert_eq!(
+        database
+            .query("SELECT id, category, price FROM rollups ORDER BY id")
+            .await?,
+        expected
+    );
+    assert_eq!(
+        database.query("SELECT count(*) AS n FROM orders").await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["n".to_owned()],
+            rows: vec![vec![Value::Int(1)]],
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn create_table_with_layout_refuses_columnar_without_schema_or_with_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+
+    assert!(
+        database
+            .create_table_with_layout("loose", None, Vec::new(), TableLayout::Columnar)
+            .is_err()
+    );
+    assert!(
+        database
+            .create_table_with_layout(
+                "indexed",
+                Some(sales_schema()),
+                vec![RelIndexSpec::new(1, 1)],
+                TableLayout::Columnar,
+            )
+            .is_err()
+    );
+    assert!(database.table("loose").is_err());
+    assert!(database.table("indexed").is_err());
+    Ok(())
+}
+
+#[test]
+fn create_table_with_layout_as_requires_database_admin_and_audits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("admin").grant(Resource::Database, Permission::Admin),
+        Role::new("reader").grant(Resource::Database, Permission::Read),
+    ]));
+    let admin = Principal::new("root").with_role("admin");
+    let reader = Principal::new("ada").with_role("reader");
+
+    assert!(matches!(
+        database.create_table_with_layout_as(
+            &reader,
+            "rollups",
+            Some(sales_schema()),
+            Vec::new(),
+            TableLayout::Columnar,
+        ),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(database.table("rollups").is_err());
+
+    let table = database.create_table_with_layout_as(
+        &admin,
+        "rollups",
+        Some(sales_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    assert_eq!(table.layout(), TableLayout::Columnar);
+
+    let audit = database.audit_events()?;
+    assert!(audit.iter().any(|event| {
+        event.action == "create_table"
+            && event.outcome == AuditOutcome::Denied
+            && event.principal.as_deref() == Some("ada")
+    }));
+    assert!(audit.iter().any(|event| {
+        event.action == "create_table"
+            && event.outcome == AuditOutcome::Succeeded
+            && event.resource == Resource::Table("rollups".to_owned())
+            && event.detail.as_deref() == Some("layout: columnar")
+    }));
+    Ok(())
+}
+
+#[test]
+fn is_valid_catalog_name_matches_validate_catalog_name() {
+    let long = "a".repeat(128);
+    let too_long = "a".repeat(129);
+    for name in [
+        "",
+        "_",
+        "__provision",
+        "orders",
+        "Orders_2",
+        "orders_notes_fts",
+        long.as_str(),
+        too_long.as_str(),
+        "1orders",
+        "order-items",
+        "order items",
+        "zamówienia",
+        "orders.notes",
+    ] {
+        assert_eq!(
+            super::is_valid_catalog_name(name),
+            super::validate_catalog_name(name).is_ok(),
+            "{name}"
+        );
+    }
+    assert!(super::is_valid_catalog_name(&long));
+    assert!(!super::is_valid_catalog_name(&too_long));
+    assert!(!super::is_valid_catalog_name(""));
+}
+
+#[test]
+fn provision_state_reads_the_record_and_refuses_unreadable_ones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+    assert_eq!(database.provision_state()?, None);
+
+    let spec = DatabaseSpec::from_db_config("app", database.config());
+    let record = json!({
+        "record_version": 1,
+        "status": "applied",
+        "plan_id": "prov_0123",
+        "spec_digest": "spec_0123",
+        "applied_spec": spec,
+        "profile_digest": "prof_0123",
+        "applied_at_millis": 1,
+        "applied_by": "local:test",
+        "binary_version": "0.1.0"
+    });
+    let put = |value: &serde_json::Value| -> Result<(), Box<dyn std::error::Error>> {
+        propose_system(
+            &database,
+            Op::Put {
+                table: super::PROVISION_TABLE.to_owned(),
+                key: b"record".to_vec(),
+                value: serde_json::to_vec(value)?,
+            },
+        )?;
+        Ok(())
+    };
+    put(&record)?;
+    let state = database.provision_state()?.ok_or("a record")?;
+    assert_eq!(state.plan_id, "prov_0123");
+    assert_eq!(state.applied_spec, spec);
+    assert!(state.objects.is_empty() && state.released_objects.is_empty());
+
+    let mut newer = record;
+    newer["record_version"] = json!(2);
+    put(&newer)?;
+    assert!(matches!(
+        database.provision_state(),
+        Err(DbError::Serde(message)) if message.contains("record_version 2")
+    ));
+    Ok(())
+}
+
+#[test]
+fn document_count_counts_the_documents_of_one_collection() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_collection("users", CollectionId::new(1), user_doc_fields(), Vec::new())?;
+    database.create_collection(
+        "others",
+        CollectionId::new(2),
+        user_doc_fields(),
+        vec![IndexSpec::new(IndexId::new(1), FieldPath::new(["name"]))],
+    )?;
+    assert_eq!(database.document_count(CollectionId::new(1))?, 0);
+    for name in ["Ada", "Grace", "Linus"] {
+        database.collection("users")?.insert(&Value::Object(
+            [("name".to_owned(), Value::Str(name.to_owned()))].into(),
+        ))?;
+    }
+    database.collection("others")?.insert(&Value::Object(
+        [("name".to_owned(), Value::Str("Alan".to_owned()))].into(),
+    ))?;
+    assert_eq!(database.document_count(CollectionId::new(1))?, 3);
+    assert_eq!(database.document_count(CollectionId::new(2))?, 1);
+    assert_eq!(database.document_count(CollectionId::new(9))?, 0);
+    Ok(())
+}
+
+#[test]
+fn provisioning_views_match_the_file_and_refuse_replicated_backends()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("views.redb");
+    let config = DbConfig::on_disk(Profile::Balanced, &path);
+    let security = SecurityConfig {
+        authz_policy: AuthzPolicy::new([
+            Role::new("reader").grant(Resource::Collection("users".to_owned()), Permission::Read)
+        ]),
+        ..SecurityConfig::default()
+    };
+    drop(create_database_with_ops(
+        config.clone(),
+        OperationalConfig::new().with_security(security.clone()),
+    )?);
+    let MetadataProbe::Initialized(probe) = inspect_database_metadata(&path) else {
+        return Err("the closed database is initialized".into());
+    };
+
+    // Plain openers reload the persisted RBAC state, so the handle enforces what is persisted.
+    let plain = open_database(config.clone())?;
+    assert_eq!(plain.probed_metadata()?, *probe);
+    assert_eq!(plain.persisted_security_state()?, security);
+    assert_eq!(*plain.authz_policy(), security.authz_policy);
+    assert!(!plain.encryption_configured());
+    assert!(!plain.audit_key_configured());
+    assert_eq!(*plain.audit_config(), super::AuditConfig::default());
+    drop(plain);
+
+    let fresh = create_database(DbConfig::new(Profile::InMemory))?;
+    assert_eq!(fresh.persisted_security_state()?, SecurityConfig::default());
+    assert!(!fresh.probed_metadata()?.values_framed);
+
+    // The public CP constructors fail closed, so only the in-crate simulated cluster has a CP
+    // backend to refuse.
+    assert!(matches!(
+        create_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config()),
+        Err(ConfigError::Unsupported(_))
+    ));
+    let cp =
+        create_simulated_cluster_database(DbConfig::new(Profile::InMemory), cp_cluster_config())?;
+    assert!(matches!(
+        cp.probed_metadata(),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    let sharded = create_sharded_database(DbConfig::new(Profile::InMemory), sharded_config())?;
+    assert!(matches!(
+        sharded.probed_metadata(),
+        Err(DbError::Config(ConfigError::Unsupported(_)))
+    ));
+    Ok(())
+}
+
+/// A provision record with the given plan id and nothing managed.
+fn provision_record(plan_id: &str) -> ProvisionRecord {
+    ProvisionRecord {
+        record_version: RECORD_VERSION,
+        status: ProvisionRecordStatus::Applied,
+        plan_id: plan_id.to_owned(),
+        spec_digest: "spec_test".to_owned(),
+        applied_spec: DatabaseSpec::from_db_config("app", &DbConfig::new(Profile::InMemory)),
+        last_applied_spec: None,
+        profile_digest: "prof_test".to_owned(),
+        objects: BTreeMap::new(),
+        managed_roles: BTreeSet::new(),
+        managed_principals: BTreeSet::new(),
+        released_objects: BTreeSet::new(),
+        guarantees: Vec::new(),
+        completed_steps: Vec::new(),
+        failed_step: None,
+        flags: Vec::new(),
+        seed_digest: None,
+        applied_at_millis: 1,
+        applied_by: "local:test".to_owned(),
+        binary_version: "test".to_owned(),
+    }
+}
+
+/// The commit-log records committed after `lsn`.
+fn commit_records_after(
+    database: &Database,
+    lsn: u64,
+) -> Result<Vec<txn::CommitLogRecord>, Box<dyn std::error::Error>> {
+    Ok(database
+        .range(txn::COMMIT_LOG_TABLE, &[], &[], ReadConsistency::Strong)?
+        .into_iter()
+        .map(|(_, value)| txn::decode_commit_log_record(&value))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|record| record.txn_id > lsn)
+        .collect())
+}
+
+#[test]
+fn provision_records_round_trip_and_history_keeps_the_newest_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = create_database(DbConfig::new(Profile::InMemory))?;
+    let history = database.provision_history()?;
+    assert!(
+        history.is_empty(),
+        "expected an empty value, got {history:?}"
+    );
+
+    for at_millis in 1..=105_u64 {
+        let record = provision_record(&format!("prov_{at_millis}"));
+        let entry = ProvisionHistoryEntry {
+            plan_id: record.plan_id.clone(),
+            status: ProvisionRecordStatus::Applied,
+            flags: vec!["allow_format_upgrade".to_owned()],
+            actor: "local:test".to_owned(),
+            at_millis,
+        };
+        database.write_provision_record(&record, Some(&entry))?;
+    }
+    // A record without a history entry leaves the history alone.
+    let last = provision_record("prov_last");
+    database.write_provision_record(&last, None)?;
+    assert_eq!(database.provision_state()?, Some(last));
+
+    let history = database.provision_history()?;
+    assert_eq!(history.len(), super::provisioning::HISTORY_LIMIT);
+    assert_eq!(history.first().map(|entry| entry.at_millis), Some(6));
+    assert_eq!(history.last().map(|entry| entry.at_millis), Some(105));
+    assert!(
+        history
+            .iter()
+            .all(|entry| entry.flags == ["allow_format_upgrade"])
+    );
+    let keys = database
+        .range(
+            super::PROVISION_TABLE,
+            b"history/",
+            b"history0",
+            ReadConsistency::Strong,
+        )?
+        .into_iter()
+        .map(|(key, _)| String::from_utf8(key))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(keys.len(), 100);
+    assert_eq!(
+        keys.first().map(String::as_str),
+        Some("history/00000000000000000006")
+    );
+    assert_eq!(
+        keys.last().map(String::as_str),
+        Some("history/00000000000000000105")
+    );
+    Ok(())
+}
+
+#[test]
+fn provision_events_need_audit_and_local_operators_toggle_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let actor = ProvisionActor::local_operator("local:test");
+    database.record_provision_event(
+        &actor,
+        "provision_apply_started",
+        Resource::System,
+        AuditOutcome::Succeeded,
+        "plan_id: prov_test",
+    )?;
+    let events = database.audit_events()?;
+    let started = events.last().ok_or("an event")?;
+    assert_eq!(started.action, "provision_apply_started");
+    assert_eq!(started.principal.as_deref(), Some("local:test"));
+
+    database.set_audit_enabled_by_provisioning("local:test", false)?;
+    assert!(!database.audit_enabled());
+    let disabled = database.audit_events()?;
+    let toggle = disabled.last().ok_or("the disable event")?;
+    assert_eq!(toggle.action, "set_audit_enabled");
+    assert_eq!(toggle.principal.as_deref(), Some("local:test"));
+    assert_eq!(toggle.detail.as_deref(), Some("enabled: false"));
+    assert!(!database.persisted_security_state()?.audit_enabled);
+    assert!(matches!(
+        database.record_provision_event(
+            &actor,
+            "provision_apply_started",
+            Resource::System,
+            AuditOutcome::Succeeded,
+            "plan_id: prov_test",
+        ),
+        Err(DbError::AuditIntegrity(_))
+    ));
+    assert_eq!(database.audit_events()?.len(), disabled.len());
+
+    database.set_audit_enabled_by_provisioning("local:test", true)?;
+    assert!(database.audit_enabled());
+    let enabled = database.audit_events()?;
+    assert_eq!(
+        enabled.last().and_then(|event| event.detail.as_deref()),
+        Some("enabled: true")
+    );
+    database.verify_audit_chain()?;
+    Ok(())
+}
+
+#[test]
+fn local_operators_cannot_disable_audit_below_the_audit_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("audit-floor.redb");
+    let overrides: ProfileKnobOverrides = serde_json::from_value(json!({}))?;
+    let resolution = resolve_named_profile("balanced", &overrides);
+    let mut resolved = resolution.resolved().cloned().ok_or("balanced resolves")?;
+    resolved.knobs.floors.audit = true;
+    resolved.digest = crate::config_spec::profile_digest(&resolved.knobs, resolved.storage_profile);
+    let binding = resolved.bind(ReplicationKind::Cp, Some(path))?;
+    let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+
+    assert!(matches!(
+        database.set_audit_enabled_by_provisioning("local:test", false),
+        Err(DbError::Config(ConfigError::ProfileFloorNotMet {
+            floor: "floors.audit",
+            ..
+        }))
+    ));
+    assert!(database.audit_enabled());
+    let events = database.audit_events()?;
+    let refused = events.last().ok_or("the refusal event")?;
+    assert_eq!(refused.outcome, AuditOutcome::Failed);
+    assert_eq!(refused.principal.as_deref(), Some("local:test"));
+    Ok(())
+}
+
+#[test]
+fn set_security_state_as_requires_system_admin_and_writes_one_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database_with_ops(
+        DbConfig::new(Profile::InMemory),
+        OperationalConfig::new().with_security(SecurityConfig {
+            authz_policy: AuthzPolicy::new([
+                Role::new("admin").grant(Resource::System, Permission::Admin),
+                Role::new("reader").grant(Resource::Database, Permission::Read),
+            ]),
+            ..SecurityConfig::default()
+        }),
+    )?;
+    let admin = Principal::new("root").with_role("admin");
+    let reader = Principal::new("ada").with_role("reader");
+    let policy = AuthzPolicy::new([
+        Role::new("admin").grant(Resource::System, Permission::Admin),
+        Role::new("writer").grant(Resource::Collection("orders".to_owned()), Permission::Write),
+    ]);
+    let principals = PrincipalRegistry::new()
+        .with_principal("svc", Principal::new("svc").with_role("writer"))
+        .with_principal("root", admin.clone());
+
+    assert!(matches!(
+        database.set_security_state_as(&reader, policy.clone(), principals.clone()),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(database.principal_registry().principals().is_empty());
+
+    let before = latest_lsn(&database)?;
+    database.set_security_state_as(&admin, policy.clone(), principals.clone())?;
+    assert_eq!(database.authz_policy(), &policy);
+    assert_eq!(database.principal_registry(), &principals);
+    let persisted = database.persisted_security_state()?;
+    assert_eq!(persisted.authz_policy, policy);
+    assert_eq!(persisted.principals, principals);
+
+    let security_records = commit_records_after(&database, before)?
+        .into_iter()
+        .filter(|record| record.writes.iter().any(|write| write.table == AUTHZ_TABLE))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        security_records.len(),
+        1,
+        "one batch for the policy and principals"
+    );
+    let keys = security_records[0]
+        .writes
+        .iter()
+        .filter(|write| write.table == AUTHZ_TABLE)
+        .map(|write| write.key.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(keys.contains(b"policy".as_slice()) && keys.contains(b"principals".as_slice()));
+
+    let events = database.audit_events()?;
+    let changed = events.last().ok_or("an event")?;
+    assert_eq!(changed.action, "set_security_state");
+    assert_eq!(changed.principal.as_deref(), Some("root"));
+    assert_eq!(changed.outcome, AuditOutcome::Succeeded);
+    Ok(())
+}
+
+#[test]
+fn auto_id_creates_as_need_database_admin_and_return_the_allocated_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("admin").grant(Resource::Database, Permission::Admin),
+        Role::new("reader").grant(Resource::Database, Permission::Read),
+    ]));
+    let admin = Principal::new("root").with_role("admin");
+    let reader = Principal::new("ada").with_role("reader");
+    let fields = || vec![DocField::document_id("id")];
+
+    assert!(matches!(
+        database.create_collection_auto_id_as(&reader, "orders", fields(), Vec::new()),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(matches!(
+        database.create_vector_collection_auto_id_as(
+            &reader,
+            "memories",
+            3,
+            VectorMetric::Cosine,
+            HnswParams::default(),
+        ),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(matches!(
+        database.create_graph_auto_id_as(&reader, "social"),
+        Err(DbError::AuthzDenied(_))
+    ));
+    assert!(database.catalog().is_empty());
+
+    database.create_collection("pinned", CollectionId::new(7), fields(), Vec::new())?;
+    assert_eq!(
+        database.create_collection_auto_id_as(&admin, "orders", fields(), Vec::new())?,
+        CollectionId::new(8)
+    );
+    assert_eq!(
+        database.create_vector_collection_auto_id_as(
+            &admin,
+            "memories",
+            3,
+            VectorMetric::L2,
+            HnswParams::default(),
+        )?,
+        CollectionId::new(9)
+    );
+    assert_eq!(
+        database.create_graph_auto_id_as(&admin, "social")?,
+        GraphId::new(1)
+    );
+    assert!(matches!(
+        database.catalog().get("memories"),
+        Some(super::CatalogEntry::Vector {
+            dim: 3,
+            metric: VectorMetric::L2,
+            ..
+        })
+    ));
+
+    let created = database
+        .audit_events()?
+        .into_iter()
+        .filter(|event| event.outcome == AuditOutcome::Succeeded)
+        .map(|event| (event.action, event.resource))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created,
+        vec![
+            (
+                "create_collection".to_owned(),
+                Resource::Collection("orders".to_owned())
+            ),
+            (
+                "create_vector_collection".to_owned(),
+                Resource::VectorCollection("memories".to_owned())
+            ),
+            (
+                "create_graph".to_owned(),
+                Resource::Graph("social".to_owned())
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn write_profile_manifest_validates_and_writes_manifest_and_version_together()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("upgrade.redb");
+    let plain = named_binding("balanced", json!({}), ReplicationKind::Cp, Some(&path))?;
+    let zstd = named_binding(
+        "balanced",
+        json!({ "compression": { "algorithm": "zstd" } }),
+        ReplicationKind::Cp,
+        Some(&path),
+    )?;
+    {
+        let database = create_database_with_profile(&plain, OperationalConfig::new())?;
+        assert!(matches!(
+            database.write_profile_manifest(&plain.manifest, 2),
+            Err(DbError::Config(ConfigError::ProfileManifestInvalid(_)))
+        ));
+        assert!(matches!(
+            database.write_profile_manifest(&zstd.manifest, 1),
+            Err(DbError::Config(ConfigError::ProfileManifestInvalid(_)))
+        ));
+        let mut tampered = zstd.manifest.clone();
+        tampered.digest = "prof_tampered".to_owned();
+        assert!(matches!(
+            database.write_profile_manifest(&tampered, 2),
+            Err(DbError::Config(ConfigError::ProfileManifestInvalid(_)))
+        ));
+        let mut floored = plain.manifest.clone();
+        floored.knobs.floors.encryption_at_rest = true;
+        floored.digest =
+            crate::config_spec::profile_digest(&floored.knobs, floored.storage_profile);
+        assert!(matches!(
+            database.write_profile_manifest(&floored, 1),
+            Err(DbError::Config(ConfigError::ProfileFloorNotMet {
+                floor: "floors.encryption_at_rest",
+                ..
+            }))
+        ));
+        assert_eq!(database.probed_metadata()?.schema_version, 1);
+
+        let before = latest_lsn(&database)?;
+        database.write_profile_manifest(&zstd.manifest, 2)?;
+        let records = commit_records_after(&database, before)?;
+        assert_eq!(records.len(), 1);
+        let keys = records[0]
+            .writes
+            .iter()
+            .filter(|write| write.table == META_TABLE)
+            .map(|write| write.key.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([KEY_PROFILE_MANIFEST.to_vec(), KEY_SCHEMA_VERSION.to_vec()])
+        );
+        let probed = database.probed_metadata()?;
+        assert_eq!(probed.schema_version, 2);
+        assert_eq!(probed.manifest.as_ref(), Some(&zstd.manifest));
+        // The session keeps its engine: framing applies from the next open.
+        assert_eq!(database.engine_kind(), EngineKind::Redb);
+        assert!(matches!(
+            database.write_profile_manifest(&plain.manifest, 1),
+            Err(DbError::Config(ConfigError::StorageFormatMismatch(_)))
+        ));
+    }
+    let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+    assert_eq!(database.engine_kind(), EngineKind::CompressedRedb);
+    assert_eq!(database.performance_config(), &zstd.performance);
+    Ok(())
+}
+
 #[test]
 fn open_database_rejects_layout_mismatch() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -4010,9 +4722,34 @@ fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
         Some(Value::Int(0..=3))
     ));
 
+    // An insert that loses the race is never seen as an update by triggers, so a
+    // before trigger that rejects updates rejects none of these statements.
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    database.register_wasm_trigger(
+        wasm_trigger(
+            "reject_counters_update",
+            "counters",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+        ),
+        &wasm,
+    )?;
+    let results = run_concurrent_statements(&database, 4, 8, |worker, index| {
+        format!(
+            "INSERT INTO counters (id, value) VALUES ({}, {worker}) \
+             ON CONFLICT (id) DO NOTHING",
+            200 + index
+        )
+    })?;
+    for completed in &results {
+        assert_eq!(completed, &(0..8).collect::<Vec<_>>());
+    }
+    assert_eq!(database.table("counters")?.scan()?.len(), 17);
+
     // Plain INSERTs of one new key from several threads: all but one report the
-    // duplicate primary key. query::tests covers the lost-race path
-    // deterministically.
+    // duplicate primary key. query::tests and
+    // sql_insert_that_loses_a_race_is_not_seen_as_an_update cover the lost-race
+    // path deterministically.
     let results = run_concurrent_statements(&database, 4, 1, |worker, _| {
         format!("INSERT INTO counters (id, value) VALUES (500, {worker})")
     });
@@ -4022,6 +4759,434 @@ fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
     };
     assert!(message.contains("duplicate primary key"), "{message}");
 
+    Ok(())
+}
+
+/// Commits a queued write right after the next relational row read, as a statement
+/// that commits between another statement's read and its commit would.
+struct RowReadRace {
+    database: Arc<Database>,
+    queued: Mutex<Option<Vec<Op>>>,
+}
+
+impl RowReadRace {
+    fn new(database: &Arc<Database>) -> Arc<Self> {
+        Arc::new(Self {
+            database: Arc::clone(database),
+            queued: Mutex::new(None),
+        })
+    }
+
+    fn queue(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        *self.queued_ops()? = Some(ops);
+        Ok(())
+    }
+
+    fn is_pending(&self) -> Result<bool, ReplError> {
+        Ok(self.queued_ops()?.is_some())
+    }
+
+    fn queued_ops(&self) -> Result<std::sync::MutexGuard<'_, Option<Vec<Op>>>, ReplError> {
+        self.queued
+            .lock()
+            .map_err(|_| ReplError::Transport("race queue poisoned".to_owned()))
+    }
+}
+
+impl Replication for RowReadRace {
+    fn propose(&self, op: Op) -> Result<(), ReplError> {
+        self.database.propose(op)
+    }
+
+    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        self.database.propose_batch(ops)
+    }
+
+    fn propose_authorized_batch(
+        &self,
+        ops: Vec<Op>,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.database.propose_authorized_batch(ops, authorization)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        self.database.propose_conditional_batch(batch)
+    }
+
+    fn read(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Option<Bytes>, ReplError> {
+        let value = self.database.read(table, key, consistency)?;
+        if table == REL_ROWS_TABLE {
+            let queued = self.queued_ops()?.take();
+            if let Some(ops) = queued {
+                self.database.propose_batch(ops)?;
+            }
+        }
+        Ok(value)
+    }
+
+    fn range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+        self.database.range(table, start, end, consistency)
+    }
+}
+
+#[test]
+fn conditional_write_that_loses_a_race_conflicts_before_triggers_see_another_event()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let ledger = database.create_table("ledger", Some(account_schema()), Vec::new())?;
+    ledger.insert(account_row(1, "Ada", 36))?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    database.register_wasm_trigger(
+        wasm_trigger(
+            "reject_ledger_insert",
+            "ledger",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+        ),
+        &wasm,
+    )?;
+    let handle = database.replication_handle();
+    let writers: [&dyn Replication; 2] = [&database, handle.as_ref()];
+
+    // An insert that read the key as missing; another writer inserts it first.
+    let row_key = accounts.row_key_for_primary_key(&Value::Int(1))?;
+    let insert = ConditionalBatch::new(
+        vec![WriteCondition::KeyMissing {
+            table: REL_ROWS_TABLE.to_owned(),
+            key: row_key,
+        }],
+        accounts.insert_ops(account_row(1, "Mine", 1))?,
+    );
+    accounts.insert(account_row(1, "Ada", 36))?;
+    for writer in writers {
+        assert!(matches!(
+            writer.propose_conditional_batch(insert.clone()),
+            Err(ReplError::Conflict)
+        ));
+    }
+
+    // An update that read the row; another writer deletes it first.
+    let row_key = ledger.row_key_for_primary_key(&Value::Int(1))?;
+    let expected = database.read(REL_ROWS_TABLE, &row_key, ReadConsistency::Strong)?;
+    let update = ConditionalBatch::new(
+        vec![WriteCondition::ValueEquals {
+            table: REL_ROWS_TABLE.to_owned(),
+            key: row_key,
+            expected,
+        }],
+        ledger.update_ops(account_row(1, "Mine", 1))?,
+    );
+    ledger.delete(&Value::Int(1))?;
+    for writer in writers {
+        assert!(matches!(
+            writer.propose_conditional_batch(update.clone()),
+            Err(ReplError::Conflict)
+        ));
+    }
+
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 36)]);
+    assert_eq!(ledger.scan()?, Vec::<Row>::new());
+    // Without a race the triggers still see the event the write has.
+    assert_rejected(
+        "update",
+        accounts.update(account_row(1, "Mine", 1)),
+        "rejected write",
+    );
+    assert_rejected(
+        "insert",
+        ledger.insert(account_row(1, "Mine", 1)),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_insert_that_loses_a_race_is_not_seen_as_an_update()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+    let database = Arc::new(database);
+    let race = RowReadRace::new(&database);
+    let mut engine = SqlEngine::new(race.clone());
+    engine.open_table("accounts", Vec::new())?;
+
+    // Another statement inserts the key after this one read it as missing: ON
+    // CONFLICT reads the row again and does nothing.
+    race.queue(accounts.insert_ops(account_row(1, "Ada", 36))?)?;
+    engine
+        .execute(
+            "INSERT INTO accounts (id, name, age) VALUES (1, 'Mine', 1) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .await?;
+    assert!(!race.is_pending()?);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 36)]);
+
+    // A plain INSERT reports the duplicate key, as it would after the other one.
+    race.queue(accounts.insert_ops(account_row(2, "Grace", 85))?)?;
+    let error = match engine
+        .execute("INSERT INTO accounts (id, name, age) VALUES (2, 'Mine', 1)")
+        .await
+    {
+        Ok(output) => return Err(format!("expected a duplicate key, got {output:?}").into()),
+        Err(error) => DbError::Query(error),
+    };
+    assert!(!race.is_pending()?);
+    assert!(
+        matches!(error, DbError::Query(QueryError::DuplicatePrimaryKey)),
+        "{error}"
+    );
+    assert_eq!(crate::compat::sqlstate_for_db_error(&error), "23505");
+
+    assert_eq!(
+        accounts.scan()?,
+        vec![account_row(1, "Ada", 36), account_row(2, "Grace", 85)]
+    );
+    assert_rejected(
+        "ON CONFLICT DO UPDATE",
+        engine
+            .execute(
+                "INSERT INTO accounts (id, name, age) VALUES (1, 'Mine', 1) \
+                 ON CONFLICT (id) DO UPDATE SET age = EXCLUDED.age",
+            )
+            .await,
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+
+    let mut attempts = 0;
+    database.transaction_with_retry(4, |txn| {
+        attempts += 1;
+        if txn.get_row("accounts", &Value::Int(1))?.is_some() {
+            return Ok(());
+        }
+        if attempts == 1 {
+            // Another writer inserts the row after this transaction's snapshot.
+            accounts.insert(account_row(1, "Ada", 36))?;
+        }
+        txn.insert_row("accounts", account_row(1, "Mine", 1))
+    })?;
+
+    // The first commit conflicts; the retry sees the row and writes nothing.
+    assert_eq!(attempts, 2);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 36)]);
+    assert_rejected(
+        "transaction update",
+        database.transaction(|txn| txn.update_row("accounts", account_row(1, "Mine", 1))),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_that_loses_a_race_on_a_later_row_conflicts_before_any_trigger_runs()
+-> Result<(), Box<dyn std::error::Error>> {
+    for isolation in [
+        txn::IsolationLevel::Snapshot,
+        txn::IsolationLevel::ReadCommitted,
+        txn::IsolationLevel::SnapshotIsolation,
+        txn::IsolationLevel::Serializable,
+    ] {
+        let options = txn::TxnOptions {
+            isolation,
+            ..txn::TxnOptions::default()
+        };
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+        accounts.insert(account_row(1, "Ada", 36))?;
+        register_accounts_trigger(
+            &database,
+            "reject_accounts_update",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+            &trigger_response("reject", None),
+        )?;
+
+        // The transaction updates row 1, which no other writer changes, and inserts
+        // row 2, which another writer inserts before the commit. Row 1 is written
+        // first, so its trigger would reject the write before the pipeline reached
+        // row 2.
+        let mut attempts = 0;
+        database.transaction_with_retry_with_options(options, |txn| {
+            attempts += 1;
+            if txn.get_row("accounts", &Value::Int(2))?.is_some() {
+                return Ok(());
+            }
+            txn.update_row("accounts", account_row(1, "Ada", 37))?;
+            txn.insert_row("accounts", account_row(2, "Mine", 1))?;
+            if attempts == 1 {
+                accounts.insert(account_row(2, "Grace", 85))?;
+            }
+            Ok(())
+        })?;
+
+        // The first commit conflicts before any trigger runs; the retry sees row 2
+        // and writes nothing.
+        assert_eq!(attempts, 2, "{isolation:?}");
+        assert_eq!(
+            accounts.scan()?,
+            vec![account_row(1, "Ada", 36), account_row(2, "Grace", 85)],
+            "{isolation:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn read_committed_insert_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_committed = txn::TxnOptions {
+        isolation: txn::IsolationLevel::ReadCommitted,
+        ..txn::TxnOptions::default()
+    };
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    accounts.insert(account_row(1, "Ada", 36))?;
+    accounts.insert(account_row(2, "Grace", 85))?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+
+    // Another writer deletes the row after this transaction's snapshot, before the
+    // transaction reads it as missing and inserts it.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.delete(&Value::Int(1))?;
+        }
+        if txn.get_row("accounts", &Value::Int(1))?.is_some() {
+            return Ok(());
+        }
+        txn.insert_row("accounts", account_row(1, "Mine", 1))
+    })?;
+    // The first commit conflicts before the trigger sees the snapshot's row; the
+    // retry inserts.
+    assert_eq!(attempts, 2);
+
+    // Another writer deletes the row before the transaction reads it and inserts it
+    // again before the commit, so the row holds its snapshot value again.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.delete(&Value::Int(2))?;
+        }
+        if txn.get_row("accounts", &Value::Int(2))?.is_some() {
+            return Ok(());
+        }
+        txn.insert_row("accounts", account_row(2, "Mine", 1))?;
+        if attempts == 1 {
+            accounts.insert(account_row(2, "Grace", 85))?;
+        }
+        Ok(())
+    })?;
+    // The first commit still conflicts; the retry sees the row and writes nothing.
+    assert_eq!(attempts, 2);
+
+    assert_eq!(
+        accounts.scan()?,
+        vec![account_row(1, "Mine", 1), account_row(2, "Grace", 85)]
+    );
+    assert_rejected(
+        "transaction update",
+        database.transaction_with_options(read_committed, |txn| {
+            txn.update_row("accounts", account_row(1, "Mine", 2))
+        }),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn read_committed_update_that_loses_a_race_retries_instead_of_firing_an_insert_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_committed = txn::TxnOptions {
+        isolation: txn::IsolationLevel::ReadCommitted,
+        ..txn::TxnOptions::default()
+    };
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    let reject_insert = wasm_trigger(
+        "reject_accounts_insert",
+        "accounts",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+    );
+
+    // Another writer inserts the row after this transaction's snapshot, and a
+    // trigger that rejects inserts is added after that insert. The transaction
+    // reads the row and updates it.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.insert(account_row(1, "Ada", 36))?;
+            database.register_wasm_trigger(reject_insert.clone(), &wasm)?;
+        }
+        if txn.get_row("accounts", &Value::Int(1))?.is_none() {
+            return Err(DbError::TransactionAborted("row 1 is missing".to_owned()));
+        }
+        txn.update_row("accounts", account_row(1, "Ada", 37))
+    })?;
+
+    // The first commit conflicts before the trigger sees the snapshot's missing
+    // row; the retry updates.
+    assert_eq!(attempts, 2);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 37)]);
+    assert_rejected(
+        "transaction insert",
+        database.transaction_with_options(read_committed, |txn| {
+            txn.insert_row("accounts", account_row(2, "Grace", 85))
+        }),
+        "rejected write",
+    );
     Ok(())
 }
 
@@ -7158,7 +8323,11 @@ fn single_node_openers_warn_about_unmet_profile_floors() -> Result<(), Box<dyn s
     let audited_config = DbConfig::on_disk(binding.db_config.profile, &audited);
     let (opened, logs) =
         capture_logs(|| open_database_with_ops(audited_config, &OperationalConfig::new()))?;
-    assert!(!opened?.audit_enabled());
+    let opened = opened?;
+    assert!(!opened.audit_enabled());
+    // The handle view that provisioning plans from lists the same floor as the file probe.
+    assert_eq!(opened.probed_metadata()?.unmet_floors, vec!["floors.audit"]);
+    drop(opened);
     assert!(
         logs.contains("WARN") && logs.contains("floors.audit"),
         "{logs}"
@@ -7480,4 +8649,144 @@ fn edit_raw_manifest(
         KEY_PROFILE_MANIFEST,
         &serde_json::to_vec(&manifest)?,
     )
+}
+
+/// Provisioning writes are system writes: the catalog entries, index entries, temporal metadata,
+/// RBAC state, audit events and journal an apply commits bypass the write pipeline. They are not
+/// charged to the tenant storage quota and never run triggers, also on the table an apply adopts
+/// and versions and for the full-text entries it backfills from the documents of a collection it
+/// adopts; user writes afterwards are charged and run triggers as before.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provisioning_writes_bypass_triggers_and_the_tenant_quota()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::provision::{
+        Confirmation, ProvisionEnvironment, ProvisionOptions, ProvisionOutcome, ProvisionSurface,
+        ProvisionTargetRef, apply_provision, plan_provision,
+    };
+
+    let ops = OperationalConfig::new().with_tenant(TenantConfig::new(
+        "tenant-a",
+        TenantQuota::storage_bytes(1 << 20),
+    ));
+    let mut database = create_database_with_ops(DbConfig::new(Profile::InMemory), ops)?;
+    database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    database
+        .table("accounts")?
+        .insert(account_row(1, "Ada", 37))?;
+    database
+        .create_collection_auto_id("notes", vec![DocField::document_id("id")], Vec::new())?
+        .insert(&Value::Object(BTreeMap::from([(
+            "body".to_owned(),
+            Value::Str("quarterly reconciliation".to_owned()),
+        )])))?;
+    for (name, timing, event) in [
+        (
+            "reject_accounts_insert",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+        ),
+        (
+            "reject_after_accounts_update",
+            TriggerTiming::After,
+            TriggerEvent::Update,
+        ),
+    ] {
+        register_accounts_trigger(
+            &database,
+            name,
+            timing,
+            event,
+            &trigger_response("reject", None),
+        )?;
+    }
+    let used = |database: &Database| {
+        database
+            .tenant
+            .as_ref()
+            .map(crate::cloud::TenantRuntime::used_storage_bytes)
+    };
+    let before = used(&database);
+    assert!(before.is_some());
+
+    let mut spec = DatabaseSpec::from_db_config("app", &DbConfig::new(Profile::InMemory));
+    spec.version = crate::config_spec::DATABASE_SPEC_VERSION_V2;
+    spec.profile = "in_memory".to_owned();
+    spec.deployment.mode = DeploymentMode::Embedded;
+    spec.deployment.storage_path = None;
+    spec.collections = serde_json::from_value(json!([
+        {
+            "name": "accounts", "role": "event_log", "domain": "primary", "indexes": ["primary"],
+            "physical": {
+                "kind": "table",
+                "columns": [
+                    { "name": "id", "type": "int" },
+                    { "name": "name", "type": "str" },
+                    { "name": "age", "type": "int" }
+                ],
+                "primary_key": "id",
+                "system_versioning": true
+            }
+        },
+        {
+            "name": "notes", "role": "document_entity", "domain": "primary",
+            "indexes": ["primary", "full_text"],
+            "physical": { "full_text": [{ "path": "body" }] }
+        }
+    ]))?;
+    spec.security = Some(serde_json::from_value(json!({
+        "roles": [{
+            "name": "accountant",
+            "grants": [{ "object": "accounts", "permissions": ["read", "write"] }]
+        }],
+        "principals": [{ "user": "books", "roles": ["accountant"] }]
+    }))?);
+    let env = ProvisionEnvironment::new(ProvisionSurface::RustApi);
+    let options = ProvisionOptions::default();
+    let plan = plan_provision(&spec, ProvisionTargetRef::Open(&database), &options, &env)?;
+    assert!(
+        plan.steps
+            .iter()
+            .any(|step| step.kind == crate::provision::ProvisionStepKind::EnableSystemVersioning),
+        "{:#?}",
+        plan.steps
+    );
+    let report = apply_provision(
+        &mut database,
+        &ProvisionActor::local_operator("local:embedded"),
+        &spec,
+        &Confirmation::PlanId(plan.plan_id.clone()),
+        &options,
+        &env,
+    )?;
+    assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+    assert!(database.catalog().contains_key("accounts_history"));
+    assert!(database.authz_policy().roles().contains_key("accountant"));
+    // The new full-text index backfilled the note the adopted collection already held.
+    let hits = database
+        .full_text_index("notes_body_fts")?
+        .search("reconciliation", 10)?;
+    assert_eq!(hits.len(), 1);
+    // No trigger ran, and nothing was charged to the tenant.
+    let failures = database.post_commit_failures()?;
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(used(&database), before);
+    assert_eq!(database.table("accounts")?.scan()?.len(), 1);
+
+    // User writes still run the pipeline: triggers and the quota.
+    assert_rejected(
+        "a user insert after provisioning",
+        database
+            .table("accounts")?
+            .insert(account_row(2, "Lin", 29)),
+        "reject_accounts_insert",
+    );
+    database
+        .collection("notes")?
+        .insert(&Value::Object(BTreeMap::from([(
+            "body".to_owned(),
+            Value::Str("x".repeat(512)),
+        )])))?;
+    assert!(used(&database) > before);
+    Ok(())
 }

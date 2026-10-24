@@ -26,6 +26,7 @@ pub mod network;
 pub mod observability;
 pub mod performance;
 pub mod phase30;
+pub mod provision;
 pub mod query;
 pub mod repl;
 pub mod roadmap;
