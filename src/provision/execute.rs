@@ -1425,7 +1425,7 @@ impl Run<'_> {
                 keep_history,
             } => {
                 let retention = TemporalRetention {
-                    min_lsn: 0,
+                    min_lsn: self.history_start(base_table)?,
                     keep_history: *keep_history,
                 };
                 match principal {
@@ -1440,6 +1440,25 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The LSN the history of `base_table` starts from (`TemporalRetention.min_lsn`). A table
+    /// this apply created had no history before it existed, so its history starts at the newest
+    /// commit, after the table's own; an existing table keeps the history the database still
+    /// holds for it, from the history GC horizon (0 when GC never pruned), so its `AS OF` reads
+    /// answer as before. Both are at or above the horizon, which `enable_system_versioning`
+    /// requires, and a kept history holds the GC watermark at its start.
+    fn history_start(&self, base_table: &str) -> Result<TxnId, DbError> {
+        let horizon = self.db.history_horizon()?;
+        let created = self.applied.iter().any(|step| {
+            step.kind == ProvisionStepKind::CreateTable
+                && step.object.as_deref() == Some(base_table)
+        });
+        if created {
+            Ok(self.db.commit_lsn()?.max(horizon))
+        } else {
+            Ok(horizon)
+        }
     }
 
     /// Creates a document collection, vector collection or graph: with its pinned id, or with

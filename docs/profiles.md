@@ -144,7 +144,7 @@ profile.
 | `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
 | `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
 | `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | enforced: applied by provisioning to the objects it creates | provisioning |
-| `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | enforced: applied by provisioning to the objects it creates | provisioning |
+| `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables; a table that keeps history holds the history GC watermark at the LSN its history starts, so GC prunes nothing newer for any table while it exists | enforced: applied by provisioning to the objects it creates | provisioning |
 | `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
 | `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
 | `consistency.default_domain` | local_snapshot \| strong_cp \| eventual_ap | generation default | `multidb init --guided --override` (domain mode and replication of the spec it writes); guided init without `--override` and templates use the product's domain | declarative | not applicable |
@@ -504,8 +504,10 @@ is pruned. No profile knob sets its retention: `history.system_versioning` and
 `history.mvcc_retention_millis` is reserved, so GC keeps only what
 `--history-retain-lsns` (`mvcc_retain_lsns`), `AS OF` pins and the temporal
 `keep_history` retentions of existing tables require. A table provisioning
-creates with `keep_history: true` keeps its history from LSN 0, so GC prunes
-nothing while it exists (see [provisioning.md](provisioning.md)).
+versions with `keep_history: true` keeps its history from where versioning
+was enabled (a table the apply creates from just after its creation, an
+existing table from the history horizon), so while it exists GC prunes and
+truncates only below that LSN (see [provisioning.md](provisioning.md)).
 
 ### Evolving the manifest
 

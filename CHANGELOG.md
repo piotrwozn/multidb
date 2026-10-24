@@ -686,15 +686,20 @@ All notable public changes will be recorded here.
 - The `history.system_versioning`, `history.keep_history`,
   `time_series.default_chunk_millis` and `time_series.default_retention_millis`
   knobs are `enforced` in `KNOB_REGISTRY`: provisioning applies them to the
-  tables and series it creates. A provisioned table that keeps its history
-  does so from LSN 0, so history GC keeps every `AS OF` result and, while the
-  table exists, prunes and truncates nothing; the provision record lives
-  outside the commit log, so GC and truncation change no plan, drift or
-  export. Explain says that every-open knobs apply to
-  databases created with `db::create_database_with_profile` or by
-  provisioning, that provisioning-timing knobs are applied by provisioning to
-  the objects it creates, and that enabling compression on an existing
-  database is the provisioning format upgrade (`allow_format_upgrade`).
+  tables and series it creates. Provisioned history starts where versioning
+  is enabled, never below the history GC horizon, so a plan that adds
+  versioning also applies after GC pruned: a table the apply creates starts
+  at the newest commit after its creation, and an existing table at the
+  horizon (LSN 0 when GC never pruned), keeping the `AS OF` history it still
+  has. A table that keeps its history holds the GC watermark at that start,
+  so GC keeps every `AS OF` result from there and, while the table exists,
+  prunes and truncates only below it; the provision record lives outside the
+  commit log, so GC and truncation change no plan, drift or export.
+  Explain says that every-open knobs apply to databases created with
+  `db::create_database_with_profile` or by provisioning, that
+  provisioning-timing knobs are applied by provisioning to the objects it
+  creates, and that enabling compression on an existing database is the
+  provisioning format upgrade (`allow_format_upgrade`).
 - Explain wording: `$.compiled_policy.storage_profile` names the storage class
   and engine instead of "storage profile selected", encryption at rest reads
   "requested; enforced only on the Rust API with an encryption config in this

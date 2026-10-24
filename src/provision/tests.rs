@@ -950,7 +950,14 @@ fn system_versioning_of_an_adopted_table_needs_a_typed_confirmation() -> TestRes
         &rust_api,
     )?;
     assert_applied(&report);
-    assert!(db.catalog().contains_key("ledger_history"));
+    // The adopted table keeps the history it has: GC never pruned, so all of it.
+    assert_eq!(
+        ledger_retention(&db)?,
+        TemporalRetention {
+            min_lsn: 0,
+            keep_history: true
+        }
+    );
     Ok(())
 }
 
@@ -5878,9 +5885,41 @@ fn write_ledger(db: &Database) -> Result<Vec<u64>, Error> {
 
 const LEDGER_SQL: &str = "SELECT entry_id, amount FROM ledger ORDER BY entry_id";
 
-/// History GC honours the history provisioning builds: a versioned table that keeps its history
-/// (`TemporalRetention { min_lsn: 0, keep_history: true }`) holds the GC watermark at 0, so every
-/// `AS OF` result survives and no commit-log record is truncated.
+/// The retention of the provisioned `ledger_history`.
+fn ledger_retention(db: &Database) -> Result<TemporalRetention, Error> {
+    match db.catalog().get("ledger_history") {
+        Some(CatalogEntry::TemporalTable { retention, .. }) => Ok(*retention),
+        other => Err(format!("ledger_history: {other:?}").into()),
+    }
+}
+
+/// `versioned_spec` with the ledger's system versioning off.
+fn unversioned_spec() -> Result<DatabaseSpec, Error> {
+    let mut spec = versioned_spec(true, false)?;
+    for collection in &mut spec.collections {
+        if let Some(physical) = &mut collection.physical {
+            physical.system_versioning = Some(false);
+            physical.keep_history = None;
+        }
+    }
+    Ok(spec)
+}
+
+/// `true` for a `RetentionExpired` result.
+fn retention_expired<T>(result: &Result<T, DbError>) -> bool {
+    matches!(
+        result,
+        Err(DbError::Temporal(
+            crate::temporal::TemporalError::RetentionExpired { .. }
+        ))
+    )
+}
+
+/// History GC honours the history provisioning builds: a versioned table that provisioning
+/// creates keeps its history from where versioning is enabled (`TemporalRetention.min_lsn`, the
+/// newest commit after the table's own), not from LSN 0, and holds the GC watermark there. Every
+/// `AS OF` result of its writes survives, the commit log is truncated only below that start,
+/// and the history table lists every version.
 #[tokio::test]
 async fn history_gc_keeps_the_as_of_history_of_provisioned_tables_that_keep_it() -> TestResult {
     use crate::temporal::TemporalPoint;
@@ -5890,6 +5929,9 @@ async fn history_gc_keeps_the_as_of_history_of_provisioned_tables_that_keep_it()
     let spec = versioned_spec(true, false)?;
     let mut db = create_with_profile(&temp_dir.path().join("kept.redb"), &spec)?;
     assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let retention = ledger_retention(&db)?;
+    assert!(retention.keep_history);
+    assert!(retention.min_lsn > 0);
     let lsns = write_ledger(&db)?;
     let mut before = Vec::new();
     for lsn in &lsns {
@@ -5900,21 +5942,210 @@ async fn history_gc_keeps_the_as_of_history_of_provisioned_tables_that_keep_it()
         commit_log_retain_lsns: Some(1),
         ..HistoryGcOptions::default()
     })?;
-    assert_eq!(report.watermark, 0);
+    let ledger = HistoryWatermarkSource::TemporalRetention {
+        table: "ledger".to_owned(),
+    };
+    assert_eq!(report.watermark, retention.min_lsn);
+    assert_eq!(report.limited_by, ledger);
+    assert_eq!(report.history_horizon, retention.min_lsn);
+    assert_eq!(report.commit_log_floor_target, Some(retention.min_lsn));
+    assert_eq!(report.commit_log_limited_by, Some(ledger));
+    assert!(report.commit_log_records_pruned > 0, "{report:?}");
+    assert!(report.complete);
+    for (lsn, expected) in lsns.iter().zip(&before) {
+        let output = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?;
+        assert_eq!(&output, expected, "AS OF {lsn}");
+    }
+    let before_versioning = db
+        .query_as_of(LEDGER_SQL, TemporalPoint::Lsn(retention.min_lsn - 1))
+        .await;
+    assert!(
+        retention_expired(&before_versioning),
+        "{before_versioning:?}"
+    );
+    let SqlOutput::Rows(versions) = db.query("SELECT * FROM ledger_history").await? else {
+        return Err("the history table returns rows".into());
+    };
+    assert_eq!(versions.rows.len(), 20);
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    Ok(())
+}
+
+/// After history GC pruned, a plan that adds a versioned table is ready and auto-approvable and
+/// its apply converges: the history starts after the GC horizon, at the newest commit when
+/// versioning is enabled, so enabling it never fails with `RetentionExpired`, and the next plan
+/// is a noop with drift in sync. GC afterwards keeps every `AS OF` result from that start when
+/// the table keeps its history, holding the watermark there instead of at 0, and holds nothing
+/// back when it does not.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn versioned_tables_provisioned_after_history_gc_converge() -> TestResult {
+    use crate::temporal::{TemporalError, TemporalPoint};
+    use crate::txn::history::{HistoryGcOptions, HistoryWatermarkSource};
+
+    for keep_history in [true, false] {
+        let temp_dir = tempfile::tempdir()?;
+        let base = spec(
+            "balanced",
+            &json!([{
+                "name": "notes", "role": "document_entity", "domain": "primary",
+                "indexes": ["primary"]
+            }]),
+        )?;
+        let mut db = create_with_profile(&temp_dir.path().join("pruned_first.redb"), &base)?;
+        assert_applied(&apply_cli(&mut db, &base, &ProvisionOptions::default())?);
+        for body in ["first", "second", "third"] {
+            db.collection("notes")?.insert(&Value::Object(
+                [("body".to_owned(), Value::Str(body.to_owned()))].into(),
+            ))?;
+        }
+        let pruned = db.gc_history(&HistoryGcOptions::default())?;
+        let horizon = pruned.history_horizon;
+        assert!(horizon > 0, "{pruned:?}");
+
+        let spec = versioned_spec(keep_history, false)?;
+        let plan = plan_open(&spec, &db)?;
+        assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+        assert!(plan.auto_approvable, "{:#?}", plan.steps);
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.kind == ProvisionStepKind::EnableSystemVersioning)
+        );
+        let applied_from = db.commit_lsn()?;
+        assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+        let retention = ledger_retention(&db)?;
+        assert_eq!(retention.keep_history, keep_history);
+        assert!(
+            retention.min_lsn > applied_from && retention.min_lsn > horizon,
+            "{retention:?} after {applied_from}, horizon {horizon}"
+        );
+        assert!(retention.min_lsn < db.commit_lsn()?);
+        assert_eq!(
+            db.provision_state()?.map(|record| record.status),
+            Some(ProvisionRecordStatus::Applied)
+        );
+        let converged = plan_open(&spec, &db)?;
+        assert_eq!(
+            converged.outcome,
+            PlanOutcome::Noop,
+            "{:#?}",
+            converged.steps
+        );
+        assert!(drift(&db, &spec, &ProvisionOptions::default())?.in_sync);
+
+        let lsns = write_ledger(&db)?;
+        let first = *lsns.first().ok_or("an LSN")?;
+        if keep_history {
+            let mut before = Vec::new();
+            for lsn in &lsns {
+                before.push(db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?);
+            }
+            let report = db.gc_history(&HistoryGcOptions::default())?;
+            assert_eq!(report.watermark, retention.min_lsn);
+            assert_eq!(
+                report.limited_by,
+                HistoryWatermarkSource::TemporalRetention {
+                    table: "ledger".to_owned()
+                }
+            );
+            assert_eq!(report.history_horizon, retention.min_lsn);
+            assert!(report.complete);
+            for (lsn, expected) in lsns.iter().zip(&before) {
+                let output = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?;
+                assert_eq!(&output, expected, "AS OF {lsn}");
+            }
+            let SqlOutput::Rows(versions) = db.query("SELECT * FROM ledger_history").await? else {
+                return Err("the history table returns rows".into());
+            };
+            assert_eq!(versions.rows.len(), 20);
+        } else {
+            let report = db.gc_history(&HistoryGcOptions::default())?;
+            assert_eq!(report.watermark, report.current_lsn);
+            assert_eq!(report.limited_by, HistoryWatermarkSource::CurrentLsn);
+            assert!(report.mvcc_versions_pruned > 0, "{report:?}");
+            let unsupported = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(first)).await;
+            assert!(
+                matches!(
+                    &unsupported,
+                    Err(DbError::Temporal(TemporalError::Unsupported(reason)))
+                        if reason.contains("history retention is disabled")
+                ),
+                "{unsupported:?}"
+            );
+        }
+        assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+        db.verify_audit_chain()?;
+    }
+    Ok(())
+}
+
+/// Versioning added to an existing table keeps the history the database still holds for it: the
+/// retention starts at the history GC horizon, so after GC pruned the plan that turns
+/// versioning on is ready, its apply converges and the table's `AS OF` reads from the horizon on
+/// answer as they did before; GC afterwards holds the watermark at that horizon.
+#[tokio::test]
+async fn versioning_an_existing_table_starts_its_history_at_the_gc_horizon() -> TestResult {
+    use crate::temporal::TemporalPoint;
+    use crate::txn::history::{HistoryGcOptions, HistoryWatermarkSource};
+
+    let temp_dir = tempfile::tempdir()?;
+    let plain = unversioned_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("existing.redb"), &plain)?;
+    assert_applied(&apply_cli(&mut db, &plain, &ProvisionOptions::default())?);
+    assert!(!db.catalog().contains_key("ledger_history"));
+    let lsns = write_ledger(&db)?;
+    let kept = lsns.get(4..).ok_or("ten ledger LSNs")?;
+    let keep_from = *kept.first().ok_or("a kept LSN")?;
+    let current = db.commit_lsn()?;
+    let pruned = db.gc_history(&HistoryGcOptions {
+        mvcc_retain_lsns: Some(current - keep_from + 1),
+        ..HistoryGcOptions::default()
+    })?;
+    assert_eq!(pruned.history_horizon, keep_from, "{pruned:?}");
+    assert!(pruned.mvcc_versions_pruned > 0, "{pruned:?}");
+    let mut before = Vec::new();
+    for lsn in kept {
+        before.push(db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?);
+    }
+
+    let spec = versioned_spec(true, false)?;
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+    assert!(plan.auto_approvable, "{:#?}", plan.steps);
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let retention = ledger_retention(&db)?;
+    assert_eq!(retention.min_lsn, keep_from);
+    assert!(retention.keep_history);
+    for (lsn, expected) in kept.iter().zip(&before) {
+        let output = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?;
+        assert_eq!(&output, expected, "AS OF {lsn}");
+    }
+    // GC kept a version from before the start, which the history table cannot list without
+    // the versions it pruned, so it fails closed.
+    let listed = db.query("SELECT * FROM ledger_history").await;
+    assert!(
+        listed
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("retention expired")),
+        "{listed:?}"
+    );
+    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    assert!(drift(&db, &spec, &ProvisionOptions::default())?.in_sync);
+
+    let report = db.gc_history(&HistoryGcOptions::default())?;
+    assert_eq!(report.watermark, keep_from);
     assert_eq!(
         report.limited_by,
         HistoryWatermarkSource::TemporalRetention {
             table: "ledger".to_owned()
         }
     );
-    assert_eq!(report.mvcc_versions_pruned, 0);
-    assert_eq!(report.commit_log_records_pruned, 0);
-    assert!(report.complete);
-    for (lsn, expected) in lsns.iter().zip(&before) {
+    for (lsn, expected) in kept.iter().zip(&before) {
         let output = db.query_as_of(LEDGER_SQL, TemporalPoint::Lsn(*lsn)).await?;
         assert_eq!(&output, expected, "AS OF {lsn}");
     }
-    assert_eq!(plan_open(&spec, &db)?.outcome, PlanOutcome::Noop);
+    db.verify_audit_chain()?;
     Ok(())
 }
 

@@ -123,16 +123,27 @@ A typed row table with system versioning derives `<table>_history`
 `history.system_versioning: typed_tables`, which applies to every typed row
 table; `keep_history` defaults to `history.keep_history`.
 
+Provisioned history starts where versioning is enabled
+(`TemporalRetention.min_lsn`), never below the history GC horizon, so a plan
+that adds versioning also applies after GC pruned. A table the apply creates
+had no history before it existed: its history starts at the newest commit
+when versioning is enabled, after the table's own. Versioning added to an
+existing table keeps the history the database still holds for it, from the
+horizon (LSN 0 when GC never pruned), so its `AS OF` reads answer as before;
+after GC pruned, its `<table>_history` table fails closed while the table
+holds versions from before the start, since it cannot list the ones GC
+removed. `AS OF` reads before the start fail with `RetentionExpired`. Plans
+and drift do not compare `min_lsn`, and export does not write it.
+
 History GC (`multidb maintenance gc`, `Database::gc_history`) honours that
-retention. A table with `keep_history: true` keeps its history from LSN 0
-(`TemporalRetention { min_lsn: 0, keep_history: true }`), which holds the GC
-watermark at 0: while it exists, GC keeps every `AS OF` result of every table
-and truncates no commit-log record. With `keep_history: false` the table has
-no `AS OF` history (such a read is refused as unsupported) and holds nothing
-back. The provision record and its history live in `__provision`, outside the
-commit log, so GC and commit-log truncation change no plan id, drift or
-export, and an index provisioned after a truncation starts from the current
-rows.
+retention. A table with `keep_history: true` holds the GC watermark at the
+start of its history: while it exists, GC keeps every `AS OF` result from
+there on, and prunes MVCC versions and truncates commit-log records of every
+table only below it. With `keep_history: false` the table has no `AS OF`
+history (such a read is refused as unsupported) and holds nothing back. The
+provision record and its history live in `__provision`, outside the commit
+log, so GC and commit-log truncation change no plan id, drift or export, and
+an index provisioned after a truncation starts from the current rows.
 
 Field types are `int`, `float`, `str`, `bool` and `bytes`. The full-text
 `language` accepts only `simple`, because this build tokenizes every language

@@ -81,6 +81,16 @@ impl Database {
         Ok(current_lsn_from_repl(self.replication_ref())?)
     }
 
+    /// The history GC horizon: `AS OF` reads and temporal retentions below it are refused. 0
+    /// when GC never pruned.
+    /// # Errors
+    /// Fails when `__txn_meta` cannot be read or decoded.
+    pub(crate) fn history_horizon(&self) -> Result<TxnId, DbError> {
+        Ok(crate::txn::history::history_horizon(
+            self.replication_ref(),
+        )?)
+    }
+
     /// The query governor knobs `override_query_governor` (or `set_query_governor`) set for this
     /// handle, as `multidb serve` does for each of `MULTIDB_MAX_CONCURRENT_QUERIES` and
     /// `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that is set: those knobs are the caller's, and a restart
