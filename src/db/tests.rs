@@ -7785,7 +7785,8 @@ fn edit_raw_manifest(
 /// Provisioning writes are system writes: the catalog entries, index entries, temporal metadata,
 /// RBAC state, audit events and journal an apply commits bypass the write pipeline. They are not
 /// charged to the tenant storage quota and never run triggers, also on the table an apply adopts
-/// and versions; user writes afterwards are charged and run triggers as before.
+/// and versions and for the full-text entries it backfills from the documents of a collection it
+/// adopts; user writes afterwards are charged and run triggers as before.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn provisioning_writes_bypass_triggers_and_the_tenant_quota()
@@ -7804,6 +7805,12 @@ fn provisioning_writes_bypass_triggers_and_the_tenant_quota()
     database
         .table("accounts")?
         .insert(account_row(1, "Ada", 37))?;
+    database
+        .create_collection_auto_id("notes", vec![DocField::document_id("id")], Vec::new())?
+        .insert(&Value::Object(BTreeMap::from([(
+            "body".to_owned(),
+            Value::Str("quarterly reconciliation".to_owned()),
+        )])))?;
     for (name, timing, event) in [
         (
             "reject_accounts_insert",
@@ -7884,9 +7891,13 @@ fn provisioning_writes_bypass_triggers_and_the_tenant_quota()
         &env,
     )?;
     assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
-    assert!(database.catalog().contains_key("notes"));
     assert!(database.catalog().contains_key("accounts_history"));
     assert!(database.authz_policy().roles().contains_key("accountant"));
+    // The new full-text index backfilled the note the adopted collection already held.
+    let hits = database
+        .full_text_index("notes_body_fts")?
+        .search("reconciliation", 10)?;
+    assert_eq!(hits.len(), 1);
     // No trigger ran, and nothing was charged to the tenant.
     let failures = database.post_commit_failures()?;
     assert!(failures.is_empty(), "{failures:?}");
