@@ -4846,6 +4846,103 @@ async fn a_spec_granted_role_runs_sql_and_others_are_denied() -> TestResult {
     Ok(())
 }
 
+/// A spec-granted role reads through SQL only the objects it is granted: a query that also
+/// reads another object of the spec, or the history table of a granted one, is denied before
+/// it runs, wherever the query reads it.
+#[tokio::test]
+async fn a_spec_granted_role_cannot_read_other_objects_through_subqueries() -> TestResult {
+    use crate::security::AuthzError;
+    use crate::temporal::TemporalPoint;
+
+    let temp_dir = tempfile::tempdir()?;
+    let objects = spec(
+        "balanced",
+        &json!([
+            {
+                "name": "ledger", "role": "event_log", "domain": "primary", "indexes": ["primary"],
+                "physical": {
+                    "kind": "table",
+                    "columns": [
+                        { "name": "entry_id", "type": "int" },
+                        { "name": "amount", "type": "float" }
+                    ],
+                    "primary_key": "entry_id",
+                    "system_versioning": true
+                }
+            },
+            {
+                "name": "payroll", "role": "document_entity", "domain": "primary",
+                "indexes": ["primary"],
+                "physical": {
+                    "kind": "table",
+                    "columns": [
+                        { "name": "employee_id", "type": "int" },
+                        { "name": "salary", "type": "float" }
+                    ],
+                    "primary_key": "employee_id"
+                }
+            }
+        ]),
+    )?;
+    let spec = with_security(
+        objects,
+        &json!({
+            "roles": [{
+                "name": "ledger_reader",
+                "grants": [{ "object": "ledger", "permissions": ["read"] }]
+            }],
+            "principals": [{ "user": "analyst", "roles": ["ledger_reader"] }]
+        }),
+    )?;
+    let mut db = create_with_profile(&temp_dir.path().join("subqueries.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    db.query("INSERT INTO ledger (entry_id, amount) VALUES (1, 2.5)")
+        .await?;
+    db.query("INSERT INTO payroll (employee_id, salary) VALUES (7, 9000.0)")
+        .await?;
+    let analyst = db.principal_for_user("analyst");
+    let lsn = TemporalPoint::Lsn(db.commit_lsn()?);
+
+    let payroll_reads = [
+        "SELECT entry_id FROM ledger ORDER BY (SELECT max(salary) FROM payroll)",
+        "SELECT entry_id FROM ledger LIMIT (SELECT count(*) FROM payroll)",
+        "SELECT abs((SELECT max(salary) FROM payroll)) FROM ledger",
+        "SELECT * FROM (VALUES ((SELECT max(salary) FROM payroll))) AS v(leak)",
+        "WITH \"Payroll\" AS (SELECT 1.0 AS salary) SELECT salary FROM payroll",
+    ];
+    let history_read =
+        "SELECT entry_id FROM ledger WHERE entry_id IN (SELECT entry_id FROM ledger_history)";
+    let denied = payroll_reads.map(|sql| (sql, "payroll"));
+    for (sql, table) in denied.into_iter().chain([(history_read, "ledger_history")]) {
+        for result in [
+            db.query_as(&analyst, sql).await,
+            db.query_as_of_as(&analyst, sql, lsn).await,
+        ] {
+            match result {
+                Err(DbError::AuthzDenied(AuthzError::Denied {
+                    resource: Resource::Table(name),
+                    permission: Permission::Read,
+                    ..
+                })) if name == table => {}
+                other => panic!("{sql} should be denied Read on {table}, got {other:?}"),
+            }
+        }
+    }
+
+    assert_eq!(
+        db.query_as(
+            &analyst,
+            "SELECT entry_id FROM ledger WHERE amount > (SELECT min(amount) - 1.0 FROM ledger)"
+        )
+        .await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["entry_id".to_owned()],
+            rows: vec![vec![Value::Int(1)]],
+        })
+    );
+    Ok(())
+}
+
 /// `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ` warns about exactly what the runtime refuses:
 /// a role that reads a full-text index but not its source collection cannot search it.
 #[tokio::test]
