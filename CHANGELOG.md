@@ -267,14 +267,33 @@ All notable public changes will be recorded here.
   The Control Plane returns HTTP 500 `internal_error` in both cases. Size the
   limits for the concurrent load or retry such failures. `multidb serve` sets
   no tenant.
-- SQL read authorization (`query_as`, `query_as_of_as`, pgwire and the
-  Control Plane `/sql`) is now checked against every table the planned query
-  reads, including subqueries in any position, and the plan that was
-  authorized is the plan that runs. A multi-statement batch runs nothing until
-  all of its reads are authorized. Table reads are matched to the catalog name
-  the planner resolves (unquoted identifiers are lowercased), so a grant on a
-  differently-cased name no longer authorizes a table; `SELECT ... INTO`
-  returns `Unsupported`, and recursive CTEs need Database read.
+- Fixed a SQL read authorization bypass. Under RBAC, SQL reads (`query_as`,
+  `query_as_of_as`, PostgreSQL wire with RBAC, the Control Plane `/sql` and
+  the SDKs that call it) were authorized by a walk over part of the parsed
+  statement. The walk missed tables read from many positions: subqueries in
+  `ORDER BY`, `LIMIT`/`OFFSET`, `VALUES`, window and `FILTER` clauses, and
+  inside expressions such as `LIKE`, `TRIM`, `SUBSTRING` or `POSITION`. A
+  quoted CTE name such as `"Secrets"` also hid the table `secrets` from the
+  check while the query still read the table, and grants were matched to the
+  name as spelled, so a grant on `ORDERS` authorized reads of `orders`. A
+  principal with `Read` on any one table could therefore read every other
+  table, collection, foreign table, materialized view and `*_history` table.
+  Row and masking policies were not applied to tables read this way either,
+  so a principal with `Read` on a policy-protected table could also see the
+  rows its row policies hide and the values its masking policies mask. Reads
+  are now authorized against every table the planned DataFusion query reads,
+  including subqueries in any position, before anything runs, and the plan
+  that was authorized is the plan that runs. A multi-statement batch runs
+  nothing until all of its reads are authorized. Row and masking policies
+  cover every table the plan reads, so a query that reads a policy-protected
+  table and any other table is rejected. Table reads are matched to the
+  catalog name the planner resolves (unquoted identifiers are lowercased). SQL
+  shapes the check cannot analyse fail closed with `Unsupported`,
+  `SELECT ... INTO` returns `Unsupported`, and recursive CTEs need Database
+  read. Not covered by this fix: extended-protocol Describe over PostgreSQL
+  wire still returns the column names and types of catalog tables (no rows)
+  without an RBAC check; the separate PostgreSQL wire extended-protocol fix
+  closes it.
 
 ### Added
 
