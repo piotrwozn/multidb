@@ -6090,9 +6090,9 @@ async fn versioning_an_existing_table_starts_its_history_at_the_gc_horizon() -> 
     use crate::txn::history::{HistoryGcOptions, HistoryWatermarkSource};
 
     let temp_dir = tempfile::tempdir()?;
-    let plain = unversioned_spec()?;
-    let mut db = create_with_profile(&temp_dir.path().join("existing.redb"), &plain)?;
-    assert_applied(&apply_cli(&mut db, &plain, &ProvisionOptions::default())?);
+    let initial = unversioned_spec()?;
+    let mut db = create_with_profile(&temp_dir.path().join("existing.redb"), &initial)?;
+    assert_applied(&apply_cli(&mut db, &initial, &ProvisionOptions::default())?);
     assert!(!db.catalog().contains_key("ledger_history"));
     let lsns = write_ledger(&db)?;
     let kept = lsns.get(4..).ok_or("ten ledger LSNs")?;
