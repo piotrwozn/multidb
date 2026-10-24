@@ -521,11 +521,14 @@ unmanaged objects under `report` or `ignore`. Guarantee statuses such as
 `operator_managed` or `enforced_with_development_key` are reported in the
 plan, not as drift. `session_pending_restart` means the session runs other
 knobs than the profile manifest, for example after a retune; a restart
-resolves it. A query governor set for the process is not drift:
-`Database::set_query_governor`, which `multidb serve` calls for
-`MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, keeps
-its two limits for the session, and a restart sets them again, so a retune
-of only those knobs leaves nothing pending.
+resolves it. A query governor knob set for the process is not drift:
+`Database::override_query_governor` keeps the limits it sets for the session
+(`set_query_governor` sets both), `multidb serve` calls it for each of
+`MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that is
+set, and a restart sets them again, so a retune of only those knobs leaves
+nothing pending. A governor knob the process did not set comes from the
+manifest at the next open, so a retune of it is `session_pending_restart` like
+any other retune, also when the other governor knob is overridden.
 
 ## Export
 
@@ -963,7 +966,8 @@ apply's answers:
 Retunes and the storage format upgrade are written to the profile manifest and
 take effect when `serve` restarts (`session_pending_restart` in the report),
 except for a query governor knob that `MULTIDB_MAX_CONCURRENT_QUERIES` or
-`MULTIDB_QUERY_QUEUE_TIMEOUT_MS` sets for the process. The Control Plane never
+`MULTIDB_QUERY_QUEUE_TIMEOUT_MS` sets for the process; with only one of them
+set, a retune of the other knob waits for the restart. The Control Plane never
 creates a database and never opens a path from a request: a spec
 `deployment.storage_path` is reported as the Advice
 `PROVISION_STORAGE_PATH_IGNORED`. Encryption at rest is not enforceable here

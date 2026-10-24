@@ -8,10 +8,10 @@
 
 use super::{
     AuditConfig, CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, KEY_PROFILE_MANIFEST,
-    KEY_SCHEMA_VERSION, PROVISION_TABLE, PersistedProfileManifest, ProbedMetadata, SCHEMA_VERSION,
-    SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op, current_lsn_from_repl, meta_put_op,
-    parse_audit_key_file, read_metadata_from_repl, read_security_from_repl, unmet_profile_floors,
-    validate_manifest,
+    KEY_SCHEMA_VERSION, PROVISION_TABLE, PersistedProfileManifest, ProbedMetadata,
+    QueryGovernorOverrides, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op,
+    current_lsn_from_repl, meta_put_op, parse_audit_key_file, read_metadata_from_repl,
+    read_security_from_repl, unmet_profile_floors, validate_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{
@@ -81,11 +81,12 @@ impl Database {
         Ok(current_lsn_from_repl(self.replication_ref())?)
     }
 
-    /// `set_query_governor` set this handle's query governor, as `multidb serve` does for
-    /// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`: its two governor
-    /// knobs are the caller's, and a restart sets them again.
-    pub(crate) const fn query_governor_overridden(&self) -> bool {
-        self.query_governor_overridden
+    /// The query governor knobs `override_query_governor` (or `set_query_governor`) set for this
+    /// handle, as `multidb serve` does for each of `MULTIDB_MAX_CONCURRENT_QUERIES` and
+    /// `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that is set: those knobs are the caller's, and a restart
+    /// sets them again. The others come from the profile manifest.
+    pub(crate) const fn query_governor_overrides(&self) -> QueryGovernorOverrides {
+        self.query_governor_overrides
     }
 
     /// Audit events are chained with a configured key rather than the built-in development key.

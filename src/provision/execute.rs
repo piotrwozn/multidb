@@ -1553,12 +1553,12 @@ impl Run<'_> {
         match step.safety {
             StepSafety::FormatUpgrade => self.session_pending_restart = true,
             // Only knobs the session does not already run wait for the next open: a query
-            // governor set for the process keeps its own limits.
+            // governor knob set for the process keeps its own limit.
             StepSafety::Retune => {
                 let session = self.db.performance_config();
                 let expected = expected_session_performance(
                     session,
-                    self.db.query_governor_overridden(),
+                    self.db.query_governor_overrides(),
                     &self.manifest,
                 );
                 if *session != expected {

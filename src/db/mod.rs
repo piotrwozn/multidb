@@ -657,13 +657,22 @@ pub struct Database {
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
-    /// `set_query_governor` set the governor of this handle, so its limits are the caller's,
-    /// not the profile's.
-    query_governor_overridden: bool,
+    /// The query governor knobs `override_query_governor` set for this handle: their limits are
+    /// the caller's, not the profile's.
+    query_governor_overrides: QueryGovernorOverrides,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
     workload: WorkloadBuffer,
+}
+
+/// The query governor knobs `Database::override_query_governor` set for a handle, one flag per
+/// knob: a set knob is the caller's for the process, and a restart sets it again; an unset one
+/// is the profile's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct QueryGovernorOverrides {
+    pub(crate) max_concurrent_queries: bool,
+    pub(crate) queue_timeout_ms: bool,
 }
 
 pub type DatabaseSelfHealingController =
@@ -1167,6 +1176,7 @@ impl Database {
     /// It takes `&mut self`, so no statement holds a slot while the limits change.
     /// The limits belong to this handle: they are never written to the database,
     /// and provisioning plans do not report them as a session pending a restart.
+    /// [`Database::override_query_governor`] sets one limit and keeps the other.
     /// # Errors
     /// Fails when either limit is zero or `max_concurrent_queries` is more than
     /// the governor can count.
@@ -1175,21 +1185,51 @@ impl Database {
         max_concurrent_queries: usize,
         queue_timeout_ms: u64,
     ) -> Result<(), ConfigError> {
-        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+        self.override_query_governor(Some(max_concurrent_queries), Some(queue_timeout_ms))
+    }
+
+    /// Sets the query governor limits that are `Some`, as [`Database::set_query_governor`]
+    /// does, and keeps the others; `None` for both changes nothing. `multidb serve` passes
+    /// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, each when it is
+    /// set.
+    ///
+    /// A limit set here belongs to this handle: it is never written to the database, and
+    /// provisioning plans do not report it as a session pending a restart. A limit never set
+    /// here stays the profile's: plans compare it with the profile manifest, so a retune of it
+    /// waits for the next open.
+    /// # Errors
+    /// Fails, and changes nothing, when a given limit is zero or `max_concurrent_queries` is
+    /// more than the governor can count.
+    pub fn override_query_governor(
+        &mut self,
+        max_concurrent_queries: Option<usize>,
+        queue_timeout_ms: Option<u64>,
+    ) -> Result<(), ConfigError> {
+        if let Some(max) = max_concurrent_queries
+            && (max == 0 || max > Semaphore::MAX_PERMITS)
+        {
             return Err(ConfigError::Unsupported(format!(
-                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                "query governor max concurrent queries must be 1 to {}, got {max}",
                 Semaphore::MAX_PERMITS
             )));
         }
-        if queue_timeout_ms == 0 {
+        if queue_timeout_ms == Some(0) {
             return Err(ConfigError::Unsupported(
                 "query governor queue timeout must be at least 1 ms".to_owned(),
             ));
         }
-        self.performance.query.max_concurrent_queries = max_concurrent_queries;
-        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        if max_concurrent_queries.is_none() && queue_timeout_ms.is_none() {
+            return Ok(());
+        }
+        if let Some(max) = max_concurrent_queries {
+            self.performance.query.max_concurrent_queries = max;
+            self.query_governor_overrides.max_concurrent_queries = true;
+        }
+        if let Some(timeout) = queue_timeout_ms {
+            self.performance.query.queue_timeout_ms = timeout;
+            self.query_governor_overrides.queue_timeout_ms = true;
+        }
         self.query_permits = query_permits_for(&self.performance);
-        self.query_governor_overridden = true;
         Ok(())
     }
 
@@ -4164,7 +4204,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
-            query_governor_overridden: false,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4197,7 +4237,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
-            query_governor_overridden: false,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4230,7 +4270,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
-            query_governor_overridden: false,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4262,7 +4302,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
-            query_governor_overridden: false,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),

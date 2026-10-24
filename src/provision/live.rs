@@ -14,7 +14,7 @@ use serde::Serialize;
 use super::ProvisionError;
 use super::record::RecordState;
 use crate::config_spec::hex_prefix;
-use crate::db::{CatalogEntry, Database, ProbedMetadata};
+use crate::db::{CatalogEntry, Database, ProbedMetadata, QueryGovernorOverrides};
 use crate::extension::PolicyConfig;
 use crate::performance::PerformanceConfig;
 use crate::query::TableSchema;
@@ -23,7 +23,7 @@ use crate::security::{AuthzPolicy, Permission, PrincipalRegistry, Resource};
 /// The fingerprint of the live state of `db` that `ProvisionPlan.live_fingerprint` reports:
 /// `live_` and 32 hex characters. It changes whenever anything a plan depends on changes (the
 /// catalog, table schemas, RBAC state, audit flag and key, encryption, extension policies,
-/// session performance and query governor override, profile manifest or provision record), but
+/// session performance and query governor overrides, profile manifest or provision record), but
 /// not when data is written.
 /// Never writes.
 /// # Errors
@@ -54,9 +54,9 @@ pub(crate) struct LiveState {
     pub policy_config: PolicyConfig,
     /// The performance this session runs with.
     pub session_performance: PerformanceConfig,
-    /// The query governor of the session was set for this process (`set_query_governor`), so
-    /// its two knobs are not compared with the profile manifest.
-    pub query_governor_overridden: bool,
+    /// The query governor knobs of the session set for this process
+    /// (`override_query_governor`), which are not compared with the profile manifest.
+    pub query_governor_overrides: QueryGovernorOverrides,
     pub record: RecordState,
     /// Document counts of the sources of new full-text and geo indexes. The planner fills it
     /// after projection; the fingerprint leaves it out.
@@ -94,7 +94,7 @@ impl LiveState {
             persisted_audit_enabled: persisted.audit_enabled,
             policy_config: db.policy_config()?,
             session_performance: db.performance_config().clone(),
-            query_governor_overridden: db.query_governor_overridden(),
+            query_governor_overrides: db.query_governor_overrides(),
             record: db.read_provision_record()?,
             source_row_counts: BTreeMap::new(),
         })
@@ -125,7 +125,7 @@ impl LiveState {
             persisted_audit_enabled: self.persisted_audit_enabled,
             policy_config: &self.policy_config,
             session_performance: &self.session_performance,
-            query_governor_overridden: self.query_governor_overridden,
+            query_governor_overrides: self.query_governor_overrides,
             record: &self.record,
         };
         let json = serde_json::to_string(&view)
@@ -155,7 +155,7 @@ struct FingerprintView<'a> {
     persisted_audit_enabled: bool,
     policy_config: &'a PolicyConfig,
     session_performance: &'a PerformanceConfig,
-    query_governor_overridden: bool,
+    query_governor_overrides: QueryGovernorOverrides,
     record: &'a RecordState,
 }
 

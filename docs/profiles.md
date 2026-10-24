@@ -477,8 +477,8 @@ it from the database (see [CLI](#cli)). An explicit
 `multidb serve` then applies `MULTIDB_MAX_CONCURRENT_QUERIES` and
 `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` when they are set: they replace
 `query.max_concurrent_queries` and `query.queue_timeout_ms` for that process
-only (`Database::set_query_governor`), the manifest and every other knob stay,
-and unset they keep the manifest values. PostgreSQL wire and the Control Plane
+only (`Database::override_query_governor`, one knob per set variable), the
+manifest and every other knob stay, and unset they keep the manifest values. PostgreSQL wire and the Control Plane
 share that one database, so statements from either run with the manifest's
 runtime performance, SQL parser limits included.
 Every one of these openers also logs a warning (`tracing::warn!`, naming the

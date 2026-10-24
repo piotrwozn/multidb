@@ -732,8 +732,12 @@ fn live_fingerprint_covers_every_part_of_the_live_state_but_document_counts() ->
             Box::new(|live| live.session_performance.cache.max_capacity += 1),
         ),
         (
-            "query governor override",
-            Box::new(|live| live.query_governor_overridden = true),
+            "max_concurrent_queries override",
+            Box::new(|live| live.query_governor_overrides.max_concurrent_queries = true),
+        ),
+        (
+            "queue_timeout_ms override",
+            Box::new(|live| live.query_governor_overrides.queue_timeout_ms = true),
         ),
         (
             "metadata",
@@ -5725,6 +5729,99 @@ fn a_process_query_governor_is_not_a_session_pending_restart() -> TestResult {
         drift_kinds(&plan_open(&cache, &db)?),
         vec![DriftKind::SessionPendingRestart]
     );
+    Ok(())
+}
+
+/// A query governor override covers only the knobs the process sets: `multidb serve` given only
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` overrides that knob alone (`override_query_governor`), so
+/// the queue timeout comes from the manifest at every open. A retune of the overridden knob
+/// leaves nothing pending; a retune of the other one is written to the manifest while the
+/// session keeps its old timeout, so the apply reports a session pending a restart and later
+/// plans report the drift, until a restart that overrides the same knob again runs the retune.
+#[test]
+fn a_query_governor_override_covers_only_the_knobs_the_process_sets() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let path = temp_dir.path().join("one_knob.redb");
+    let spec = orders_spec()?;
+    let mut db = create_with_profile(&path, &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    let query = db.performance_config().query.clone();
+    let max_concurrent_queries = query.max_concurrent_queries + 1;
+    db.override_query_governor(Some(max_concurrent_queries), None)?;
+    let plan = plan_open(&spec, &db)?;
+    assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.drift);
+    assert!(drift(&db, &spec, &ProvisionOptions::default())?.in_sync);
+
+    let max_only = with_custom_profile(
+        spec.clone(),
+        "orders_max",
+        &json!({
+            "extends": "balanced",
+            "knobs": { "query": { "max_concurrent_queries": 3 } }
+        }),
+    )?;
+    let report = apply_cli(&mut db, &max_only, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert!(!report.session_pending_restart);
+    let governed = plan_open(&max_only, &db)?;
+    assert!(drift_kinds(&governed).is_empty(), "{:#?}", governed.drift);
+
+    let retuned_timeout = query.queue_timeout_ms + 250;
+    let timeout = with_custom_profile(
+        spec,
+        "orders_timeout",
+        &json!({
+            "extends": "balanced",
+            "knobs": {
+                "query": { "max_concurrent_queries": 3, "queue_timeout_ms": retuned_timeout }
+            }
+        }),
+    )?;
+    let report = apply_cli(&mut db, &timeout, &ProvisionOptions::default())?;
+    assert_applied(&report);
+    assert!(report.session_pending_restart);
+    assert_eq!(
+        db.performance_config().query.queue_timeout_ms,
+        query.queue_timeout_ms
+    );
+    assert_eq!(
+        drift_kinds(&plan_open(&timeout, &db)?),
+        vec![DriftKind::SessionPendingRestart]
+    );
+    let drifted = drift(&db, &timeout, &ProvisionOptions::default())?;
+    assert!(!drifted.in_sync);
+    assert_eq!(
+        drifted
+            .items
+            .iter()
+            .map(|item| item.kind)
+            .collect::<Vec<_>>(),
+        vec![DriftKind::SessionPendingRestart]
+    );
+    drop(db);
+
+    // The restart reads the retuned timeout from the manifest and overrides the same knob.
+    let mut db = open_database_with_ops(
+        DbConfig::on_disk(Profile::Balanced, &path),
+        &OperationalConfig::new(),
+    )?;
+    db.override_query_governor(Some(max_concurrent_queries), None)?;
+    assert_eq!(
+        db.performance_config().query.queue_timeout_ms,
+        retuned_timeout
+    );
+    assert_eq!(
+        db.performance_config().query.max_concurrent_queries,
+        max_concurrent_queries
+    );
+    let restarted = plan_open(&timeout, &db)?;
+    assert_eq!(
+        restarted.outcome,
+        PlanOutcome::Noop,
+        "{:#?}",
+        restarted.drift
+    );
+    assert!(drift_kinds(&restarted).is_empty(), "{:#?}", restarted.drift);
     Ok(())
 }
 

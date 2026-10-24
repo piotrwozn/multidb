@@ -30,8 +30,8 @@ use crate::config_spec::{
 };
 use crate::db::{
     AuditConfig, CatalogEntry, Database, EncryptionConfig, EncryptionMode, MetadataProbe,
-    PersistedProfileManifest, Profile, ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED,
-    inspect_database_metadata, performance_for_manifest,
+    PersistedProfileManifest, Profile, QueryGovernorOverrides, ReplicationKind, SCHEMA_VERSION,
+    SCHEMA_VERSION_FRAMED, inspect_database_metadata, performance_for_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{CollectionId, IndexSpec};
@@ -3369,7 +3369,7 @@ fn plan_manifest(live: &LiveState, desired: &PersistedProfileManifest) -> Manife
         ));
     }
     let session = &live.session_performance;
-    if *session != expected_session_performance(session, live.query_governor_overridden, current) {
+    if *session != expected_session_performance(session, live.query_governor_overrides, current) {
         plan.drift.push(drift_item(
             "profile",
             DriftKind::SessionPendingRestart,
@@ -3490,7 +3490,7 @@ fn legacy_manifest_plan(
     let session = without_compression(&live.session_performance);
     let wanted = without_compression(&expected_session_performance(
         &live.session_performance,
-        live.query_governor_overridden,
+        live.query_governor_overrides,
         desired,
     ));
     let safety = if session == wanted {
@@ -3567,24 +3567,27 @@ fn format_upgrade_step(desired: &PersistedProfileManifest) -> ProvisionStep {
     .with_flag("allow_format_upgrade".to_owned())
 }
 
-/// The session performance without compression, which only a value-framing engine applies.
-/// The performance a session opened with `manifest` runs with. A query governor set for the
-/// process (`Database::set_query_governor`; `multidb serve` sets it from
-/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`) keeps the session's own
-/// limits: they are never written to the database, and a restart sets them again.
+/// The performance a session opened with `manifest` runs with. A query governor knob set for
+/// the process (`Database::override_query_governor`; `multidb serve` sets each of
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that is given) keeps the
+/// session's own limit: it is never written to the database, and a restart sets it again. A
+/// knob the process did not set comes from the manifest at the next open, so it is compared.
 pub(super) fn expected_session_performance(
     session: &PerformanceConfig,
-    query_governor_overridden: bool,
+    overrides: QueryGovernorOverrides,
     manifest: &PersistedProfileManifest,
 ) -> PerformanceConfig {
     let mut performance = performance_for_manifest(manifest);
-    if query_governor_overridden {
+    if overrides.max_concurrent_queries {
         performance.query.max_concurrent_queries = session.query.max_concurrent_queries;
+    }
+    if overrides.queue_timeout_ms {
         performance.query.queue_timeout_ms = session.query.queue_timeout_ms;
     }
     performance
 }
 
+/// The session performance without compression, which only a value-framing engine applies.
 fn without_compression(performance: &PerformanceConfig) -> PerformanceConfig {
     let mut performance = performance.clone();
     performance.compression.algorithm = CompressionAlgorithm::None;

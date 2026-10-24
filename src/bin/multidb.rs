@@ -4715,22 +4715,14 @@ where
     }
 }
 
-/// Applies the `multidb serve` query governor overrides before the database is shared.
+/// Applies the `multidb serve` query governor overrides before the database is shared: only
+/// the limits whose variable is set, so the other one stays the profile's, and provisioning
+/// still compares it with the profile manifest.
 fn apply_query_governor(
     database: &mut multidb::db::Database,
     governor: ServeQueryGovernor,
 ) -> Result<(), CliError> {
-    if governor == ServeQueryGovernor::default() {
-        return Ok(());
-    }
-    let defaults = &database.performance_config().query;
-    let max_concurrent_queries = governor
-        .max_concurrent_queries
-        .unwrap_or(defaults.max_concurrent_queries);
-    let queue_timeout_ms = governor
-        .queue_timeout_ms
-        .unwrap_or(defaults.queue_timeout_ms);
-    database.set_query_governor(max_concurrent_queries, queue_timeout_ms)?;
+    database.override_query_governor(governor.max_concurrent_queries, governor.queue_timeout_ms)?;
     Ok(())
 }
 
@@ -5597,6 +5589,103 @@ mod tests {
 
         let reopened = open_database(binding.db_config.clone())?;
         assert_eq!(reopened.performance_config(), &binding.performance);
+        Ok(())
+    }
+
+    /// With only `MULTIDB_MAX_CONCURRENT_QUERIES` set, serve overrides that knob alone, so the
+    /// queue timeout stays the manifest's: a retune of `query.queue_timeout_ms` applied to the
+    /// running server is a session pending a restart, in the apply report and in the next
+    /// plan, and the restart with the same variable runs it and plans in sync.
+    #[test]
+    fn serve_query_governor_from_one_variable_leaves_the_other_knob_to_the_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::provision::{
+            Confirmation, DriftKind, ProvisionActor, ProvisionEnvironment, ProvisionOptions,
+            ProvisionOutcome, ProvisionSurface, ProvisionTargetRef, apply_provision,
+            plan_provision,
+        };
+
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let orders = provision_spec(&json!([document_collection("orders")]))?;
+        write_yaml_spec(&spec_path, &orders)?;
+        let config = spec_serve_config(
+            &spec_path,
+            &[
+                ("MULTIDB_SPEC_APPLY", "create"),
+                ("MULTIDB_MAX_CONCURRENT_QUERIES", "3"),
+            ],
+        )?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        let timeout = database.performance_config().query.queue_timeout_ms;
+        assert_eq!(
+            database.performance_config().query.max_concurrent_queries,
+            3
+        );
+
+        let mut retuned = orders;
+        retuned.profile = "shop_timeout".to_owned();
+        retuned.custom_profile = Some(serde_json::from_value(json!({
+            "extends": "balanced",
+            "knobs": { "query": { "queue_timeout_ms": timeout + 250 } }
+        }))?);
+        let serve = ProvisionEnvironment::new(ProvisionSurface::Serve);
+        let options = ProvisionOptions::default();
+        let drift_kinds = |database: &multidb::db::Database| {
+            plan_provision(
+                &retuned,
+                ProvisionTargetRef::Open(database),
+                &options,
+                &serve,
+            )
+            .map(|plan| {
+                plan.drift
+                    .items
+                    .iter()
+                    .map(|item| item.kind)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let plan = plan_provision(
+            &retuned,
+            ProvisionTargetRef::Open(&database),
+            &options,
+            &serve,
+        )?;
+        let report = apply_provision(
+            &mut database,
+            &ProvisionActor::local_operator("local:serve"),
+            &retuned,
+            &Confirmation::PlanId(plan.plan_id),
+            &options,
+            &serve,
+        )?;
+        assert_eq!(report.status, ProvisionOutcome::Applied, "{report:#?}");
+        assert!(report.session_pending_restart);
+        assert_eq!(
+            database.performance_config().query.queue_timeout_ms,
+            timeout
+        );
+        assert_eq!(
+            drift_kinds(&database)?,
+            vec![DriftKind::SessionPendingRestart]
+        );
+        drop(database);
+
+        write_yaml_spec(&spec_path, &retuned)?;
+        let config = spec_serve_config(&spec_path, &[("MULTIDB_MAX_CONCURRENT_QUERIES", "3")])?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        assert_eq!(
+            database.performance_config().query.queue_timeout_ms,
+            timeout + 250
+        );
+        assert_eq!(
+            database.performance_config().query.max_concurrent_queries,
+            3
+        );
+        assert_eq!(drift_kinds(&database)?, Vec::new());
         Ok(())
     }
 

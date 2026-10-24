@@ -148,7 +148,9 @@ apply a reviewed spec itself through the preview Control Plane endpoints
 step with what you apply, or the next `verify` start refuses. After
 provisioning, `MULTIDB_MAX_CONCURRENT_QUERIES` and
 `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` set the query governor of the running server
-(never the database), and provisioning plans do not report them as drift.
+(never the database), and provisioning plans do not report a knob they set as
+drift; with only one of them set, a retune of the other knob is a session
+pending a restart.
 Then the admin password bootstrap runs as before; its `admin` and `root`
 names are reserved, so provisioning never touches them.
 

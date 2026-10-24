@@ -512,6 +512,10 @@ All notable public changes will be recorded here.
 - `Database::set_security_state_as`, which replaces the RBAC policy and the
   principal registry in one persisted batch after checking `System:Admin`,
   audited as `set_security_state`.
+- `Database::override_query_governor`, which sets the query governor limits
+  that are `Some` and keeps the others. `multidb serve` uses it for each of
+  `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that
+  is set, where it used to fill the unset limit from the profile.
 - CLI provisioning (preview), as the local operator `local:cli`:
   `multidb config plan --spec <file> [--db <path>] [--out <plan.json>
   [--force]]` (a dry run that never creates the database file; text output
@@ -602,10 +606,13 @@ All notable public changes will be recorded here.
   inferred). Plans, drift, state and `/config/live` run under the shared
   `serve` lock next to statements, and an apply holds the exclusive lock from
   its recomputed plan through its last step; a wrapped busy query governor
-  stays 503 `busy` and a write conflict 409 `conflict`. A query governor set
-  for the process (`MULTIDB_MAX_CONCURRENT_QUERIES`,
-  `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, `Database::set_query_governor`) is not
-  reported as `session_pending_restart`. Every endpoint needs
+  stays 503 `busy` and a write conflict 409 `conflict`. A query governor knob
+  set for the process (each of `MULTIDB_MAX_CONCURRENT_QUERIES` and
+  `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` that is set, through
+  `Database::override_query_governor`, or both with
+  `Database::set_query_governor`) is not reported as
+  `session_pending_restart`; a retune of a governor knob the process did not
+  set is, in the apply report and in later plans. Every endpoint needs
   `System:Admin`, and applying also `Database:Admin`; a spec `storage_path` is
   the Advice `PROVISION_STORAGE_PATH_IGNORED`, since the Control Plane never
   creates databases or opens paths. The `OpenAPI` snapshot documents the five
