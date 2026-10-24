@@ -70,7 +70,28 @@ export type CollectionIndexKind =
   | "columnar"
   | "time_series";
 
+/**
+ * `DatabaseSpec.custom_profile` (spec version 2): a profile that extends one built-in
+ * product slug or alias. `knobs` holds only the overridden knob leaves, keyed by section.
+ */
+export type CustomProfileSpec = JsonObject & {
+  extends: string;
+  description?: string;
+  knobs?: JsonObject;
+  floors?: JsonObject & {
+    audit?: boolean;
+    backup?: boolean;
+    pitr?: boolean;
+    encryption_at_rest?: boolean;
+  };
+  compatible_roles?: JsonObject & {
+    add?: CollectionRole[];
+    remove?: CollectionRole[];
+  };
+};
+
 export type DatabaseSpec = JsonObject & {
+  /** Spec version: 1, or 2 for specs that use `custom_profile`. */
   version: number;
   name: string;
   profile: string;
@@ -107,6 +128,8 @@ export type DatabaseSpec = JsonObject & {
   extensions: JsonValue[];
   overrides: JsonObject;
   operation_hints: JsonObject;
+  /** Version 2 only. */
+  custom_profile?: CustomProfileSpec;
 };
 
 export type AuthMe = {
@@ -349,6 +372,13 @@ export type RuntimeAdviceReport = {
   recommendations: RuntimeAdvice[];
 };
 
+/** A built-in variant of a product profile, pinned to one storage profile. */
+export type ProfileVariantSummary = {
+  name: string;
+  storage_profile: string;
+  canonical: boolean;
+};
+
 export type ProfileSummary = {
   slug: string;
   aliases: string[];
@@ -356,6 +386,10 @@ export type ProfileSummary = {
   description: string;
   default_domain: string;
   compatible_roles: string[];
+  /** The product's variants; exactly one is canonical. */
+  variants?: ProfileVariantSummary[];
+  /** The preset knobs of the canonical variant. */
+  knobs?: JsonObject;
 };
 
 export type RoleSummary = {

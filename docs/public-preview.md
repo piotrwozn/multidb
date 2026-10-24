@@ -63,6 +63,70 @@ To smoke a release binary directly:
 .\scripts\preview-smoke.ps1 -Bin .\target\release\multidb.exe
 ```
 
+## Profiles
+
+`multidb profile list` shows the six product profiles with their variants.
+Each variant pins one storage profile; `docs/profiles.md` has the full model
+and knob reference.
+
+```powershell
+multidb profile list --json
+multidb profile show high_durability
+multidb profile show secure_app --override cache.max_entries=8192 --override floors.audit=true
+multidb profile show --db .\orders.redb
+multidb profile explain --spec .\orders.yaml
+multidb profile knobs
+```
+
+- `profile show <profile>` prints the resolved knobs with where each value
+  came from, when it applies and whether this build enforces it.
+  `--override path=value` (repeatable, or comma-separated) gives a what-if
+  view; a misspelled knob gets a did-you-mean suggestion.
+- `profile show --db <path>` prints the profile manifest a database was
+  created with, or "legacy database" for databases without one. It opens the
+  file read-only and never creates or writes a file. It warns about each
+  manifest floor the file visibly misses: `floors.encryption_at_rest`, because
+  it read the metadata without a key, so the file is not encrypted, and
+  `floors.audit` when the stored audit flag is off. `restore` refuses a backup
+  whose restored database would miss such a floor (a restore target is never
+  encrypted) and creates nothing, unless `--allow-unmet-floors` is given; it
+  then prints the same warnings.
+- `profile explain --spec <file>` resolves the profile of a spec; it exits 2
+  when the profile is invalid, including a version 1 spec that sets
+  `custom_profile` (`FIELD_REQUIRES_SPEC_V2`).
+- `init --guided --profile <profile> --override path=value [--profile-name <slug>]`
+  writes a version 2 spec whose `custom_profile` extends `<profile>`. Without
+  `--override`, guided init writes the same version 1 spec as before; an alias
+  of a non-canonical variant (for example `high_durability`) gets a warning,
+  because a version 1 spec records the product slug.
+- `config upgrade --spec <file> [--out <file>] [--force]` converts a spec to
+  version 2. When `custom_profile` is unset, it turns the
+  `profile.custom.base` override of older Studio specs, with
+  `profile.custom.description`, into a real `custom_profile`, and writes the
+  `profile.custom.slug` operation hint to the spec's `profile` field (the
+  current Studio builder writes
+  `custom_profile` itself). Any other `profile.custom.*` key, these keys
+  without a base, and these keys beside an existing `custom_profile` stay in
+  place; the upgrade notes and the validation suggestions say what to move by
+  hand. It is idempotent, writes `--out` in the format of its extension
+  (stdout keeps the input format), does not keep YAML comments, refuses to
+  overwrite a file without `--force`, and never writes a result that does not
+  validate or that grows past 1 MiB when re-serialized (exit 2).
+- Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
+  (as before), a product slug or alias in snake or kebab case, or `auto`,
+  which reads the storage profile of the existing database without writing
+  it. A database that was not closed cleanly (`serve` has no graceful
+  shutdown, so this follows every stop by a signal) first gets redb's crash
+  recovery, as with a named profile; `profile show --db` never writes and
+  reports it as needing recovery. The CLI and `serve` open single-node CP
+  databases only, so an AP database fails with `ReplicationMismatch` with
+  `auto` as with a named profile. `restore` does not accept `auto`, because
+  its target must be empty.
+
+Only the Rust API (`db::create_database_with_profile`) creates databases from
+profile knobs in this build; the CLI writes and inspects specs and opens
+existing databases with their persisted profile.
+
 ## Docker Quickstart
 
 Use Docker Compose if you do not want to build Rust or Node locally:

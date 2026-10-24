@@ -195,11 +195,22 @@ impl FormatRegistry {
     #[must_use]
     pub fn phase_24_default() -> Self {
         Self::new(vec![
+            // schema_version 2 marks a value-framed profile-manifest database; every other
+            // database keeps schema_version 1, which older binaries still open.
             PersistentFormat::new(
                 "database metadata",
                 "schema_version",
-                1,
-                1,
+                crate::db::SCHEMA_VERSION_FRAMED,
+                crate::db::SCHEMA_VERSION,
+                DowngradePolicy::AllowedUntilNewFormatWritten,
+            ),
+            // `__meta.profile_manifest` of databases created with a profile. Binaries without
+            // manifest support ignore it, so they run with storage profile defaults.
+            PersistentFormat::new(
+                "profile manifest",
+                "__meta.profile_manifest/manifest_version",
+                crate::db::MANIFEST_VERSION,
+                crate::db::MANIFEST_VERSION,
                 DowngradePolicy::AllowedUntilNewFormatWritten,
             ),
             PersistentFormat::new(
@@ -501,6 +512,7 @@ mod tests {
         let registry = FormatRegistry::default();
         let report = registry.check_completeness(&[
             "database metadata",
+            "profile manifest",
             "value codec",
             "backup manifest",
             "txn versions",
@@ -514,5 +526,30 @@ mod tests {
         ]);
         assert!(report.is_ok());
         assert!(!check_backup_manifest_version(99, &registry).is_ok());
+    }
+
+    #[test]
+    fn format_registry_tracks_the_metadata_and_profile_manifest_versions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = FormatRegistry::default();
+        let metadata = registry
+            .find("database metadata")
+            .ok_or("database metadata is registered")?;
+        // schema_version 2 (value-framed manifest databases) is written; 1 is still read.
+        assert_eq!(
+            (metadata.current_version, metadata.min_read_version),
+            (2, 1)
+        );
+        assert!(metadata.accepts(1) && metadata.accepts(2) && !metadata.accepts(3));
+
+        let manifest = registry
+            .find("profile manifest")
+            .ok_or("profile manifest is registered")?;
+        assert_eq!(
+            (manifest.current_version, manifest.min_read_version),
+            (1, 1)
+        );
+        assert!(manifest.future_version_message(2).is_some());
+        Ok(())
     }
 }

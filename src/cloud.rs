@@ -1809,8 +1809,8 @@ mod tests {
 
     use crate::{
         backup::{
-            BackupConfig, BackupKind, BackupManifest, RestoreTarget, full_backup, list_backups,
-            restore_backup, verify_backup,
+            BackupConfig, BackupError, BackupKind, BackupManifest, RestoreTarget, full_backup,
+            list_backups, restore_backup, verify_backup,
         },
         cloud::{
             BackupGcPolicy, BackupUri, CLOUD_SEGMENTS_TABLE, CloudError, CloudLease,
@@ -1818,18 +1818,23 @@ mod tests {
             TenantQuota, TenantRuntime, TieredSegmentPointer, TieringPolicy, TieringReport,
             TieringState, decode_segment_metadata, encode_segment_metadata, full_backup_to_uri,
             gc_backup_uri, hibernate_database, open_object_store, read_hibernation_marker,
-            resolve_tiered_segment_payload, restore_backup_from_uri, resume_database_guarded,
-            tier_columnar_segments, verify_backup_uri,
+            resolve_tiered_segment_payload, restore_backup_from_uri, resume_database,
+            resume_database_guarded, tier_columnar_segments, verify_backup_uri,
+        },
+        config_spec::{
+            PolicyCompiler, ProfileKnobOverrides, resolve_named_profile,
+            spec_io::{SpecFormat, decode_spec_bytes},
         },
         db::{
             Database, DbConfig, DbError, OperationalConfig, Profile, ReplicationKind,
-            create_ap_database, create_database, create_database_with_ops, open_database,
+            create_ap_database, create_database, create_database_with_ops,
+            create_database_with_profile, open_database,
         },
         keyenc,
         model::Value,
         query::{ColumnDef, ColumnType, REL_COLUMNAR_SEGMENTS_TABLE, RelTable, TableSchema},
         repl::{ApClusterConfig, Op, ReadConsistency, ReplError, Replication, propose_system},
-        storage::Bytes,
+        storage::{Bytes, EngineKind, ReadTransaction, RedbEngine, StorageEngine},
         txn,
     };
 
@@ -2268,6 +2273,80 @@ mod tests {
         Ok(())
     }
 
+    /// Hibernation resume takes no `RestoreConfig`, so it has no opt-in for unmet profile
+    /// floors: both resume paths refuse a hibernated database whose audit is off below
+    /// `floors.audit`, create nothing, keep the marker, and say that resume cannot proceed.
+    #[test]
+    fn resume_refuses_a_hibernated_database_below_a_profile_floor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let spec = decode_spec_bytes(
+            include_str!("../examples/custom-profile/multidb.yaml").as_bytes(),
+            SpecFormat::Yaml,
+        )?;
+        let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+        let binding = compiled.binding(&spec.deployment, Some(temp.path().join("source.redb")))?;
+        assert!(binding.manifest.knobs.floors.audit);
+        let profile = binding.db_config.profile;
+        let database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        // An older binary that ignores the manifest could switch audit off.
+        propose_system(
+            &database,
+            Op::Put {
+                table: "__authz_policy".to_owned(),
+                key: b"audit_enabled".to_vec(),
+                value: b"false".to_vec(),
+            },
+        )?;
+        let guarded = crate::cloud::HibernateConfig::new(ObjectStoreConfig::local_dir(
+            temp.path().join("guarded-objects"),
+        ));
+        hibernate_database(&database, &guarded)?;
+        let plain = crate::cloud::HibernateConfig::new(ObjectStoreConfig::local_dir(
+            temp.path().join("plain-objects"),
+        ));
+        let plain_backup = hibernate_database(&database, &plain)?.backup_id;
+        drop(database);
+
+        let refusal = |result: &Result<(), CloudError>| match result {
+            Err(error @ CloudError::Backup(BackupError::ProfileFloorsNotMet { floors }))
+                if floors == &["floors.audit"] =>
+            {
+                Ok(error.to_string())
+            }
+            other => Err(format!("unexpected result: {other:?}")),
+        };
+        let guarded_target = temp.path().join("guarded.redb");
+        let message = refusal(
+            &resume_database_guarded(
+                &guarded.object_store.uri,
+                DbConfig::on_disk(profile, &guarded_target),
+            )
+            .map(drop),
+        )?;
+        assert!(
+            message.contains(
+                "hibernation resume (cloud::resume_database, resume_database_guarded) has no \
+                 such opt-in and cannot resume below a floor"
+            ),
+            "{message}"
+        );
+        assert!(!guarded_target.exists(), "nothing is created when refused");
+        assert!(read_hibernation_marker(&guarded.object_store.uri).is_ok());
+
+        let plain_target = temp.path().join("plain.redb");
+        refusal(
+            &resume_database(
+                &plain.object_store.uri,
+                &plain_backup,
+                DbConfig::on_disk(profile, &plain_target),
+            )
+            .map(drop),
+        )?;
+        assert!(!plain_target.exists(), "nothing is created when refused");
+        Ok(())
+    }
+
     #[test]
     fn non_pointer_segment_payload_is_returned_as_is() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = b"plain parquet bytes";
@@ -2576,6 +2655,101 @@ mod tests {
         )?;
         let restored = open_database(DbConfig::on_disk(Profile::Analytical, &restore_path))?;
         assert_eq!(restored.table("sales")?.scan()?.len(), 2);
+        let segment = segment_value(&restored, &key)?.ok_or("missing restored segment")?;
+        assert!(decode_tiered_segment_pointer(&segment)?.is_none());
+        assert!(
+            restored
+                .begin_transaction()?
+                .get_row("sales", &Value::Int(1))?
+                .is_some()
+        );
+        let latest = latest_mvcc_value(
+            &restored,
+            &txn::version_key(REL_COLUMNAR_SEGMENTS_TABLE, &key)?,
+        )?
+        .ok_or("latest segment version is a delete")?;
+        assert!(decode_tiered_segment_pointer(&latest)?.is_none());
+        assert_eq!(latest, segment);
+        Ok(())
+    }
+
+    /// Tiering composes with profile manifests: on a zstd-framed analytical manifest database
+    /// the pointer is stored framed and reads resolve it, and a full backup inlines the segment,
+    /// so verify and restore succeed without the object store, the restored manifest database
+    /// stores the segment bytes framed again and its latest MVCC version and transactional reads
+    /// see the inlined segment, not a pointer.
+    #[test]
+    fn tiered_segments_of_a_profile_manifest_database_back_up_and_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("framed.redb");
+        let overrides: ProfileKnobOverrides = serde_json::from_value(serde_json::json!({
+            "compression": { "algorithm": "zstd", "min_bytes": 64 }
+        }))?;
+        let resolution = resolve_named_profile("analytical", &overrides);
+        let resolved = resolution
+            .resolved()
+            .ok_or_else(|| format!("analytical did not resolve: {:?}", resolution.issues()))?;
+        let binding = resolved.bind(ReplicationKind::default(), Some(db_path.clone()))?;
+        assert_eq!(binding.db_config.profile, Profile::Analytical);
+        assert!(binding.manifest.storage_format.value_framing);
+        let mut database = create_database_with_profile(&binding, OperationalConfig::new())?;
+        let schema = TableSchema::new(
+            vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("amount", ColumnType::Int, false),
+            ],
+            0,
+        );
+        let table = database.create_table("sales", Some(schema), Vec::new())?;
+        let rows = vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+        ];
+        for row in &rows {
+            table.insert(row.clone())?;
+        }
+
+        let objects = temp.path().join("objects");
+        let report = tier_columnar_segments(
+            &database,
+            &ObjectStoreConfig::local_dir(&objects),
+            &TieringPolicy::default(),
+        )?;
+        assert_eq!(report.uploaded_segments, 1);
+        let (key, _) = only_segment(&database)?;
+        current_pointer(&database, &key)?;
+        assert_eq!(table.scan()?, rows);
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        drop(table);
+        drop(database);
+        let raw_segment = |path: &Path| -> Result<Bytes, Box<dyn std::error::Error>> {
+            let engine = RedbEngine::open(path)?;
+            let value = engine
+                .begin_read()?
+                .get(REL_COLUMNAR_SEGMENTS_TABLE, &key)?
+                .ok_or("missing raw segment")?;
+            Ok(value)
+        };
+        assert!(raw_segment(&db_path)?.starts_with(b"MDBC1"));
+
+        std::fs::remove_dir_all(&objects)?;
+        verify_backup(&backup.path)?;
+        let restore_path = temp.path().join("framed-restore.redb");
+        restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Analytical, &restore_path),
+            RestoreTarget::Latest,
+        )?;
+        assert!(raw_segment(&restore_path)?.starts_with(b"MDBC1"));
+        let restored = open_database(DbConfig::on_disk(Profile::Analytical, &restore_path))?;
+        assert_eq!(restored.engine_kind(), EngineKind::CompressedRedb);
+        assert_eq!(restored.performance_config(), &binding.performance);
+        assert_eq!(restored.table("sales")?.scan()?, rows);
         let segment = segment_value(&restored, &key)?.ok_or("missing restored segment")?;
         assert!(decode_tiered_segment_pointer(&segment)?.is_none());
         assert!(

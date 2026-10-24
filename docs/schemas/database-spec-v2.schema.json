@@ -1,0 +1,665 @@
+{
+  "$defs": {
+    "collection_role": {
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "indexes": {
+          "items": {
+            "enum": [
+              "primary",
+              "document",
+              "vector",
+              "graph",
+              "full_text",
+              "columnar",
+              "time_series"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "document_entity",
+            "key_value",
+            "event_log",
+            "vector_memory",
+            "cache",
+            "audit",
+            "graph",
+            "analytics",
+            "time_series"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "role",
+        "domain",
+        "indexes"
+      ],
+      "type": "object"
+    },
+    "consistency_domain": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "local_snapshot",
+            "strong_cp",
+            "eventual_ap"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "custom_profile": {
+      "additionalProperties": false,
+      "properties": {
+        "compatible_roles": {
+          "additionalProperties": false,
+          "properties": {
+            "add": {
+              "items": {
+                "enum": [
+                  "document_entity",
+                  "key_value",
+                  "event_log",
+                  "vector_memory",
+                  "cache",
+                  "audit",
+                  "graph",
+                  "analytics",
+                  "time_series"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "remove": {
+              "items": {
+                "enum": [
+                  "document_entity",
+                  "key_value",
+                  "event_log",
+                  "vector_memory",
+                  "cache",
+                  "audit",
+                  "graph",
+                  "analytics",
+                  "time_series"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "description": {
+          "maxLength": 500,
+          "type": "string"
+        },
+        "extends": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "floors": {
+          "additionalProperties": false,
+          "properties": {
+            "audit": {
+              "type": "boolean"
+            },
+            "backup": {
+              "type": "boolean"
+            },
+            "encryption_at_rest": {
+              "type": "boolean"
+            },
+            "pitr": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "knobs": {
+          "$ref": "#/$defs/profile_knob_overrides"
+        }
+      },
+      "required": [
+        "extends"
+      ],
+      "type": "object"
+    },
+    "defaults": {
+      "additionalProperties": false,
+      "properties": {
+        "consistency_domain": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "replication": {
+          "enum": [
+            "cp",
+            "ap"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "consistency_domain",
+        "replication"
+      ],
+      "type": "object"
+    },
+    "deployment": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "embedded",
+            "single_node",
+            "cluster"
+          ],
+          "type": "string"
+        },
+        "storage_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "storage_path"
+      ],
+      "type": "object"
+    },
+    "extension_ref": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stability": {
+          "enum": [
+            "stable",
+            "experimental"
+          ],
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "stability"
+      ],
+      "type": "object"
+    },
+    "guarantees": {
+      "additionalProperties": false,
+      "properties": {
+        "audit": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "type": "object"
+        },
+        "backup": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "pitr": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enabled",
+            "pitr"
+          ],
+          "type": "object"
+        },
+        "conflict_resolution": {
+          "enum": [
+            "none",
+            "last_write_wins",
+            "vector_clock",
+            "crdt",
+            "custom"
+          ],
+          "type": "string"
+        },
+        "encryption": {
+          "additionalProperties": false,
+          "properties": {
+            "at_rest": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "at_rest"
+          ],
+          "type": "object"
+        },
+        "sensitive_data": {
+          "type": "boolean"
+        },
+        "strict_cross_domain_transactions": {
+          "type": "boolean"
+        },
+        "write_ack": {
+          "enum": [
+            "local",
+            "quorum",
+            "all"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "write_ack",
+        "conflict_resolution",
+        "backup",
+        "encryption",
+        "audit",
+        "sensitive_data",
+        "strict_cross_domain_transactions"
+      ],
+      "type": "object"
+    },
+    "profile_knob_overrides": {
+      "additionalProperties": false,
+      "properties": {
+        "cache": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "description": "Whether the read cache is on.",
+              "type": "boolean"
+            },
+            "max_entries": {
+              "description": "Maximum number of cached values.",
+              "maximum": 1048576,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "compression": {
+          "additionalProperties": false,
+          "properties": {
+            "algorithm": {
+              "description": "Value compression; anything but none turns on value framing (schema_version 2). Switching lz4 and zstd later is a retune.",
+              "enum": [
+                "none",
+                "lz4",
+                "zstd"
+              ],
+              "type": "string"
+            },
+            "min_bytes": {
+              "description": "Values shorter than this are stored in a raw frame.",
+              "maximum": 1048576,
+              "minimum": 64,
+              "type": "integer"
+            },
+            "zstd_level": {
+              "description": "zstd compression level; only used with algorithm zstd.",
+              "maximum": 19,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "consistency": {
+          "additionalProperties": false,
+          "properties": {
+            "default_domain": {
+              "description": "Consistency domain of the spec that init --guided --override writes. Guided init without --override and templates use the product's domain.",
+              "enum": [
+                "local_snapshot",
+                "strong_cp",
+                "eventual_ap"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "durability": {
+          "additionalProperties": false,
+          "properties": {
+            "commit": {
+              "description": "Commit protocol of every redb write transaction.",
+              "enum": [
+                "immediate",
+                "two_phase"
+              ],
+              "type": "string"
+            },
+            "group_commit_window_ms": {
+              "description": "How long single-node commits wait to be batched together.",
+              "maximum": 50,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "history": {
+          "additionalProperties": false,
+          "properties": {
+            "keep_history": {
+              "description": "Whether system-versioned history is kept.",
+              "type": "boolean"
+            },
+            "system_versioning": {
+              "description": "Whether provisioned typed tables keep system-versioned history.",
+              "enum": [
+                "off",
+                "typed_tables"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "max_batch_ops": {
+              "description": "Largest accepted write batch; only unlimited is accepted because the write pipeline does not enforce it yet.",
+              "oneOf": [
+                {
+                  "const": "unlimited"
+                },
+                {
+                  "maximum": 1000000,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            "max_value_bytes": {
+              "description": "Largest accepted user value; only unlimited is accepted because the write pipeline does not enforce it yet.",
+              "oneOf": [
+                {
+                  "const": "unlimited"
+                },
+                {
+                  "maximum": 67108864,
+                  "minimum": 1024,
+                  "type": "integer"
+                }
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "query": {
+          "additionalProperties": false,
+          "properties": {
+            "batch_rows": {
+              "description": "Rows per record batch.",
+              "maximum": 1048576,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_concurrent_queries": {
+              "description": "Query permits; auto is four per available thread.",
+              "oneOf": [
+                {
+                  "const": "auto"
+                },
+                {
+                  "maximum": 4096,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            "max_sql_bytes": {
+              "description": "Maximum SQL text size.",
+              "maximum": 16777216,
+              "minimum": 1024,
+              "type": "integer"
+            },
+            "max_statements": {
+              "description": "Maximum statements per SQL request.",
+              "maximum": 1024,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "max_values_rows": {
+              "description": "Maximum rows in one VALUES list.",
+              "maximum": 1000000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "memory_limit_bytes": {
+              "description": "Memory pool of one SQL query.",
+              "maximum": 68719476736,
+              "minimum": 67108864,
+              "type": "integer"
+            },
+            "parser_recursion_limit": {
+              "description": "SQL parser recursion depth; SELECTs that DataFusion plans stay capped at DataFusion's own limit of 50.",
+              "maximum": 1024,
+              "minimum": 16,
+              "type": "integer"
+            },
+            "queue_timeout_ms": {
+              "description": "How long a query waits for a permit before it is rejected.",
+              "maximum": 60000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "spill_limit_bytes": {
+              "description": "Maximum spill-to-disk size of one SQL query.",
+              "maximum": 1099511627776,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "target_partitions": {
+              "description": "DataFusion partitions; auto is the storage profile default.",
+              "oneOf": [
+                {
+                  "const": "auto"
+                },
+                {
+                  "maximum": 256,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              ]
+            },
+            "timeout_ms": {
+              "description": "SQL execution timeout.",
+              "maximum": 3600000,
+              "minimum": 100,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "storage": {
+          "additionalProperties": false,
+          "properties": {
+            "layout": {
+              "description": "Default table layout of the database.",
+              "enum": [
+                "row",
+                "columnar"
+              ],
+              "type": "string"
+            },
+            "medium": {
+              "description": "Whether data lives in a durable redb file or only in memory.",
+              "enum": [
+                "durable",
+                "volatile"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "time_series": {
+          "additionalProperties": false,
+          "properties": {
+            "default_chunk_millis": {
+              "description": "Default chunk width of time series.",
+              "maximum": 2678400000,
+              "minimum": 1000,
+              "type": "integer"
+            },
+            "default_retention_millis": {
+              "description": "Default retention of time series; null keeps data forever and a value must be at least one chunk.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "string_map": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "propertyNames": {
+        "minLength": 1
+      },
+      "type": "object"
+    },
+    "topology": {
+      "additionalProperties": false,
+      "properties": {
+        "replica_count": {
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "shard_count": {
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "replica_count",
+        "shard_count"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://multidb.dev/schemas/database-spec-v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "collections": {
+      "items": {
+        "$ref": "#/$defs/collection_role"
+      },
+      "type": "array"
+    },
+    "custom_profile": {
+      "$ref": "#/$defs/custom_profile"
+    },
+    "defaults": {
+      "$ref": "#/$defs/defaults"
+    },
+    "deployment": {
+      "$ref": "#/$defs/deployment"
+    },
+    "domains": {
+      "items": {
+        "$ref": "#/$defs/consistency_domain"
+      },
+      "type": "array"
+    },
+    "extensions": {
+      "items": {
+        "$ref": "#/$defs/extension_ref"
+      },
+      "type": "array"
+    },
+    "guarantees": {
+      "$ref": "#/$defs/guarantees"
+    },
+    "name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "operation_hints": {
+      "$ref": "#/$defs/string_map"
+    },
+    "overrides": {
+      "$ref": "#/$defs/string_map"
+    },
+    "profile": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "topology": {
+      "$ref": "#/$defs/topology"
+    },
+    "version": {
+      "const": 2
+    }
+  },
+  "required": [
+    "version",
+    "name",
+    "profile",
+    "deployment",
+    "defaults",
+    "guarantees",
+    "domains",
+    "collections",
+    "extensions",
+    "overrides",
+    "operation_hints"
+  ],
+  "title": "MultiDB DatabaseSpec v2",
+  "type": "object"
+}

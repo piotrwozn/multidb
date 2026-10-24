@@ -1,0 +1,59 @@
+version: 1
+name: Secure SaaS
+profile: secure_app
+deployment:
+  mode: single_node
+  storage_path: secure_saas.redb
+defaults:
+  consistency_domain: primary
+  replication: cp
+guarantees:
+  write_ack: quorum
+  conflict_resolution: none
+  backup:
+    enabled: true
+    pitr: true
+  encryption:
+    at_rest: true
+  audit:
+    enabled: true
+  sensitive_data: true
+  strict_cross_domain_transactions: true
+domains:
+- name: primary
+  mode: strong_cp
+collections:
+- name: tenants
+  role: document_entity
+  domain: primary
+  indexes:
+  - document
+- name: app_state
+  role: key_value
+  domain: primary
+  indexes:
+  - primary
+- name: audit_log
+  role: audit
+  domain: primary
+  indexes:
+  - primary
+- name: outbox
+  role: event_log
+  domain: primary
+  indexes:
+  - primary
+extensions:
+- name: audit
+  version: 1.0.0
+  stability: stable
+- name: cdc
+  version: 1.0.0
+  stability: stable
+- name: document_index
+  version: 1.0.0
+  stability: stable
+overrides: {}
+operation_hints:
+  template.profile_reason: Uses the stable secure_app profile with strong CP intent, backup, PITR, encryption and audit enabled while keeping enterprise SLA concerns explicit.
+  template.slug: secure-saas
