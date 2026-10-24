@@ -16,9 +16,11 @@ use serde_json::{Value as JsonValue, json};
 use crate::db::{DbConfig, Profile, ReplicationKind};
 
 mod knobs;
+mod physical_spec;
 mod profile;
 mod schema;
 mod schema_v2;
+mod security_spec;
 pub mod spec_io;
 mod suggest;
 
@@ -26,6 +28,21 @@ pub use knobs::{
     ChangePolicy, KNOB_REGISTRY, KnobAssignment, KnobAssignmentError, KnobDefinition,
     KnobEnforcement, KnobTiming, KnobType, RESERVED_KNOBS, ReservedKnob, knob_definition,
     parse_knob_assignment,
+};
+pub(crate) use physical_spec::{
+    CheckMode, PlannedDocIndex, PlannedField, PlannedKind, PlannedObject, PlannedTableIndex,
+    SpecPath, plan_catalog,
+};
+pub use physical_spec::{
+    ColumnSpec, ColumnTypeSpec, DEFAULT_FULL_TEXT_LANGUAGE, DEFAULT_GEO_PRECISION,
+    DEFAULT_HNSW_EF_CONSTRUCTION, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_M,
+    DEFAULT_REFRESH_LAG_TARGET, DOCUMENT_ID_PATH, DocFieldSpec, DocIndexSpec, FullTextSpec,
+    GeoSpec, HnswSpec, MAX_CATALOG_OBJECTS, MAX_CHUNK_MILLIS, MAX_COLLECTIONS,
+    MAX_FIELDS_PER_COLLECTION, MAX_FULL_TEXT_PER_COLLECTION, MAX_GEO_PER_COLLECTION,
+    MAX_INDEXES_PER_COLLECTION, MAX_MAP_ENTRIES, MAX_MAP_KEY_BYTES, MAX_MAP_VALUE_BYTES,
+    MAX_PATH_SEGMENTS, MAX_VECTOR_DIM, MIN_CHUNK_MILLIS, PhysicalKind, PhysicalObjectSpec,
+    TableIndexExpressionSpec, TableIndexSpec, VectorMetricSpec, allowed_kinds,
+    full_text_index_name, geo_index_name, history_table_name,
 };
 pub use profile::{
     AutoOr, CacheKnobs, CacheOverrides, CommitMode, CompressionKnob, CompressionKnobs,
@@ -42,10 +59,17 @@ pub(crate) use profile::{
 };
 pub use schema::database_spec_v1_schema;
 pub use schema_v2::database_spec_v2_schema;
+pub use security_spec::{
+    GrantScope, GrantSpec, MAX_GRANTS_PER_ROLE, MAX_PRINCIPALS, MAX_ROLES, PermissionSpec,
+    PrincipalSpec, ProvisioningPolicySpec, RESERVED_PRINCIPAL_NAMES, RESERVED_ROLE_NAMES, RoleSpec,
+    SecuritySpec, UnmanagedPolicy,
+};
 
 /// The version v1 writers emit. Documents that need no version 2 field keep using it.
 pub const DATABASE_SPEC_VERSION: u32 = 1;
-/// The first version with `custom_profile`. Its new checks are Errors instead of Warnings.
+/// The first version with `custom_profile`, `security`, `provisioning`,
+/// `collections[].physical` and the `geo` index kind. Its new checks are Errors instead of
+/// Warnings.
 pub const DATABASE_SPEC_VERSION_V2: u32 = 2;
 /// Every `DatabaseSpec.version` this build reads.
 pub const SUPPORTED_SPEC_VERSIONS: RangeInclusive<u32> =
@@ -73,6 +97,12 @@ pub struct DatabaseSpec {
     /// sets it fails validation with `FIELD_REQUIRES_SPEC_V2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_profile: Option<CustomProfileSpec>,
+    /// Roles and principals provisioning manages. Spec version 2 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecuritySpec>,
+    /// How provisioning treats objects the spec does not declare. Spec version 2 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ProvisioningPolicySpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -221,6 +251,9 @@ pub struct CollectionRoleSpec {
     pub role: CollectionRole,
     pub domain: String,
     pub indexes: Vec<CollectionIndexKind>,
+    /// The parameters provisioning builds the collection with. Spec version 2 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<PhysicalObjectSpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -247,6 +280,8 @@ pub enum CollectionIndexKind {
     FullText,
     Columnar,
     TimeSeries,
+    /// A geo index on a document path. Spec version 2 only; it needs no extension.
+    Geo,
 }
 
 /// Every `CollectionIndexKind` in declaration order; the v2 JSON schema enum is generated from it.
@@ -258,6 +293,7 @@ pub(crate) const ALL_INDEX_KINDS: &[CollectionIndexKind] = &[
     CollectionIndexKind::FullText,
     CollectionIndexKind::Columnar,
     CollectionIndexKind::TimeSeries,
+    CollectionIndexKind::Geo,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -815,7 +851,8 @@ impl ExtensionManifestValidator {
     }
 }
 
-fn role_required_extensions(role: CollectionRole) -> &'static [&'static str] {
+/// The built-in extensions a collection role needs.
+pub(crate) fn role_required_extensions(role: CollectionRole) -> &'static [&'static str] {
     match role {
         CollectionRole::EventLog => &["cdc"],
         CollectionRole::VectorMemory => &["vector_hnsw"],
@@ -827,7 +864,8 @@ fn role_required_extensions(role: CollectionRole) -> &'static [&'static str] {
     }
 }
 
-fn index_required_extensions(indexes: &[CollectionIndexKind]) -> Vec<String> {
+/// The built-in extensions a set of index kinds needs, sorted and without duplicates.
+pub(crate) fn index_required_extensions(indexes: &[CollectionIndexKind]) -> Vec<String> {
     let mut required = BTreeSet::new();
     for index in indexes {
         match index {
@@ -849,7 +887,7 @@ fn index_required_extensions(indexes: &[CollectionIndexKind]) -> Vec<String> {
             CollectionIndexKind::TimeSeries => {
                 required.insert("time_series");
             }
-            CollectionIndexKind::Primary => {}
+            CollectionIndexKind::Primary | CollectionIndexKind::Geo => {}
         }
     }
     required.into_iter().map(str::to_owned).collect()
@@ -1175,6 +1213,8 @@ impl DatabaseSpec {
             overrides: BTreeMap::new(),
             operation_hints: BTreeMap::new(),
             custom_profile: None,
+            security: None,
+            provisioning: None,
         }
     }
 
@@ -1583,6 +1623,7 @@ impl GuaranteeValidator {
 
         issues.extend(trailing_issues);
         check_override_keys(spec, strict, &mut issues);
+        check_provisioning_fields(spec, resolution.resolved(), strict, &mut issues);
 
         let valid = !issues
             .iter()
@@ -1829,6 +1870,19 @@ impl PolicyCompiler {
         Ok(Self::compile_valid(spec, resolution.as_ref()))
     }
 
+    /// Validates `spec` and, when the report has no errors, compiles it from the same profile
+    /// resolution, so provisioning resolves the profile once.
+    pub(crate) fn validate_and_compile(
+        spec: &DatabaseSpec,
+    ) -> (ValidationReport, Option<CompiledPolicy>) {
+        let (report, resolution) = GuaranteeValidator::validate_with_resolution(spec);
+        if report.has_errors() {
+            return (report, None);
+        }
+        let policy = Self::compile_valid(spec, resolution.as_ref());
+        (report, Some(policy))
+    }
+
     /// Compiles a spec whose validation report has no errors, from the profile resolution that
     /// validation produced.
     fn compile_valid(
@@ -1887,10 +1941,64 @@ impl PolicyCompiler {
 /// Reports every field that needs a newer spec version than the document declares.
 fn spec_version_gate(spec: &DatabaseSpec) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
-    if spec.version == DATABASE_SPEC_VERSION && spec.custom_profile.is_some() {
+    if spec.version != DATABASE_SPEC_VERSION {
+        return issues;
+    }
+    if spec.custom_profile.is_some() {
         issues.push(custom_profile_requires_spec_v2());
     }
+    if spec.security.is_some() {
+        issues.push(field_requires_spec_v2("security", "security"));
+    }
+    if spec.provisioning.is_some() {
+        issues.push(field_requires_spec_v2("provisioning", "provisioning"));
+    }
+    for (index, collection) in spec.collections.iter().enumerate() {
+        if collection.physical.is_some() {
+            issues.push(field_requires_spec_v2(
+                &format!("collections[{index}].physical"),
+                "physical",
+            ));
+        }
+        for (position, kind) in collection.indexes.iter().enumerate() {
+            if *kind == CollectionIndexKind::Geo {
+                issues.push(field_requires_spec_v2(
+                    &format!("collections[{index}].indexes[{position}]"),
+                    "the geo index kind",
+                ));
+            }
+        }
+    }
     issues
+}
+
+/// `FIELD_REQUIRES_SPEC_V2` at `path` for a version 2 `field` in a version 1 document.
+fn field_requires_spec_v2(path: &str, field: &str) -> ValidationIssue {
+    validation_issue(
+        "FIELD_REQUIRES_SPEC_V2",
+        ValidationSeverity::Error,
+        path,
+        format!("{field} is a DatabaseSpec version 2 field, but the document declares version 1"),
+        format!("Set version: 2 to use {field}, or remove it."),
+        CertificationImpact::BlocksCertified,
+    )
+}
+
+/// Names, size limits, physical parameters and security. Version 1 gets only name and size
+/// Warnings (its version 2 fields are gated); version 2 gets Errors, with
+/// `PHYSICAL_PARAMETER_REQUIRED` as Advice.
+fn check_provisioning_fields(
+    spec: &DatabaseSpec,
+    resolved: Option<&ResolvedProfile>,
+    strict: bool,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let mode = if strict { CheckMode::V2 } else { CheckMode::V1 };
+    let plan = plan_catalog(spec, resolved, mode);
+    issues.extend(plan.issues);
+    if strict {
+        security_spec::check_security(spec, &plan.objects, issues);
+    }
 }
 
 /// `FIELD_REQUIRES_SPEC_V2` for a version 1 document that sets `custom_profile`. The version
@@ -2502,8 +2610,7 @@ fn explain_compiled_policy(policy: &CompiledPolicy, decisions: &mut Vec<ExplainD
 
 /// Outcome of every knob applied at each open.
 const EVERY_OPEN_OUTCOME: &str = "persisted in __meta.profile_manifest and applied at every open of \
-     a database created with db::create_database_with_profile; the CLI, serve and Control Plane \
-     do not create databases from specs in this build";
+     a database created with db::create_database_with_profile or by provisioning";
 
 /// What a spec cannot configure in this build, reported by explain under
 /// `$.profile.not_configurable`.
@@ -2633,16 +2740,14 @@ fn knob_outcome(
                 "no value framing: the database keeps schema_version 1".to_owned()
             } else {
                 "forward-only format change: schema_version 2 (value framing, refused by older \
-                 binaries); applied only by db::create_database_with_profile in this build"
+                 binaries); applied by db::create_database_with_profile and by provisioning, \
+                 which upgrades an existing database only with allow_format_upgrade"
                     .to_owned()
             }
         }
         KnobTiming::Creation => fixed_at_creation.to_owned(),
         KnobTiming::EveryOpen => EVERY_OPEN_OUTCOME.to_owned(),
-        KnobTiming::Provisioning => {
-            "recorded only; applied by provisioning, which is not available in this build"
-                .to_owned()
-        }
+        KnobTiming::Provisioning => "applied by provisioning to the objects it creates".to_owned(),
         KnobTiming::GenerationDefault => {
             "default for generated specs (guided init and templates); no runtime effect".to_owned()
         }
@@ -2776,6 +2881,32 @@ fn diff_top_level(current: &DatabaseSpec, desired: &DatabaseSpec, steps: &mut Ve
         ),
     );
     diff_guarantees(&current.guarantees, &desired.guarantees, steps);
+    record_diff(
+        steps,
+        "$.security",
+        &current.security,
+        &desired.security,
+        diff_metadata(
+            MigrationStepKind::Unsupported,
+            unsupported_impact("security is applied by provisioning, not by config apply v1"),
+            "Restore the previous security block.",
+            false,
+        ),
+    );
+    record_diff(
+        steps,
+        "$.provisioning",
+        &current.provisioning,
+        &desired.provisioning,
+        diff_metadata(
+            MigrationStepKind::Unsupported,
+            unsupported_impact(
+                "the provisioning policy is applied by provisioning, not by config apply v1",
+            ),
+            "Restore the previous provisioning block.",
+            false,
+        ),
+    );
 }
 
 fn diff_guarantees(
@@ -2993,6 +3124,20 @@ fn diff_collections(
                             "collection domain changes can move data across consistency boundaries",
                         ),
                         "Restore the previous collection domain.",
+                        false,
+                    ),
+                );
+                record_diff(
+                    steps,
+                    format!("$.collections.{}.physical", desired.name),
+                    &current.physical,
+                    &desired.physical,
+                    diff_metadata(
+                        MigrationStepKind::ChangeCollection,
+                        unsupported_impact(
+                            "physical parameters are applied by provisioning, not by config apply v1",
+                        ),
+                        "Restore the previous physical parameters.",
                         false,
                     ),
                 );
@@ -3244,7 +3389,7 @@ fn aggregate_impact(steps: &[MigrationStep]) -> PlanImpact {
     impact
 }
 
-fn merge_impact(target: &mut PlanImpact, source: &PlanImpact) {
+pub(crate) fn merge_impact(target: &mut PlanImpact, source: &PlanImpact) {
     target.downtime = target.downtime.max(source.downtime);
     target.disk = target.disk.max(source.disk);
     target.cpu = target.cpu.max(source.cpu);
@@ -3258,11 +3403,11 @@ fn merge_impact(target: &mut PlanImpact, source: &PlanImpact) {
     }
 }
 
-fn impact_none() -> PlanImpact {
+pub(crate) fn impact_none() -> PlanImpact {
     PlanImpact::default()
 }
 
-fn low_risk_impact(note: &str) -> PlanImpact {
+pub(crate) fn low_risk_impact(note: &str) -> PlanImpact {
     PlanImpact {
         downtime: ImpactLevel::None,
         disk: ImpactLevel::None,
@@ -3274,7 +3419,7 @@ fn low_risk_impact(note: &str) -> PlanImpact {
     }
 }
 
-fn medium_impact(note: &str) -> PlanImpact {
+pub(crate) fn medium_impact(note: &str) -> PlanImpact {
     PlanImpact {
         downtime: ImpactLevel::Low,
         disk: ImpactLevel::Low,
@@ -3301,6 +3446,24 @@ fn unsupported_impact(note: &str) -> PlanImpact {
     }
 }
 
+/// The canonical JSON form of a spec: `serde_json` in struct field order, with every map sorted
+/// by key (`BTreeMap`) and unset optional fields left out. Two specs that mean the same thing
+/// serialize to the same bytes, so digests and provisioning plan ids are stable across builds.
+#[must_use]
+pub fn canonical_spec_json(spec: &DatabaseSpec) -> String {
+    describe_value(spec)
+}
+
+/// The digest of a spec: `spec_` and 32 hex characters of
+/// blake3("multidb-spec-v1" ‖ [`canonical_spec_json`]).
+#[must_use]
+pub fn spec_digest(spec: &DatabaseSpec) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"multidb-spec-v1");
+    hasher.update(canonical_spec_json(spec).as_bytes());
+    format!("spec_{}", hex_prefix(hasher.finalize().as_bytes(), 16))
+}
+
 fn stable_plan_id(current: &DatabaseSpec, desired: &DatabaseSpec) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"multidb-config-migration-plan-v1");
@@ -3317,7 +3480,7 @@ fn update_hash_with_json<T: Serialize>(hasher: &mut blake3::Hasher, value: &T) {
     };
 }
 
-fn hex_prefix(bytes: &[u8], len: usize) -> String {
+pub(crate) fn hex_prefix(bytes: &[u8], len: usize) -> String {
     let mut output = String::with_capacity(len.saturating_mul(2));
     for byte in bytes.iter().take(len) {
         output.push(hex_digit(byte >> 4));
@@ -4363,6 +4526,7 @@ mod tests {
             role,
             domain: "primary".to_owned(),
             indexes,
+            physical: None,
         }
     }
 
@@ -4385,6 +4549,7 @@ mod tests {
             role: CollectionRole::DocumentEntity,
             domain: "primary".to_owned(),
             indexes: vec![CollectionIndexKind::Document],
+            physical: None,
         });
         spec.overrides
             .insert("storage.cache.max_capacity".to_owned(), "4096".to_owned());
@@ -4547,6 +4712,7 @@ mod tests {
             role: CollectionRole::EventLog,
             domain: "missing".to_owned(),
             indexes: Vec::new(),
+            physical: None,
         });
 
         assert_eq!(
@@ -4794,6 +4960,7 @@ mod tests {
             role: CollectionRole::KeyValue,
             domain: "primary".to_owned(),
             indexes: vec![CollectionIndexKind::Primary],
+            physical: None,
         });
 
         assert_eq!(spec.catalog_support_status(), SupportStatus::Certified);
@@ -4807,6 +4974,7 @@ mod tests {
             role: CollectionRole::KeyValue,
             domain: "primary".to_owned(),
             indexes: vec![CollectionIndexKind::Primary],
+            physical: None,
         });
         assert_eq!(
             unknown_profile.catalog_support_status(),
@@ -4826,6 +4994,7 @@ mod tests {
             role: CollectionRole::Graph,
             domain: "primary".to_owned(),
             indexes: vec![CollectionIndexKind::Graph],
+            physical: None,
         });
 
         assert_eq!(spec.catalog_support_status(), SupportStatus::Custom);
@@ -6006,13 +6175,17 @@ mod tests {
                 }
                 _ if definition.timing == super::KnobTiming::EveryOpen => {
                     assert!(
-                        knob.outcome.contains("db::create_database_with_profile")
-                            && knob.outcome.contains("do not create databases from specs"),
+                        knob.outcome
+                            .contains("db::create_database_with_profile or by provisioning")
+                            && !knob.outcome.contains("do not create databases from specs"),
                         "{knob:?}"
                     );
                 }
                 _ if definition.timing == super::KnobTiming::Provisioning => {
-                    assert!(knob.outcome.starts_with("recorded only"), "{knob:?}");
+                    assert_eq!(
+                        knob.outcome, "applied by provisioning to the objects it creates",
+                        "{knob:?}"
+                    );
                 }
                 _ => {}
             }
@@ -6035,10 +6208,11 @@ mod tests {
             decision("$.profile.knobs.query.timeout_ms")?.source,
             "preset:secure_app"
         );
+        let compression = decision("$.profile.knobs.compression.algorithm")?;
+        assert!(compression.outcome.contains("schema_version 2"));
         assert!(
-            decision("$.profile.knobs.compression.algorithm")?
-                .outcome
-                .contains("schema_version 2")
+            compression.outcome.contains("allow_format_upgrade"),
+            "{compression:?}"
         );
         let storage = decision("$.profile.storage_profile")?;
         assert_eq!(storage.source, "derived:storage_class");
@@ -6205,6 +6379,992 @@ mod tests {
             "{:?}",
             report.issues
         );
+        Ok(())
+    }
+
+    fn v2_spec_with(
+        collections: serde_json::Value,
+    ) -> Result<DatabaseSpec, Box<dyn std::error::Error>> {
+        let mut spec = catalog_spec("balanced", ConsistencyMode::StrongCp);
+        spec.version = DATABASE_SPEC_VERSION_V2;
+        spec.collections = serde_json::from_value(collections)?;
+        Ok(spec)
+    }
+
+    fn issue_at<'a>(
+        report: &'a super::ValidationReport,
+        code: &str,
+        path: &str,
+    ) -> Option<&'a super::ValidationIssue> {
+        report
+            .issues
+            .iter()
+            .find(|issue| issue.code == code && issue.path == path)
+    }
+
+    #[test]
+    fn v2_fields_in_a_v1_document_are_rejected_at_their_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(catalog_spec("balanced", ConsistencyMode::StrongCp))?;
+        value["security"] = json!({ "roles": [] });
+        value["provisioning"] = json!({ "unmanaged": "fail" });
+        value["collections"] = json!([{
+            "name": "orders",
+            "role": "document_entity",
+            "domain": "primary",
+            "indexes": ["primary", "geo"],
+            "physical": { "geo": [{ "path": "shipping.location" }] }
+        }]);
+        let mut spec = serde_json::from_value::<DatabaseSpec>(value)?;
+
+        let report = GuaranteeValidator::validate(&spec);
+
+        assert!(!report.valid);
+        assert_eq!(report.status, SupportStatus::Invalid);
+        let gated = report
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "FIELD_REQUIRES_SPEC_V2")
+            .map(|issue| (issue.path.as_str(), issue.severity))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gated,
+            [
+                ("security", ValidationSeverity::Error),
+                ("provisioning", ValidationSeverity::Error),
+                ("collections[0].physical", ValidationSeverity::Error),
+                ("collections[0].indexes[1]", ValidationSeverity::Error),
+            ]
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| !issue.code.starts_with("PHYSICAL_")
+                    && !issue.code.starts_with("SECURITY_")),
+            "{:?}",
+            report.issues
+        );
+        assert!(PolicyCompiler::compile(&spec).is_err());
+
+        spec.version = DATABASE_SPEC_VERSION_V2;
+        let v2 = GuaranteeValidator::validate(&spec);
+        assert!(v2.valid, "{:?}", v2.issues);
+        assert!(!issue_codes(&v2).contains("FIELD_REQUIRES_SPEC_V2"));
+        Ok(())
+    }
+
+    #[test]
+    fn physical_and_security_round_trip_and_reject_unknown_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(v2_spec_with(json!([
+            {
+                "name": "orders",
+                "role": "document_entity",
+                "domain": "primary",
+                "indexes": ["document", "full_text", "geo"],
+                "physical": {
+                    "collection_id": 12,
+                    "fields": [
+                        { "name": "id", "path": "$id", "type": "bytes" },
+                        { "name": "total", "path": "total", "type": "float" }
+                    ],
+                    "document_indexes": [{ "path": "status", "id": 3 }],
+                    "full_text": [{ "path": "notes", "language": "simple", "refresh_lag_target": 2 }],
+                    "geo": [{ "path": "at", "name": "orders_at", "precision": 8 }]
+                }
+            },
+            {
+                "name": "ledger",
+                "role": "event_log",
+                "domain": "primary",
+                "indexes": ["document"],
+                "physical": {
+                    "kind": "table",
+                    "layout": "row",
+                    "columns": [
+                        { "name": "id", "type": "int" },
+                        { "name": "memo", "type": "str", "nullable": true }
+                    ],
+                    "primary_key": "id",
+                    "table_indexes": [{ "column": "memo", "expression": "lower_ascii", "include": ["id"] }],
+                    "system_versioning": true,
+                    "keep_history": false
+                }
+            },
+            {
+                "name": "memories",
+                "role": "vector_memory",
+                "domain": "primary",
+                "indexes": ["vector"],
+                "physical": { "dim": 8, "metric": "l2", "hnsw": { "m": 8, "ef_construction": 64, "ef_search": 16 } }
+            }
+        ]))?)?;
+        value["security"] = json!({
+            "roles": [{
+                "name": "order_writer",
+                "grants": [
+                    { "object": "orders", "permissions": ["read", "write"] },
+                    { "resource": "database", "permissions": ["read"] }
+                ]
+            }],
+            "principals": [{ "user": "orders_svc", "principal": "orders", "roles": ["order_writer"] }]
+        });
+        value["provisioning"] = json!({ "unmanaged": "fail" });
+
+        let spec = serde_json::from_value::<DatabaseSpec>(value.clone())?;
+        let from_yaml = super::spec_io::decode_spec_bytes(
+            serde_norway::to_string(&spec)?.as_bytes(),
+            super::spec_io::SpecFormat::Yaml,
+        )?;
+
+        assert_eq!(serde_json::to_value(&spec)?, value);
+        assert_eq!(from_yaml, spec);
+        let security = spec.security.as_ref().ok_or("security")?;
+        assert_eq!(security.principals[0].principal_name(), "orders");
+        assert_eq!(
+            spec.provisioning.map(|provisioning| provisioning.unmanaged),
+            Some(super::UnmanagedPolicy::Fail)
+        );
+        let report = GuaranteeValidator::validate(&spec);
+        assert!(report.valid, "{:?}", report.issues);
+
+        // Unset fields are not serialized, so documents without them keep their exact form.
+        let plain = catalog_spec("balanced", ConsistencyMode::StrongCp);
+        let plain_value = serde_json::to_value(&plain)?;
+        assert!(plain_value.get("security").is_none());
+        assert!(plain_value.get("provisioning").is_none());
+        let mut with_collection = plain;
+        with_collection
+            .collections
+            .push(collection("users", CollectionRole::KeyValue, Vec::new()));
+        assert!(
+            serde_json::to_value(&with_collection)?["collections"][0]
+                .get("physical")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(super::ProvisioningPolicySpec::default())?,
+            json!({ "unmanaged": "report" })
+        );
+
+        for (pointer, bad) in [
+            ("/collections/0/physical/dims", json!(3)),
+            ("/collections/0/physical/fields/0/kind", json!("x")),
+            ("/collections/2/physical/hnsw/levels", json!(3)),
+            ("/security/roles/0/grants/0/scope", json!("system")),
+            ("/security/roles/0/grants/1/resource", json!("system")),
+            ("/security/principals/0/password", json!("secret")),
+            ("/provisioning/unmanaged", json!("delete")),
+            ("/collections/0/physical/fields/1/type", json!("text")),
+            ("/collections/0/indexes/0", json!("spatial")),
+        ] {
+            let mut broken = value.clone();
+            let (parent, key) = pointer.rsplit_once('/').ok_or("pointer")?;
+            match broken.pointer_mut(parent) {
+                Some(serde_json::Value::Object(object)) => {
+                    object.insert(key.to_owned(), bad);
+                }
+                Some(serde_json::Value::Array(items)) => {
+                    let index = key.parse::<usize>()?;
+                    items[index] = bad;
+                }
+                _ => return Err(format!("no parent at {parent}").into()),
+            }
+            assert!(
+                serde_json::from_value::<DatabaseSpec>(broken).is_err(),
+                "{pointer} was accepted"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_null_retention_is_refused_instead_of_inheriting_the_knob()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metrics = |physical: serde_json::Value| {
+            v2_spec_with(json!([{
+                "name": "metrics",
+                "role": "time_series",
+                "domain": "primary",
+                "indexes": ["time_series"],
+                "physical": physical
+            }]))
+        };
+        assert_eq!(
+            metrics(json!({ "retention_millis": 86_400_000 }))?.collections[0]
+                .physical
+                .as_ref()
+                .and_then(|physical| physical.retention_millis),
+            Some(86_400_000)
+        );
+        // Left out, the field takes the profile knob.
+        assert_eq!(
+            metrics(json!({ "chunk_millis": 3_600_000 }))?.collections[0]
+                .physical
+                .as_ref()
+                .and_then(|physical| physical.retention_millis),
+            None
+        );
+
+        let Err(error) = metrics(json!({ "retention_millis": null })) else {
+            return Err("a null retention_millis was accepted".into());
+        };
+        assert!(error.to_string().contains("cannot be null"), "{error}");
+        let mut value = serde_json::to_value(metrics(json!({}))?)?;
+        value["collections"][0]["physical"] = json!({ "retention_millis": null });
+        assert!(super::spec_io::decode_spec_value(value.clone()).is_err());
+        let yaml = serde_norway::to_string(&value)?;
+        assert!(yaml.contains("retention_millis: null"), "{yaml}");
+        assert!(
+            super::spec_io::decode_spec_bytes(yaml.as_bytes(), super::spec_io::SpecFormat::Yaml)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// `physical.max_future_skew_millis` is a tri-state: left out is the default bound, a
+    /// number is that bound, and `null` is no bound. `i64::MAX`, the runtime's value for no
+    /// bound, is read as `null` and never written back as a number, in JSON or YAML, also when a
+    /// caller builds the spec with it, since JavaScript clients cannot represent it. Both
+    /// spellings are one spec with one digest.
+    #[test]
+    fn an_unbounded_future_skew_round_trips_as_null() -> Result<(), Box<dyn std::error::Error>> {
+        use super::spec_io::{SpecFormat, decode_spec_bytes, decode_spec_value};
+
+        let metrics = |physical: serde_json::Value| {
+            v2_spec_with(json!([{
+                "name": "metrics",
+                "role": "time_series",
+                "domain": "primary",
+                "indexes": ["time_series"],
+                "physical": physical
+            }]))
+        };
+        let skew = |spec: &DatabaseSpec| {
+            spec.collections[0].physical.as_ref().map(|physical| {
+                (
+                    physical.max_future_skew_millis,
+                    physical.future_skew_bound(),
+                )
+            })
+        };
+        let written = |spec: &DatabaseSpec| -> Result<_, Box<dyn std::error::Error>> {
+            Ok(serde_json::to_value(spec)?["collections"][0]["physical"]
+                .get("max_future_skew_millis")
+                .cloned())
+        };
+        let unbounded = i64::MAX.to_string();
+
+        let defaulted = metrics(json!({ "chunk_millis": 3_600_000 }))?;
+        assert_eq!(skew(&defaulted), Some((None, 300_000)));
+        assert_eq!(written(&defaulted)?, None);
+        let bounded = metrics(json!({ "max_future_skew_millis": 5_000 }))?;
+        assert_eq!(skew(&bounded), Some((Some(Some(5_000)), 5_000)));
+        assert_eq!(written(&bounded)?, Some(json!(5_000)));
+        // A negative bound is kept as written, so validation can name it.
+        let negative = metrics(json!({ "max_future_skew_millis": -1 }))?;
+        assert_eq!(skew(&negative), Some((Some(Some(-1)), -1)));
+
+        let null = metrics(json!({ "max_future_skew_millis": null }))?;
+        let spelled_out = metrics(json!({ "max_future_skew_millis": i64::MAX }))?;
+        let mut built = metrics(json!({}))?;
+        if let Some(physical) = built.collections[0].physical.as_mut() {
+            physical.max_future_skew_millis = Some(Some(i64::MAX));
+        }
+        assert_eq!(skew(&null), Some((Some(None), i64::MAX)));
+        assert_eq!(spelled_out, null);
+        assert_eq!(skew(&built), Some((Some(Some(i64::MAX)), i64::MAX)));
+        for spec in [&null, &spelled_out, &built] {
+            assert_eq!(written(spec)?, Some(serde_json::Value::Null));
+            let json = serde_json::to_string(spec)?;
+            let yaml = serde_norway::to_string(spec)?;
+            assert!(yaml.contains("max_future_skew_millis: null"), "{yaml}");
+            for (text, format) in [(&json, SpecFormat::Json), (&yaml, SpecFormat::Yaml)] {
+                assert!(!text.contains(&unbounded), "{text}");
+                assert_eq!(decode_spec_bytes(text.as_bytes(), format)?, null);
+            }
+            assert_eq!(super::spec_digest(spec), super::spec_digest(&null));
+        }
+        // YAML reads i64::MAX as no bound too, and a bounded spec reads back unchanged.
+        let yaml = serde_norway::to_string(&bounded)?.replace(
+            "max_future_skew_millis: 5000",
+            &format!("max_future_skew_millis: {unbounded}"),
+        );
+        assert!(yaml.contains(&unbounded), "{yaml}");
+        assert_eq!(decode_spec_bytes(yaml.as_bytes(), SpecFormat::Yaml)?, null);
+        assert_eq!(
+            decode_spec_bytes(
+                serde_json::to_string(&bounded)?.as_bytes(),
+                SpecFormat::Json
+            )?,
+            bounded
+        );
+
+        // What a JavaScript client sends for i64::MAX (2^63) does not fit and is refused, as is
+        // any other value that is not an integer.
+        for refused in [
+            json!(9_223_372_036_854_775_808_u64),
+            json!(1.5),
+            json!("none"),
+        ] {
+            let mut value = serde_json::to_value(&defaulted)?;
+            value["collections"][0]["physical"]["max_future_skew_millis"] = refused.clone();
+            assert!(decode_spec_value(value).is_err(), "{refused}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collection_names_warn_in_v1_and_fail_in_v2() -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = catalog_spec("balanced", ConsistencyMode::StrongCp);
+        spec.collections = vec![
+            collection("order-items", CollectionRole::KeyValue, Vec::new()),
+            collection("__shadow", CollectionRole::KeyValue, Vec::new()),
+            collection("users", CollectionRole::KeyValue, Vec::new()),
+        ];
+
+        let v1 = GuaranteeValidator::validate(&spec);
+        assert!(v1.valid, "{:?}", v1.issues);
+        assert_eq!(
+            v1.issues
+                .iter()
+                .map(|issue| (issue.code.as_str(), issue.path.as_str(), issue.severity))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "COLLECTION_NAME_INVALID",
+                    "collections[0].name",
+                    ValidationSeverity::Warning
+                ),
+                (
+                    "COLLECTION_NAME_RESERVED",
+                    "collections[1].name",
+                    ValidationSeverity::Warning
+                ),
+            ]
+        );
+
+        spec.version = DATABASE_SPEC_VERSION_V2;
+        let v2 = GuaranteeValidator::validate(&spec);
+        assert!(!v2.valid);
+        for path in ["collections[0].name", "collections[1].name"] {
+            assert!(
+                v2.issues
+                    .iter()
+                    .any(|issue| issue.path == path && issue.severity == ValidationSeverity::Error),
+                "{path}: {:?}",
+                v2.issues
+            );
+        }
+
+        // Derived names follow the same rule, so a long path cannot overflow 128 bytes.
+        let long_collection = "a".repeat(100);
+        let mut derived = v2_spec_with(json!([{
+            "name": long_collection,
+            "role": "document_entity",
+            "domain": "primary",
+            "indexes": ["full_text"],
+            "physical": { "full_text": [{ "path": "b".repeat(30) }] }
+        }]))?;
+        let report = GuaranteeValidator::validate(&derived);
+        let issue = issue_at(
+            &report,
+            "COLLECTION_NAME_INVALID",
+            "collections[0].physical.full_text[0].path",
+        )
+        .ok_or_else(|| format!("{:?}", report.issues))?;
+        assert_eq!(issue.severity, ValidationSeverity::Error);
+        assert!(issue.message.contains("135 bytes"), "{issue:?}");
+        if let Some(physical) = derived.collections[0].physical.as_mut() {
+            physical.full_text[0].name = Some("notes_search".to_owned());
+        }
+        let renamed = GuaranteeValidator::validate(&derived);
+        assert!(renamed.valid, "{:?}", renamed.issues);
+        Ok(())
+    }
+
+    #[test]
+    fn spec_size_limits_warn_in_v1_and_fail_in_v2() -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = catalog_spec("balanced", ConsistencyMode::StrongCp);
+        for index in 0..=super::MAX_MAP_ENTRIES {
+            spec.operation_hints
+                .insert(format!("note.{index}"), "x".to_owned());
+        }
+        spec.overrides.insert(
+            "note.long".to_owned(),
+            "x".repeat(super::MAX_MAP_VALUE_BYTES + 1),
+        );
+
+        let v1 = GuaranteeValidator::validate(&spec);
+        assert!(v1.valid, "{:?}", v1.issues);
+        for path in ["overrides.note.long", "operation_hints"] {
+            let issue = issue_at(&v1, "SPEC_LIMIT_EXCEEDED", path)
+                .ok_or_else(|| format!("{path}: {:?}", v1.issues))?;
+            assert_eq!(issue.severity, ValidationSeverity::Warning);
+        }
+
+        spec.version = DATABASE_SPEC_VERSION_V2;
+        let v2 = GuaranteeValidator::validate(&spec);
+        assert!(!v2.valid);
+        assert_eq!(
+            issue_at(&v2, "SPEC_LIMIT_EXCEEDED", "operation_hints").map(|issue| issue.severity),
+            Some(ValidationSeverity::Error)
+        );
+
+        let fields = (0..=super::MAX_FIELDS_PER_COLLECTION)
+            .map(|index| json!({ "name": format!("f{index}"), "path": format!("f{index}"), "type": "str" }))
+            .collect::<Vec<_>>();
+        let wide = v2_spec_with(json!([{
+            "name": "wide",
+            "role": "document_entity",
+            "domain": "primary",
+            "indexes": ["primary"],
+            "physical": { "fields": fields }
+        }]))?;
+        let report = GuaranteeValidator::validate(&wide);
+        assert_eq!(
+            issue_at(
+                &report,
+                "SPEC_LIMIT_EXCEEDED",
+                "collections[0].physical.fields"
+            )
+            .map(|issue| issue.severity),
+            Some(ValidationSeverity::Error),
+            "{:?}",
+            report.issues
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn physical_checks_report_code_severity_and_path() -> Result<(), Box<dyn std::error::Error>> {
+        let table = |physical: serde_json::Value| {
+            let mut physical = physical;
+            physical["kind"] = json!("table");
+            json!([{ "name": "items", "role": "key_value", "domain": "primary", "indexes": ["primary"], "physical": physical }])
+        };
+        let columns =
+            json!([{ "name": "id", "type": "str" }, { "name": "value", "type": "float" }]);
+        let cases = [
+            (
+                json!([{ "name": "memories", "role": "vector_memory", "domain": "primary", "indexes": ["vector"], "physical": { "kind": "document" } }]),
+                "PHYSICAL_KIND_INCOMPATIBLE_WITH_ROLE",
+                "collections[0].physical.kind",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["primary"], "physical": { "dim": 3 } }]),
+                "PHYSICAL_FIELD_NOT_APPLICABLE",
+                "collections[0].physical.dim",
+            ),
+            (
+                json!([{ "name": "rollups", "role": "analytics", "domain": "primary", "indexes": ["columnar"], "physical": {
+                    "columns": columns, "primary_key": "id", "table_indexes": [{ "column": "id" }]
+                } }]),
+                "PHYSICAL_FIELD_NOT_APPLICABLE",
+                "collections[0].physical.table_indexes",
+            ),
+            (
+                json!([{ "name": "rollups", "role": "analytics", "domain": "primary", "indexes": ["columnar", "document"], "physical": {
+                    "columns": columns, "primary_key": "id"
+                } }]),
+                "PHYSICAL_FIELD_NOT_APPLICABLE",
+                "collections[0].indexes[1]",
+            ),
+            (
+                json!([{ "name": "rollups", "role": "analytics", "domain": "primary", "indexes": ["columnar"], "physical": {
+                    "columns": columns, "primary_key": "id", "system_versioning": true
+                } }]),
+                "PHYSICAL_FIELD_NOT_APPLICABLE",
+                "collections[0].physical.system_versioning",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["primary"], "physical": { "document_indexes": [{ "path": "a" }] } }]),
+                "PROVISION_INDEX_KIND_MISSING",
+                "collections[0].physical.document_indexes",
+            ),
+            (
+                table(
+                    json!({ "columns": columns, "primary_key": "id", "table_indexes": [{ "column": "value" }] }),
+                ),
+                "PROVISION_INDEX_KIND_MISSING",
+                "collections[0].physical.table_indexes",
+            ),
+            (
+                json!([{ "name": "memories", "role": "vector_memory", "domain": "primary", "indexes": ["vector"], "physical": { "dim": 0 } }]),
+                "VECTOR_DIM_OUT_OF_RANGE",
+                "collections[0].physical.dim",
+            ),
+            (
+                json!([{ "name": "memories", "role": "vector_memory", "domain": "primary", "indexes": ["vector"], "physical": { "dim": 65_537 } }]),
+                "VECTOR_DIM_OUT_OF_RANGE",
+                "collections[0].physical.dim",
+            ),
+            (
+                json!([{ "name": "memories", "role": "vector_memory", "domain": "primary", "indexes": ["vector"], "physical": { "dim": 3, "hnsw": { "m": 0 } } }]),
+                "VECTOR_PARAMS_OUT_OF_RANGE",
+                "collections[0].physical.hnsw.m",
+            ),
+            (
+                json!([{ "name": "memories", "role": "vector_memory", "domain": "primary", "indexes": ["vector"], "physical": { "dim": 3, "hnsw": { "m": 64, "ef_construction": 32 } } }]),
+                "VECTOR_PARAMS_OUT_OF_RANGE",
+                "collections[0].physical.hnsw.ef_construction",
+            ),
+            (
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "chunk_millis": 999 } }]),
+                "TIME_SERIES_PARAMS_INVALID",
+                "collections[0].physical.chunk_millis",
+            ),
+            (
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "retention_millis": 0 } }]),
+                "TIME_SERIES_PARAMS_INVALID",
+                "collections[0].physical.retention_millis",
+            ),
+            (
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "chunk_millis": 60_000, "retention_millis": 1_000 } }]),
+                "TIME_SERIES_PARAMS_INVALID",
+                "collections[0].physical.retention_millis",
+            ),
+            (
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "max_future_skew_millis": -1 } }]),
+                "TIME_SERIES_PARAMS_INVALID",
+                "collections[0].physical.max_future_skew_millis",
+            ),
+            (
+                table(json!({ "columns": columns, "primary_key": "ids" })),
+                "TABLE_PRIMARY_KEY_UNKNOWN",
+                "collections[0].physical.primary_key",
+            ),
+            (
+                table(json!({ "columns": columns })),
+                "TABLE_PRIMARY_KEY_UNKNOWN",
+                "collections[0].physical.primary_key",
+            ),
+            (
+                table(
+                    json!({ "columns": [{ "name": "id", "type": "str" }, { "name": "id", "type": "int" }], "primary_key": "id" }),
+                ),
+                "TABLE_COLUMN_DUPLICATE",
+                "collections[0].physical.columns[1].name",
+            ),
+            (
+                json!([{ "name": "items", "role": "key_value", "domain": "primary", "indexes": ["document"], "physical": {
+                    "kind": "table", "columns": columns, "primary_key": "id", "table_indexes": [{ "column": "valeu" }]
+                } }]),
+                "TABLE_INDEX_COLUMN_UNKNOWN",
+                "collections[0].physical.table_indexes[0].column",
+            ),
+            (
+                json!([{ "name": "items", "role": "key_value", "domain": "primary", "indexes": ["document"], "physical": {
+                    "kind": "table", "columns": columns, "primary_key": "id", "table_indexes": [{ "column": "value", "expression": "lower_ascii" }]
+                } }]),
+                "PHYSICAL_FIELD_NOT_APPLICABLE",
+                "collections[0].physical.table_indexes[0].expression",
+            ),
+            (
+                json!([{ "name": "items", "role": "key_value", "domain": "primary", "indexes": ["primary", "full_text"], "physical": { "kind": "table" } }]),
+                "INDEX_SOURCE_NOT_DOCUMENT",
+                "collections[0].indexes[1]",
+            ),
+            (
+                json!([
+                    { "name": "a", "role": "key_value", "domain": "primary", "indexes": ["primary"], "physical": { "collection_id": 7 } },
+                    { "name": "b", "role": "vector_memory", "domain": "primary", "indexes": ["vector"], "physical": { "dim": 3, "collection_id": 7 } }
+                ]),
+                "ID_CONFLICT",
+                "collections[1].physical.collection_id",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["document"], "physical": { "document_indexes": [{ "path": "a b" }] } }]),
+                "PROVISION_PATH_INVALID",
+                "collections[0].physical.document_indexes[0].path",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["full_text"], "physical": { "full_text": [{ "path": "notes", "name": "items" }] } }]),
+                "OBJECT_NAME_COLLISION",
+                "collections[0].physical.full_text[0].name",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["full_text"], "physical": { "full_text": [{ "path": "notes", "language": "english" }] } }]),
+                "PROFILE_KNOB_NOT_SUPPORTED_BY_RUNTIME",
+                "collections[0].physical.full_text[0].language",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["geo"], "physical": { "geo": [{ "path": "at", "precision": 13 }] } }]),
+                "GEO_PARAMS_OUT_OF_RANGE",
+                "collections[0].physical.geo[0].precision",
+            ),
+            (
+                json!([{ "name": "items", "role": "document_entity", "domain": "primary", "indexes": ["primary"], "physical": { "fields": [{ "name": "a-b", "path": "a", "type": "str" }] } }]),
+                "PHYSICAL_NAME_INVALID",
+                "collections[0].physical.fields[0].name",
+            ),
+        ];
+        for (collections, code, path) in cases {
+            let spec = v2_spec_with(collections)?;
+            let report = GuaranteeValidator::validate(&spec);
+            let Some(issue) = issue_at(&report, code, path) else {
+                panic!("missing {code} at {path}: {:#?}", report.issues);
+            };
+            assert_eq!(issue.severity, ValidationSeverity::Error, "{code} {path}");
+            assert!(!report.valid, "{code} {path}");
+        }
+
+        // As in the runtime, any future-skew bound of at least 0 is accepted, and so is `null`,
+        // no bound.
+        for skew in [
+            json!(0),
+            json!(5_000),
+            json!(i64::MAX),
+            serde_json::Value::Null,
+        ] {
+            let report = GuaranteeValidator::validate(&v2_spec_with(
+                json!([{ "name": "metrics", "role": "time_series", "domain": "primary", "indexes": ["time_series"], "physical": { "max_future_skew_millis": skew } }]),
+            )?);
+            assert!(
+                !report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.path.contains("max_future_skew_millis")),
+                "{skew}: {:#?}",
+                report.issues
+            );
+        }
+
+        let mut pk = v2_spec_with(table(json!({ "columns": columns, "primary_key": "ids" })))?;
+        let report = GuaranteeValidator::validate(&pk);
+        assert!(
+            issue_at(
+                &report,
+                "TABLE_PRIMARY_KEY_UNKNOWN",
+                "collections[0].physical.primary_key"
+            )
+            .is_some_and(|issue| issue.suggestion == "Did you mean id?"),
+            "{:?}",
+            report.issues
+        );
+        // Without `physical`, version 2 validation leaves kind checks to provisioning.
+        pk.collections = vec![collection(
+            "items",
+            CollectionRole::DocumentEntity,
+            vec![CollectionIndexKind::Vector],
+        )];
+        assert!(GuaranteeValidator::validate(&pk).valid);
+        Ok(())
+    }
+
+    #[test]
+    fn physical_parameter_required_is_absent_in_v1_and_advice_in_v2()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut v1 = catalog_spec("balanced", ConsistencyMode::StrongCp);
+        v1.collections = vec![
+            collection(
+                "orders",
+                CollectionRole::DocumentEntity,
+                vec![CollectionIndexKind::Document],
+            ),
+            collection(
+                "memories",
+                CollectionRole::VectorMemory,
+                vec![CollectionIndexKind::Vector],
+            ),
+        ];
+        let report = GuaranteeValidator::validate(&v1);
+        assert!(!issue_codes(&report).contains("PHYSICAL_PARAMETER_REQUIRED"));
+
+        let mut v2 = v1.clone();
+        v2.version = DATABASE_SPEC_VERSION_V2;
+        v2.collections.extend(serde_json::from_value::<Vec<CollectionRoleSpec>>(json!([
+            { "name": "rollups", "role": "analytics", "domain": "primary", "indexes": ["columnar"] },
+            { "name": "notes", "role": "document_entity", "domain": "primary", "indexes": ["full_text", "geo"] },
+            { "name": "ledger", "role": "key_value", "domain": "primary", "indexes": ["primary"], "physical": { "kind": "table", "system_versioning": true } }
+        ]))?);
+        let report = GuaranteeValidator::validate(&v2);
+        assert!(report.valid, "{:?}", report.issues);
+        let required = report
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "PHYSICAL_PARAMETER_REQUIRED")
+            .map(|issue| (issue.path.as_str(), issue.severity))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            required,
+            [
+                (
+                    "collections[0].physical.document_indexes",
+                    ValidationSeverity::Advice
+                ),
+                ("collections[1].physical.dim", ValidationSeverity::Advice),
+                (
+                    "collections[2].physical.columns",
+                    ValidationSeverity::Advice
+                ),
+                (
+                    "collections[3].physical.full_text",
+                    ValidationSeverity::Advice
+                ),
+                ("collections[3].physical.geo", ValidationSeverity::Advice),
+                (
+                    "collections[4].physical.columns",
+                    ValidationSeverity::Advice
+                ),
+            ]
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.code == "PHYSICAL_PARAMETER_REQUIRED")
+                .all(|issue| issue.suggestion.contains("multidb config upgrade"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn security_checks_report_code_severity_and_path() -> Result<(), Box<dyn std::error::Error>> {
+        let base = v2_spec_with(json!([
+            {
+                "name": "orders",
+                "role": "document_entity",
+                "domain": "primary",
+                "indexes": ["full_text"],
+                "physical": { "full_text": [{ "path": "notes" }] }
+            },
+            { "name": "ledger", "role": "key_value", "domain": "primary", "indexes": ["primary"] }
+        ]))?;
+        let role = |grants: serde_json::Value| json!({ "roles": [{ "name": "writers", "grants": grants }] });
+        let cases = [
+            (
+                json!({ "roles": [{ "name": "admin", "grants": [] }] }),
+                "SECURITY_RESERVED_NAME",
+                "security.roles[0].name",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                json!({ "principals": [{ "user": "root", "roles": [] }] }),
+                "SECURITY_RESERVED_NAME",
+                "security.principals[0].user",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                json!({ "principals": [{ "user": "svc", "principal": "admin", "roles": [] }] }),
+                "SECURITY_RESERVED_NAME",
+                "security.principals[0].principal",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                json!({ "roles": [{ "name": "writers", "grants": [] }], "principals": [{ "user": "svc", "roles": ["admin"] }] }),
+                "SECURITY_RESERVED_NAME",
+                "security.principals[0].roles[0]",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                json!({ "roles": [{ "name": "Writers", "grants": [] }] }),
+                "SECURITY_NAME_INVALID",
+                "security.roles[0].name",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                json!({ "principals": [{ "user": "orders svc", "roles": [] }] }),
+                "SECURITY_NAME_INVALID",
+                "security.principals[0].user",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                role(json!([{ "permissions": ["read"] }])),
+                "SECURITY_GRANT_TARGET_INVALID",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                role(
+                    json!([{ "object": "orders", "resource": "database", "permissions": ["read"] }]),
+                ),
+                "SECURITY_GRANT_TARGET_INVALID",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                role(json!([{ "object": "__audit_log", "permissions": ["read"] }])),
+                "SECURITY_SYSTEM_GRANT_FORBIDDEN",
+                "security.roles[0].grants[0].object",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                role(json!([{ "object": "order", "permissions": ["read"] }])),
+                "SECURITY_GRANT_UNKNOWN_OBJECT",
+                "security.roles[0].grants[0].object",
+                ValidationSeverity::Error,
+                Some("Did you mean orders?"),
+            ),
+            (
+                json!({ "roles": [{ "name": "writers", "grants": [] }], "principals": [{ "user": "svc", "roles": ["writer"] }] }),
+                "SECURITY_PRINCIPAL_UNKNOWN_ROLE",
+                "security.principals[0].roles[0]",
+                ValidationSeverity::Error,
+                Some("Did you mean writers?"),
+            ),
+            (
+                json!({ "roles": [{ "name": "writers", "grants": [] }, { "name": "writers", "grants": [] }] }),
+                "SECURITY_DUPLICATE",
+                "security.roles[1].name",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                role(json!([{ "object": "ledger", "permissions": ["read", "read"] }])),
+                "SECURITY_DUPLICATE",
+                "security.roles[0].grants[0].permissions[1]",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                json!({ "principals": [{ "user": "svc", "roles": [] }, { "user": "svc", "roles": [] }] }),
+                "SECURITY_DUPLICATE",
+                "security.principals[1].user",
+                ValidationSeverity::Error,
+                None,
+            ),
+            (
+                role(json!([{ "resource": "database", "permissions": ["admin"] }])),
+                "SECURITY_BROAD_GRANT",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Warning,
+                Some("Grant admin on the objects the role needs instead."),
+            ),
+            (
+                role(json!([{ "resource": "database", "permissions": ["read"] }])),
+                "SECURITY_BROAD_GRANT",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Warning,
+                Some("Grant read on the objects the role needs instead."),
+            ),
+            (
+                role(json!([{ "resource": "database", "permissions": ["read", "write"] }])),
+                "SECURITY_BROAD_GRANT",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Warning,
+                Some("Grant read, write on the objects the role needs instead."),
+            ),
+            (
+                role(json!([{ "object": "orders_notes_fts", "permissions": ["read"] }])),
+                "SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ",
+                "security.roles[0].grants[0]",
+                ValidationSeverity::Warning,
+                None,
+            ),
+        ];
+        for (security, code, path, severity, suggestion) in cases {
+            let mut spec = base.clone();
+            spec.security = Some(serde_json::from_value(security)?);
+            let report = GuaranteeValidator::validate(&spec);
+            let Some(issue) = issue_at(&report, code, path) else {
+                panic!("missing {code} at {path}: {:#?}", report.issues);
+            };
+            assert_eq!(issue.severity, severity, "{code} {path}");
+            assert_eq!(
+                report.valid,
+                severity != ValidationSeverity::Error,
+                "{code}"
+            );
+            if let Some(suggestion) = suggestion {
+                assert_eq!(issue.suggestion, suggestion, "{code}");
+            }
+        }
+
+        let mut spec = base;
+        spec.security = Some(serde_json::from_value(json!({
+            "roles": [{
+                "name": "readers",
+                "grants": [
+                    { "object": "orders_notes_fts", "permissions": ["read"] },
+                    { "object": "orders", "permissions": ["read"] },
+                    { "object": "ledger", "permissions": ["read", "write"] }
+                ]
+            }],
+            "principals": [{ "user": "svc", "roles": ["readers"] }]
+        }))?);
+        let report = GuaranteeValidator::validate(&spec);
+        assert!(report.valid, "{:?}", report.issues);
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| !issue.code.starts_with("SECURITY_")),
+            "{:?}",
+            report.issues
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_planner_reports_physical_and_security_changes_as_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = v2_spec_with(json!([{
+            "name": "orders",
+            "role": "document_entity",
+            "domain": "primary",
+            "indexes": ["document"],
+            "physical": { "document_indexes": [{ "path": "status" }] }
+        }]))?;
+        let mut desired = current.clone();
+        if let Some(physical) = desired.collections[0].physical.as_mut() {
+            physical.document_indexes.push(super::DocIndexSpec {
+                path: "customer.id".to_owned(),
+                id: None,
+            });
+        }
+        desired.security = Some(serde_json::from_value(json!({
+            "roles": [{ "name": "readers", "grants": [{ "object": "orders", "permissions": ["read"] }] }]
+        }))?);
+        desired.provisioning = Some(super::ProvisioningPolicySpec {
+            unmanaged: super::UnmanagedPolicy::Fail,
+        });
+
+        let plan = MigrationPlanner::plan(&current, &desired);
+
+        assert!(plan.valid, "{:?}", plan.desired_validation.issues);
+        assert!(!plan.apply_supported);
+        let steps = plan
+            .steps
+            .iter()
+            .map(|step| (step.path.as_str(), step.kind, step.supported))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            [
+                ("$.security", MigrationStepKind::Unsupported, false),
+                ("$.provisioning", MigrationStepKind::Unsupported, false),
+                (
+                    "$.collections.orders.physical",
+                    MigrationStepKind::ChangeCollection,
+                    false
+                ),
+            ]
+        );
+        assert!(plan.steps.iter().all(|step| {
+            step.impact
+                .notes
+                .iter()
+                .any(|note| note.contains("provisioning"))
+        }));
+        assert_eq!(
+            MigrationPlanner::check_apply(&plan, &plan.plan_id).status,
+            ApplyStatus::Unsupported
+        );
+
+        let frozen =
+            MigrationPlanner::plan(&corpus_spec("game-save")?, &corpus_spec("secure-saas")?);
+        assert_eq!(frozen.plan_id, "plan_cc80287c930fc6604ad0695a051f1e2c");
         Ok(())
     }
 }

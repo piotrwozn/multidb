@@ -200,6 +200,37 @@ class ControlPlaneClient:
     def apply(self, plan: JsonObject, confirm: str) -> JsonObject:
         return self._request("POST", "/config/apply", {"plan": plan, "confirm": confirm})
 
+    def provision_state(self) -> JsonObject:
+        """What provisioning manages in the served database (preview)."""
+        return self._request("GET", "/provision/state")
+
+    def provision_plan(self, spec: JsonObject, options: Optional[JsonObject] = None) -> JsonObject:
+        """Plans ``spec`` against the served database (preview, a dry run).
+
+        A blocked plan is HTTP 422: the raised ``ControlPlaneError`` carries the plan in
+        ``body["data"]``.
+        """
+        return self._request("POST", "/provision/plan", _provision_body(spec, options))
+
+    def provision_apply(
+        self, spec: JsonObject, confirm: str, options: Optional[JsonObject] = None
+    ) -> JsonObject:
+        """Applies ``spec`` when ``confirm`` is the ``prov_`` id of its current plan (preview).
+
+        The server recomputes the plan; pass the options the plan was computed with.
+        """
+        body = _provision_body(spec, options)
+        body["confirm"] = confirm
+        return self._request("POST", "/provision/apply", body)
+
+    def provision_drift(self, spec: JsonObject, options: Optional[JsonObject] = None) -> JsonObject:
+        """How the served database differs from ``spec`` (preview)."""
+        return self._request("POST", "/provision/drift", _provision_body(spec, options))
+
+    def live_config(self) -> JsonObject:
+        """The served database described as a spec (preview)."""
+        return self._request("GET", "/config/live")
+
     def profiles(self) -> JsonValue:
         return self._request("GET", "/profiles")
 
@@ -280,6 +311,13 @@ def _urllib_transport(method: str, url: str, headers: Mapping[str, str], body: O
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read()
+
+
+def _provision_body(spec: JsonObject, options: Optional[JsonObject]) -> dict[str, JsonValue]:
+    body: dict[str, JsonValue] = {"spec": spec}
+    if options is not None:
+        body["options"] = options
+    return body
 
 
 def _quote(value: str) -> str:

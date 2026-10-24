@@ -1,9 +1,12 @@
-version: 1
+version: 2
 name: Arcade Save
 profile: game_local_balanced
 deployment:
   mode: embedded
   storage_path: null
+topology:
+  replica_count: 1
+  shard_count: 1
 defaults:
   consistency_domain: primary
   replication: cp
@@ -28,6 +31,9 @@ collections:
   domain: primary
   indexes:
   - document
+  physical:
+    document_indexes:
+    - path: slot
 - name: player_state
   role: key_value
   domain: primary

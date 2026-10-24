@@ -184,6 +184,20 @@ if (-not $Explain.validation.valid) {
     throw "generated preview spec explain was invalid"
 }
 
+# Dry-run the provisioning plan of the generated spec: the template carries every physical
+# parameter, so the plan is ready, and a dry run creates no database file.
+$PlanDb = Join-Path $ResolvedWorkDir "preview_smoke.redb"
+$Plan = Invoke-JsonCommand `
+    -Label "multidb config plan --spec --db --json" `
+    -Arguments @("config", "plan", "--spec", $SpecPath, "--db", $PlanDb, "--json") `
+    -Binary $Binary
+if ($Plan.outcome -ne "ready") {
+    throw "generated preview spec plan is $($Plan.outcome), expected ready"
+}
+if (Test-Path $PlanDb) {
+    throw "config plan created $PlanDb"
+}
+
 $Summary = [ordered]@{
     schema_version = 1
     generated_at_utc = (Get-Date).ToUniversalTime().ToString("o")
@@ -201,6 +215,11 @@ $Summary = [ordered]@{
         valid = $Explain.validation.valid
         status = [string] $Explain.validation.status
         decisions = @($Explain.decisions).Count
+    }
+    plan = [ordered]@{
+        outcome = [string] $Plan.outcome
+        plan_id = [string] $Plan.plan_id
+        steps = @($Plan.steps).Count
     }
 }
 

@@ -371,7 +371,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         value_type: KnobType::Enum(&["off", "typed_tables"]),
         timing: KnobTiming::Provisioning,
         sink: "enable_system_versioning on typed tables that provisioning creates",
-        enforcement: KnobEnforcement::Declarative,
+        enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::Provisioning,
         description: "Whether provisioned typed tables keep system-versioned history.",
     },
@@ -380,7 +380,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         value_type: KnobType::Bool,
         timing: KnobTiming::Provisioning,
         sink: "TemporalRetention.keep_history of provisioned typed tables",
-        enforcement: KnobEnforcement::Declarative,
+        enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::Provisioning,
         description: "Whether system-versioned history is kept.",
     },
@@ -392,7 +392,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         },
         timing: KnobTiming::Provisioning,
         sink: "TimeSeriesConfig.chunk_millis default of provisioned series",
-        enforcement: KnobEnforcement::Declarative,
+        enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::Provisioning,
         description: "Default chunk width of time series.",
     },
@@ -404,7 +404,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         },
         timing: KnobTiming::Provisioning,
         sink: "TimeSeriesConfig.retention_millis default of provisioned series",
-        enforcement: KnobEnforcement::Declarative,
+        enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::Provisioning,
         description: "Default retention of time series; null keeps data forever and a value \
                       must be at least one chunk.",
@@ -755,7 +755,7 @@ mod tests {
             }
             if matches!(section, "history" | "time_series") {
                 assert_eq!(definition.timing, KnobTiming::Provisioning);
-                assert_eq!(definition.enforcement, KnobEnforcement::Declarative);
+                assert_eq!(definition.enforcement, KnobEnforcement::Enforced);
             }
             // The runtime checks these floors at creation and on restore, not only validation.
             if matches!(

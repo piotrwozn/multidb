@@ -1,9 +1,12 @@
-version: 1
+version: 2
 name: Agent Memory
 profile: ai_agent_memory
 deployment:
   mode: single_node
   storage_path: agent_memory.redb
+topology:
+  replica_count: 1
+  shard_count: 1
 defaults:
   consistency_domain: primary
   replication: cp
@@ -28,11 +31,17 @@ collections:
   domain: primary
   indexes:
   - vector
+  physical:
+    dim: 1536
+    metric: cosine
 - name: facts
   role: document_entity
   domain: primary
   indexes:
   - document
+  physical:
+    document_indexes:
+    - path: subject
 - name: conversation_events
   role: event_log
   domain: primary

@@ -1,9 +1,12 @@
-version: 1
+version: 2
 name: Secure SaaS
 profile: secure_app
 deployment:
   mode: single_node
   storage_path: secure_saas.redb
+topology:
+  replica_count: 1
+  shard_count: 1
 defaults:
   consistency_domain: primary
   replication: cp
@@ -28,6 +31,9 @@ collections:
   domain: primary
   indexes:
   - document
+  physical:
+    document_indexes:
+    - path: tenant_id
 - name: app_state
   role: key_value
   domain: primary

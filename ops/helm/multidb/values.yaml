@@ -43,6 +43,7 @@ persistence:
   size: 10Gi
 
 config:
+  # Ignored when spec.enabled: the spec decides the profile and the replication.
   profile: transactional
   replication: cp
   auditJsonlPath: /var/lib/multidb/audit/audit.jsonl
@@ -50,6 +51,20 @@ config:
   minioEndpoint: http://minio:9000
   vaultAddress: http://vault:8200
   vaultKekPath: secret/data/multidb/kek
+
+# Spec mode (preview, docs/provisioning.md#serve): serve builds the database from a
+# DatabaseSpec mounted read-only from a ConfigMap and checks it against the spec at every
+# start. runtime.dbPath is still set explicitly, so it wins over the spec storage_path.
+spec:
+  enabled: false
+  # ConfigMap that holds the spec under spec.key.
+  configMap: multidb-spec
+  key: multidb.yaml
+  mountPath: /etc/multidb/spec
+  # MULTIDB_SPEC_APPLY: verify (never changes the database; refuses to start when it is
+  # missing or differs), create (also creates a missing database) or additive (also applies
+  # auto-approvable additive changes).
+  apply: verify
 
 resources:
   requests:

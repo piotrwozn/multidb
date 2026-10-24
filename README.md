@@ -69,10 +69,18 @@ GitHub Actions runs the Go checks.
 ```powershell
 multidb template list
 multidb template explain ai-memory --json
-multidb init --guided --template ai-memory --name "Agent Memory" --out .\agent-memory
+multidb init --guided --template ai-memory --name "Agent Memory" --out .\agent-memory --apply
 multidb config validate --spec .\agent-memory\multidb.yaml
 multidb config explain --spec .\agent-memory\multidb.yaml
+multidb config drift --spec .\agent-memory\multidb.yaml
 ```
+
+Built-in templates emit version 2 specs with the physical parameters
+provisioning needs (document index paths, the vector dimension, time-series
+chunks and table columns), so `init --template <t> --apply` writes the files
+and creates the database in one step; `config drift` exits 0 while it matches
+the spec. `secure-saas` asks for encryption at rest, which is provisioned
+through the Rust API only, so its `init --apply` writes the files and exits 2.
 
 Profiles have typed knobs. Inspect them, or write a version 2 spec with a
 custom profile that extends a built-in one:
@@ -86,8 +94,31 @@ multidb profile explain --spec .\orders.yaml
 
 See `docs/profiles.md` for the knob reference and the profile commands.
 
+Build a database from a spec (preview). `config plan --spec` is a dry run that
+prints every step, the flags it needs and how each guarantee is enforced;
+`config apply` recomputes the plan and applies it with the `prov_` id it
+printed, or with `--auto-approve` when the plan only creates, adopts or
+records:
+
+```powershell
+multidb init --guided --profile secure_app --name Shop --out .\shop.yaml --apply
+# after editing shop.yaml:
+multidb config plan --spec .\shop.yaml
+multidb config apply --spec .\shop.yaml --confirm <prov_id>
+multidb config drift --spec .\shop.yaml
+multidb config status --db .\shop.redb
+multidb config export --db .\shop.redb --out .\exported.yaml
+```
+
+See `docs/provisioning.md` for the spec fields, the plan, the flags and the
+exit codes. A running `multidb serve` provisions the database it serves
+through the preview Control Plane endpoints `/provision/plan`,
+`/provision/apply`, `/provision/drift`, `/provision/state` and `/config/live`.
+
 Checked-in examples are under `examples/`, with SDK examples under
-`examples/sdk/`.
+`examples/sdk/`; `examples/provisioning` is a full version 2 spec with
+full-text and geo indexes, a versioned table, a columnar table, roles and
+principals.
 
 ## Repository Gates
 
@@ -127,8 +158,19 @@ Release-sensitive gate:
   changefeeds, subscriptions, continuous queries, materialized views,
   after-commit hooks, system versioning and incremental full-text/geo refresh)
   instead of returning empty results.
-- `config apply` is confirmation/audit-only for v1 and does not perform
-  physical data migrations.
+- `config apply --plan` (the version 1 migration plan) stays
+  confirmation/audit-only and does not perform physical data migrations.
+  Provisioning (`config plan|apply --spec`, `init --apply`, `multidb serve`
+  spec mode and `POST /provision/apply`) is a preview for embedded and
+  single-node CP databases: it
+  creates and adopts objects, roles and the profile, but never drops or alters
+  an object, switches a profile or storage class, or re-encrypts; encryption
+  at rest is provisioned through the Rust API only, so a spec with
+  `encryption.at_rest: true`, such as the `secure-saas` template, is blocked
+  on the CLI and the Control Plane and refused by `multidb serve` in spec
+  mode (`MULTIDB_SPEC_PATH`, see `docs/docker.md`). Values fixed at creation,
+  such as a vector `dim` or table columns, are edited in the spec before the
+  first apply.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and
   migration dry-run workflows.
 - Full PostgreSQL compatibility, Mongo wire protocol, public extension

@@ -35,19 +35,26 @@ use crate::{
     compat::SERVER_VERSION,
     config_spec::{
         ApplyCheckReport, ApplyStatus, DatabaseSpec, GuaranteeValidator, MigrationPlan,
-        MigrationPlanner, ProfileKnobOverrides, ProfileKnobs, ValidationReport, built_in_profiles,
-        collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
-        extension_catalog_entries, profile_variants, resolve_named_profile,
+        MigrationPlanner, ProfileKnobOverrides, ProfileKnobs, ValidationReport, ValidationSeverity,
+        built_in_profiles, collection_role_definitions, consistency_domain_definition,
+        consistency_domain_definitions, extension_catalog_entries, profile_variants,
+        resolve_named_profile,
         spec_io::{self, SpecIoError},
     },
     db::{
-        AdminCredentialRecord, CatalogEntry, Database, DbError, Profile, ReplicationKind,
-        bootstrap_admin_identity,
+        AdminCredentialRecord, CatalogEntry, ConfigError, ConfigPlanSource, Database, DbError,
+        PersistedProfileManifest, Profile, ReplicationKind, bootstrap_admin_identity,
     },
     geo::GeoIndexConfig,
     graph::GraphId,
     model::{CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, Value as ModelValue},
     observability,
+    provision::{
+        self, Confirmation, ExportSource, PlanOutcome, ProvisionActor, ProvisionApplyReport,
+        ProvisionEnvironment, ProvisionError, ProvisionHistoryEntry, ProvisionOptions,
+        ProvisionOutcome, ProvisionPlan, ProvisionRecord, ProvisionSurface, ProvisionTargetRef,
+        StartupMode, StepOutcome,
+    },
     query::{
         DocField, QueryError, RelIndexExpression, RelIndexSpec, Row, SqlOutput, TableLayout,
         TableSchema,
@@ -168,6 +175,9 @@ pub struct StudioManifest {
     pub openapi_endpoint: &'static str,
     pub physical_migration_supported: bool,
     pub config_apply_data_mutated: bool,
+    /// `/provision/*` and `GET /config/live` are served: the served database can be planned,
+    /// applied and checked for drift against a spec (preview).
+    pub provisioning_supported: bool,
     pub endpoints: Vec<String>,
     pub operations: Vec<ControlPlaneOperation>,
     pub capabilities: Vec<&'static str>,
@@ -447,6 +457,41 @@ const CONTROL_PLANE_OPERATIONS: &[ControlPlaneOperation] = &[
         operation_id: "applyConfig",
         auth_required: true,
         stability: "stable",
+    },
+    ControlPlaneOperation {
+        method: "GET",
+        path: "/config/live",
+        operation_id: "getLiveConfig",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "GET",
+        path: "/provision/state",
+        operation_id: "getProvisionState",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/provision/plan",
+        operation_id: "planProvision",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/provision/apply",
+        operation_id: "applyProvision",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/provision/drift",
+        operation_id: "checkProvisionDrift",
+        auth_required: true,
+        stability: "preview",
     },
     ControlPlaneOperation {
         method: "GET",
@@ -1133,6 +1178,40 @@ pub struct AuditResponse {
     pub events: Vec<AuditEvent>,
 }
 
+/// The spec `multidb serve` started from in spec mode, as `GET /provision/state` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct ServeSpecMode {
+    /// `config_spec::spec_digest` of the spec.
+    pub spec_digest: String,
+    /// `MULTIDB_SPEC_APPLY`: what a start may change.
+    pub apply_mode: StartupMode,
+}
+
+/// `GET /provision/state`: what provisioning manages in the served database.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProvisionStateResponse {
+    /// The database has a provision record.
+    pub provisioned: bool,
+    pub record: Option<ProvisionRecord>,
+    /// The apply history, oldest first (at most 100 entries).
+    pub history: Vec<ProvisionHistoryEntry>,
+    /// The persisted profile manifest; `None` for a legacy database.
+    pub manifest: Option<PersistedProfileManifest>,
+    /// The fingerprint plans of the database are computed against right now.
+    pub live_fingerprint: String,
+    /// The spec `multidb serve` started from, in spec mode.
+    pub spec_mode: Option<ServeSpecMode>,
+}
+
+/// `GET /config/live`: the served database described as a spec (`provision::export_spec`).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LiveConfigResponse {
+    pub spec: DatabaseSpec,
+    pub source: ExportSource,
+    pub notes: Vec<String>,
+    pub live_fingerprint: String,
+}
+
 #[derive(Clone)]
 pub struct AdminState {
     /// Shared with `PostgreSQL` wire in `multidb serve`.
@@ -1152,6 +1231,7 @@ pub struct AdminState {
     admin_password_verifier: Arc<Semaphore>,
     insecure_local_admin: bool,
     studio_assets_dir: Option<Arc<PathBuf>>,
+    spec_mode: Option<ServeSpecMode>,
 }
 
 impl AdminState {
@@ -1173,6 +1253,7 @@ impl AdminState {
             admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
+            spec_mode: None,
         }
     }
 
@@ -1197,6 +1278,7 @@ impl AdminState {
             admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
+            spec_mode: None,
         }
     }
 
@@ -1221,6 +1303,7 @@ impl AdminState {
             admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
+            spec_mode: None,
         }
     }
 
@@ -1312,6 +1395,21 @@ impl AdminState {
     #[must_use]
     pub fn with_studio_assets_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.studio_assets_dir = Some(Arc::new(dir.into()));
+        self
+    }
+
+    /// Reports the spec `multidb serve` started from in spec mode (`MULTIDB_SPEC_PATH`) in
+    /// `GET /provision/state`: its `spec_digest` and the `MULTIDB_SPEC_APPLY` mode.
+    #[must_use]
+    pub fn with_spec_mode(
+        mut self,
+        spec_digest: impl Into<String>,
+        apply_mode: StartupMode,
+    ) -> Self {
+        self.spec_mode = Some(ServeSpecMode {
+            spec_digest: spec_digest.into(),
+            apply_mode,
+        });
         self
     }
 
@@ -1484,6 +1582,11 @@ fn api_router() -> Router<AdminState> {
         .route("/config/validate", post(config_validate_handler))
         .route("/config/plan", post(config_plan_handler))
         .route("/config/apply", post(config_apply_handler))
+        .route("/config/live", get(config_live_handler))
+        .route("/provision/state", get(provision_state_handler))
+        .route("/provision/plan", post(provision_plan_handler))
+        .route("/provision/apply", post(provision_apply_handler))
+        .route("/provision/drift", post(provision_drift_handler))
         .route("/profiles", get(profiles_handler))
         .route("/roles", get(roles_handler))
         .route("/domains", get(domains_handler))
@@ -2804,19 +2907,23 @@ async fn config_plan_handler(
 async fn config_apply_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<ConfigApplyRequest>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let Json(request) = match body {
+    let Json(value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
+    };
+    let (plan, confirm, source) = match config_apply_request(value) {
+        Ok(request) => request,
+        Err(response) => return *response,
     };
     let database = Arc::clone(&state.database).read_owned().await;
     let principal = state.principal_from_headers(&database, &headers);
     run_blocking(move || {
-        match database.confirm_config_apply_as(&principal, &request.plan, &request.confirm) {
+        match database.confirm_config_apply_with_source_as(&principal, &plan, &confirm, source) {
             Ok(report) => {
                 let status = status_for_apply_report(&report);
                 api_ok(status, report)
@@ -2825,6 +2932,277 @@ async fn config_apply_handler(
         }
     })
     .await
+}
+
+/// The plan a `POST /config/apply` body confirms. `{plan, confirm}` is a `ConfigApplyRequest`
+/// whose plan the client computed (`plan_source: client`); `{current, desired, confirm}` has
+/// the server recompute the plan with `MigrationPlanner::plan`, each side decoded through
+/// `spec_io` as in `/config/plan` (`plan_source: recomputed`). Either way the apply stays
+/// audit-only.
+fn config_apply_request(
+    mut value: JsonValue,
+) -> Result<(MigrationPlan, String, ConfigPlanSource), Box<Response>> {
+    if value.get("plan").is_some() {
+        return serde_json::from_value::<ConfigApplyRequest>(value)
+            .map(|request| (request.plan, request.confirm, ConfigPlanSource::Client))
+            .map_err(|error| Box::new(invalid_json_body(error)));
+    }
+    if value.get("current").is_none() && value.get("desired").is_none() {
+        return Err(Box::new(invalid_json_body("missing field `plan`")));
+    }
+    let current = decode_plan_side(&mut value, "current")
+        .map_err(|error| Box::new(plan_side_error("current", error)))?;
+    let desired = decode_plan_side(&mut value, "desired")
+        .map_err(|error| Box::new(plan_side_error("desired", error)))?;
+    let confirm = match value.get("confirm") {
+        Some(JsonValue::String(confirm)) => confirm.clone(),
+        Some(_) => return Err(Box::new(invalid_json_body("`confirm` must be a string"))),
+        None => return Err(Box::new(invalid_json_body("missing field `confirm`"))),
+    };
+    Ok((
+        MigrationPlanner::plan(&current, &desired),
+        confirm,
+        ConfigPlanSource::Recomputed,
+    ))
+}
+
+async fn config_live_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    // Exporting and fingerprinting only read, so they share the database with statements.
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || live_config_response(&database, &principal)).await
+}
+
+fn live_config_response(database: &Database, principal: &Principal) -> Response {
+    if let Err(error) = database.authorize_provision_read(principal, "config_live") {
+        return db_error(&error);
+    }
+    let exported = match provision::export_spec(database) {
+        Ok(exported) => exported,
+        Err(error) => return provision_error(&error),
+    };
+    match provision::live_fingerprint(database) {
+        Ok(live_fingerprint) => api_ok(
+            StatusCode::OK,
+            LiveConfigResponse {
+                spec: exported.spec,
+                source: exported.source,
+                notes: exported.notes,
+                live_fingerprint,
+            },
+        ),
+        Err(error) => provision_error(&error),
+    }
+}
+
+async fn provision_state_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let spec_mode = state.spec_mode.clone();
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || provision_state_response(&database, &principal, spec_mode)).await
+}
+
+fn provision_state_response(
+    database: &Database,
+    principal: &Principal,
+    spec_mode: Option<ServeSpecMode>,
+) -> Response {
+    if let Err(error) = database.authorize_provision_read(principal, "provision_state") {
+        return db_error(&error);
+    }
+    let live_fingerprint = match provision::live_fingerprint(database) {
+        Ok(live_fingerprint) => live_fingerprint,
+        Err(error) => return provision_error(&error),
+    };
+    let state = database.provision_state().and_then(|record| {
+        let history = database.provision_history()?;
+        let manifest = database.probed_metadata()?.manifest;
+        Ok(ProvisionStateResponse {
+            provisioned: record.is_some(),
+            record,
+            history,
+            manifest,
+            live_fingerprint,
+            spec_mode,
+        })
+    });
+    match state {
+        Ok(state) => api_ok(StatusCode::OK, state),
+        Err(error) => db_error(&error),
+    }
+}
+
+async fn provision_plan_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<JsonValue>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(value) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let request = match decode_provision_request(value, false) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    // A plan only reads (a denial is audited, as on every read endpoint), so it runs under a
+    // shared guard next to statements; an apply recomputes it under the exclusive guard anyway.
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || plan_response(&database, &request, &principal)).await
+}
+
+fn plan_response(
+    database: &Database,
+    request: &ProvisionRequest,
+    principal: &Principal,
+) -> Response {
+    if let Err(error) = database.authorize_provision_read(principal, "provision_plan") {
+        return db_error(&error);
+    }
+    match plan_served(database, request, principal) {
+        Ok(plan) if plan.outcome == PlanOutcome::Blocked => blocked_plan_response(&plan),
+        Ok(plan) => api_ok(StatusCode::OK, plan),
+        Err(error) => provision_error(&error),
+    }
+}
+
+async fn provision_apply_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<JsonValue>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(value) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let request = match decode_provision_request(value, true) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    // One exclusive guard from the recomputed plan through the last step: it waits for running
+    // statements, and nothing else reads or changes the database in between.
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(provision::carry_test_injections(move || {
+        apply_served(&mut database, principal, &request)
+    }))
+    .await
+}
+
+/// Applies a spec to the served database as `principal`, which needs `System:Admin` and
+/// `Database:Admin` (checked first, so a caller without them learns nothing about the plan).
+/// The plan is always recomputed: `confirm` must be its `prov_` id. Without `confirm` the
+/// recomputed plan is returned with 422, except for a noop, which needs no confirmation.
+fn apply_served(
+    database: &mut Database,
+    principal: Principal,
+    request: &ProvisionRequest,
+) -> Response {
+    if let Err(error) = database.authorize_provision_actor(&principal) {
+        return db_error(&error);
+    }
+    let env = control_plane_environment(&principal);
+    let confirm = if let Some(confirm) = &request.confirm {
+        confirm.clone()
+    } else {
+        let plan = match provision::plan_provision(
+            &request.spec,
+            ProvisionTargetRef::Open(database),
+            &request.options,
+            &env,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return provision_error(&error),
+        };
+        match plan.outcome {
+            PlanOutcome::Noop => plan.plan_id,
+            PlanOutcome::Blocked => return blocked_plan_response(&plan),
+            PlanOutcome::NeedsFlags => {
+                return api_error_with_data(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "flags_required",
+                    flags_message(&plan),
+                    &plan,
+                );
+            }
+            PlanOutcome::Ready => {
+                return api_error_with_data(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "confirmation_required",
+                    format!(
+                        "review the plan and confirm it: send confirm {}",
+                        plan.plan_id
+                    ),
+                    &plan,
+                );
+            }
+        }
+    };
+    match provision::apply_provision(
+        database,
+        &ProvisionActor::Principal(principal),
+        &request.spec,
+        &Confirmation::PlanId(confirm),
+        &request.options,
+        &env,
+    ) {
+        Ok(report) => apply_report_response(&report),
+        Err(error) => provision_error(&error),
+    }
+}
+
+async fn provision_drift_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<JsonValue>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(value) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let request = match decode_provision_request(value, false) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || drift_response(&database, &request, &principal)).await
+}
+
+fn drift_response(
+    database: &Database,
+    request: &ProvisionRequest,
+    principal: &Principal,
+) -> Response {
+    if let Err(error) = database.authorize_provision_read(principal, "provision_drift") {
+        return db_error(&error);
+    }
+    match plan_served(database, request, principal) {
+        Ok(plan) if !plan.validation.valid => api_error_with_data(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_spec",
+            format!("the spec is invalid: {}", describe_report(&plan.validation)),
+            &plan.validation,
+        ),
+        Ok(plan) => api_ok(StatusCode::OK, plan.drift),
+        Err(error) => provision_error(&error),
+    }
 }
 
 async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
@@ -2990,6 +3368,7 @@ async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
             openapi_endpoint: "/openapi.json",
             physical_migration_supported: false,
             config_apply_data_mutated: false,
+            provisioning_supported: true,
             endpoints: control_plane_operations()
                 .iter()
                 .map(|operation| operation.endpoint())
@@ -3001,6 +3380,7 @@ async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
                 "config_validate",
                 "migration_dry_run",
                 "apply_confirm_audit_only",
+                "provision_apply",
                 "catalog_view",
                 "advisor_read_only",
                 "runtime_advisor_v2",
@@ -3560,6 +3940,252 @@ fn describe_report(report: &ValidationReport) -> String {
         .join("; ")
 }
 
+/// The body of `POST /provision/plan`, `/provision/apply` and `/provision/drift`.
+struct ProvisionRequest {
+    spec: DatabaseSpec,
+    options: ProvisionOptions,
+    /// The `prov_` id an apply confirms.
+    confirm: Option<String>,
+}
+
+/// Decodes a provisioning body: `spec` through `spec_io` (a decode error is 400
+/// `invalid_json`, a missing or unsupported version 422 `invalid_spec_version` with the report
+/// in `data`), `options` as `ProvisionOptions` (unknown fields are 400) and, for an apply, the
+/// optional `confirm`. Any other key is 400: there is no client plan, the server always
+/// recomputes it.
+fn decode_provision_request(
+    value: JsonValue,
+    accepts_confirm: bool,
+) -> Result<ProvisionRequest, Box<Response>> {
+    let JsonValue::Object(mut body) = value else {
+        return Err(Box::new(invalid_json_body(
+            "the request body must be a JSON object",
+        )));
+    };
+    let known =
+        |key: &str| matches!(key, "spec" | "options") || (accepts_confirm && key == "confirm");
+    if let Some(unknown) = body.keys().find(|key| !known(key)) {
+        return Err(Box::new(invalid_json_body(format!(
+            "unknown field `{unknown}`"
+        ))));
+    }
+    let Some(spec) = body.remove("spec") else {
+        return Err(Box::new(invalid_json_body("missing field `spec`")));
+    };
+    let spec = spec_io::decode_spec_value(spec).map_err(|error| {
+        Box::new(match error.validation_report() {
+            Some(report) => api_error_with_data(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_spec_version",
+                format!("spec: {}", describe_report(&report)),
+                &report,
+            ),
+            None => invalid_spec_json(&error),
+        })
+    })?;
+    let options = match body.remove("options") {
+        None | Some(JsonValue::Null) => ProvisionOptions::default(),
+        Some(options) => serde_json::from_value(options)
+            .map_err(|error| Box::new(invalid_json_body(format!("invalid options: {error}"))))?,
+    };
+    let confirm = match body.remove("confirm") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::String(confirm)) => Some(confirm),
+        Some(_) => return Err(Box::new(invalid_json_body("`confirm` must be a string"))),
+    };
+    Ok(ProvisionRequest {
+        spec,
+        options,
+        confirm,
+    })
+}
+
+/// The environment of a Control Plane plan or apply: the `control_plane` surface, with the
+/// calling principal checked for `RBAC_SELF_LOCKOUT` (it is not part of the plan id).
+fn control_plane_environment(principal: &Principal) -> ProvisionEnvironment {
+    ProvisionEnvironment {
+        principal: Some(principal.clone()),
+        ..ProvisionEnvironment::new(ProvisionSurface::ControlPlane)
+    }
+}
+
+/// The plan of a request against the served database, on the Control Plane surface.
+fn plan_served(
+    database: &Database,
+    request: &ProvisionRequest,
+    principal: &Principal,
+) -> Result<ProvisionPlan, ProvisionError> {
+    provision::plan_provision(
+        &request.spec,
+        ProvisionTargetRef::Open(database),
+        &request.options,
+        &control_plane_environment(principal),
+    )
+}
+
+/// A blocked plan: 422 with the plan in `data`.
+fn blocked_plan_response(plan: &ProvisionPlan) -> Response {
+    api_error_with_data(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        blocked_code(plan),
+        format!(
+            "provisioning plan {} is blocked: {}",
+            plan.plan_id,
+            blocking_issues(plan)
+        ),
+        plan,
+    )
+}
+
+/// The error code of a blocked plan: `invalid_spec`, `rbac_self_lockout`, `audit_required` or
+/// `provision_blocked`.
+fn blocked_code(plan: &ProvisionPlan) -> &'static str {
+    let has = |code: &str| {
+        plan.issues
+            .iter()
+            .any(|found| found.code == code && found.severity == ValidationSeverity::Error)
+    };
+    if !plan.validation.valid {
+        "invalid_spec"
+    } else if has("RBAC_SELF_LOCKOUT") {
+        "rbac_self_lockout"
+    } else if has("AUDIT_REQUIRED_FOR_APPLY") {
+        "audit_required"
+    } else {
+        "provision_blocked"
+    }
+}
+
+/// The blocking issues of a plan, as `CODE at path` items.
+fn blocking_issues(plan: &ProvisionPlan) -> String {
+    let issues = plan
+        .validation
+        .issues
+        .iter()
+        .chain(&plan.issues)
+        .filter(|found| found.severity == ValidationSeverity::Error)
+        .map(|found| format!("{} at {}", found.code, found.path))
+        .collect::<Vec<_>>();
+    if issues.is_empty() {
+        "see the plan".to_owned()
+    } else {
+        issues.join("; ")
+    }
+}
+
+fn flags_message(plan: &ProvisionPlan) -> String {
+    format!(
+        "provisioning plan {} needs flags: {}; send them in options and confirm the plan they \
+         give",
+        plan.plan_id,
+        plan.required_flags.join(", ")
+    )
+}
+
+/// An apply report: 200 for `applied` and `noop`; with the report in `data`, 422
+/// `confirmation_required` for a rejected confirmation, and for a partial apply 409
+/// `object_conflict` when a create failed because the object exists, else 500
+/// `provision_partially_applied`.
+fn apply_report_response(report: &ProvisionApplyReport) -> Response {
+    match apply_report_status(report) {
+        (status, None) => api_ok(status, report),
+        (status, Some(code)) => {
+            api_error_with_data(status, code, report.check.message.clone(), report)
+        }
+    }
+}
+
+fn apply_report_status(report: &ProvisionApplyReport) -> (StatusCode, Option<&'static str>) {
+    match report.status {
+        ProvisionOutcome::Applied | ProvisionOutcome::Noop => (StatusCode::OK, None),
+        ProvisionOutcome::Rejected => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("confirmation_required"),
+        ),
+        ProvisionOutcome::Blocked => (StatusCode::UNPROCESSABLE_ENTITY, Some("provision_blocked")),
+        ProvisionOutcome::PlanChanged => (StatusCode::CONFLICT, Some("plan_changed")),
+        ProvisionOutcome::PartiallyApplied => {
+            let conflict = report.applied_steps.iter().any(|step| {
+                step.outcome == StepOutcome::Failed
+                    && step.error_kind.as_deref() == Some("catalog_object_exists")
+            });
+            if conflict {
+                (StatusCode::CONFLICT, Some("object_conflict"))
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some("provision_partially_applied"),
+                )
+            }
+        }
+    }
+}
+
+/// A provisioning error: blocked plans, missing flags and confirmations are 422 with the plan in
+/// `data`, a changed plan 409 `plan_changed`, missing permissions 403 `forbidden`, a database
+/// provisioning does not support 422 `provision_unsupported`.
+fn provision_error(error: &ProvisionError) -> Response {
+    let unprocessable = StatusCode::UNPROCESSABLE_ENTITY;
+    match error {
+        ProvisionError::InvalidSpec(report) => {
+            api_error_with_data(unprocessable, "invalid_spec", error.to_string(), report)
+        }
+        ProvisionError::Blocked(plan) => blocked_plan_response(plan),
+        ProvisionError::NeedsFlags(plan) => {
+            api_error_with_data(unprocessable, "flags_required", flags_message(plan), plan)
+        }
+        ProvisionError::ConfirmationRequired(plan) => api_error_with_data(
+            unprocessable,
+            "confirmation_required",
+            format!(
+                "provisioning plan {} needs a confirmation: send confirm {}",
+                plan.plan_id, plan.plan_id
+            ),
+            plan,
+        ),
+        ProvisionError::PlanChanged { confirmed, current } => api_error_with_data(
+            StatusCode::CONFLICT,
+            "plan_changed",
+            error.to_string(),
+            json!({ "confirmed_plan_id": confirmed, "current_plan_id": current }),
+        ),
+        ProvisionError::AuditRequired => {
+            api_error(unprocessable, "audit_required", error.to_string())
+        }
+        ProvisionError::PermissionMissing(_) => {
+            api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string())
+        }
+        ProvisionError::Config(ConfigError::Unsupported(_))
+        | ProvisionError::Db(DbError::Config(ConfigError::Unsupported(_))) => {
+            api_error(unprocessable, "provision_unsupported", error.to_string())
+        }
+        ProvisionError::Db(error) => db_error(error),
+        ProvisionError::RecordUnreadable(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provision_record_unreadable",
+            error.to_string(),
+        ),
+        ProvisionError::AlreadyInitialized
+        | ProvisionError::Locked(_)
+        | ProvisionError::StartupRefused(_)
+        | ProvisionError::Config(_)
+        | ProvisionError::Io(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            error.to_string(),
+        ),
+    }
+}
+
+/// A body that is JSON but not the expected request: 400 `invalid_json`.
+fn invalid_json_body(message: impl std::fmt::Display) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+        format!("invalid JSON request body: {message}"),
+    )
+}
+
 fn invalid_json_value(message: impl Into<String>) -> Response {
     api_error(StatusCode::BAD_REQUEST, "invalid_value", message)
 }
@@ -3656,6 +4282,28 @@ fn blocking_task_failed(error: &tokio::task::JoinError) -> Response {
 
 fn api_ok<T: Serialize>(status: StatusCode, data: T) -> Response {
     (status, Json(json!({ "ok": true, "data": data }))).into_response()
+}
+
+/// An error envelope that also carries `data`, such as the blocked plan of a 422 or the report
+/// of a partial apply.
+fn api_error_with_data<T: Serialize>(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    data: T,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message.into(),
+            },
+            "data": data,
+        })),
+    )
+        .into_response()
 }
 
 fn api_error(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Response {
@@ -5156,6 +5804,32 @@ mod tests {
                 .iter()
                 .any(|item| item["operation_id"] == "getMetrics" && item["stability"] == "preview")
         }));
+        assert_eq!(body["data"]["provisioning_supported"], true);
+        assert_eq!(body["data"]["physical_migration_supported"], false);
+        assert_eq!(body["data"]["config_apply_data_mutated"], false);
+        assert!(
+            body["data"]["capabilities"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "provision_apply"))
+        );
+        for operation in [
+            "getProvisionState",
+            "planProvision",
+            "applyProvision",
+            "checkProvisionDrift",
+            "getLiveConfig",
+        ] {
+            assert!(
+                body["data"]["operations"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["operation_id"] == operation
+                            && item["stability"] == "preview"
+                            && item["auth_required"] == true
+                    })
+                }),
+                "{operation}"
+            );
+        }
         Ok(())
     }
 
@@ -5314,11 +5988,19 @@ mod tests {
     }
 
     /// A spec body over the 1 MiB router body limit never reaches `spec_io`: it is HTTP 400
-    /// `invalid_json`, not a `SPEC_TOO_LARGE` report (docs/profiles.md, "Reading specs").
+    /// `invalid_json`, not a `SPEC_TOO_LARGE` report (docs/profiles.md, "Reading specs"), on
+    /// the provisioning routes as on the config routes.
     #[tokio::test]
     async fn oversized_spec_bodies_are_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
         let padding = "x".repeat(super::MAX_CONTROL_PLANE_BODY_BYTES);
-        for uri in ["/config/validate", "/config/plan"] {
+        for uri in [
+            "/config/validate",
+            "/config/plan",
+            "/config/apply",
+            "/provision/plan",
+            "/provision/apply",
+            "/provision/drift",
+        ] {
             let body = serde_json::to_vec(&serde_json::json!({ "version": 1, "pad": padding }))?;
             let response = super::router(test_state()?)
                 .oneshot(
@@ -6541,6 +7223,1141 @@ mod tests {
             event.action == "create_table" && event.outcome == crate::security::AuditOutcome::Denied
         }));
         Ok(())
+    }
+
+    /// The 5 provisioning operations: their bodies, error envelopes and the spec schema the
+    /// request bodies point at are documented in the `OpenAPI` snapshot.
+    #[test]
+    fn phase52_provisioning_operations_document_their_envelopes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let openapi: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        for (path, statuses) in [
+            ("/provision/plan", &["400", "403", "422"][..]),
+            ("/provision/apply", &["400", "403", "409", "422", "500"][..]),
+            ("/provision/drift", &["400", "403", "422"][..]),
+        ] {
+            for status in statuses {
+                assert!(
+                    openapi_documents_envelope(&openapi, path, status, false)?,
+                    "OpenAPI {path} {status} does not document an error envelope"
+                );
+            }
+            assert!(openapi_documents_envelope(&openapi, path, "200", true)?);
+            let operation = resolve_openapi_operation(&openapi, &openapi["paths"][path]["post"])?;
+            let body = resolve_openapi_operation(&openapi, &operation["requestBody"])?;
+            let schema = resolve_openapi_operation(
+                &openapi,
+                &body["content"]["application/json"]["schema"],
+            )?;
+            assert_eq!(
+                schema["properties"]["spec"]["x-multidb-json-schema"],
+                crate::config_spec::database_spec_v2_schema()["$id"],
+                "{path}"
+            );
+        }
+        for path in ["/provision/state", "/config/live"] {
+            let operation = resolve_openapi_operation(&openapi, &openapi["paths"][path]["get"])?;
+            let response = resolve_openapi_operation(&openapi, &operation["responses"]["403"])?;
+            assert!(response["content"]["application/json"]["schema"].is_object());
+        }
+        let config = resolve_openapi_operation(&openapi, &openapi["paths"]["/config"]["get"])?;
+        assert!(
+            config["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("/config/live"))
+        );
+        Ok(())
+    }
+
+    /// Plans of the served database: 200 for a ready plan, 422 with the plan in `data` for a
+    /// blocked one. Planning writes nothing, not even an audit event.
+    #[tokio::test]
+    async fn provision_plan_is_ready_or_422_with_the_blocked_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let events = database.read().await.audit_events()?.len();
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+
+        let (status, body) = post_as(&app, "/provision/plan", &plan_body(&spec), "root").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        let plan = &body["data"];
+        assert_eq!(plan["outcome"], "ready");
+        assert_eq!(plan["surface"], "control_plane");
+        assert_eq!(plan["target"]["kind"], "existing_database");
+        assert_eq!(plan["required_confirmation"], plan["plan_id"]);
+        assert!(
+            plan["plan_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("prov_"))
+        );
+        assert!(plan["issues"].as_array().is_some_and(|issues| {
+            issues.iter().any(|issue| {
+                issue["code"] == "PROVISION_STORAGE_PATH_IGNORED" && issue["severity"] == "advice"
+            })
+        }));
+
+        let mut at_rest = spec.clone();
+        at_rest.guarantees.encryption.at_rest = true;
+        let (status, body) =
+            post_as(&app, "/api/provision/plan", &plan_body(&at_rest), "root").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "provision_blocked");
+        assert_eq!(body["data"]["outcome"], "blocked");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("at guarantees.encryption.at_rest")),
+            "{body}"
+        );
+        let openapi: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        assert!(openapi_documents_envelope(
+            &openapi,
+            "/provision/plan",
+            "422",
+            false
+        )?);
+
+        let mut invalid = spec.clone();
+        invalid.guarantees.write_ack = crate::config_spec::WriteAck::Local;
+        let (status, body) = post_as(&app, "/provision/plan", &plan_body(&invalid), "root").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_spec");
+        assert_eq!(body["data"]["validation"]["valid"], false);
+
+        let database = database.read().await;
+        assert!(database.catalog().is_empty());
+        assert_eq!(database.provision_state()?, None);
+        assert_eq!(database.audit_events()?.len(), events);
+        Ok(())
+    }
+
+    /// Provisioning bodies decode like config specs: a spec decode error, unknown options and
+    /// unknown keys (there is no client plan) are 400, an unsupported version is 422.
+    #[tokio::test]
+    async fn provision_bodies_decode_specs_and_options_strictly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let spec = serde_json::to_value(provisioning_spec(&serde_json::json!([]))?)?;
+        let mut unknown_field = spec.clone();
+        unknown_field["unknown"] = serde_json::json!(true);
+        let mut version_3 = spec.clone();
+        version_3["version"] = serde_json::json!(3);
+        for path in ["/provision/plan", "/provision/apply", "/provision/drift"] {
+            for (body, status, code) in [
+                (
+                    serde_json::json!({ "spec": unknown_field }),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                ),
+                (
+                    serde_json::json!({ "spec": version_3 }),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_spec_version",
+                ),
+                (
+                    serde_json::json!({ "spec": spec, "options": { "allow_everything": true } }),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                ),
+                (
+                    serde_json::json!({ "spec": spec, "plan": {} }),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                ),
+                (
+                    serde_json::json!({ "options": {} }),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                ),
+                (
+                    serde_json::json!([]),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                ),
+            ] {
+                let (actual, response) = post_as(&app, path, &body, "root").await?;
+                assert_eq!(actual, status, "{path}: {body}: {response}");
+                assert_eq!(response["ok"], false, "{path}");
+                assert_eq!(response["error"]["code"], code, "{path}: {response}");
+            }
+        }
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &serde_json::json!({ "spec": spec, "confirm": 7 }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) = post_as(
+            &app,
+            "/provision/plan",
+            &serde_json::json!({ "spec": spec, "confirm": "prov_x" }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(database.read().await.catalog().is_empty());
+        Ok(())
+    }
+
+    /// An apply confirms the recomputed `prov_` id: it applies as the calling principal, a
+    /// second apply is a noop, a stale id or an out-of-band builder call between plan and apply
+    /// is 409 `plan_changed`, and a database `Read` principal is 403.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provision_apply_applies_then_noops_and_refuses_changed_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+        let plan_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &plan_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["status"], "applied");
+        assert_eq!(body["data"]["plan_id"], plan_id.as_str());
+        assert_eq!(body["data"]["check"]["data_mutated"], true);
+        {
+            let database = database.read().await;
+            assert!(database.catalog().contains_key("orders"));
+            let record = database.provision_state()?.ok_or("a provision record")?;
+            assert_eq!(record.applied_by, "root");
+            assert!(database.audit_events()?.iter().any(|event| {
+                event.action == "create_collection"
+                    && event.principal.as_deref() == Some("root")
+                    && event.outcome == crate::security::AuditOutcome::Succeeded
+            }));
+        }
+
+        // The applied id no longer confirms anything: the database changed.
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &plan_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "plan_changed");
+        assert_eq!(body["data"]["confirmed_plan_id"], plan_id.as_str());
+        // A noop needs no confirmation, and its own id confirms it too.
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &serde_json::json!({ "spec": spec }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["status"], "noop");
+        assert_eq!(body["data"]["check"]["data_mutated"], false);
+        let noop_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+        let events = database.read().await.audit_events()?.len();
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &noop_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["status"], "noop");
+        assert_eq!(database.read().await.audit_events()?.len(), events);
+
+        // An out-of-band builder call between plan and apply changes the plan.
+        let both = provisioning_spec(&serde_json::json!([
+            document_collection("orders"),
+            document_collection("notes")
+        ]))?;
+        let both_id = planned_id(&app, &both, &serde_json::json!({})).await?;
+        let created = app
+            .clone()
+            .oneshot(request_as(
+                Method::POST,
+                "/builder/collection",
+                Some(&events_collection()),
+                "root",
+            )?)
+            .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&both, &both_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "plan_changed");
+        assert!(!database.read().await.catalog().contains_key("notes"));
+
+        // A principal with database Read only cannot plan, apply, check drift or read state.
+        for (method, path) in [
+            (Method::POST, "/provision/plan"),
+            (Method::POST, "/provision/apply"),
+            (Method::POST, "/provision/drift"),
+            (Method::GET, "/provision/state"),
+            (Method::GET, "/config/live"),
+        ] {
+            let body = match path {
+                "/provision/apply" => Some(apply_body(&both, &both_id)),
+                "/provision/plan" | "/provision/drift" => Some(plan_body(&both)),
+                _ => None,
+            };
+            let response = app
+                .clone()
+                .oneshot(request_as(method, path, body.as_ref(), "ada")?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "forbidden", "{path}");
+        }
+        let database = database.read().await;
+        assert!(!database.catalog().contains_key("notes"));
+        assert!(database.audit_events()?.iter().any(|event| {
+            event.action == "provision_apply"
+                && event.principal.as_deref() == Some("ada")
+                && event.outcome == crate::security::AuditOutcome::Denied
+        }));
+        Ok(())
+    }
+
+    /// Applies the Control Plane refuses with 422: no confirmation, a confirmation that is not a
+    /// `prov_` id, missing flags, a blocked plan, audit kept off and a self-lockout.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provision_apply_refusals_are_422_with_their_codes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &serde_json::json!({ "spec": spec }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "confirmation_required");
+        assert_eq!(body["data"]["outcome"], "ready");
+        for confirm in ["plan_0123456789abcdef0123456789abcdef", "yes"] {
+            let (status, body) = post_as(
+                &app,
+                "/provision/apply",
+                &apply_body(&spec, confirm),
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert_eq!(body["error"]["code"], "confirmation_required");
+            assert_eq!(body["data"]["status"], "rejected");
+            assert_eq!(body["data"]["check"]["data_mutated"], false);
+        }
+        assert!(database.read().await.catalog().is_empty());
+
+        // A blocked plan is refused with or without its id.
+        let mut at_rest = spec.clone();
+        at_rest.guarantees.encryption.at_rest = true;
+        let (status, planned) =
+            post_as(&app, "/provision/plan", &plan_body(&at_rest), "root").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{planned}");
+        let blocked_id = planned["data"]["plan_id"].as_str().ok_or("a plan id")?;
+        for body in [
+            apply_body(&at_rest, blocked_id),
+            serde_json::json!({ "spec": at_rest }),
+        ] {
+            let (status, response) = post_as(&app, "/provision/apply", &body, "root").await?;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+            assert_eq!(response["error"]["code"], "provision_blocked");
+            assert_eq!(response["data"]["outcome"], "blocked");
+        }
+
+        // Releasing a managed object is destructive and needs its flag.
+        let plan_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &plan_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let empty = provisioning_spec(&serde_json::json!([]))?;
+        let (status, body) = post_as(&app, "/provision/plan", &plan_body(&empty), "root").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["outcome"], "needs_flags");
+        let release_id = body["data"]["plan_id"]
+            .as_str()
+            .ok_or("a plan id")?
+            .to_owned();
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&empty, &release_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "flags_required");
+        assert!(
+            body["data"]["required_flags"]
+                .as_array()
+                .is_some_and(|flags| flags
+                    .iter()
+                    .any(|flag| flag == "allow_destructive:collections.orders"))
+        );
+        let options = serde_json::json!({ "allow_destructive": ["collections.orders"] });
+        let release_id = planned_id(&app, &empty, &options).await?;
+        let mut body = apply_body(&empty, &release_id);
+        body["options"] = options;
+        let (status, response) = post_as(&app, "/provision/apply", &body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(database.read().await.catalog().contains_key("orders"));
+
+        // A principal whose system administration comes from a managed role cannot revoke it.
+        let ops = with_security(
+            spec.clone(),
+            &serde_json::json!({
+                "roles": [{ "name": "ops", "grants": [{ "resource": "database", "permissions": ["admin"] }] }],
+                "principals": [{ "user": "ops", "roles": ["ops"] }]
+            }),
+        )?;
+        let ops_id = planned_id(&app, &ops, &serde_json::json!({})).await?;
+        let (status, body) =
+            post_as(&app, "/provision/apply", &apply_body(&ops, &ops_id), "root").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let narrowed = with_security(
+            spec.clone(),
+            &serde_json::json!({
+                "roles": [{ "name": "ops", "grants": [{ "resource": "database", "permissions": ["read"] }] }],
+                "principals": [{ "user": "ops", "roles": ["ops"] }]
+            }),
+        )?;
+        let options = serde_json::json!({ "allow_weakening": ["security.roles.ops"] });
+        let mut body = plan_body(&narrowed);
+        body["options"] = options.clone();
+        let (status, planned) = post_as(&app, "/provision/plan", &body, "ops").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{planned}");
+        assert_eq!(planned["error"]["code"], "rbac_self_lockout");
+        let lockout_id = planned["data"]["plan_id"].as_str().ok_or("a plan id")?;
+        let mut body = apply_body(&narrowed, lockout_id);
+        body["options"] = options;
+        let (status, response) = post_as(&app, "/provision/apply", &body, "ops").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["error"]["code"], "rbac_self_lockout");
+        assert!(
+            database
+                .read()
+                .await
+                .authz_policy()
+                .roles()
+                .get("ops")
+                .is_some_and(|role| role.allows(&Resource::System, Permission::Admin))
+        );
+
+        // Audit off, and a spec that keeps it off, refuses every apply.
+        {
+            let mut database = database.write().await;
+            let root = database.principal_for_user("root");
+            database.set_audit_enabled_as(&root, false)?;
+        }
+        let mut quiet = ops.clone();
+        quiet.guarantees.audit.enabled = false;
+        quiet.collections = serde_json::from_value(serde_json::json!([
+            document_collection("orders"),
+            document_collection("notes")
+        ]))?;
+        let (status, planned) =
+            post_as(&app, "/provision/plan", &plan_body(&quiet), "root").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{planned}");
+        assert_eq!(planned["error"]["code"], "audit_required");
+        let quiet_id = planned["data"]["plan_id"].as_str().ok_or("a plan id")?;
+        let (status, response) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&quiet, quiet_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["error"]["code"], "audit_required");
+        assert!(!database.read().await.catalog().contains_key("notes"));
+        Ok(())
+    }
+
+    /// A step that fails leaves a partial apply: 500 with the report in `data`, and the next
+    /// plan applies what remains. The failure hook is thread-local, so this runs on the
+    /// current-thread runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn provision_apply_reports_partial_applies_as_500()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+        let plan_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+
+        crate::provision::fail_provision_step_for_tests(Some(0));
+        let response = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &plan_id),
+            "root",
+        )
+        .await;
+        crate::provision::fail_provision_step_for_tests(None);
+        let (status, body) = response?;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "provision_partially_applied");
+        assert_eq!(body["data"]["status"], "partially_applied");
+        assert_eq!(body["data"]["failed_step"], "pstep-001");
+        let record = database
+            .read()
+            .await
+            .provision_state()?
+            .ok_or("a failed record")?;
+        assert_eq!(
+            record.status,
+            crate::provision::ProvisionRecordStatus::Failed
+        );
+
+        let retry_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &retry_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["status"], "applied");
+        assert!(database.read().await.catalog().contains_key("orders"));
+        Ok(())
+    }
+
+    /// A create that fails because the object exists is a conflict, any other partial apply an
+    /// internal error; rejected confirmations are 422.
+    #[test]
+    fn apply_report_status_maps_conflicts_partial_applies_and_rejections() {
+        use super::ProvisionOutcome as Outcome;
+        use crate::provision::{AppliedStep, ProvisionStepKind};
+        let report = |status, error_kind: Option<&str>| super::ProvisionApplyReport {
+            status,
+            check: crate::config_spec::ApplyCheckReport {
+                plan_id: "prov_0".to_owned(),
+                status: ApplyStatus::Confirmed,
+                valid: true,
+                confirmation_matched: true,
+                audit_recorded: true,
+                data_mutated: true,
+                message: "message".to_owned(),
+            },
+            plan_id: "prov_0".to_owned(),
+            applied_steps: vec![AppliedStep {
+                step_id: "pstep-001".to_owned(),
+                kind: ProvisionStepKind::CreateCollection,
+                object: Some("orders".to_owned()),
+                outcome: super::StepOutcome::Failed,
+                detail: "failed".to_owned(),
+                error_kind: error_kind.map(str::to_owned),
+            }],
+            failed_step: Some("pstep-001".to_owned()),
+            record: None,
+            warnings: Vec::new(),
+            session_pending_restart: false,
+        };
+        assert_eq!(
+            super::apply_report_status(&report(
+                Outcome::PartiallyApplied,
+                Some("catalog_object_exists")
+            )),
+            (StatusCode::CONFLICT, Some("object_conflict"))
+        );
+        assert_eq!(
+            super::apply_report_status(&report(Outcome::PartiallyApplied, Some("storage"))),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("provision_partially_applied")
+            )
+        );
+        assert_eq!(
+            super::apply_report_status(&report(Outcome::Rejected, None)),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("confirmation_required")
+            )
+        );
+        assert_eq!(
+            super::apply_report_status(&report(Outcome::Applied, None)),
+            (StatusCode::OK, None)
+        );
+        assert_eq!(
+            super::apply_report_status(&report(Outcome::Noop, None)),
+            (StatusCode::OK, None)
+        );
+    }
+
+    /// State, drift and the live spec describe the served database before and after an apply;
+    /// an object a builder call creates is reported as unmanaged.
+    #[tokio::test]
+    async fn provision_state_drift_and_live_config_follow_the_served_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database = Arc::new(RwLock::new(provisioning_database(
+            &temp.path().join("app.redb"),
+        )?));
+        let app = super::router_with_api_prefix(
+            AdminState::from_database_handle(Arc::clone(&database))
+                .with_admin_token("secret")
+                .with_spec_mode("spec_0123", crate::provision::StartupMode::Verify),
+        );
+
+        let (status, state) = get_as(&app, "/api/provision/state", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["data"]["provisioned"], false);
+        assert_eq!(state["data"]["record"], Value::Null);
+        assert_eq!(state["data"]["history"], serde_json::json!([]));
+        assert_eq!(state["data"]["manifest"]["profile"], "balanced");
+        assert_eq!(state["data"]["spec_mode"]["spec_digest"], "spec_0123");
+        assert_eq!(state["data"]["spec_mode"]["apply_mode"], "verify");
+        let fingerprint = state["data"]["live_fingerprint"].clone();
+        assert!(
+            fingerprint
+                .as_str()
+                .is_some_and(|value| value.starts_with("live_"))
+        );
+        let (status, live) = get_as(&app, "/config/live", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        assert_eq!(live["data"]["source"], "inferred");
+        assert_eq!(live["data"]["spec"]["version"], 2);
+        assert_eq!(live["data"]["live_fingerprint"], fingerprint);
+
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+        let (status, drift) = post_as(&app, "/provision/drift", &plan_body(&spec), "root").await?;
+        assert_eq!(status, StatusCode::OK, "{drift}");
+        assert_eq!(drift["data"]["in_sync"], false);
+        let plan_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+        let (status, body) = post_as(
+            &app,
+            "/provision/apply",
+            &apply_body(&spec, &plan_id),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = app
+            .clone()
+            .oneshot(request_as(
+                Method::POST,
+                "/builder/collection",
+                Some(&events_collection()),
+                "root",
+            )?)
+            .await?;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let (status, state) = get_as(&app, "/provision/state", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["data"]["provisioned"], true);
+        assert_eq!(state["data"]["record"]["status"], "applied");
+        assert_eq!(state["data"]["record"]["plan_id"], plan_id.as_str());
+        assert_eq!(state["data"]["history"].as_array().map(Vec::len), Some(1));
+        assert_ne!(state["data"]["live_fingerprint"], fingerprint);
+
+        let (status, drift) = post_as(&app, "/provision/drift", &plan_body(&spec), "root").await?;
+        assert_eq!(status, StatusCode::OK, "{drift}");
+        assert_eq!(drift["data"]["in_sync"], true, "{drift}");
+        assert!(
+            drift["data"]["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["kind"] == "unmanaged_object" && item["path"] == "database.catalog.events"
+                })
+            }),
+            "{drift}"
+        );
+        let mut strict = plan_body(&spec);
+        strict["options"] = serde_json::json!({ "unmanaged": "fail" });
+        let (status, drift) = post_as(&app, "/provision/drift", &strict, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{drift}");
+        assert_eq!(drift["data"]["in_sync"], false);
+        let mut invalid = spec.clone();
+        invalid.guarantees.write_ack = crate::config_spec::WriteAck::Local;
+        let (status, drift) =
+            post_as(&app, "/provision/drift", &plan_body(&invalid), "root").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{drift}");
+        assert_eq!(drift["error"]["code"], "invalid_spec");
+        assert_eq!(drift["data"]["valid"], false);
+
+        let (status, live) = get_as(&app, "/config/live", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        assert_eq!(live["data"]["source"], "applied_record");
+        assert_eq!(live["data"]["spec"], serde_json::to_value(&spec)?);
+        Ok(())
+    }
+
+    /// A served time series without a future-skew bound (`i64::MAX` in the runtime, as for one
+    /// created before the bound existed) is `null` in `GET /config/live` and in plans, never
+    /// `i64::MAX`, which JavaScript clients (the SDK, Studio) cannot represent. The live spec
+    /// posted back as it came adopts the series.
+    #[tokio::test]
+    async fn live_config_writes_an_unbounded_future_skew_as_null()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut database = provisioning_database(&temp.path().join("app.redb"))?;
+        database.create_time_series(
+            crate::timeseries::TimeSeriesConfig::new("metrics")
+                .with_chunk_millis(3_600_000)
+                .with_max_future_skew_millis(i64::MAX),
+        )?;
+        let app = super::router(
+            AdminState::from_database_handle(Arc::new(RwLock::new(database)))
+                .with_admin_token("secret"),
+        );
+        let unbounded = i64::MAX.to_string();
+
+        let (status, live) = get_as(&app, "/config/live", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{live}");
+        let physical = &live["data"]["spec"]["collections"][0]["physical"];
+        assert_eq!(physical["kind"], "time_series", "{live}");
+        assert!(
+            physical
+                .get("max_future_skew_millis")
+                .is_some_and(Value::is_null),
+            "{live}"
+        );
+        assert!(!live.to_string().contains(&unbounded), "{live}");
+
+        let body = serde_json::json!({ "spec": live["data"]["spec"] });
+        let (status, plan) = post_as(&app, "/provision/plan", &body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        assert!(
+            plan["data"]["steps"].as_array().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| step["kind"] == "adopt_object" && step["object"] == "metrics")
+            }),
+            "{plan}"
+        );
+        assert!(!plan.to_string().contains(&unbounded), "{plan}");
+
+        // Applying it, and the record, drift and live spec that follow, keep writing null.
+        let plan_id = plan["data"]["plan_id"].as_str().ok_or("a plan id")?;
+        let apply = serde_json::json!({ "spec": live["data"]["spec"], "confirm": plan_id });
+        let (status, applied) = post_as(&app, "/provision/apply", &apply, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(applied["data"]["status"], "applied", "{applied}");
+        let (status, state) = get_as(&app, "/provision/state", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert!(
+            state["data"]["record"]["applied_spec"]["collections"][0]["physical"]
+                .get("max_future_skew_millis")
+                .is_some_and(Value::is_null),
+            "{state}"
+        );
+        let (status, drift) = post_as(&app, "/provision/drift", &body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{drift}");
+        assert_eq!(drift["data"]["in_sync"], true, "{drift}");
+        let (status, relive) = get_as(&app, "/config/live", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{relive}");
+        for response in [&applied, &state, &drift, &relive] {
+            assert!(!response.to_string().contains(&unbounded), "{response}");
+        }
+        Ok(())
+    }
+
+    /// Plans, drift, state and the live spec take the shared guard, so they answer while a
+    /// statement holds the database. An apply takes the exclusive guard: it waits for the
+    /// statement, holds back new readers until it has run, and then applies the plan it
+    /// recomputed.
+    #[tokio::test]
+    async fn provisioning_reads_share_the_database_and_an_apply_waits_for_readers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let (app, database) = provisioning_app(temp.path())?;
+        let spec = provisioning_spec(&serde_json::json!([document_collection("orders")]))?;
+        let plan_id = planned_id(&app, &spec, &serde_json::json!({})).await?;
+
+        let reader = database.read().await;
+        for (method, path, body) in [
+            (Method::POST, "/provision/plan", Some(plan_body(&spec))),
+            (Method::POST, "/provision/drift", Some(plan_body(&spec))),
+            (Method::GET, "/provision/state", None),
+            (Method::GET, "/config/live", None),
+        ] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                app.clone()
+                    .oneshot(request_as(method, path, body.as_ref(), "root")?),
+            )
+            .await??;
+            let status = response.status();
+            let body = json_body(response).await?;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        }
+
+        let mut apply = tokio::spawn(app.clone().oneshot(request_as(
+            Method::POST,
+            "/provision/apply",
+            Some(&apply_body(&spec, &plan_id)),
+            "root",
+        )?));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut apply)
+                .await
+                .is_err()
+        );
+        // The queued apply holds back new readers until it has run.
+        assert!(database.try_read().is_err());
+        assert!(!reader.catalog().contains_key("orders"));
+        drop(reader);
+        let applied = tokio::time::timeout(Duration::from_secs(10), apply).await???;
+        let status = applied.status();
+        let body = json_body(applied).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["status"], "applied");
+        assert!(database.read().await.catalog().contains_key("orders"));
+        Ok(())
+    }
+
+    /// A provisioning error that wraps a busy query governor or an optimistic write conflict
+    /// keeps the retryable answers of `db_error`: 503 `busy` with `Retry-After`, 409 `conflict`.
+    #[tokio::test]
+    async fn provisioning_errors_keep_busy_and_conflict_retryable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let busy = super::provision_error(&crate::provision::ProvisionError::Db(DbError::Query(
+            QueryError::Busy("query queue exceeded 100 ms".to_owned()),
+        )));
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(json_body(busy).await?["error"]["code"], "busy");
+
+        let conflict = super::provision_error(&crate::provision::ProvisionError::Db(
+            DbError::Storage(StorageError::Conflict),
+        ));
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(conflict.headers().get(RETRY_AFTER).is_none());
+        assert_eq!(json_body(conflict).await?["error"]["code"], "conflict");
+        Ok(())
+    }
+
+    /// `/config/apply` recomputes the plan from `{current, desired, confirm}` and records
+    /// `plan_source: recomputed`; a client plan, even a forged one, is recorded as `client`.
+    /// Both stay audit-only.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn config_apply_records_whether_the_plan_was_recomputed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        let current = {
+            let database = database.read().await;
+            DatabaseSpec::from_db_config("current", database.config())
+        };
+        let mut desired = current.clone();
+        desired.profile = "secure_app".to_owned();
+        desired.domains[0].mode = crate::config_spec::ConsistencyMode::StrongCp;
+        let plan = MigrationPlanner::plan(&current, &desired);
+        assert!(!plan.apply_supported);
+
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/apply",
+                Some(&serde_json::json!({
+                    "current": current,
+                    "desired": desired,
+                    "confirm": plan.required_confirmation,
+                })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["data"]["status"], "unsupported");
+        assert_eq!(body["data"]["data_mutated"], false);
+
+        // A client plan that claims the change is supported is confirmed as before, audit-only.
+        let mut forged = plan.clone();
+        forged.apply_supported = true;
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/apply",
+                Some(&ConfigApplyRequest {
+                    confirm: forged.required_confirmation.clone(),
+                    plan: forged,
+                }),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        assert_eq!(body["data"]["status"], "confirmed");
+        assert_eq!(body["data"]["data_mutated"], false);
+        {
+            let database = database.read().await;
+            let details = database
+                .audit_events()?
+                .into_iter()
+                .filter(|event| event.action == "config_apply")
+                .filter_map(|event| event.detail)
+                .collect::<Vec<_>>();
+            assert_eq!(details.len(), 2, "{details:?}");
+            assert!(
+                details[0].contains("plan_source: recomputed"),
+                "{details:?}"
+            );
+            assert!(details[0].contains("data_mutated: false"), "{details:?}");
+            assert!(details[1].contains("plan_source: client"), "{details:?}");
+            assert!(database.catalog().is_empty());
+        }
+
+        // A forged, overlong plan id cannot push plan_source out of the audit detail.
+        let mut long = MigrationPlanner::plan(&current, &current);
+        long.plan_id = "p".repeat(300);
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/apply",
+                Some(&ConfigApplyRequest {
+                    confirm: long.required_confirmation.clone(),
+                    plan: long,
+                }),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            database
+                .read()
+                .await
+                .audit_events()?
+                .last()
+                .and_then(|event| event.detail.as_deref())
+                .is_some_and(|detail| detail.ends_with("plan_source: client"))
+        );
+
+        for (body, status, code) in [
+            (
+                serde_json::json!({ "current": current, "desired": current }),
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+            ),
+            (
+                serde_json::json!({ "current": current, "confirm": "x" }),
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+            ),
+            (
+                serde_json::json!({ "confirm": "x" }),
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+            ),
+            (
+                serde_json::json!({ "plan": { "plan_id": 1 }, "confirm": "x" }),
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(Method::POST, "/config/apply", Some(&body))?)
+                .await?;
+            assert_eq!(response.status(), status, "{body}");
+            let response = json_body(response).await?;
+            assert_eq!(response["error"]["code"], code, "{body}");
+        }
+        let mut version_3 = serde_json::to_value(&current)?;
+        version_3["version"] = serde_json::json!(3);
+        let response = app
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/apply",
+                Some(&serde_json::json!({
+                    "current": current,
+                    "desired": version_3,
+                    "confirm": "x"
+                })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["error"]["code"], "invalid_spec_version");
+        Ok(())
+    }
+
+    /// An on-disk database whose RBAC is persisted: the admin role with the principals `root`
+    /// (whom `authed_request` names) and `admin` (the bootstrap administrator), plus `ada`, who
+    /// may only read the database; created with the `balanced` profile manifest.
+    /// `ensure_bootstrap_admin_principal` alone persists `admin` only, and the RBAC of the
+    /// in-memory fixture is not persisted, so provisioning would refuse that one as stale (and
+    /// volatile).
+    fn provisioning_database(
+        path: &std::path::Path,
+    ) -> Result<crate::db::Database, Box<dyn std::error::Error>> {
+        let spec = provisioning_spec(&serde_json::json!([]))?;
+        let resolved = crate::config_spec::resolve_profile(&spec)
+            .resolved()
+            .cloned()
+            .ok_or("the balanced profile resolves")?;
+        let binding = resolved.bind(crate::db::ReplicationKind::Cp, Some(path.to_path_buf()))?;
+        let security = crate::db::SecurityConfig {
+            authz_policy: AuthzPolicy::new([
+                Role::new("admin")
+                    .grant(Resource::System, Permission::Admin)
+                    .grant(Resource::Database, Permission::Read)
+                    .grant(Resource::Database, Permission::Write)
+                    .grant(Resource::Database, Permission::Admin),
+                Role::new("reader").grant(Resource::Database, Permission::Read),
+            ]),
+            principals: PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin"))
+                .with_principal("admin", Principal::new("admin").with_role("admin"))
+                .with_principal("ada", Principal::new("ada").with_role("reader")),
+            ..crate::db::SecurityConfig::default()
+        };
+        Ok(crate::db::create_database_with_profile(
+            &binding,
+            crate::db::OperationalConfig::new().with_security(security),
+        )?)
+    }
+
+    type SharedDatabase = Arc<RwLock<crate::db::Database>>;
+
+    /// The router over a new provisioning fixture in `dir`, and the database it serves.
+    fn provisioning_app(
+        dir: &std::path::Path,
+    ) -> Result<(axum::Router, SharedDatabase), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(provisioning_database(&dir.join("app.redb"))?));
+        let app = super::router_with_api_prefix(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        Ok((app, database))
+    }
+
+    /// A version 2 `balanced` spec with `collections`.
+    fn provisioning_spec(collections: &Value) -> Result<DatabaseSpec, Box<dyn std::error::Error>> {
+        let mut spec =
+            DatabaseSpec::from_db_config("app", &DbConfig::on_disk(Profile::Balanced, "app.redb"));
+        spec.version = crate::config_spec::DATABASE_SPEC_VERSION_V2;
+        spec.profile = "balanced".to_owned();
+        spec.collections = serde_json::from_value(collections.clone())?;
+        Ok(spec)
+    }
+
+    fn with_security(
+        mut spec: DatabaseSpec,
+        security: &Value,
+    ) -> Result<DatabaseSpec, Box<dyn std::error::Error>> {
+        spec.security = Some(serde_json::from_value(security.clone())?);
+        Ok(spec)
+    }
+
+    fn document_collection(name: &str) -> Value {
+        serde_json::json!({
+            "name": name, "role": "document_entity", "domain": "primary", "indexes": ["primary"]
+        })
+    }
+
+    /// A `/builder/collection` body for a collection created outside provisioning.
+    fn events_collection() -> Value {
+        serde_json::json!({
+            "name": "events",
+            "fields": [{ "name": "id", "source": "DocumentId", "ty": "Bytes" }],
+            "indexes": []
+        })
+    }
+
+    fn plan_body(spec: &DatabaseSpec) -> Value {
+        serde_json::json!({ "spec": spec })
+    }
+
+    fn apply_body(spec: &DatabaseSpec, confirm: &str) -> Value {
+        serde_json::json!({ "spec": spec, "confirm": confirm })
+    }
+
+    /// The `prov_` id of a ready or noop plan of `spec` with `options`, as `root`.
+    async fn planned_id(
+        app: &axum::Router,
+        spec: &DatabaseSpec,
+        options: &Value,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut body = plan_body(spec);
+        body["options"] = options.clone();
+        let (status, plan) = post_as(app, "/provision/plan", &body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        Ok(plan["data"]["plan_id"]
+            .as_str()
+            .ok_or("a plan id")?
+            .to_owned())
+    }
+
+    async fn post_as(
+        app: &axum::Router,
+        uri: &str,
+        body: &Value,
+        principal: &str,
+    ) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
+        let response = app
+            .clone()
+            .oneshot(request_as(Method::POST, uri, Some(body), principal)?)
+            .await?;
+        let status = response.status();
+        Ok((status, json_body(response).await?))
+    }
+
+    async fn get_as(
+        app: &axum::Router,
+        uri: &str,
+        principal: &str,
+    ) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
+        let response = app
+            .clone()
+            .oneshot(request_as(Method::GET, uri, None::<&Value>, principal)?)
+            .await?;
+        let status = response.status();
+        Ok((status, json_body(response).await?))
+    }
+
+    /// `authed_request` as `principal`.
+    fn request_as<T: Serialize>(
+        method: Method,
+        uri: &str,
+        body: Option<&T>,
+        principal: &str,
+    ) -> Result<Request<Body>, Box<dyn std::error::Error>> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, "Bearer secret")
+            .header("x-multidb-principal", principal);
+        let body = if let Some(body) = body {
+            builder = builder.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(body)?)
+        } else {
+            Body::empty()
+        };
+        Ok(builder.body(body)?)
     }
 
     #[tokio::test]

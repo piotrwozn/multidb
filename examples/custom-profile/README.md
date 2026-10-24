@@ -5,9 +5,11 @@ the `high_durability` variant of `secure_app` (two-phase commit) and overrides
 compression, cache, query and history knobs, raises the audit and backup
 floors and adds the `time_series` role.
 
-In this build the example is for validation and explain only. The CLI,
-`serve` and the Control Plane do not create databases from a spec, so nothing
-here changes a running database.
+The example is for validation and explain: its `orders` collection has a
+`document` index without `physical.document_indexes`, so a provisioning plan
+for it (`multidb config plan --spec .\multidb.yaml --db .\orders.redb`) is
+blocked with `PHYSICAL_PARAMETER_REQUIRED`. `examples/provisioning` is a spec
+that provisioning builds end to end.
 
 ## Validate And Explain
 

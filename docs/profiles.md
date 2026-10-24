@@ -11,15 +11,21 @@ API in `multidb::config_spec` (`resolve_profile`, `resolve_named_profile`,
 is a version 2 field. `multidb config validate`, `config explain`,
 `config plan` and the Control Plane `/config/validate` and `/config/plan`
 resolve the profile of every spec, report its issues and explain every knob.
-Only the Rust API builds a database from a resolved profile:
+The Rust API builds a database from a resolved profile:
 `db::create_database_with_profile` persists the knobs in
 `__meta.profile_manifest`, and every single-node opener, `serve` included,
 re-applies them (see [Persistence and format](#persistence-and-format)).
-Nothing in the CLI, `serve` or the Control Plane creates a database from a
-spec. The CLI inspects profiles and specs (`multidb profile show`, `profile
-explain`, `profile knobs`), writes version 2 specs (`init --override`,
-`config upgrade`) and reads a database's own profile with `--profile auto`
-(see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and
+Spec provisioning (`provision::provision_new_database` and
+`provision::apply_provision`, see [provisioning.md](provisioning.md)) creates
+databases this way and writes the manifest of an adopted, retuned or
+format-upgraded database. The CLI provisions through it (`config apply
+--spec`, `init --apply`, see [provisioning.md](provisioning.md#cli)), and so
+does `serve` in spec mode (`MULTIDB_SPEC_PATH`, see
+[provisioning.md](provisioning.md#serve)); the Control Plane does not create
+databases from specs yet. The CLI inspects profiles and specs
+(`multidb profile show`, `profile explain`, `profile knobs`), writes version 2
+specs (`init --override`, `config upgrade`) and reads a database's own profile
+with `--profile auto` (see [CLI](#cli)). `GET /profiles` lists the variants and preset knobs, and
 the Studio custom-profile builder writes version 2 `custom_profile` specs for
 validation and dry-run plans (see
 [Control Plane and Studio](#control-plane-and-studio)). Existing version 1
@@ -137,10 +143,10 @@ profile.
 | `query.parser_recursion_limit` | 16..=1024 | every open | SQL parser limits; DataFusion parses the SELECTs it plans again, with its own fixed limit of 50 | enforced | retune |
 | `limits.max_value_bytes` | unlimited \| 1 KiB..=64 MiB | every open | `LimitPolicy.max_value_bytes` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
 | `limits.max_batch_ops` | unlimited \| 1..=1000000 | every open | `LimitPolicy.max_batch_ops` (the write pipeline does not check it yet) | planned (write pipeline limit check): only `unlimited` is accepted | provisioning |
-| `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | declarative: recorded only until provisioning exists | provisioning |
-| `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables | declarative: recorded only until provisioning exists | provisioning |
-| `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
-| `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | declarative: recorded only until provisioning exists | provisioning |
+| `history.system_versioning` | off \| typed_tables | provisioning | `enable_system_versioning` on typed tables that provisioning creates | enforced: applied by provisioning to the objects it creates | provisioning |
+| `history.keep_history` | true \| false | provisioning | `TemporalRetention.keep_history` of provisioned typed tables; a table that keeps history holds the history GC watermark at the LSN its history starts, so GC prunes nothing newer for any table while it exists | enforced: applied by provisioning to the objects it creates | provisioning |
+| `time_series.default_chunk_millis` | 1000..=2678400000 | provisioning | `TimeSeriesConfig.chunk_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
+| `time_series.default_retention_millis` | null \| 1..=9223372036854775807, at least one chunk | provisioning | `TimeSeriesConfig.retention_millis` default of provisioned series | enforced: applied by provisioning to the objects it creates | provisioning |
 | `consistency.default_domain` | local_snapshot \| strong_cp \| eventual_ap | generation default | `multidb init --guided --override` (domain mode and replication of the spec it writes); guided init without `--override` and templates use the product's domain | declarative | not applicable |
 | `floors.audit` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.audit.enabled`); at runtime `create_database_with_profile` refuses audit off (`ProfileFloorNotMet`), `set_audit_enabled_as` keeps audit on, and restore refuses a backup with audit off unless `RestoreConfig.allow_unmet_profile_floors` (`restore --allow-unmet-floors`) | enforced | not applicable |
 | `floors.backup` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR`, or `PRODUCTION_BACKUP_DISABLED` for production_cp (`guarantees.backup.enabled`) | enforced | not applicable |
@@ -290,6 +296,15 @@ other leaves as `variant` or `preset`.
 - **`compatible_roles`** adds and removes collection roles; collections with
   other roles get `ROLE_OUTSIDE_PROFILE_CERTIFICATION`, as for built-ins.
 
+Version 2 also carries the optional provisioning fields:
+`collections[].physical` (how each collection is built: kind, fields, indexes,
+columns, vector dimension, chunk width), the `geo` index kind, `security`
+(managed roles and principals) and `provisioning` (what a plan does with
+undeclared objects).
+Their defaults come from the profile knobs, for example
+`time_series.default_chunk_millis` and `history.system_versioning`; see
+[provisioning.md](provisioning.md) for the fields and their validation codes.
+
 ### Version 1 and version 2 severities
 
 New checks never make a version 1 document that decoded before invalid:
@@ -322,7 +337,7 @@ codes are in the table above.
 | `SPEC_TOO_COMPLEX` | Error | YAML anchors and aliases expand beyond the node or scalar-byte budget |
 | `MISSING_VERSION` | Error | no integer `version` at the root of a mapping |
 | `UNSUPPORTED_VERSION` | Error | `version` is not 1 or 2 |
-| `FIELD_REQUIRES_SPEC_V2` | Error | a version 2 field (`custom_profile`) in a version 1 document |
+| `FIELD_REQUIRES_SPEC_V2` | Error | a version 2 field (`custom_profile`, `security`, `provisioning`, `collections[].physical` or a `geo` index kind) in a version 1 document, at its path |
 | `PROFILE_UNKNOWN` | Error (version 2) | `profile` is no built-in slug or alias and there is no `custom_profile` |
 | `PROFILE_NOT_PROVISIONABLE` | Advice (version 1) | the same, in a version 1 document; follows `CUSTOM_PROFILE` |
 | `GUARANTEE_BELOW_PROFILE_FLOOR` | Error | a resolved floor is not met by its guarantee |
@@ -380,9 +395,11 @@ Syntax errors and decode errors keep exit code 1 and HTTP 400
   spec cannot set: MVCC and commit-log retention, cache TTL and eviction,
   backup schedules, runtime write acknowledgement and conflict knobs, and a
   per-collection consistency domain. Every-open knobs are applied only to
-  databases created with `db::create_database_with_profile`; explain says so,
-  and that the CLI, `serve` and the Control Plane do not create databases
-  from specs in this build.
+  databases created with `db::create_database_with_profile` or by
+  provisioning, and explain says so; the `history.*` and `time_series.*`
+  knobs are applied by provisioning to the tables and series it creates, and
+  the compression outcome names the provisioning format upgrade
+  (`allow_format_upgrade`).
 - `config plan` reports a `custom_profile` change as an unsupported
   `change_profile` step at `$.custom_profile`, and a change of `version` alone
   as one supported no-op step at `$.version`. Version 1 pairs plan exactly as
@@ -391,9 +408,10 @@ Syntax errors and decode errors keep exit code 1 and HTTP 400
 ### JSON schema
 
 `docs/schemas/database-spec-v2.schema.json` (`database_spec_v2_schema()`) is
-the version 1 schema with `version: 2` and `custom_profile`. Its knob bounds,
-role enum and index enum are generated from `KNOB_REGISTRY` and the Rust
-enums; `auto` and `unlimited` are `oneOf` a constant or an integer range.
+the version 1 schema with `version: 2`, `custom_profile`, `security`,
+`provisioning`, `collections[].physical` and the `geo` index kind. Its knob
+bounds, role enum and index enum are generated from `KNOB_REGISTRY` and the
+Rust enums; `auto` and `unlimited` are `oneOf` a constant or an integer range.
 `docs/schemas/database-spec-v1.schema.json` is unchanged.
 
 ## Persistence and format
@@ -459,8 +477,8 @@ it from the database (see [CLI](#cli)). An explicit
 `multidb serve` then applies `MULTIDB_MAX_CONCURRENT_QUERIES` and
 `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` when they are set: they replace
 `query.max_concurrent_queries` and `query.queue_timeout_ms` for that process
-only (`Database::set_query_governor`), the manifest and every other knob stay,
-and unset they keep the manifest values. PostgreSQL wire and the Control Plane
+only (`Database::override_query_governor`, one knob per set variable), the
+manifest and every other knob stay, and unset they keep the manifest values. PostgreSQL wire and the Control Plane
 share that one database, so statements from either run with the manifest's
 runtime performance, SQL parser limits included.
 Every one of these openers also logs a warning (`tracing::warn!`, naming the
@@ -485,7 +503,11 @@ is pruned. No profile knob sets its retention: `history.system_versioning` and
 `history.keep_history` describe the typed tables provisioning creates, and
 `history.mvcc_retention_millis` is reserved, so GC keeps only what
 `--history-retain-lsns` (`mvcc_retain_lsns`), `AS OF` pins and the temporal
-`keep_history` retentions of existing tables require.
+`keep_history` retentions of existing tables require. A table provisioning
+versions with `keep_history: true` keeps its history from where versioning
+was enabled (a table the apply creates from just after its creation, an
+existing table from the history horizon), so while it exists GC prunes and
+truncates only below that LSN (see [provisioning.md](provisioning.md)).
 
 ### Evolving the manifest
 
@@ -521,8 +543,9 @@ manifests fails CI.
   is framed, fail to decode the metadata. Turning framing off is never
   possible. A manifest database created without compression refuses
   `OperationalConfig.performance.compression` with `StorageFormatMismatch`;
-  enabling compression later is a provisioning format upgrade, which this
-  build does not perform.
+  enabling compression later is the provisioning format upgrade
+  (`allow_format_upgrade`, see [provisioning.md](provisioning.md)), which
+  takes effect at the next open.
 - Downgrades of a manifest database without compression do not fail closed:
   it keeps `schema_version` 1, so an older binary opens it, ignores
   `__meta.profile_manifest` and runs with the storage profile defaults
@@ -719,6 +742,10 @@ converts a spec to version 2:
   file and renaming it into place: the sibling is created exclusively, so a
   planted symlink cannot redirect the write, and the rename replaces a
   symlink at `--out` instead of writing through it;
+- it adds a note for every physical parameter provisioning still needs
+  (`PHYSICAL_PARAMETER_REQUIRED`, Advice in version 2 validation), for
+  example a vector `physical.dim`, so the converted spec says what to add
+  before `config apply --spec`;
 - the result is validated: exit 2 when it is invalid, for example
   `PROFILE_UNKNOWN` for a version 1 profile that is not built in and has no
   `profile.custom.base`, and an invalid result is never written to `--out`,

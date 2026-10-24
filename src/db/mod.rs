@@ -62,7 +62,7 @@ use crate::query::{
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
     SqlEngine, SqlOutput, SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
-    parse_with_limits, schema_put_op,
+    parse_with_limits,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -100,11 +100,12 @@ use crate::vector::{
 
 mod history;
 mod profile_binding;
+mod provisioning;
 mod runtime;
 
 pub(crate) use profile_binding::{
-    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, unmet_profile_floors,
-    validate_manifest,
+    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
+    unmet_profile_floors, validate_manifest,
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
@@ -140,6 +141,30 @@ const KEY_AUTHZ_POLICY: &[u8] = b"policy";
 const KEY_PRINCIPAL_REGISTRY: &[u8] = b"principals";
 const KEY_AUDIT_ENABLED: &[u8] = b"audit_enabled";
 const ADMIN_AUTH_TABLE: &str = "__admin_auth";
+/// The system table of spec provisioning: the provision record (key `record`) and its history
+/// (keys `history/{seq:020}`). Backup and restore carry it like every registered keyspace.
+pub(crate) const PROVISION_TABLE: &str = "__provision";
+/// The characters of a config apply plan id its audit detail keeps; real `plan_` ids have 37.
+const CONFIG_APPLY_DETAIL_PLAN_ID_CHARS: usize = 48;
+
+/// Where the plan a config apply confirms comes from, recorded as `plan_source` in its audit
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigPlanSource {
+    /// The caller sent the plan: `POST /config/apply` with `plan`, or the Rust API.
+    Client,
+    /// The Control Plane recomputed the plan from the `current` and `desired` specs it was sent.
+    Recomputed,
+}
+
+impl ConfigPlanSource {
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Recomputed => "recomputed",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Profile {
@@ -632,10 +657,22 @@ pub struct Database {
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
+    /// The query governor knobs `override_query_governor` set for this handle: their limits are
+    /// the caller's, not the profile's.
+    query_governor_overrides: QueryGovernorOverrides,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
     workload: WorkloadBuffer,
+}
+
+/// The query governor knobs `Database::override_query_governor` set for a handle, one flag per
+/// knob: a set knob is the caller's for the process, and a restart sets it again; an unset one
+/// is the profile's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct QueryGovernorOverrides {
+    pub(crate) max_concurrent_queries: bool,
+    pub(crate) queue_timeout_ms: bool,
 }
 
 pub type DatabaseSelfHealingController =
@@ -1137,6 +1174,9 @@ impl Database {
     /// (SQLSTATE 53200).
     ///
     /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// The limits belong to this handle: they are never written to the database,
+    /// and provisioning plans do not report them as a session pending a restart.
+    /// [`Database::override_query_governor`] sets one limit and keeps the other.
     /// # Errors
     /// Fails when either limit is zero or `max_concurrent_queries` is more than
     /// the governor can count.
@@ -1145,19 +1185,50 @@ impl Database {
         max_concurrent_queries: usize,
         queue_timeout_ms: u64,
     ) -> Result<(), ConfigError> {
-        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+        self.override_query_governor(Some(max_concurrent_queries), Some(queue_timeout_ms))
+    }
+
+    /// Sets the query governor limits that are `Some`, as [`Database::set_query_governor`]
+    /// does, and keeps the others; `None` for both changes nothing. `multidb serve` passes
+    /// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`, each when it is
+    /// set.
+    ///
+    /// A limit set here belongs to this handle: it is never written to the database, and
+    /// provisioning plans do not report it as a session pending a restart. A limit never set
+    /// here stays the profile's: plans compare it with the profile manifest, so a retune of it
+    /// waits for the next open.
+    /// # Errors
+    /// Fails, and changes nothing, when a given limit is zero or `max_concurrent_queries` is
+    /// more than the governor can count.
+    pub fn override_query_governor(
+        &mut self,
+        max_concurrent_queries: Option<usize>,
+        queue_timeout_ms: Option<u64>,
+    ) -> Result<(), ConfigError> {
+        if let Some(max) = max_concurrent_queries
+            && (max == 0 || max > Semaphore::MAX_PERMITS)
+        {
             return Err(ConfigError::Unsupported(format!(
-                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                "query governor max concurrent queries must be 1 to {}, got {max}",
                 Semaphore::MAX_PERMITS
             )));
         }
-        if queue_timeout_ms == 0 {
+        if queue_timeout_ms == Some(0) {
             return Err(ConfigError::Unsupported(
                 "query governor queue timeout must be at least 1 ms".to_owned(),
             ));
         }
-        self.performance.query.max_concurrent_queries = max_concurrent_queries;
-        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        if max_concurrent_queries.is_none() && queue_timeout_ms.is_none() {
+            return Ok(());
+        }
+        if let Some(max) = max_concurrent_queries {
+            self.performance.query.max_concurrent_queries = max;
+            self.query_governor_overrides.max_concurrent_queries = true;
+        }
+        if let Some(timeout) = queue_timeout_ms {
+            self.performance.query.queue_timeout_ms = timeout;
+            self.query_governor_overrides.queue_timeout_ms = true;
+        }
         self.query_permits = query_permits_for(&self.performance);
         Ok(())
     }
@@ -1440,7 +1511,8 @@ impl Database {
     /// Confirms a configuration apply plan after checking system admin permission.
     ///
     /// This is an audited control-plane confirmation only. It never mutates user
-    /// data, catalog state, indexes, extensions, or runtime configuration.
+    /// data, catalog state, indexes, extensions, or runtime configuration. The audit
+    /// event records `plan_source: client`: the caller supplied the plan.
     /// # Errors
     /// Fails when authorization fails, audit is disabled, or the audit write fails.
     pub fn confirm_config_apply_as(
@@ -1448,6 +1520,20 @@ impl Database {
         principal: &Principal,
         plan: &MigrationPlan,
         confirm: &str,
+    ) -> Result<ApplyCheckReport, DbError> {
+        self.confirm_config_apply_with_source_as(principal, plan, confirm, ConfigPlanSource::Client)
+    }
+
+    /// [`Database::confirm_config_apply_as`], recording where the plan comes from: a plan the
+    /// client sent, or one the Control Plane recomputed from `current` and `desired` specs.
+    /// # Errors
+    /// Fails when authorization fails, audit is disabled, or the audit write fails.
+    pub(crate) fn confirm_config_apply_with_source_as(
+        &self,
+        principal: &Principal,
+        plan: &MigrationPlan,
+        confirm: &str,
+        source: ConfigPlanSource,
     ) -> Result<ApplyCheckReport, DbError> {
         self.authorize_or_audit(
             principal,
@@ -1467,9 +1553,19 @@ impl Database {
         } else {
             AuditOutcome::Failed
         };
+        // A client plan id is not checked, so only its start is recorded: the detail is cut at
+        // 160 characters, and `plan_source` must survive a forged, overlong id.
+        let plan_id = report
+            .plan_id
+            .chars()
+            .take(CONFIG_APPLY_DETAIL_PLAN_ID_CHARS)
+            .collect::<String>();
         let detail = format!(
-            "plan_id: {}; status: {:?}; confirmation_matched: {}; data_mutated: false",
-            report.plan_id, report.status, report.confirmation_matched
+            "plan_id: {plan_id}; status: {:?}; confirmation_matched: {}; data_mutated: false; \
+             plan_source: {}",
+            report.status,
+            report.confirmation_matched,
+            source.slug()
         );
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -1553,6 +1649,17 @@ impl Database {
             Permission::Admin,
             "set_audit_enabled",
         )?;
+        self.change_audit_enabled(principal, enabled)
+    }
+
+    /// The body of [`Database::set_audit_enabled_as`] after authorization, shared with
+    /// provisioning's local operators: the `floors.audit` refusal, the disable event before the
+    /// flag and the enable event after it.
+    fn change_audit_enabled(
+        &mut self,
+        principal: &Principal,
+        enabled: bool,
+    ) -> Result<(), DbError> {
         if !enabled {
             // Only single-node openers accept a profile manifest: CP, AP and sharded openers
             // refuse one (`refuse_profile_manifest`), and an AP database keeps `__meta` outside
@@ -1873,32 +1980,8 @@ impl Database {
         schema: Option<TableSchema>,
         indexes: Vec<RelIndexSpec>,
     ) -> Result<RelTable, DbError> {
-        let name = name.into();
-        self.ensure_name_available(&name)?;
         let layout = self.layout();
-        let table = RelTable::handle_with_layout(
-            self.replication_handle(),
-            name.clone(),
-            schema,
-            indexes,
-            layout,
-        )?;
-
-        let mut ops = Vec::new();
-        if let Some(schema) = table.schema() {
-            ops.push(schema_put_op(table.name(), schema)?);
-        }
-
-        let entry = CatalogEntry::Table {
-            indexes: table.indexes().to_vec(),
-            layout,
-        };
-        ops.push(catalog_put_op(&name, &entry)?);
-        propose_system_batch(&self.repl, ops)?;
-        self.catalog.insert(name, entry);
-        self.invalidate_plan_cache();
-
-        Ok(table)
+        self.create_table_with_layout(name, schema, indexes, layout)
     }
 
     /// Creates a foreign table backed by a local object-store file or remote PG-compatible source.
@@ -4121,6 +4204,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4153,6 +4237,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4185,6 +4270,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4216,6 +4302,7 @@ impl Database {
             performance,
             performance_cache,
             query_permits,
+            query_governor_overrides: QueryGovernorOverrides::default(),
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -8502,17 +8589,25 @@ fn next_graph_id_op(next: u32) -> Result<Op, DbError> {
 }
 
 fn validate_catalog_name(name: &str) -> Result<(), DbError> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
+    if name.is_empty() {
         return Err(DbError::InvalidCatalogName("empty name".to_owned()));
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(DbError::InvalidCatalogName(name.to_owned()));
     }
-    if name.len() > 128 || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+    if !is_valid_catalog_name(name) {
         return Err(DbError::InvalidCatalogName(name.to_owned()));
     }
     Ok(())
+}
+
+/// The catalog naming rule every `create_*` call enforces: an ASCII letter or `_`, then ASCII
+/// letters, digits or `_`, at most 128 bytes. Spec validation applies the same rule.
+pub(crate) fn is_valid_catalog_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && name.len() <= 128
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn kind_mismatch(name: &str, expected: &'static str, entry: &CatalogEntry) -> DbError {

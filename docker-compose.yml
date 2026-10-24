@@ -14,11 +14,18 @@ services:
       MULTIDB_DB_PATH: /var/lib/multidb/multidb.redb
       MULTIDB_BIND: 0.0.0.0:8080
       MULTIDB_PG_BIND: 0.0.0.0:5432
+      # Spec mode (preview, docs/docker.md#spec-mode): build the database from a mounted
+      # spec and check it at every start. Set MULTIDB_PROFILE above to "" (removing it
+      # falls back to the image default, transactional) or make it agree with the spec
+      # profile, and mount the spec under volumes below.
+      # MULTIDB_SPEC_PATH: /etc/multidb/multidb.yaml
+      # MULTIDB_SPEC_APPLY: create
     ports:
       - "5432:5432"
       - "8080:8080"
     volumes:
       - multidb-data:/var/lib/multidb
+      # - ./multidb.yaml:/etc/multidb/multidb.yaml:ro
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
       interval: 10s
