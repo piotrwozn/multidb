@@ -24,13 +24,11 @@ use tokio::sync::Semaphore;
 use crate::autoscale::ResourcePolicy;
 use crate::cdc::{
     self, ChangeEvent, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedPage, FeedError,
-    HookError, HookSpec, HookedReplication, LogicalTarget, MaterializedViewError,
-    MaterializedViewRows, MaterializedViewSpec, ResumeToken, SubscriptionConfig, SubscriptionError,
-    SubscriptionState,
+    HookError, HookSpec, LogicalTarget, MaterializedViewError, MaterializedViewRows,
+    MaterializedViewSpec, PostCommitFailure, PostCommitStage, ResumeToken, SubscriptionConfig,
+    SubscriptionError, SubscriptionState,
 };
-use crate::cloud::{
-    CloudConfig, QuotaReplication, TenantConfig, TenantId, TenantRuntime, repl_quota_error,
-};
+use crate::cloud::{CloudConfig, TenantConfig, TenantId, TenantRuntime, repl_quota_error};
 use crate::compat::{self, PgCatalogSnapshot};
 use crate::config_spec::{
     ApplyCheckReport, ApplyStatus, DatabaseSpec, MigrationPlan, MigrationPlanner,
@@ -51,20 +49,21 @@ use crate::geo::{GeoError, GeoIndex, GeoIndexConfig, GeoPoint};
 use crate::graph::{Graph, GraphError, GraphId, GraphNodeId, TraversalOptions};
 use crate::keyenc;
 use crate::model::{
-    CollectionId, DOCUMENT_TABLE, DocumentCollection, DocumentId, IndexSpec, ModelError, Predicate,
-    QueryResult, Value, collection_range_bounds, decode_value, encode_value,
+    CollectionId, DOCUMENT_TABLE, DerivedIndexes, DocumentCollection, DocumentId, IndexSpec,
+    ModelError, Predicate, QueryResult, Value, collection_range_bounds, decode_value, encode_value,
 };
 use crate::observability;
 use crate::observability::MetricsConfig;
 use crate::performance::{
-    BenchmarkReport, CompressionAlgorithm, PerformanceCache, PerformanceConfig, RegressionGate,
+    BenchmarkReport, CompressionAlgorithm, PerformanceCache, PerformanceConfig,
+    QueryExecutionConfig, RegressionGate,
 };
 use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
-    REL_COLUMNAR_SEGMENTS_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row, SqlEngine, SqlOutput,
-    SqlReadGuard, SqlReadTarget, SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
-    schema_put_op,
+    REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
+    SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, SqlRows, StatsCatalog, TableLayout,
+    TableSchema, decode_row_bytes, parse_with_limits, schema_put_op,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -83,15 +82,15 @@ use crate::security::{
     AuthzPolicy, FileAuditSink, Permission, Principal, PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{
-    AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, StorageEngine, StorageError,
-    WriteTransaction,
+    AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, ReencryptionReport, StorageEngine,
+    StorageError, WriteTransaction, decode_stored_value, is_framed,
 };
 use crate::temporal::{TemporalError, TemporalPoint, TemporalRetention};
-use crate::text::{FullTextIndex, FullTextIndexConfig, TextError};
+use crate::text::{FullTextIndex, FullTextIndexConfig, TextError, TextSource};
 use crate::timeseries::{TimeSeriesCollection, TimeSeriesConfig, TimeSeriesError, time_bucket};
 use crate::tuning::{
     self, IndexAdviceReport, IndexAdvisor, ReprofileJob, ReprofilePlan, ReprofileStatus,
-    TuningDecision, TuningError, TuningLogEntry, TuningPolicy, TuningSystemView, WorkloadProfiler,
+    TuningDecision, TuningError, TuningLogEntry, TuningPolicy, TuningSystemView, WorkloadBuffer,
     WorkloadReport, WorkloadSample, WorkloadWindow,
 };
 use crate::txn::{self, IsolationLevel, TxnId, TxnOptions, WriteKey, WriteSet};
@@ -100,8 +99,18 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod history;
+mod profile_binding;
 mod runtime;
 
+pub(crate) use profile_binding::{
+    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, unmet_profile_floors,
+    validate_manifest,
+};
+pub use profile_binding::{
+    MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
+    create_database_with_profile, inspect_database_metadata, recover_database_file,
+};
 use runtime::wasm_runtime_for_database;
 
 const META_TABLE: &str = "__meta";
@@ -113,9 +122,20 @@ const KEY_PROFILE_NAME: &str = "profile";
 const KEY_REPLICATION: &[u8] = b"replication";
 const KEY_REPLICATION_NAME: &str = "replication";
 const KEY_LAYOUT: &[u8] = b"layout";
+const KEY_LAYOUT_NAME: &str = "layout";
+const KEY_PROFILE_MANIFEST: &[u8] = b"profile_manifest";
 const KEY_NEXT_COLLECTION_ID: &[u8] = b"next_collection_id";
 const KEY_NEXT_GRAPH_ID: &[u8] = b"next_graph_id";
-const SCHEMA_VERSION: u32 = 1;
+/// `schema_version` of every database whose values are not compression-framed.
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// `schema_version` of a profile-manifest database with value framing. Older binaries refuse it.
+pub(crate) const SCHEMA_VERSION_FRAMED: u32 = 2;
+/// A legacy database (no profile manifest) whose values are compression-framed, read through an
+/// engine that does not frame values.
+const LEGACY_FRAMED_DATABASE: &str =
+    "legacy compression-framed database: open with OperationalConfig.performance.compression";
+/// Every encryption frame starts with this prefix (`MDBE1`, `MDBE2`, `MDBE3`).
+const ENCRYPTED_FRAME_PREFIX: &[u8] = b"MDBE";
 const AUTHZ_TABLE: &str = "__authz_policy";
 const KEY_AUTHZ_POLICY: &[u8] = b"policy";
 const KEY_PRINCIPAL_REGISTRY: &[u8] = b"principals";
@@ -371,6 +391,28 @@ pub enum ConfigError {
     #[error("metadata schema version mismatch: expected {expected}, found {found}")]
     SchemaVersionMismatch { expected: u32, found: u32 },
 
+    #[error(
+        "database metadata already exists; create_database_with_profile only initializes new databases"
+    )]
+    AlreadyInitialized,
+
+    #[error("storage format mismatch: {0}")]
+    StorageFormatMismatch(String),
+
+    #[error("unsupported profile manifest version {found}; this build reads version 1")]
+    UnsupportedProfileManifest { found: u32 },
+
+    #[error("invalid profile manifest: {0}")]
+    ProfileManifestInvalid(String),
+
+    #[error("profile floor {floor} is not met: {reason}")]
+    ProfileFloorNotMet { floor: &'static str, reason: String },
+
+    #[error(
+        "database metadata key {key} is unreadable ({reason}); metadata is encrypted or corrupt; supply OperationalConfig.encryption"
+    )]
+    MetadataUnreadable { key: &'static str, reason: String },
+
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
 
@@ -594,14 +636,16 @@ pub struct Database {
     audit_enabled: bool,
     audit_config: AuditConfig,
     audit_lock: Arc<Mutex<()>>,
+    history_pins: Arc<Mutex<txn::ActiveSnapshotRegistry>>,
     encryption: Option<EncryptionConfig>,
     plan_cache: Arc<Mutex<PlanCache>>,
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
     tenant: Option<TenantRuntime>,
-    wasm_runtime: WasmRuntime,
+    wasm_runtime: Arc<WasmRuntime>,
     vector_indexes: Arc<Mutex<BTreeMap<CollectionId, SharedVectorIndex>>>,
+    workload: WorkloadBuffer,
 }
 
 pub type DatabaseSelfHealingController =
@@ -610,6 +654,8 @@ pub type DatabaseSelfHealingController =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShardBackendConfig {
     Local(DbConfig),
+    /// Fails closed like [`create_cluster_database`] until the embedded API is
+    /// wired to the live `OpenRaft` runtime.
     Cp {
         config: DbConfig,
         cluster: CpClusterConfig,
@@ -1065,9 +1111,65 @@ impl Database {
         self.repl.storage()
     }
 
+    /// Proposes a crate-internal conditional maintenance batch.
+    ///
+    /// This is the conditional counterpart of the system batch path: it runs no
+    /// user WASM triggers, CDC hooks, or tenant quota accounting. Conditions and
+    /// ops must still target public keyspaces.
+    pub(crate) fn propose_maintenance_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+    ) -> Result<(), ReplError> {
+        self.repl.propose_conditional_batch(batch)
+    }
+
+    pub(crate) const fn uses_ap_replication(&self) -> bool {
+        self.repl.is_ap()
+    }
+
+    fn ensure_commit_log_available(&self, feature: &str) -> Result<(), ConfigError> {
+        if self.repl.is_ap() {
+            return Err(ConfigError::Unsupported(format!(
+                "AP replication does not support {feature}: AP writes are not recorded in the commit log"
+            )));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn performance_config(&self) -> &PerformanceConfig {
         &self.performance
+    }
+
+    /// Sets the query governor: at most `max_concurrent_queries` statements run
+    /// at once, and a statement that finds no free slot waits up to
+    /// `queue_timeout_ms` before it fails with [`QueryError::Busy`]
+    /// (SQLSTATE 53200).
+    ///
+    /// It takes `&mut self`, so no statement holds a slot while the limits change.
+    /// # Errors
+    /// Fails when either limit is zero or `max_concurrent_queries` is more than
+    /// the governor can count.
+    pub fn set_query_governor(
+        &mut self,
+        max_concurrent_queries: usize,
+        queue_timeout_ms: u64,
+    ) -> Result<(), ConfigError> {
+        if max_concurrent_queries == 0 || max_concurrent_queries > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::Unsupported(format!(
+                "query governor max concurrent queries must be 1 to {}, got {max_concurrent_queries}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if queue_timeout_ms == 0 {
+            return Err(ConfigError::Unsupported(
+                "query governor queue timeout must be at least 1 ms".to_owned(),
+            ));
+        }
+        self.performance.query.max_concurrent_queries = max_concurrent_queries;
+        self.performance.query.queue_timeout_ms = queue_timeout_ms;
+        self.query_permits = query_permits_for(&self.performance);
+        Ok(())
     }
 
     #[must_use]
@@ -1076,6 +1178,9 @@ impl Database {
     }
 
     /// Rotates the current data encryption key for an envelope-encrypted database.
+    ///
+    /// New writes use the new key; existing values keep their old key until
+    /// [`Self::reencrypt_existing_values`] rewrites them.
     /// # Errors
     /// Fails when the database is not encrypted or the key provider cannot rotate.
     pub fn rotate_dek(&self) -> Result<u64, DbError> {
@@ -1090,8 +1195,15 @@ impl Database {
     }
 
     /// Destroys one data encryption key version for crypto-shredding.
+    ///
+    /// Refuses the current key, the last live key, and any key that still
+    /// protects stored values: call [`Self::rotate_dek`], then
+    /// [`Self::reencrypt_existing_values`] until it reports nothing left to
+    /// rewrite, then destroy the old key. Backups and other residual copies
+    /// encrypted under a destroyed key become permanently unreadable.
     /// # Errors
-    /// Fails when the database is not encrypted or the key id is unknown.
+    /// Fails when the database is not encrypted, the key id is unknown, or the
+    /// key is current, last, or still in use.
     pub fn destroy_dek(&self, key_id: u64) -> Result<(), DbError> {
         Ok(self
             .local_storage()
@@ -1101,6 +1213,29 @@ impl Database {
                 )
             })?
             .destroy_dek(key_id)?)
+    }
+
+    /// Re-encrypts every stored value under the current data encryption key.
+    ///
+    /// Runs in committed batches of at most `batch_size` values and is safe to
+    /// rerun; rerun it until `reencrypted_values` is zero before destroying old
+    /// keys. Each batch holds the storage writer and the call is synchronous, so
+    /// async callers should use `spawn_blocking`.
+    /// # Errors
+    /// Fails when the database is not encrypted, `batch_size` is zero, or a
+    /// batch cannot be read, decrypted, or committed.
+    pub fn reencrypt_existing_values(
+        &self,
+        batch_size: usize,
+    ) -> Result<ReencryptionReport, DbError> {
+        Ok(self
+            .local_storage()
+            .ok_or_else(|| {
+                ConfigError::Unsupported(
+                    "replication backend has no local encrypted storage".to_owned(),
+                )
+            })?
+            .reencrypt_existing_values(batch_size)?)
     }
 
     /// Lists live data encryption key versions.
@@ -1237,6 +1372,40 @@ impl Database {
         self.principals = registry;
     }
 
+    /// Reports whether `ensure_bootstrap_admin_principal` would leave the
+    /// security state unchanged, so that callers can skip it and the exclusive
+    /// access it needs.
+    #[must_use]
+    pub(crate) fn has_bootstrap_admin_principal(&self) -> bool {
+        let (role, principal) = self.bootstrap_admin_updates();
+        role.is_none() && principal.is_none()
+    }
+
+    /// The bootstrap admin role and principal merged into the loaded security
+    /// state, keeping grants and roles they already hold. Each is `None` when
+    /// the merge would not change it.
+    fn bootstrap_admin_updates(&self) -> (Option<Role>, Option<Principal>) {
+        let (bootstrap_role, bootstrap_principal) = bootstrap_admin_identity();
+        let current_role = self.authz.roles().get(bootstrap_role.name());
+        let mut role = current_role
+            .cloned()
+            .unwrap_or_else(|| Role::new(bootstrap_role.name()));
+        for (resource, permissions) in bootstrap_role.grants() {
+            for permission in permissions {
+                role = role.grant(resource.clone(), *permission);
+            }
+        }
+        let current_principal = self.principals.principals().get(bootstrap_principal.name());
+        let principal = current_principal
+            .cloned()
+            .unwrap_or_else(|| Principal::new(bootstrap_principal.name()))
+            .with_role(bootstrap_role.name());
+        (
+            (current_role != Some(&role)).then_some(role),
+            (current_principal != Some(&principal)).then_some(principal),
+        )
+    }
+
     /// Ensures the bootstrap admin identity can use password-backed sessions.
     ///
     /// Merges the bootstrap admin role and principal into the loaded security
@@ -1245,30 +1414,16 @@ impl Database {
     /// # Errors
     /// Fails when the updated security metadata cannot be persisted.
     pub fn ensure_bootstrap_admin_principal(&mut self) -> Result<(), DbError> {
-        let current_role = self.authz.roles().get("admin");
-        let admin_role = current_role
-            .cloned()
-            .unwrap_or_else(|| Role::new("admin"))
-            .grant(Resource::System, Permission::Admin)
-            .grant(Resource::Database, Permission::Read)
-            .grant(Resource::Database, Permission::Write)
-            .grant(Resource::Database, Permission::Admin);
-        let role_changed = current_role != Some(&admin_role);
-        let current_principal = self.principals.principals().get("admin");
-        let admin_principal = current_principal
-            .cloned()
-            .unwrap_or_else(|| Principal::new("admin"))
-            .with_role("admin");
-        let principal_changed = current_principal != Some(&admin_principal);
-        if !role_changed && !principal_changed {
+        let (role, principal) = self.bootstrap_admin_updates();
+        if role.is_none() && principal.is_none() {
             return Ok(());
         }
-
-        if role_changed {
-            self.authz = self.authz.clone().allow(admin_role);
+        if let Some(role) = role {
+            self.authz = self.authz.clone().allow(role);
         }
-        if principal_changed {
-            self.principals.insert("admin", admin_principal);
+        if let Some(principal) = principal {
+            self.principals
+                .insert(principal.name().to_owned(), principal);
         }
         self.persist_security_state()
     }
@@ -1391,9 +1546,12 @@ impl Database {
 
     /// Enables or disables audit recording after checking system admin permission.
     ///
-    /// Disabling audit writes an audit event before the flag is persisted.
+    /// Disabling audit writes an audit event before the flag is persisted. A database whose
+    /// profile manifest sets `floors.audit` keeps audit on: disabling it is refused and audited
+    /// as failed.
     /// # Errors
-    /// Fails when authorization, audit, or metadata persistence fails.
+    /// Fails when authorization, audit, or metadata persistence fails, and with
+    /// `Config(ProfileFloorNotMet)` when disabling audit would break the `floors.audit` floor.
     pub fn set_audit_enabled_as(
         &mut self,
         principal: &Principal,
@@ -1406,6 +1564,32 @@ impl Database {
             "set_audit_enabled",
         )?;
         if !enabled {
+            // Only single-node openers accept a profile manifest: CP, AP and sharded openers
+            // refuse one (`refuse_profile_manifest`), and an AP database keeps `__meta` outside
+            // the tables its replication reads, so `__meta` is read for a single node only.
+            let audit_floor = match &self.repl {
+                DatabaseRepl::SingleNode(repl) => read_metadata_from_repl(repl.as_ref())?
+                    .manifest
+                    .is_some_and(|manifest| manifest.knobs.floors.audit),
+                DatabaseRepl::CpRaft(_) | DatabaseRepl::ApDynamo(_) | DatabaseRepl::Sharded(_) => {
+                    false
+                }
+            };
+            if audit_floor {
+                self.record_audit(&AuditEvent::new(
+                    Some(principal),
+                    "set_audit_enabled",
+                    Resource::System,
+                    AuditOutcome::Failed,
+                    Some("enabled: false; refused by profile floor floors.audit"),
+                ))?;
+                return Err(DbError::Config(ConfigError::ProfileFloorNotMet {
+                    floor: "floors.audit",
+                    reason: "the profile manifest of this database requires audit, so it cannot \
+                             be disabled"
+                        .to_owned(),
+                }));
+            }
             self.record_audit(&AuditEvent::new(
                 Some(principal),
                 "set_audit_enabled",
@@ -1541,12 +1725,12 @@ impl Database {
             None,
         ))?;
 
+        let derived = self.derived_indexes_for(collection_id);
         let repl: &dyn Replication = self;
-        Ok(DocumentCollection::with_indexes(
-            repl,
-            collection_id,
-            returned_indexes,
-        ))
+        Ok(
+            DocumentCollection::with_indexes(repl, collection_id, returned_indexes)
+                .with_derived_indexes(derived),
+        )
     }
 
     /// Creates a vector collection after checking `Admin` on the database.
@@ -1578,8 +1762,12 @@ impl Database {
     }
 
     /// Creates a full-text index after checking `Admin` on the database.
+    ///
+    /// Existing documents are backfilled and later document writes keep the index current
+    /// (see `create_full_text_index`).
     /// # Errors
-    /// Fails when authorization, catalog, or index metadata persistence fails.
+    /// Fails when authorization, catalog validation, the backfill, or index metadata
+    /// persistence fails, including when the source is not a document collection.
     pub fn create_full_text_index_as(
         &mut self,
         principal: &Principal,
@@ -1657,8 +1845,12 @@ impl Database {
     }
 
     /// Creates a geo index after checking `Admin` on the database.
+    ///
+    /// Existing documents are backfilled and later document writes keep the index current
+    /// (see `create_geo_index`).
     /// # Errors
-    /// Fails when authorization, catalog, or index validation fails.
+    /// Fails when authorization, catalog validation, the backfill, or index validation
+    /// fails, including when the source is not a document collection.
     pub fn create_geo_index_as(
         &mut self,
         principal: &Principal,
@@ -1759,18 +1951,29 @@ impl Database {
 
     /// Enables MVCC-backed system versioning for a table and registers its history object.
     /// # Errors
-    /// Fails when the base table is missing, untyped, or the history name collides.
+    /// Fails when the database uses AP replication, the base table is missing, untyped, or the
+    /// history name collides, and with `RetentionExpired` when `retention.min_lsn` is below the
+    /// history GC horizon.
     pub fn enable_system_versioning(
         &mut self,
         table: &str,
         retention: TemporalRetention,
     ) -> Result<String, DbError> {
+        if self.repl.is_ap() {
+            return Err(TemporalError::Unsupported(
+                "AP replication does not support system versioning: AP writes do not record MVCC \
+                 history"
+                    .to_owned(),
+            )
+            .into());
+        }
         let base = self.table(table)?;
         let schema = base.schema().cloned().ok_or_else(|| {
             QueryError::InvalidSchema("temporal tables require schema".to_owned())
         })?;
         let history_name = format!("{table}_history");
         self.ensure_name_available(&history_name)?;
+        self.ensure_retention_above_history_horizon(retention.min_lsn)?;
         let entry = CatalogEntry::TemporalTable {
             base_table: table.to_owned(),
             schema,
@@ -1813,12 +2016,12 @@ impl Database {
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
 
+        let derived = self.derived_indexes_for(collection_id);
         let repl: &dyn Replication = self;
-        Ok(DocumentCollection::with_indexes(
-            repl,
-            collection_id,
-            indexes,
-        ))
+        Ok(
+            DocumentCollection::with_indexes(repl, collection_id, indexes)
+                .with_derived_indexes(derived),
+        )
     }
 
     /// Creates a document collection with the next available collection id.
@@ -1889,28 +2092,38 @@ impl Database {
     }
 
     /// Creates a named full-text index and persists it in the catalog.
+    ///
+    /// Documents already in the source collection are backfilled before the index is
+    /// published. After that, document writes made through `collection` handles,
+    /// transactions and Control Plane document CRUD maintain the index in the same batch.
     /// # Errors
-    /// Fails when the name collides or storage rejects metadata.
+    /// Fails when the name collides, the source is not an existing document collection,
+    /// the backfill fails, or storage rejects metadata.
     pub fn create_full_text_index(
         &mut self,
         config: FullTextIndexConfig,
     ) -> Result<FullTextIndex<'_, dyn Replication + '_>, DbError> {
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
-        {
+        let TextSource::Collection { collection_id, .. } = &config.source;
+        self.ensure_document_collection(*collection_id)?;
+        // Backfill before the catalog entry becomes visible: `&mut self` keeps in-process
+        // writers out until it is published, and every later write through `collection`
+        // handles maintains the index itself.
+        let state = {
             let repl: &dyn Replication = self;
-            FullTextIndex::new(repl, config.clone())?;
-        }
+            FullTextIndex::new(repl, config.clone())?.rebuild_entries()?
+        };
         let entry = CatalogEntry::FullTextIndex {
             config: config.clone(),
         };
-        let mut ops = FullTextIndex::<dyn Replication>::metadata_ops(&config)?;
+        let mut ops = FullTextIndex::<dyn Replication>::metadata_ops_with_state(&config, &state)?;
         ops.push(catalog_put_op(&name, &entry)?);
         propose_system_batch(&self.repl, ops)?;
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
         let repl: &dyn Replication = self;
-        Ok(FullTextIndex::new(repl, config)?)
+        Ok(FullTextIndex::new(repl, config)?.with_commit_log(!self.repl.is_ap()))
     }
 
     /// Creates a named time-series collection and persists it in the catalog.
@@ -1978,28 +2191,38 @@ impl Database {
     }
 
     /// Creates a named geo index and persists it in the catalog.
+    ///
+    /// Documents already in the source collection are backfilled before the index is
+    /// published; documents with an invalid point are skipped and counted. After that,
+    /// document writes made through `collection` handles, transactions and Control Plane
+    /// document CRUD maintain the index in the same batch.
     /// # Errors
-    /// Fails when the name collides or index validation fails.
+    /// Fails when the name collides, the source is not an existing document collection,
+    /// index validation or the backfill fails, or storage rejects metadata.
     pub fn create_geo_index(
         &mut self,
         config: GeoIndexConfig,
     ) -> Result<GeoIndex<'_, dyn Replication + '_>, DbError> {
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
-        {
+        self.ensure_document_collection(config.collection_id)?;
+        // Backfill before the catalog entry becomes visible: `&mut self` keeps in-process
+        // writers out until it is published, and every later write through `collection`
+        // handles maintains the index itself.
+        let state = {
             let repl: &dyn Replication = self;
-            let _ = GeoIndex::new(repl, config.clone())?;
-        }
+            GeoIndex::new(repl, config.clone())?.rebuild_entries()?
+        };
         let entry = CatalogEntry::GeoIndex {
             config: config.clone(),
         };
-        let mut ops = GeoIndex::<dyn Replication>::metadata_ops(&config)?;
+        let mut ops = GeoIndex::<dyn Replication>::metadata_ops_with_state(&config, &state)?;
         ops.push(catalog_put_op(&name, &entry)?);
         propose_system_batch(&self.repl, ops)?;
         self.catalog.insert(name, entry);
         self.invalidate_plan_cache();
         let repl: &dyn Replication = self;
-        Ok(GeoIndex::new(repl, config)?)
+        Ok(GeoIndex::new(repl, config)?.with_commit_log(!self.repl.is_ap()))
     }
 
     /// Opens a named relational table from the catalog.
@@ -2019,6 +2242,9 @@ impl Database {
     }
 
     /// Opens a named document collection from the catalog.
+    ///
+    /// Writes built by the handle also maintain the collection's full-text and geo
+    /// indexes in the same batch.
     /// # Errors
     /// Fails when the name is missing or has the wrong kind.
     pub fn collection(
@@ -2031,12 +2257,12 @@ impl Database {
                 indexes,
                 ..
             }) => {
+                let derived = self.derived_indexes_for(*collection_id);
                 let repl: &dyn Replication = self;
-                Ok(DocumentCollection::with_indexes(
-                    repl,
-                    *collection_id,
-                    indexes.clone(),
-                ))
+                Ok(
+                    DocumentCollection::with_indexes(repl, *collection_id, indexes.clone())
+                        .with_derived_indexes(derived),
+                )
             }
             Some(other) => Err(kind_mismatch(name, "collection", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -2081,7 +2307,7 @@ impl Database {
         match self.catalog.get(name) {
             Some(CatalogEntry::FullTextIndex { config }) => {
                 let repl: &dyn Replication = self;
-                Ok(FullTextIndex::new(repl, config.clone())?)
+                Ok(FullTextIndex::new(repl, config.clone())?.with_commit_log(!self.repl.is_ap()))
             }
             Some(other) => Err(kind_mismatch(name, "full-text index", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -2126,7 +2352,7 @@ impl Database {
         match self.catalog.get(name) {
             Some(CatalogEntry::GeoIndex { config }) => {
                 let repl: &dyn Replication = self;
-                Ok(GeoIndex::new(repl, config.clone())?)
+                Ok(GeoIndex::new(repl, config.clone())?.with_commit_log(!self.repl.is_ap()))
             }
             Some(other) => Err(kind_mismatch(name, "geo index", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -2159,17 +2385,37 @@ impl Database {
     }
 
     /// Records one workload observation from trusted code or tests.
+    ///
+    /// The sample is persisted, together with any buffered SQL observations, in one system
+    /// write before this returns.
     /// # Errors
     /// Fails when workload metadata cannot be persisted.
     pub fn record_workload_sample(&self, sample: &WorkloadSample) -> Result<(), DbError> {
-        Ok(WorkloadProfiler::record(self.replication_ref(), sample)?)
+        self.workload.record(self.replication_ref(), sample)?;
+        self.flush_workload_samples()
     }
 
-    /// Reads the persisted workload profile.
+    /// Persists buffered workload observations in one batched system write.
+    ///
+    /// SQL statements only aggregate workload samples in memory. The buffer is also flushed
+    /// once enough statements, distinct fingerprints or SQL text have accumulated, on the
+    /// first statement after the oldest buffered sample is 10 seconds old, best-effort before
+    /// index or runtime advice, and when a single-node database is dropped. Samples buffered
+    /// since the last flush are lost on crash.
+    /// # Errors
+    /// Fails when workload metadata cannot be read or persisted; the drained samples are
+    /// discarded.
+    pub fn flush_workload_samples(&self) -> Result<(), DbError> {
+        Ok(self.workload.flush(self.replication_ref())?)
+    }
+
+    /// Reads the workload profile, including SQL observations still buffered in memory.
+    ///
+    /// This performs no write.
     /// # Errors
     /// Fails when workload metadata cannot be read.
     pub fn workload_report(&self, window: WorkloadWindow) -> Result<WorkloadReport, DbError> {
-        Ok(WorkloadProfiler::report(self.replication_ref(), window)?)
+        Ok(self.workload.report(self.replication_ref(), window)?)
     }
 
     /// Reads workload profile after checking system read permission.
@@ -2190,9 +2436,12 @@ impl Database {
     }
 
     /// Builds and persists index recommendations from workload observations.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when workload metadata or advice storage fails.
     pub fn index_advice(&self) -> Result<IndexAdviceReport, DbError> {
+        self.flush_workload_samples_before_advice();
         Ok(IndexAdvisor::advise(
             self.replication_ref(),
             &self.catalog_index_map(),
@@ -2224,9 +2473,12 @@ impl Database {
     }
 
     /// Builds Runtime Advisor V2 recommendations from workload, planner feedback and config state.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when advisor metadata or dry-run planning cannot be read.
     pub fn runtime_advice(&self) -> Result<RuntimeAdviceReport, DbError> {
+        self.flush_workload_samples_before_advice();
         let current = DatabaseSpec::from_db_config("current", self.config());
         Ok(RuntimeAdvisor::advise(
             self.replication_ref(),
@@ -2261,9 +2513,12 @@ impl Database {
     }
 
     /// Returns the dry-run migration plan for a runtime advice id.
+    ///
+    /// Buffered SQL observations are flushed first on a best-effort basis.
     /// # Errors
     /// Fails when the advice cannot be generated or the id is unknown.
     pub fn runtime_advice_plan(&self, advice_id: &str) -> Result<MigrationPlan, DbError> {
+        self.flush_workload_samples_before_advice();
         let current = DatabaseSpec::from_db_config("current", self.config());
         Ok(RuntimeAdvisor::plan_by_id(
             self.replication_ref(),
@@ -2589,7 +2844,8 @@ impl Database {
 
     /// Reads committed changes after a resume token.
     /// # Errors
-    /// Fails when the token is invalid or CDC metadata cannot be read.
+    /// Fails when the database uses AP replication, the token is invalid, or CDC metadata cannot
+    /// be read.
     pub fn poll_changefeed(
         &self,
         token: &ResumeToken,
@@ -2597,6 +2853,7 @@ impl Database {
         options: &ChangefeedOptions,
         max: usize,
     ) -> Result<(Vec<ChangeEvent>, ResumeToken), DbError> {
+        self.ensure_commit_log_available("changefeeds")?;
         Ok(cdc::poll_changefeed(
             self.replication_ref(),
             &self.catalog,
@@ -2609,7 +2866,8 @@ impl Database {
 
     /// Reads one page of committed changes after a resume token.
     /// # Errors
-    /// Fails when the token is invalid or CDC metadata cannot be read.
+    /// Fails when the database uses AP replication, the token is invalid, or CDC metadata cannot
+    /// be read.
     pub fn poll_changefeed_page(
         &self,
         token: &ResumeToken,
@@ -2617,6 +2875,7 @@ impl Database {
         options: &ChangefeedOptions,
         max: usize,
     ) -> Result<ChangefeedPage, DbError> {
+        self.ensure_commit_log_available("changefeeds")?;
         Ok(cdc::poll_changefeed_page(
             self.replication_ref(),
             &self.catalog,
@@ -2678,12 +2937,14 @@ impl Database {
 
     /// Creates or replaces a named CDC subscription after checking RBAC.
     /// # Errors
-    /// Fails when authorization or subscription metadata persistence fails.
+    /// Fails when the database uses AP replication, or authorization or subscription metadata
+    /// persistence fails.
     pub fn create_subscription_as(
         &self,
         principal: &Principal,
         config: SubscriptionConfig,
     ) -> Result<SubscriptionState, DbError> {
+        self.ensure_commit_log_available("CDC subscriptions")?;
         Ok(cdc::create_subscription(
             self.replication_ref(),
             &self.authz,
@@ -2694,11 +2955,12 @@ impl Database {
 
     /// Creates or replaces a named CDC subscription from trusted embedded/admin code.
     /// # Errors
-    /// Fails when subscription metadata persistence fails.
+    /// Fails when the database uses AP replication or subscription metadata persistence fails.
     pub fn create_subscription(
         &self,
         config: SubscriptionConfig,
     ) -> Result<SubscriptionState, DbError> {
+        self.ensure_commit_log_available("CDC subscriptions")?;
         Ok(cdc::create_subscription_trusted(
             self.replication_ref(),
             config,
@@ -2752,11 +3014,12 @@ impl Database {
 
     /// Creates a continuous query on top of the durable CDC subscription machinery.
     /// # Errors
-    /// Fails when metadata or subscription persistence fails.
+    /// Fails when the database uses AP replication, or metadata or subscription persistence fails.
     pub fn create_continuous_query(
         &self,
         spec: &ContinuousQuerySpec,
     ) -> Result<ContinuousQueryState, DbError> {
+        self.ensure_commit_log_available("continuous queries")?;
         let state = continuous::create_continuous_query(self.replication_ref(), spec)?;
         cdc::create_subscription_trusted(self.replication_ref(), spec.subscription_config())?;
         Ok(state)
@@ -2919,8 +3182,12 @@ impl Database {
 
     /// Registers a CDC hook.
     /// # Errors
-    /// Fails when hook metadata cannot be written.
+    /// Fails when an after-commit hook is registered on an AP database or hook metadata cannot
+    /// be written.
     pub fn register_hook(&self, hook: &HookSpec) -> Result<(), DbError> {
+        if hook.kind == cdc::HookKind::AfterCommit {
+            self.ensure_commit_log_available("after-commit hooks")?;
+        }
         Ok(cdc::register_hook(self.replication_ref(), hook)?)
     }
 
@@ -2929,6 +3196,17 @@ impl Database {
     /// Fails when hook metadata cannot be deleted.
     pub fn unregister_hook(&self, name: &str) -> Result<(), DbError> {
         Ok(cdc::unregister_hook(self.replication_ref(), name)?)
+    }
+
+    /// Lists after-commit hook and after-trigger failures, oldest first.
+    ///
+    /// A write whose backend commit succeeded is never reported as failed. When an
+    /// after-commit hook or an after trigger fails afterwards, the failure is logged,
+    /// counted in `multidb_post_commit_failures_total`, and recorded here instead.
+    /// # Errors
+    /// Fails when the failure records cannot be read or decoded.
+    pub fn post_commit_failures(&self) -> Result<Vec<PostCommitFailure>, DbError> {
+        Ok(cdc::read_post_commit_failures(self.replication_ref())?)
     }
 
     #[must_use]
@@ -3002,14 +3280,30 @@ impl Database {
     }
 
     /// Registers a WASM trigger from trusted embedded/admin code.
+    ///
+    /// Triggers run for every user write to the target: `Database` writes, table
+    /// handles, SQL `INSERT`, transactions and stored procedures. A before trigger
+    /// returns `accept`, `reject` or `replace`. A `replace` value must be a row that
+    /// matches the table schema and keeps the primary key, and the row's
+    /// secondary-index entries are rebuilt. After triggers must return `accept`;
+    /// anything else is recorded as a post-commit failure and does not fail the
+    /// committed write. Triggers are supported on row-layout tables only.
     /// # Errors
-    /// Fails when the table is missing, WASM validation fails, or metadata cannot be written.
+    /// Fails when the table is missing or columnar, WASM validation fails, or
+    /// metadata cannot be written.
     pub fn register_wasm_trigger(
         &self,
         mut spec: TriggerSpec,
         wasm: &[u8],
     ) -> Result<TriggerSpec, DbError> {
-        let _ = self.table(&spec.table)?;
+        // A columnar write replaces a whole segment, so row events cannot be told
+        // apart; refuse triggers there instead of firing them with the wrong event.
+        if self.table(&spec.table)?.layout() == TableLayout::Columnar {
+            return Err(DbError::Query(QueryError::Unsupported(format!(
+                "WASM triggers on columnar table {}",
+                spec.table
+            ))));
+        }
         let module =
             extension::register_wasm_module(self.replication_ref(), &self.wasm_runtime, wasm)?;
         spec.module_hash = module.hash;
@@ -3096,7 +3390,9 @@ impl Database {
         udf.budget = spec.budget.clone();
         let value = self.wasm_runtime.call_udf(&udf, &wasm, args)?;
         let commands = continuous::procedure_commands_from_value(value)?;
-        apply_procedure_commands(self.replication_ref(), commands)
+        // Procedure writes are user writes: route them through the write pipeline.
+        let repl: &dyn Replication = self;
+        apply_procedure_commands(repl, commands)
     }
 
     /// Calls a registered WASM procedure after checking database write permission.
@@ -3228,9 +3524,12 @@ impl Database {
                 .map(|_| SqlOutput::AffectedRows(1));
             return self.finish_query(sql, started, result);
         }
-        if let Some(output) =
-            compat::execute_compat_sql(sql, &self.config, &self.compat_catalog_snapshot())?
-        {
+        if let Some(output) = compat::execute_compat_sql(
+            sql,
+            &self.config,
+            &self.compat_catalog_snapshot(),
+            &self.performance.query,
+        )? {
             return self.finish_query(sql, started, Ok(output));
         }
         if let Some(output) = self.execute_tuning_system_sql(sql)? {
@@ -3283,6 +3582,7 @@ impl Database {
         }
         let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
+        let _history_pin = self.pin_history_lsn(lsn)?;
         let engine = self.sql_engine()?.with_snapshot_lsn(lsn);
         Ok(engine.execute_with_read_guard(sql, guard).await?)
     }
@@ -3315,7 +3615,15 @@ impl Database {
             return Ok(());
         }
         let sample = tuning::output_to_workload_sample(sql, elapsed, output);
-        self.record_workload_sample(&sample)
+        Ok(self.workload.record(self.replication_ref(), &sample)?)
+    }
+
+    fn flush_workload_samples_before_advice(&self) {
+        // Advice falls back to persisted statistics when the flush fails, as it did when
+        // per-statement workload writes failed.
+        if self.flush_workload_samples().is_err() {
+            tracing::debug!("failed to flush workload observations before advice");
+        }
     }
 
     fn execute_tuning_system_sql(&self, sql: &str) -> Result<Option<SqlOutput>, DbError> {
@@ -3438,7 +3746,7 @@ impl Database {
     /// # Errors
     /// Fails when authorization, catalog metadata, or query execution fails.
     pub async fn query_as(&self, principal: &Principal, sql: &str) -> Result<SqlOutput, DbError> {
-        let requirements = sql_requirements(sql, &self.catalog)?;
+        let requirements = sql_requirements(sql, &self.catalog, &self.performance.query)?;
         for (resource, permission) in &requirements {
             self.authorize_or_audit(principal, resource, *permission, "query")?;
         }
@@ -3472,7 +3780,7 @@ impl Database {
         sql: &str,
         point: TemporalPoint,
     ) -> Result<SqlOutput, DbError> {
-        let requirements = sql_requirements(sql, &self.catalog)?;
+        let requirements = sql_requirements(sql, &self.catalog, &self.performance.query)?;
         for (resource, permission) in &requirements {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
@@ -3510,6 +3818,22 @@ impl Database {
         };
         let policy = self.policy_config()?;
         let resources = policy_resources(requirements);
+        // Index search rows do not carry the source document's field names, so the source
+        // collection's row and masking policies cannot be applied to them.
+        let searches_index = requirements.iter().any(|(resource, _)| {
+            matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
+        });
+        if searches_index
+            && resources
+                .iter()
+                .any(|resource| policy_has_row_or_masking(&policy, resource))
+        {
+            return Err(ExtensionError::PolicyDenied(
+                "index searches over collections with row or masking policies are not supported"
+                    .to_owned(),
+            )
+            .into());
+        }
         if resources.len() != 1 {
             if resources
                 .iter()
@@ -3740,7 +4064,10 @@ impl Database {
 
     /// Runs one transactional attempt over relational tables and document collections.
     /// # Errors
-    /// Returns the closure error without writing anything, or a storage error on commit.
+    /// Returns the closure error without writing anything, or a commit error: a
+    /// conflict or storage failure, a before trigger or before-commit hook
+    /// rejection, or an exceeded tenant quota. Nothing is written in any of these
+    /// cases; after-commit failures are recorded instead of returned.
     pub fn transaction<T>(
         &self,
         f: impl FnOnce(&mut MultiModelTxn<'_>) -> Result<T, DbError>,
@@ -3750,7 +4077,10 @@ impl Database {
 
     /// Runs one transactional attempt with explicit isolation options.
     /// # Errors
-    /// Returns the closure error without writing anything, or a storage error on commit.
+    /// Returns the closure error without writing anything, or a commit error: a
+    /// conflict or storage failure, a before trigger or before-commit hook
+    /// rejection, or an exceeded tenant quota. Nothing is written in any of these
+    /// cases; after-commit failures are recorded instead of returned.
     pub fn transaction_with_options<T>(
         &self,
         options: TxnOptions,
@@ -3800,15 +4130,6 @@ impl Database {
         }
     }
 
-    fn new(
-        config: DbConfig,
-        engine: AnyEngine,
-        catalog: BTreeMap<String, CatalogEntry>,
-    ) -> Result<Self, ConfigError> {
-        let performance = PerformanceConfig::for_profile(config.profile);
-        Self::new_with_performance(config, engine, catalog, performance)
-    }
-
     fn new_with_performance(
         config: DbConfig,
         engine: AnyEngine,
@@ -3830,6 +4151,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -3838,6 +4160,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3860,6 +4183,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -3868,6 +4192,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3890,6 +4215,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -3898,6 +4224,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3919,6 +4246,7 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
             performance,
@@ -3927,6 +4255,7 @@ impl Database {
             tenant: None,
             wasm_runtime,
             vector_indexes: Arc::new(Mutex::new(BTreeMap::new())),
+            workload: WorkloadBuffer::default(),
         })
     }
 
@@ -3937,7 +4266,7 @@ impl Database {
         )
         .await
         .map_err(|_| {
-            QueryError::ResourceLimit(format!(
+            QueryError::Busy(format!(
                 "query queue exceeded {} ms",
                 self.performance.query.queue_timeout_ms
             ))
@@ -3945,12 +4274,18 @@ impl Database {
         .map_err(|_| QueryError::ResourceLimit("query governor closed".to_owned()))
     }
 
+    /// Returns the handle given to `RelTable` and `SqlEngine`. Its writes run the
+    /// same write pipeline as `Database` writes (triggers, hooks, tenant quotas).
     fn replication_handle(&self) -> Arc<dyn Replication> {
-        let handle: Arc<dyn Replication> =
-            Arc::new(HookedReplication::new(self.repl.replication_handle()));
-        self.tenant.as_ref().map_or(handle.clone(), |tenant| {
-            Arc::new(QuotaReplication::new(handle, tenant.clone())) as Arc<dyn Replication>
-        })
+        Arc::new(self.write_pipeline())
+    }
+
+    fn write_pipeline(&self) -> WritePipeline {
+        WritePipeline {
+            backend: self.repl.replication_handle(),
+            tenant: self.tenant.clone(),
+            wasm_runtime: Arc::clone(&self.wasm_runtime),
+        }
     }
 
     fn replication_ref(&self) -> &dyn Replication {
@@ -4045,9 +4380,7 @@ impl Database {
     }
 
     fn validate_temporal_retention_for_sql(&self, sql: &str, lsn: TxnId) -> Result<(), DbError> {
-        let dialect = PostgreSqlDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
-            .map_err(|error| QueryError::Parse(error.to_string()))?;
+        let statements = parse_with_limits(sql, &self.performance.query)?;
         let mut names = BTreeSet::new();
         for statement in statements {
             if let Statement::Query(query) = statement {
@@ -4334,6 +4667,52 @@ impl Database {
         Ok(())
     }
 
+    /// Requires `collection_id` to name an existing document collection.
+    fn ensure_document_collection(&self, collection_id: CollectionId) -> Result<(), DbError> {
+        for (name, entry) in &self.catalog {
+            match entry {
+                CatalogEntry::Collection {
+                    collection_id: existing,
+                    ..
+                } if *existing == collection_id => return Ok(()),
+                CatalogEntry::Vector {
+                    collection_id: existing,
+                    ..
+                } if *existing == collection_id => {
+                    return Err(kind_mismatch(name, "collection", entry));
+                }
+                _ => {}
+            }
+        }
+        Err(DbError::MissingCatalogObject(format!(
+            "collection id {}",
+            collection_id.as_u32()
+        )))
+    }
+
+    /// Collects the full-text and geo indexes whose source is `collection_id`.
+    fn derived_indexes_for(&self, collection_id: CollectionId) -> DerivedIndexes {
+        let mut derived = DerivedIndexes::default();
+        for entry in self.catalog.values() {
+            match entry {
+                CatalogEntry::FullTextIndex { config } => {
+                    let TextSource::Collection {
+                        collection_id: source,
+                        ..
+                    } = &config.source;
+                    if *source == collection_id {
+                        derived.full_text.push(config.clone());
+                    }
+                }
+                CatalogEntry::GeoIndex { config } if config.collection_id == collection_id => {
+                    derived.geo.push(config.clone());
+                }
+                _ => {}
+            }
+        }
+        derived
+    }
+
     fn ensure_graph_id_available(&self, graph_id: GraphId) -> Result<(), DbError> {
         if self.catalog.values().any(|entry| {
             matches!(entry, CatalogEntry::Graph { graph_id: existing } if *existing == graph_id)
@@ -4411,11 +4790,6 @@ struct TxnSavepoint {
     write_set: WriteSet,
     read_keys: BTreeSet<WriteKey>,
     read_ranges: Vec<TxnReadRange>,
-}
-
-enum SnapshotLookup {
-    Missing,
-    Found(Option<Bytes>),
 }
 
 impl MultiModelTxn<'_> {
@@ -4553,32 +4927,8 @@ impl MultiModelTxn<'_> {
     }
 
     fn read_snapshot_raw(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
-        if let SnapshotLookup::Found(value) = self.read_mvcc_snapshot_raw(table, key)? {
-            return Ok(value);
-        }
+        // `self.read` is the point-in-time storage snapshot that defined `snapshot_id`.
         Ok(self.read.get(table, key)?)
-    }
-
-    fn read_mvcc_snapshot_raw(&self, table: &str, key: &[u8]) -> Result<SnapshotLookup, DbError> {
-        let prefix = txn::version_key(table, key)?;
-        let end = keyenc::range_end(&prefix);
-        let mut selected = None;
-        let rows = self
-            .read
-            .range(txn::TXN_MVCC_TABLE, &prefix, &end)?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (version_key, value) in rows {
-            if version_key.len() != prefix.len() + 8 || !version_key.starts_with(&prefix) {
-                continue;
-            }
-            let version = txn::decode_txn_id(&version_key[prefix.len()..])?;
-            if version <= self.snapshot_id {
-                selected = Some((version, txn::decode_mvcc_record(&value)?.value));
-            }
-        }
-        Ok(selected.map_or(SnapshotLookup::Missing, |(_, value)| {
-            SnapshotLookup::Found(value)
-        }))
     }
 
     fn record_read_key(&self, table: &str, key: &[u8]) {
@@ -4605,11 +4955,14 @@ impl MultiModelTxn<'_> {
     pub fn get_row(&self, table: &str, primary_key: &Value) -> Result<Option<Row>, DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            return Ok(self.columnar_rows(&table)?.into_iter().find(|row| {
-                table
-                    .primary_key_value_for_row(row)
-                    .is_ok_and(|key| key == *primary_key)
-            }));
+            let segments = self.columnar_segments(&table)?;
+            return Ok(Self::columnar_rows(&table, &segments)?
+                .into_iter()
+                .find(|row| {
+                    table
+                        .primary_key_value_for_row(row)
+                        .is_ok_and(|key| key == *primary_key)
+                }));
         }
 
         let row_key = table.row_key_for_primary_key(primary_key)?;
@@ -4623,7 +4976,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if rows.iter().any(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4633,7 +4987,7 @@ impl MultiModelTxn<'_> {
             }
 
             rows.push(row);
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4653,7 +5007,8 @@ impl MultiModelTxn<'_> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
             let primary_key = table.primary_key_value_for_row(&row)?;
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             if let Some(index) = rows.iter().position(|existing| {
                 table
                     .primary_key_value_for_row(existing)
@@ -4664,7 +5019,7 @@ impl MultiModelTxn<'_> {
                 rows.push(row);
             }
 
-            self.queue_ops(table.columnar_replace_ops(rows)?);
+            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             return Ok(());
         }
 
@@ -4684,7 +5039,8 @@ impl MultiModelTxn<'_> {
     pub fn delete_row(&mut self, table: &str, primary_key: &Value) -> Result<(), DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            let mut rows = self.columnar_rows(&table)?;
+            let segments = self.columnar_segments(&table)?;
+            let mut rows = Self::columnar_rows(&table, &segments)?;
             let before = rows.len();
             rows.retain(|row| {
                 !table
@@ -4693,7 +5049,7 @@ impl MultiModelTxn<'_> {
             });
 
             if rows.len() != before {
-                self.queue_ops(table.columnar_replace_ops(rows)?);
+                self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
             }
 
             return Ok(());
@@ -4764,19 +5120,18 @@ impl MultiModelTxn<'_> {
         Ok(())
     }
 
-    /// Commits the transaction.
+    /// Commits the transaction through the database write pipeline (triggers, hooks,
+    /// tenant quotas). After-commit hook and after-trigger failures are recorded in
+    /// [`Database::post_commit_failures`]; they never fail a committed transaction.
     /// # Errors
-    /// Fails with conflict when a written key changed after this transaction snapshot.
+    /// Fails with conflict when a written key changed after this transaction snapshot,
+    /// when a before trigger or before hook rejects the write, or when the tenant
+    /// storage quota or write concurrency limit is exceeded.
     pub fn commit(self) -> Result<(), DbError> {
         let database = self.database;
         let snapshot_id = self.snapshot_id;
         let isolation = self.options.isolation;
         let write_set = self.write_set;
-        let initial_ops = ops_from_write_set(&write_set);
-        let final_ops = database.apply_before_wasm_triggers(initial_ops)?;
-        let after_triggers = database.after_wasm_trigger_invocations(&final_ops)?;
-        let write_set = txn::ops_to_write_set(final_ops.clone());
-        let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
         let read_keys = self.read_keys.into_inner();
         let read_ranges = self.read_ranges.into_inner();
 
@@ -4792,33 +5147,36 @@ impl MultiModelTxn<'_> {
                     snapshot_id,
                     &read_keys,
                     &read_ranges,
-                    &write_keys,
+                    &BTreeSet::new(),
                 )?;
             }
             return Ok(());
         }
 
-        cdc::validate_write_set_hooks(database.replication_ref(), &write_set)?;
-        let before = txn::current_txn_id(storage)?;
-        if isolation == IsolationLevel::Serializable {
-            database
-                .repl
-                .commit_write_set_with_preflight(snapshot_id, write_set, |write| {
-                    validate_serializable_reads(
-                        write,
+        database
+            .write_pipeline()
+            .execute(ops_from_write_set(&write_set), |final_ops| {
+                let write_set = txn::ops_to_write_set(final_ops);
+                let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
+                if isolation == IsolationLevel::Serializable {
+                    database.repl.commit_write_set_with_preflight(
                         snapshot_id,
-                        &read_keys,
-                        &read_ranges,
-                        &write_keys,
-                    )
-                })?;
-        } else {
-            database.repl.commit_write_set(snapshot_id, write_set)?;
-        }
-        let after = txn::current_txn_id(storage)?;
-        cdc::deliver_after_commit_hooks(database.replication_ref(), before, after)?;
-        database.deliver_after_wasm_triggers(after_triggers)?;
-        Ok(())
+                        write_set,
+                        |write| {
+                            validate_serializable_reads(
+                                write,
+                                snapshot_id,
+                                &read_keys,
+                                &read_ranges,
+                                &write_keys,
+                            )
+                        },
+                    )?;
+                } else {
+                    database.repl.commit_write_set(snapshot_id, write_set)?;
+                }
+                Ok(())
+            })
     }
 
     pub fn rollback(self) {}
@@ -4831,10 +5189,17 @@ impl MultiModelTxn<'_> {
         Ok(decode_row_bytes(&bytes)?)
     }
 
-    fn columnar_rows(&self, table: &RelTable) -> Result<Vec<Row>, DbError> {
-        let key = table.columnar_segment_key();
-        let bytes = self.read_raw(REL_COLUMNAR_SEGMENTS_TABLE, &key)?;
-        Ok(table.decode_columnar_rows(bytes.as_deref())?)
+    fn columnar_segments(&self, table: &RelTable) -> Result<Vec<(Bytes, Bytes)>, DbError> {
+        let (start, end) = table.columnar_segment_bounds();
+        self.range_raw(REL_COLUMNAR_SEGMENTS_TABLE, &start, &end)
+    }
+
+    fn columnar_rows(table: &RelTable, segments: &[(Bytes, Bytes)]) -> Result<Vec<Row>, DbError> {
+        let mut rows = Vec::new();
+        for (_, bytes) in segments {
+            rows.extend(table.decode_columnar_rows(Some(bytes))?);
+        }
+        Ok(rows)
     }
 
     fn queue_ops(&mut self, ops: Vec<Op>) {
@@ -4884,6 +5249,57 @@ fn validate_serializable_reads(
     Ok(())
 }
 
+/// The one write pipeline every user write goes through: `Database` writes,
+/// `MultiModelTxn` commits, stored procedures, and the `RelTable`/`SqlEngine`
+/// handles built from [`Database::replication_handle`].
+///
+/// Stages run in this order:
+/// 1. before triggers, which may reject the write or replace a row;
+/// 2. the after-trigger snapshot (old values are read before the commit);
+/// 3. before-commit hooks;
+/// 4. the tenant write permit and storage reservation;
+/// 5. the backend commit;
+/// 6. tenant settlement;
+/// 7. after-commit hooks and after triggers.
+///
+/// Once the backend commit returns `Ok`, the pipeline never returns `Err`: an
+/// after-commit hook or after trigger failure is logged, counted in
+/// `multidb_post_commit_failures_total` and recorded in
+/// [`cdc::POST_COMMIT_FAILURES_TABLE`]. System writes (`propose_authorized_batch`)
+/// bypass every stage.
+#[derive(Clone)]
+struct WritePipeline {
+    backend: Arc<dyn Replication>,
+    tenant: Option<TenantRuntime>,
+    wasm_runtime: Arc<WasmRuntime>,
+}
+
+/// Maps rejections raised before the commit into the caller's error type.
+trait PipelineError: From<ReplError> {
+    fn trigger(error: DbError) -> Self;
+    fn hook(error: HookError) -> Self;
+}
+
+impl PipelineError for ReplError {
+    fn trigger(error: DbError) -> Self {
+        db_trigger_to_repl(&error)
+    }
+
+    fn hook(error: HookError) -> Self {
+        db_hook_to_repl(error)
+    }
+}
+
+impl PipelineError for DbError {
+    fn trigger(error: DbError) -> Self {
+        error
+    }
+
+    fn hook(error: HookError) -> Self {
+        Self::Hook(error)
+    }
+}
+
 #[derive(Clone)]
 struct WasmTriggerInvocation {
     spec: TriggerSpec,
@@ -4892,28 +5308,188 @@ struct WasmTriggerInvocation {
     old: Option<Bytes>,
 }
 
-impl Database {
-    fn apply_before_wasm_triggers(&self, ops: Vec<Op>) -> Result<Vec<Op>, DbError> {
-        let triggers = self.enabled_wasm_triggers(TriggerTiming::Before)?;
+/// An enabled trigger with the catalog entry of its target, read once per write.
+struct ResolvedTrigger {
+    spec: TriggerSpec,
+    target: Option<CatalogEntry>,
+}
+
+#[derive(Default)]
+struct ResolvedTriggers {
+    before: Vec<ResolvedTrigger>,
+    after: Vec<ResolvedTrigger>,
+}
+
+/// A relational row replaced by a before trigger. Its index entries are rebuilt.
+struct ReplacedRow {
+    trigger: String,
+    table: RelTable,
+    row_key: Bytes,
+    original: Row,
+    replacement: Row,
+}
+
+const AFTER_COMMIT_HOOKS_FAILURE_NAME: &str = "after_commit_hooks";
+
+impl WritePipeline {
+    fn execute<E: PipelineError>(
+        &self,
+        ops: Vec<Op>,
+        commit: impl FnOnce(Vec<Op>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let triggers = self.resolved_triggers(&ops).map_err(E::trigger)?;
+        let ops = self
+            .apply_before_triggers(&triggers.before, ops)
+            .map_err(E::trigger)?;
+        let invocations = self
+            .after_trigger_invocations(&triggers.after, &ops)
+            .map_err(E::trigger)?;
+        cdc::validate_before_hooks(self.backend.as_ref(), &ops).map_err(E::hook)?;
+        let start_lsn = current_lsn_from_repl(self.backend.as_ref())?;
+        let write_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_write().map_err(repl_quota_error))
+            .transpose()?;
+        let reservation = match &self.tenant {
+            Some(tenant) => Some((
+                tenant,
+                tenant.reserve_ops(&ops).map_err(repl_quota_error)?,
+                ops.clone(),
+            )),
+            None => None,
+        };
+        if let Err(error) = commit(ops) {
+            if let Some((tenant, reservation, _)) = &reservation {
+                tenant.release(reservation);
+            }
+            return Err(error);
+        }
+
+        // The write is durable from here on: nothing below may return an error.
+        if let Some((tenant, reservation, committed)) = &reservation {
+            tenant.commit_successful_ops(committed, reservation);
+        }
+        drop(write_permit);
+        self.after_commit(start_lsn, invocations);
+        Ok(())
+    }
+
+    /// Runs after-commit hooks and after triggers. The write is already durable, so
+    /// every failure is recorded and none is returned.
+    fn after_commit(&self, start_lsn: TxnId, invocations: Vec<WasmTriggerInvocation>) {
+        let mut failures = Vec::new();
+        let end_lsn = match current_lsn_from_repl(self.backend.as_ref()) {
+            Ok(end_lsn) => {
+                if let Err(error) =
+                    cdc::deliver_after_commit_hooks(self.backend.as_ref(), start_lsn, end_lsn)
+                {
+                    observability::record_hook_failure(hook_failure_kind(&error));
+                    failures.push(PostCommitFailure::new(
+                        PostCommitStage::AfterHook,
+                        AFTER_COMMIT_HOOKS_FAILURE_NAME,
+                        start_lsn,
+                        end_lsn,
+                        error.to_string(),
+                    ));
+                }
+                end_lsn
+            }
+            Err(error) => {
+                // Only a missed delivery is a failure; record it unless no after-commit
+                // hook is registered. An unreadable hook list counts as a missed delivery.
+                if cdc::has_enabled_after_commit_hooks(self.backend.as_ref()).unwrap_or(true) {
+                    failures.push(PostCommitFailure::new(
+                        PostCommitStage::AfterHook,
+                        AFTER_COMMIT_HOOKS_FAILURE_NAME,
+                        start_lsn,
+                        start_lsn,
+                        format!("cannot read the commit LSN for after-commit hooks: {error}"),
+                    ));
+                }
+                start_lsn
+            }
+        };
+
+        for invocation in invocations {
+            let error = match self.run_wasm_trigger(
+                &invocation.spec,
+                TriggerTiming::After,
+                invocation.event,
+                &invocation.op,
+                invocation.old.as_deref(),
+            ) {
+                Ok(TriggerOutcome::Accept) => continue,
+                Ok(_) => format!("after trigger {} must return accept", invocation.spec.name),
+                Err(error) => error.to_string(),
+            };
+            failures.push(PostCommitFailure::new(
+                PostCommitStage::AfterTrigger,
+                invocation.spec.name,
+                start_lsn,
+                end_lsn,
+                error,
+            ));
+        }
+
+        cdc::record_post_commit_failures(self.backend.as_ref(), &failures);
+    }
+
+    /// Reads the enabled triggers once and resolves each target catalog entry.
+    fn resolved_triggers(&self, ops: &[Op]) -> Result<ResolvedTriggers, DbError> {
+        let mut triggers = ResolvedTriggers::default();
+        if ops.is_empty() {
+            return Ok(triggers);
+        }
+
+        for spec in continuous::read_triggers(self.backend.as_ref())? {
+            if !spec.enabled {
+                continue;
+            }
+            let target = read_catalog_entry_from_repl(self.backend.as_ref(), &spec.table)?;
+            let timing = spec.timing;
+            let resolved = ResolvedTrigger { spec, target };
+            match timing {
+                TriggerTiming::Before => triggers.before.push(resolved),
+                TriggerTiming::After => triggers.after.push(resolved),
+            }
+        }
+        Ok(triggers)
+    }
+
+    fn apply_before_triggers(
+        &self,
+        triggers: &[ResolvedTrigger],
+        ops: Vec<Op>,
+    ) -> Result<Vec<Op>, DbError> {
         if triggers.is_empty() || ops.is_empty() {
             return Ok(ops);
         }
 
         let mut transformed = Vec::with_capacity(ops.len());
+        let mut replaced = Vec::new();
         for op in ops {
+            if !triggers
+                .iter()
+                .any(|trigger| trigger_targets_op(trigger, &op))
+            {
+                transformed.push(op);
+                continue;
+            }
             let mut current = op;
             let old = self.old_value_for_op(&current)?;
-            let Some(event) = Self::event_for_op(&current, old.as_deref()) else {
+            let Some(event) = event_for_op(&current, old.as_deref()) else {
                 transformed.push(current);
                 continue;
             };
 
-            for spec in &triggers {
-                if !self.trigger_matches_op(spec, &current, event) {
+            let mut replacement = None;
+            for trigger in triggers {
+                if !trigger_matches_op(trigger, &current, event) {
                     continue;
                 }
                 match self.run_wasm_trigger(
-                    spec,
+                    &trigger.spec,
                     TriggerTiming::Before,
                     event,
                     &current,
@@ -4923,44 +5499,149 @@ impl Database {
                     TriggerOutcome::Reject(message) => {
                         return Err(ContinuousError::Invalid(format!(
                             "before trigger {} rejected write: {message}",
-                            spec.name
+                            trigger.spec.name
                         ))
                         .into());
                     }
                     TriggerOutcome::Replace(value) => {
-                        current = replace_trigger_op_value(current, &value)?;
+                        let (op, row) =
+                            self.replace_trigger_row(trigger, current, value, replacement.take())?;
+                        current = op;
+                        replacement = Some(row);
                     }
                 }
             }
 
+            replaced.extend(replacement);
             transformed.push(current);
         }
 
-        Ok(transformed)
+        if replaced.is_empty() {
+            return Ok(transformed);
+        }
+        reject_repeated_replaced_rows(&transformed, &replaced)?;
+        rebuild_replaced_row_indexes(transformed, replaced)
     }
 
-    fn after_wasm_trigger_invocations(
+    /// Validates a before-trigger `replace` value and builds the replacement op.
+    ///
+    /// Only rows of row-layout tables can be replaced. The replacement must match
+    /// the table schema and keep the primary key; anything else fails closed.
+    fn replace_trigger_row(
         &self,
+        trigger: &ResolvedTrigger,
+        op: Op,
+        value: Value,
+        previous: Option<ReplacedRow>,
+    ) -> Result<(Op, ReplacedRow), DbError> {
+        let name = &trigger.spec.name;
+        let (storage_table, key, current_value) = match op {
+            Op::Put { table, key, value } => (table, key, value),
+            Op::Delete { .. } => {
+                return Err(ContinuousError::Invalid(
+                    "delete triggers cannot replace a deleted value".to_owned(),
+                )
+                .into());
+            }
+        };
+        if storage_table != REL_ROWS_TABLE {
+            let target = match storage_table.as_str() {
+                REL_COLUMNAR_SEGMENTS_TABLE => "columnar table segments".to_owned(),
+                DOCUMENT_TABLE => "documents".to_owned(),
+                other => format!("writes to {other}"),
+            };
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {name} cannot replace {target}; only rows of row-layout tables can be replaced"
+            ))
+            .into());
+        }
+        let Some(CatalogEntry::Table {
+            indexes,
+            layout: TableLayout::Row,
+        }) = &trigger.target
+        else {
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {name} can only replace rows of row-layout tables"
+            ))
+            .into());
+        };
+        let Value::Array(row) = value else {
+            return Err(ContinuousError::Invalid(
+                "relational trigger replacement must be a row array".to_owned(),
+            )
+            .into());
+        };
+
+        let table = RelTable::open_with_layout(
+            Arc::clone(&self.backend),
+            &trigger.spec.table,
+            indexes.clone(),
+            TableLayout::Row,
+        )?;
+        let row_key = table.row_key_for_row(&row).map_err(|error| {
+            ContinuousError::Invalid(format!(
+                "before trigger {name} replacement is invalid: {error}"
+            ))
+        })?;
+        if row_key != key {
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {name} replacement must keep the primary key"
+            ))
+            .into());
+        }
+        let original = match previous {
+            Some(previous) => previous.original,
+            None => decode_row_bytes(&current_value)?.ok_or_else(|| {
+                QueryError::Storage(StorageError::Corruption(
+                    "trigger row payload is missing".to_owned(),
+                ))
+            })?,
+        };
+
+        let op = Op::Put {
+            table: storage_table,
+            key,
+            value: encode_value(&Value::Array(row.clone()))?,
+        };
+        Ok((
+            op,
+            ReplacedRow {
+                trigger: name.clone(),
+                table,
+                row_key,
+                original,
+                replacement: row,
+            },
+        ))
+    }
+
+    fn after_trigger_invocations(
+        &self,
+        triggers: &[ResolvedTrigger],
         ops: &[Op],
     ) -> Result<Vec<WasmTriggerInvocation>, DbError> {
-        let triggers = self.enabled_wasm_triggers(TriggerTiming::After)?;
         if triggers.is_empty() || ops.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut invocations = Vec::new();
         for op in ops {
+            if !triggers
+                .iter()
+                .any(|trigger| trigger_targets_op(trigger, op))
+            {
+                continue;
+            }
             let old = self.old_value_for_op(op)?;
-            let Some(event) = Self::event_for_op(op, old.as_deref()) else {
+            let Some(event) = event_for_op(op, old.as_deref()) else {
                 continue;
             };
             invocations.extend(
                 triggers
                     .iter()
-                    .filter(|spec| self.trigger_matches_op(spec, op, event))
-                    .cloned()
-                    .map(|spec| WasmTriggerInvocation {
-                        spec,
+                    .filter(|trigger| trigger_matches_op(trigger, op, event))
+                    .map(|trigger| WasmTriggerInvocation {
+                        spec: trigger.spec.clone(),
                         event,
                         op: op.clone(),
                         old: old.clone(),
@@ -4971,67 +5652,9 @@ impl Database {
         Ok(invocations)
     }
 
-    fn deliver_after_wasm_triggers(
-        &self,
-        invocations: Vec<WasmTriggerInvocation>,
-    ) -> Result<(), DbError> {
-        for invocation in invocations {
-            let outcome = self.run_wasm_trigger(
-                &invocation.spec,
-                TriggerTiming::After,
-                invocation.event,
-                &invocation.op,
-                invocation.old.as_deref(),
-            )?;
-            if !matches!(outcome, TriggerOutcome::Accept) {
-                return Err(ContinuousError::Invalid(format!(
-                    "after trigger {} must return accept",
-                    invocation.spec.name
-                ))
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    fn enabled_wasm_triggers(&self, timing: TriggerTiming) -> Result<Vec<TriggerSpec>, DbError> {
-        Ok(continuous::read_triggers(self.replication_ref())?
-            .into_iter()
-            .filter(|spec| spec.enabled && spec.timing == timing)
-            .collect())
-    }
-
     fn old_value_for_op(&self, op: &Op) -> Result<Option<Bytes>, DbError> {
         let (table, key) = op_table_key(op);
-        Ok(self.repl.read(table, key, ReadConsistency::Strong)?)
-    }
-
-    fn event_for_op(op: &Op, old: Option<&[u8]>) -> Option<TriggerEvent> {
-        match op {
-            Op::Put { .. } if old.is_some() => Some(TriggerEvent::Update),
-            Op::Put { .. } => Some(TriggerEvent::Insert),
-            Op::Delete { .. } if old.is_some() => Some(TriggerEvent::Delete),
-            Op::Delete { .. } => None,
-        }
-    }
-
-    fn trigger_matches_op(&self, spec: &TriggerSpec, op: &Op, event: TriggerEvent) -> bool {
-        if spec.event != event {
-            return false;
-        }
-
-        let (storage_table, key) = op_table_key(op);
-        match self.catalog.get(&spec.table) {
-            Some(CatalogEntry::Table { .. }) => {
-                (storage_table == REL_ROWS_TABLE || storage_table == REL_COLUMNAR_SEGMENTS_TABLE)
-                    && key_has_rel_table_prefix(key, &spec.table)
-            }
-            Some(CatalogEntry::Collection { collection_id, .. }) => {
-                storage_table == DOCUMENT_TABLE
-                    && key_in_bounds(key, &collection_range_bounds(*collection_id))
-            }
-            _ => false,
-        }
+        Ok(self.backend.read(table, key, ReadConsistency::Strong)?)
     }
 
     fn run_wasm_trigger(
@@ -5042,7 +5665,7 @@ impl Database {
         op: &Op,
         old: Option<&[u8]>,
     ) -> Result<TriggerOutcome, DbError> {
-        let (_, wasm) = extension::read_wasm_module(self.replication_ref(), &spec.module_hash)?;
+        let (_, wasm) = extension::read_wasm_module(self.backend.as_ref(), &spec.module_hash)?;
         let mut udf = UdfSpec::scalar(&spec.name, &spec.module_hash);
         udf.entry.clone_from(&spec.entry);
         udf.abi = spec.abi;
@@ -5054,6 +5677,186 @@ impl Database {
         )?;
         Ok(continuous::trigger_outcome_from_value(value)?)
     }
+}
+
+impl Replication for WritePipeline {
+    fn propose(&self, op: Op) -> Result<(), ReplError> {
+        self.propose_batch(vec![op])
+    }
+
+    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        self.execute(ops, |ops| self.backend.propose_batch(ops))
+    }
+
+    fn propose_authorized_batch(
+        &self,
+        ops: Vec<Op>,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.backend.propose_authorized_batch(ops, authorization)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        let ConditionalBatch { conditions, ops } = batch;
+        self.execute(ops, |ops| {
+            self.backend
+                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        })
+    }
+
+    fn read(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Option<Bytes>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.read(table, key, consistency)
+    }
+
+    fn range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.range(table, start, end, consistency)
+    }
+
+    fn scan_range_batches(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        batch_rows: usize,
+        cancelled: &dyn Fn() -> bool,
+        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.scan_range_batches(
+            table,
+            start,
+            end,
+            consistency,
+            batch_rows,
+            cancelled,
+            on_batch,
+        )
+    }
+}
+
+fn event_for_op(op: &Op, old: Option<&[u8]>) -> Option<TriggerEvent> {
+    match op {
+        Op::Put { .. } if old.is_some() => Some(TriggerEvent::Update),
+        Op::Put { .. } => Some(TriggerEvent::Insert),
+        Op::Delete { .. } if old.is_some() => Some(TriggerEvent::Delete),
+        Op::Delete { .. } => None,
+    }
+}
+
+/// Whether `op` writes the object a trigger is defined on, for any event.
+fn trigger_targets_op(trigger: &ResolvedTrigger, op: &Op) -> bool {
+    let (storage_table, key) = op_table_key(op);
+    match &trigger.target {
+        Some(CatalogEntry::Table { .. }) => {
+            (storage_table == REL_ROWS_TABLE || storage_table == REL_COLUMNAR_SEGMENTS_TABLE)
+                && key_has_rel_table_prefix(key, &trigger.spec.table)
+        }
+        Some(CatalogEntry::Collection { collection_id, .. }) => {
+            storage_table == DOCUMENT_TABLE
+                && key_in_bounds(key, &collection_range_bounds(*collection_id))
+        }
+        _ => false,
+    }
+}
+
+fn trigger_matches_op(trigger: &ResolvedTrigger, op: &Op, event: TriggerEvent) -> bool {
+    trigger.spec.event == event && trigger_targets_op(trigger, op)
+}
+
+/// Fails closed when a replaced row is written more than once in one batch (for
+/// example `INSERT .. VALUES (1, ..), (1, ..) ON CONFLICT DO UPDATE`): the index
+/// entries of the earlier write could not be rebuilt reliably.
+fn reject_repeated_replaced_rows(ops: &[Op], replaced: &[ReplacedRow]) -> Result<(), DbError> {
+    let mut row_writes = BTreeMap::<&[u8], usize>::new();
+    for op in ops {
+        let (table, key) = op_table_key(op);
+        if table == REL_ROWS_TABLE {
+            *row_writes.entry(key).or_default() += 1;
+        }
+    }
+    for row in replaced {
+        if row_writes
+            .get(row.row_key.as_slice())
+            .copied()
+            .unwrap_or_default()
+            > 1
+        {
+            return Err(ContinuousError::Invalid(format!(
+                "before trigger {} cannot replace a row that the same batch writes more than once",
+                row.trigger
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Rebuilds the secondary-index entries of rows replaced by before triggers.
+///
+/// The writer built index puts for the original row. Those puts become deletes in
+/// place: in a transaction write set such a put may also stand for the delete of
+/// the previous row's entry with the same key. The replacement row's index puts are
+/// appended at the end, so last-write-wins ordering keeps exactly its entries.
+fn rebuild_replaced_row_indexes(
+    ops: Vec<Op>,
+    replaced: Vec<ReplacedRow>,
+) -> Result<Vec<Op>, DbError> {
+    let mut stale = BTreeSet::new();
+    let mut fresh = Vec::new();
+    for row in replaced {
+        stale.extend(
+            row.table
+                .index_delete_ops_for_key(&row.original, &row.row_key)?
+                .into_iter()
+                .map(|op| match op {
+                    Op::Put { key, .. } | Op::Delete { key, .. } => key,
+                }),
+        );
+        fresh.extend(
+            row.table
+                .put_ops_for_key(row.replacement, &row.row_key)?
+                .into_iter()
+                .filter(|op| op_table_key(op).0 == REL_INDEX_TABLE),
+        );
+    }
+
+    let mut ops = ops
+        .into_iter()
+        .map(|op| match op {
+            Op::Put { table, key, .. } if table == REL_INDEX_TABLE && stale.contains(&key) => {
+                Op::Delete { table, key }
+            }
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    ops.extend(fresh);
+    Ok(ops)
 }
 
 fn op_table_key(op: &Op) -> (&str, &[u8]) {
@@ -5080,7 +5883,7 @@ fn ops_from_write_set(write_set: &WriteSet) -> Vec<Op> {
 }
 
 fn db_trigger_to_repl(error: &DbError) -> ReplError {
-    ReplError::Transport(format!("WASM trigger failed: {error}"))
+    ReplError::Rejected(format!("WASM trigger failed: {error}"))
 }
 
 fn key_has_rel_table_prefix(key: &[u8], table: &str) -> bool {
@@ -5146,28 +5949,6 @@ fn trigger_payload_value(storage_table: &str, bytes: &[u8]) -> Result<Value, DbE
     Ok(Value::Bytes(bytes.to_vec()))
 }
 
-fn replace_trigger_op_value(op: Op, value: &Value) -> Result<Op, DbError> {
-    match op {
-        Op::Put { table, key, .. } => {
-            if table == REL_ROWS_TABLE && !matches!(value, Value::Array(_)) {
-                return Err(ContinuousError::Invalid(
-                    "relational trigger replacement must be a row array".to_owned(),
-                )
-                .into());
-            }
-            Ok(Op::Put {
-                table,
-                key,
-                value: encode_value(value)?,
-            })
-        }
-        Op::Delete { .. } => Err(ContinuousError::Invalid(
-            "delete triggers cannot replace a deleted value".to_owned(),
-        )
-        .into()),
-    }
-}
-
 fn trigger_timing_name(timing: TriggerTiming) -> &'static str {
     match timing {
         TriggerTiming::Before => "before",
@@ -5183,46 +5964,27 @@ fn trigger_event_name(event: TriggerEvent) -> &'static str {
     }
 }
 
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Workload statistics are advisory. Cluster backends are skipped so drop never blocks
+        // on Raft or quorum writes, and nothing is written when no sample is buffered.
+        if std::thread::panicking() || !matches!(self.repl, DatabaseRepl::SingleNode(_)) {
+            return;
+        }
+        if self.flush_workload_samples().is_err() {
+            tracing::debug!("failed to flush workload observations on drop");
+        }
+    }
+}
+
 impl Replication for Database {
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
-        let ops = self
-            .apply_before_wasm_triggers(ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        let after_triggers = self
-            .after_wasm_trigger_invocations(&ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        cdc::validate_before_hooks(self.repl.replication_ref(), &ops).map_err(db_hook_to_repl)?;
-        let before = current_lsn_from_repl(self.repl.replication_ref())?;
-        let quota_ops = ops.clone();
-        let _write_permit = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.try_begin_write().map_err(repl_quota_error))
-            .transpose()?;
-        let reservation = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.reserve_ops(&ops).map_err(repl_quota_error))
-            .transpose()?;
-        if let Err(error) = self.repl.propose_batch(ops) {
-            if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-                tenant.release(reservation);
-            }
-            return Err(error);
-        }
-        if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-            tenant.commit_successful_ops(&quota_ops, reservation);
-        }
-        let after = current_lsn_from_repl(self.repl.replication_ref())?;
-        cdc::deliver_after_commit_hooks(self.repl.replication_ref(), before, after)
-            .map_err(db_hook_to_repl)?;
-        self.deliver_after_wasm_triggers(after_triggers)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        Ok(())
+        self.write_pipeline()
+            .execute(ops, |ops| self.repl.propose_batch(ops))
     }
 
     fn propose_authorized_batch(
@@ -5234,42 +5996,11 @@ impl Replication for Database {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let mut batch = batch;
-        batch.ops = self
-            .apply_before_wasm_triggers(batch.ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        let after_triggers = self
-            .after_wasm_trigger_invocations(&batch.ops)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        cdc::validate_before_hooks(self.repl.replication_ref(), &batch.ops)
-            .map_err(db_hook_to_repl)?;
-        let before = current_lsn_from_repl(self.repl.replication_ref())?;
-        let quota_ops = batch.ops.clone();
-        let _write_permit = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.try_begin_write().map_err(repl_quota_error))
-            .transpose()?;
-        let reservation = self
-            .tenant
-            .as_ref()
-            .map(|tenant| tenant.reserve_ops(&batch.ops).map_err(repl_quota_error))
-            .transpose()?;
-        if let Err(error) = self.repl.propose_conditional_batch(batch) {
-            if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-                tenant.release(reservation);
-            }
-            return Err(error);
-        }
-        if let (Some(tenant), Some(reservation)) = (&self.tenant, &reservation) {
-            tenant.commit_successful_ops(&quota_ops, reservation);
-        }
-        let after = current_lsn_from_repl(self.repl.replication_ref())?;
-        cdc::deliver_after_commit_hooks(self.repl.replication_ref(), before, after)
-            .map_err(db_hook_to_repl)?;
-        self.deliver_after_wasm_triggers(after_triggers)
-            .map_err(|error| db_trigger_to_repl(&error))?;
-        Ok(())
+        let ConditionalBatch { conditions, ops } = batch;
+        self.write_pipeline().execute(ops, |ops| {
+            self.repl
+                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        })
     }
 
     fn read(
@@ -5340,15 +6071,31 @@ fn current_lsn_from_repl(repl: &dyn Replication) -> Result<TxnId, ReplError> {
     Ok(txn::decode_txn_id(&bytes)?)
 }
 
+fn hook_failure_kind(error: &HookError) -> &'static str {
+    match error {
+        HookError::Rejected(_) => "rejected",
+        HookError::Timeout(_) => "timeout",
+        HookError::InvalidTarget(_) => "invalid_target",
+        HookError::Repl(_) => "replication",
+        HookError::Serde(_) => "serde",
+    }
+}
+
 fn db_hook_to_repl(error: HookError) -> ReplError {
-    let (kind, message) = match error {
-        HookError::Rejected(message) => ("rejected", format!("hook rejected write: {message}")),
-        HookError::Timeout(message) => ("timeout", format!("hook timed out: {message}")),
-        HookError::Serde(message) => ("serde", message),
-        HookError::Repl(error) => return error,
-    };
-    observability::record_hook_failure(kind);
-    ReplError::Transport(message)
+    if !matches!(error, HookError::Repl(_)) {
+        observability::record_hook_failure(hook_failure_kind(&error));
+    }
+    match error {
+        HookError::Rejected(message) => {
+            ReplError::Rejected(format!("hook rejected write: {message}"))
+        }
+        HookError::Timeout(message) => ReplError::Rejected(format!("hook timed out: {message}")),
+        HookError::InvalidTarget(message) => {
+            ReplError::Rejected(format!("invalid hook target: {message}"))
+        }
+        HookError::Serde(message) => ReplError::Transport(message),
+        HookError::Repl(error) => error,
+    }
 }
 
 /// Creates a database and initializes metadata when it is missing.
@@ -5358,17 +6105,23 @@ fn db_hook_to_repl(error: HookError) -> ReplError {
 pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
 
-    match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+    let read = match read_metadata(&engine) {
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            read
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
+            MetadataRead::written(&config)
         }
         Err(error) => return Err(error),
-    }
+    };
 
+    let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let mut database = Database::new(config, engine, catalog)?;
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.load_persisted_security()?;
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
@@ -5378,11 +6131,13 @@ pub fn create_database(config: DbConfig) -> Result<Database, ConfigError> {
 /// conflicts, or persisted security metadata cannot be read or decoded.
 pub fn open_database(config: DbConfig) -> Result<Database, ConfigError> {
     let engine = engine_for(&config)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    let (engine, performance) = finish_single_node_open(engine, None, &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let mut database = Database::new(config, engine, catalog)?;
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.load_persisted_security()?;
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
@@ -5396,21 +6151,27 @@ pub fn create_database_with_ops(
     validate_operational(&config, &ops)?;
     let engine = engine_for_operational(&config, &ops)?;
 
-    match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+    let read = match read_metadata(&engine) {
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            read
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
+            MetadataRead::written(&config)
         }
         Err(error) => return Err(error),
-    }
+    };
 
+    let (engine, performance) =
+        finish_single_node_open(engine, ops.performance.as_ref(), &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let performance = effective_performance(&config, &ops);
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
     write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(ops.security);
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
@@ -5423,23 +6184,66 @@ pub fn open_database_with_ops(
 ) -> Result<Database, ConfigError> {
     validate_operational(&config, ops)?;
     let engine = engine_for_operational(&config, ops)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    let (engine, performance) =
+        finish_single_node_open(engine, ops.performance.as_ref(), &config, &read)?;
     let catalog = read_catalog(&engine)?;
-    let performance = effective_performance(&config, ops);
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
     let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
+    profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
 
 /// Creates a database backed by a CP/Raft replication backend.
+///
+/// The embedded `Database` API is not wired to the live `OpenRaft` runtime yet,
+/// so this constructor fails closed instead of acknowledging writes without
+/// replication. Use `repl::start_cp_cluster` for replicated CP storage, or
+/// `create_database` for a single node.
+/// # Errors
+/// Fails when config or cluster topology validation fails, and otherwise always
+/// returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
+pub fn create_cluster_database(
+    config: DbConfig,
+    cluster: CpClusterConfig,
+) -> Result<Database, ConfigError> {
+    ensure_cluster_supported(&config, &cluster)?;
+    Err(cluster_database_requires_live_raft())
+}
+
+/// Opens a database backed by a CP/Raft replication backend.
+///
+/// The embedded `Database` API is not wired to the live `OpenRaft` runtime yet,
+/// so this constructor fails closed instead of acknowledging writes without
+/// replication. Use `repl::start_cp_cluster` for replicated CP storage, or
+/// `open_database` for a single node (it also opens data written by earlier
+/// versions of this constructor).
+/// # Errors
+/// Fails when config or cluster topology validation fails, and otherwise always
+/// returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
+pub fn open_cluster_database(
+    config: DbConfig,
+    cluster: CpClusterConfig,
+) -> Result<Database, ConfigError> {
+    ensure_cluster_supported(&config, &cluster)?;
+    Err(cluster_database_requires_live_raft())
+}
+
+/// Creates a database on the in-process simulated CP adapter for in-crate tests.
+///
+/// The adapter has no `OpenRaft` runtime or transport: every node acknowledges
+/// writes locally and reports itself as leader. Never use it for a deployment.
 /// # Errors
 /// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
 /// security metadata cannot be read or decoded.
-pub fn create_cluster_database(
+#[doc(hidden)]
+pub fn create_simulated_cluster_database(
     config: DbConfig,
     cluster: CpClusterConfig,
 ) -> Result<Database, ConfigError> {
@@ -5447,7 +6251,10 @@ pub fn create_cluster_database(
     let engine = engine_for(&config)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5460,18 +6267,23 @@ pub fn create_cluster_database(
     Ok(database)
 }
 
-/// Opens a database backed by a CP/Raft replication backend.
+/// Opens a database on the in-process simulated CP adapter for in-crate tests.
+///
+/// The adapter has no `OpenRaft` runtime or transport: every node acknowledges
+/// writes locally and reports itself as leader. Never use it for a deployment.
 /// # Errors
 /// Fails when config, cluster topology, storage, or metadata validation fails, or persisted
 /// security metadata cannot be read or decoded.
-pub fn open_cluster_database(
+#[doc(hidden)]
+pub fn open_simulated_cluster_database(
     config: DbConfig,
     cluster: CpClusterConfig,
 ) -> Result<Database, ConfigError> {
     ensure_cluster_supported(&config, &cluster)?;
     let engine = engine_for(&config)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_cp(config, engine, catalog, cluster)?;
     database.load_persisted_security()?;
@@ -5479,8 +6291,13 @@ pub fn open_cluster_database(
 }
 
 /// Creates a CP/Raft database with operational settings.
+///
+/// Fails closed like [`create_cluster_database`]: the embedded `Database` API is
+/// not wired to the live `OpenRaft` runtime yet.
 /// # Errors
-/// Fails when config, cluster topology, encryption, storage, or metadata validation fails.
+/// Fails when config, cluster topology or operational validation fails, and
+/// otherwise always returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
 pub fn create_cluster_database_with_ops(
     config: DbConfig,
     cluster: CpClusterConfig,
@@ -5488,28 +6305,17 @@ pub fn create_cluster_database_with_ops(
 ) -> Result<Database, ConfigError> {
     ensure_cluster_supported(&config, &cluster)?;
     validate_operational(&config, &ops)?;
-    let engine = engine_for_operational(&config, &ops)?;
-
-    match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
-        Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
-            write_metadata(&engine, &config)?;
-        }
-        Err(error) => return Err(error),
-    }
-
-    let catalog = read_catalog(&engine)?;
-    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
-    database.encryption.clone_from(&ops.encryption);
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
-    database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
-    Ok(database)
+    Err(cluster_database_requires_live_raft())
 }
 
 /// Opens a CP/Raft database with operational settings.
+///
+/// Fails closed like [`open_cluster_database`]: the embedded `Database` API is
+/// not wired to the live `OpenRaft` runtime yet.
 /// # Errors
-/// Fails when config, cluster topology, encryption, storage, or metadata validation fails.
+/// Fails when config, cluster topology or operational validation fails, and
+/// otherwise always returns `ConfigError::Unsupported`.
+#[allow(clippy::needless_pass_by_value)]
 pub fn open_cluster_database_with_ops(
     config: DbConfig,
     cluster: CpClusterConfig,
@@ -5517,16 +6323,7 @@ pub fn open_cluster_database_with_ops(
 ) -> Result<Database, ConfigError> {
     ensure_cluster_supported(&config, &cluster)?;
     validate_operational(&config, ops)?;
-    let engine = engine_for_operational(&config, ops)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
-    let catalog = read_catalog(&engine)?;
-    let mut database = Database::new_cp(config, engine, catalog, cluster)?;
-    database.encryption.clone_from(&ops.encryption);
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
-    database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(security);
-    Ok(database)
+    Err(cluster_database_requires_live_raft())
 }
 
 /// Creates a database backed by an AP/Dynamo-style replication backend.
@@ -5541,7 +6338,10 @@ pub fn create_ap_database(
     let engine = engine_for(&config)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5564,8 +6364,9 @@ pub fn open_ap_database(
 ) -> Result<Database, ConfigError> {
     ensure_ap_supported(&config, &cluster)?;
     let engine = engine_for(&config)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.load_persisted_security()?;
@@ -5585,7 +6386,10 @@ pub fn create_ap_database_with_ops(
     let engine = engine_for_operational(&config, &ops)?;
 
     match read_metadata(&engine) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata(&engine, &config)?;
         }
@@ -5612,8 +6416,9 @@ pub fn open_ap_database_with_ops(
     ensure_ap_supported(&config, &cluster)?;
     validate_operational(&config, ops)?;
     let engine = engine_for_operational(&config, ops)?;
-    let metadata = read_metadata(&engine)?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata(&engine)?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
@@ -5635,7 +6440,10 @@ pub fn create_sharded_database(
     let repl = Arc::new(build_sharded_replication(sharding, true)?);
 
     match read_metadata_from_repl(repl.as_ref()) {
-        Ok(metadata) => ensure_metadata_matches(&config, metadata)?,
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
         Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
             write_metadata_to_repl(repl.as_ref(), &config)?;
         }
@@ -5658,8 +6466,9 @@ pub fn open_sharded_database(
 ) -> Result<Database, ConfigError> {
     validate(&config)?;
     let repl = Arc::new(build_sharded_replication(sharding, false)?);
-    let metadata = read_metadata_from_repl(repl.as_ref())?;
-    ensure_metadata_matches(&config, metadata)?;
+    let read = read_metadata_from_repl(repl.as_ref())?;
+    ensure_metadata_matches(&config, read.metadata)?;
+    refuse_profile_manifest(&read)?;
     let catalog = read_catalog_from_repl(repl.as_ref())?;
     let mut database = Database::new_sharded(config, repl, catalog)?;
     database.load_persisted_security()?;
@@ -5911,16 +6720,109 @@ fn compressed_encrypted_redb_high_durability_for(
     }
 }
 
-fn effective_performance(config: &DbConfig, ops: &OperationalConfig) -> PerformanceConfig {
-    ops.performance
-        .clone()
-        .unwrap_or_else(|| PerformanceConfig::for_profile(config.profile))
+/// Applies what a single-node database records in `__meta` to the engine and the runtime
+/// performance: the storage format of its profile manifest (`docs/profiles.md`, "Persistence and
+/// format") and the manifest knobs, re-applied at every open.
+///
+/// Without a manifest the legacy behaviour is kept: `ops_performance`, else the storage
+/// profile's defaults. A legacy database whose values are compression-framed must be opened
+/// with an engine that frames values.
+fn finish_single_node_open(
+    engine: AnyEngine,
+    ops_performance: Option<&PerformanceConfig>,
+    config: &DbConfig,
+    read: &MetadataRead,
+) -> Result<(AnyEngine, PerformanceConfig), ConfigError> {
+    let Some(manifest) = &read.manifest else {
+        if read.values_framed {
+            return Err(ConfigError::StorageFormatMismatch(
+                LEGACY_FRAMED_DATABASE.to_owned(),
+            ));
+        }
+        let performance = ops_performance
+            .cloned()
+            .unwrap_or_else(|| PerformanceConfig::for_profile(config.profile));
+        return Ok((engine, performance));
+    };
+
+    let engine = if manifest.storage_format.value_framing {
+        if engine.is_value_framed() {
+            // Frames are self-describing: an ops algorithm or level that differs from the
+            // manifest still reads every value.
+            engine
+        } else {
+            let compression = ops_performance.map_or_else(
+                || manifest.storage_format.compression.clone(),
+                |performance| performance.compression.clone(),
+            );
+            engine.with_value_framing(compression)
+        }
+    } else if read.values_framed {
+        return Err(ConfigError::ProfileManifestInvalid(
+            "the manifest records no value framing, but __meta values are compression-framed"
+                .to_owned(),
+        ));
+    } else if engine.is_value_framed() {
+        return Err(ConfigError::StorageFormatMismatch(
+            "the database was created without value framing: enable compression through a \
+             provisioning format upgrade, not OperationalConfig.performance.compression"
+                .to_owned(),
+        ));
+    } else {
+        engine
+    };
+
+    let performance = match ops_performance {
+        Some(performance) => {
+            tracing::warn!(
+                profile = %manifest.profile,
+                digest = %manifest.digest,
+                "OperationalConfig.performance overrides the persisted profile manifest for this session"
+            );
+            performance.clone()
+        }
+        None => profile_binding::performance_for_manifest(manifest),
+    };
+    Ok((engine, performance))
+}
+
+/// CP, AP and sharded openers: profile manifests are single-node only in this build, and a
+/// database whose values are compression-framed needs an engine that frames values.
+fn refuse_profile_manifest(read: &MetadataRead) -> Result<(), ConfigError> {
+    if read.manifest.is_some() {
+        return Err(ConfigError::Unsupported(
+            "profile manifests are single-node only in this build".to_owned(),
+        ));
+    }
+    if read.values_framed {
+        return Err(ConfigError::StorageFormatMismatch(
+            LEGACY_FRAMED_DATABASE.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn query_permits_for(performance: &PerformanceConfig) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(
         performance.query.max_concurrent_queries.max(1),
     ))
+}
+
+/// The bootstrap `admin` role and the `admin` principal that holds it.
+///
+/// Password-backed Control Plane sessions and the insecure local admin act as
+/// this principal. `Database::ensure_bootstrap_admin_principal` merges this
+/// definition into the stored `admin` role and principal, and
+/// `Database::has_bootstrap_admin_principal` reports whether that merge would
+/// change anything, so a grant change here applies to both.
+pub(crate) fn bootstrap_admin_identity() -> (Role, Principal) {
+    let role = Role::new("admin")
+        .grant(Resource::System, Permission::Admin)
+        .grant(Resource::Database, Permission::Read)
+        .grant(Resource::Database, Permission::Write)
+        .grant(Resource::Database, Permission::Admin);
+    let principal = Principal::new("admin").with_role(role.name());
+    (role, principal)
 }
 
 #[cfg(test)]
@@ -6165,8 +7067,9 @@ impl SqlReadGuard for SqlReadAuthorizer<'_> {
 fn sql_requirements(
     sql: &str,
     catalog: &BTreeMap<String, CatalogEntry>,
+    limits: &QueryExecutionConfig,
 ) -> Result<Vec<(Resource, Permission)>, DbError> {
-    if compat::compat_sql_requirements(sql)? {
+    if compat::compat_sql_requirements(sql, limits)? {
         return Ok(vec![(Resource::Database, Permission::Read)]);
     }
 
@@ -6183,7 +7086,7 @@ fn sql_requirements(
         });
     }
 
-    if let Some(requirements) = phase19_requirements(sql)? {
+    if let Some(requirements) = phase19_requirements(sql, catalog)? {
         return Ok(requirements);
     }
 
@@ -6195,9 +7098,7 @@ fn sql_requirements(
         return Ok(vec![(Resource::Database, Permission::Write)]);
     }
 
-    let dialect = PostgreSqlDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|error| QueryError::Parse(error.to_string()))?;
+    let statements = parse_with_limits(sql, limits)?;
     if statements.is_empty() {
         return Err(QueryError::Unsupported("empty SQL".to_owned()).into());
     }
@@ -6239,7 +7140,7 @@ fn sql_requirements(
                 }
             }
             Statement::Explain { statement, .. } => {
-                requirements.extend(sql_requirements(&statement.to_string(), catalog)?);
+                requirements.extend(sql_requirements(&statement.to_string(), catalog, limits)?);
             }
             other => return Err(QueryError::Unsupported(other.to_string()).into()),
         }
@@ -6250,19 +7151,22 @@ fn sql_requirements(
     Ok(requirements)
 }
 
-fn phase19_requirements(sql: &str) -> Result<Option<Vec<(Resource, Permission)>>, QueryError> {
+fn phase19_requirements(
+    sql: &str,
+    catalog: &BTreeMap<String, CatalogEntry>,
+) -> Result<Option<Vec<(Resource, Permission)>>, QueryError> {
     let Some(call) = parse_phase19_call(sql)? else {
         return Ok(None);
     };
     let requirements = match call.name.as_str() {
-        "match" => vec![(
-            Resource::FullTextIndex(phase19_resource_name(&call, "match")?),
-            Permission::Read,
-        )],
-        "within_radius" => vec![(
-            Resource::GeoIndex(phase19_resource_name(&call, "within_radius")?),
-            Permission::Read,
-        )],
+        "match" => {
+            let name = phase19_resource_name(&call, "match")?;
+            index_with_source_requirements(Resource::FullTextIndex(name.clone()), &name, catalog)
+        }
+        "within_radius" => {
+            let name = phase19_resource_name(&call, "within_radius")?;
+            index_with_source_requirements(Resource::GeoIndex(name.clone()), &name, catalog)
+        }
         "graph_neighbors" => vec![(
             Resource::Graph(phase19_resource_name(&call, "graph_neighbors")?),
             Permission::Read,
@@ -6271,6 +7175,41 @@ fn phase19_requirements(sql: &str) -> Result<Option<Vec<(Resource, Permission)>>
         _ => Vec::new(),
     };
     Ok(Some(requirements))
+}
+
+/// Index searches return source document text, ids and points, so they also need Read on the
+/// source collection; its row and masking policies then deny the multi-resource result.
+fn index_with_source_requirements(
+    index: Resource,
+    name: &str,
+    catalog: &BTreeMap<String, CatalogEntry>,
+) -> Vec<(Resource, Permission)> {
+    let source = match catalog.get(name) {
+        Some(CatalogEntry::FullTextIndex { config }) => {
+            let TextSource::Collection { collection_id, .. } = &config.source;
+            Some(*collection_id)
+        }
+        Some(CatalogEntry::GeoIndex { config }) => Some(config.collection_id),
+        _ => None,
+    };
+    let mut requirements = vec![(index, Permission::Read)];
+    if let Some(collection) = source.and_then(|id| collection_name_for_id(catalog, id)) {
+        requirements.push((Resource::Collection(collection), Permission::Read));
+    }
+    requirements
+}
+
+fn collection_name_for_id(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    collection_id: CollectionId,
+) -> Option<String> {
+    catalog.iter().find_map(|(name, entry)| match entry {
+        CatalogEntry::Collection {
+            collection_id: existing,
+            ..
+        } if *existing == collection_id => Some(name.clone()),
+        _ => None,
+    })
 }
 
 fn phase19_resource_name(call: &Phase19Call, function: &str) -> Result<String, QueryError> {
@@ -6909,12 +7848,7 @@ fn build_shard_backend(
 ) -> Result<Arc<dyn Replication>, ConfigError> {
     match backend {
         ShardBackendConfig::Local(config) => {
-            let database = if create {
-                create_database(config.clone())?
-            } else {
-                open_database(config.clone())?
-            };
-            Ok(Arc::new(database))
+            Ok(Arc::new(open_local_shard(config.clone(), create)?))
         }
         ShardBackendConfig::Cp { config, cluster } => {
             let database = if create {
@@ -6935,6 +7869,31 @@ fn build_shard_backend(
     }
 }
 
+/// Opens one local shard, initializing its metadata when `create` is set. A local shard is a
+/// plain single-node database, except that a profile manifest on any shard is refused before
+/// the shard database is built. Like `open_database`, it restores the shard's persisted security
+/// state.
+fn open_local_shard(config: DbConfig, create: bool) -> Result<Database, ConfigError> {
+    let engine = engine_for(&config)?;
+
+    match read_metadata(&engine) {
+        Ok(read) => {
+            ensure_metadata_matches(&config, read.metadata)?;
+            refuse_profile_manifest(&read)?;
+        }
+        Err(ConfigError::MissingMetadata { key }) if create && key == KEY_SCHEMA_VERSION_NAME => {
+            write_metadata(&engine, &config)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    let catalog = read_catalog(&engine)?;
+    let performance = PerformanceConfig::for_profile(config.profile);
+    let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
+    database.load_persisted_security()?;
+    Ok(database)
+}
+
 fn ensure_cluster_supported(
     config: &DbConfig,
     cluster: &CpClusterConfig,
@@ -6946,6 +7905,17 @@ fn ensure_cluster_supported(
     }
 
     validate_cp_cluster_config(cluster, false).map_err(ConfigError::InvalidClusterConfig)
+}
+
+fn cluster_database_requires_live_raft() -> ConfigError {
+    ConfigError::Unsupported(
+        "multi-node CP cluster databases are not available through the embedded Database API: \
+         it is not wired to the live OpenRaft runtime, so writes would be acknowledged without \
+         replication; use repl::start_cp_cluster for replicated CP storage, or \
+         create_database/open_database for a single node (also opens data written by earlier \
+         versions)"
+            .to_owned(),
+    )
 }
 
 fn ensure_ap_supported(config: &DbConfig, cluster: &ApClusterConfig) -> Result<(), ConfigError> {
@@ -6991,6 +7961,33 @@ struct Metadata {
     layout: TableLayout,
 }
 
+/// `__meta` as the frame-tolerant reader decoded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetadataRead {
+    metadata: Metadata,
+    manifest: Option<PersistedProfileManifest>,
+    /// A `__meta` value still carried a compression frame after the engine read it: the database
+    /// frames values but the engine that read them does not. A framing engine strips every frame
+    /// itself, so this is only ever set when the engine does not frame values.
+    values_framed: bool,
+}
+
+impl MetadataRead {
+    /// The legacy metadata `write_metadata` just wrote for `config`.
+    fn written(config: &DbConfig) -> Self {
+        Self {
+            metadata: Metadata {
+                schema_version: SCHEMA_VERSION,
+                profile: config.profile,
+                replication: config.replication,
+                layout: layout_for(config.profile),
+            },
+            manifest: None,
+            values_framed: false,
+        }
+    }
+}
+
 #[derive(Serialize, serde::Deserialize)]
 struct StoredAuthzPolicy {
     roles: Vec<StoredRole>,
@@ -7018,32 +8015,121 @@ fn write_metadata<S: StorageEngine>(engine: &S, config: &DbConfig) -> Result<(),
     Ok(())
 }
 
-fn read_metadata<S: StorageEngine>(engine: &S) -> Result<Metadata, ConfigError> {
+fn read_metadata<S: StorageEngine>(engine: &S) -> Result<MetadataRead, ConfigError> {
     let txn = engine.begin_read()?;
-    let schema_version = read_json(&txn, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME)?;
+    decode_metadata(|key| Ok(txn.get(META_TABLE, key)?))
+}
 
-    if schema_version != SCHEMA_VERSION {
+/// The frame-tolerant `__meta` reader behind `read_metadata` and `read_metadata_from_repl`.
+///
+/// Every value passes through `decode_stored_value` before serde, so compression-framed
+/// metadata decodes and is reported as `values_framed`. `schema_version` 1 and 2 are accepted;
+/// the profile manifest is decoded and re-validated against the rest of `__meta`.
+fn decode_metadata(
+    get: impl Fn(&[u8]) -> Result<Option<Bytes>, ConfigError>,
+) -> Result<MetadataRead, ConfigError> {
+    let mut framed = false;
+    let schema_version: u32 = required_meta_value(
+        &get,
+        KEY_SCHEMA_VERSION,
+        KEY_SCHEMA_VERSION_NAME,
+        &mut framed,
+    )?;
+
+    if !(SCHEMA_VERSION..=SCHEMA_VERSION_FRAMED).contains(&schema_version) {
         return Err(ConfigError::SchemaVersionMismatch {
-            expected: SCHEMA_VERSION,
+            expected: SCHEMA_VERSION_FRAMED,
             found: schema_version,
         });
     }
 
-    let profile = read_json(&txn, KEY_PROFILE, KEY_PROFILE_NAME)?;
-    let replication = read_json(&txn, KEY_REPLICATION, KEY_REPLICATION_NAME)?;
-    let layout = match txn.get(META_TABLE, KEY_LAYOUT)? {
-        Some(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))?
-        }
+    let profile = required_meta_value(&get, KEY_PROFILE, KEY_PROFILE_NAME, &mut framed)?;
+    let replication =
+        required_meta_value(&get, KEY_REPLICATION, KEY_REPLICATION_NAME, &mut framed)?;
+    let layout = match get(KEY_LAYOUT)? {
+        Some(raw) => decode_meta_value(&raw, KEY_LAYOUT_NAME, &mut framed)?,
         None => layout_for(profile),
     };
+    let manifest = match get(KEY_PROFILE_MANIFEST)? {
+        Some(raw) => Some(profile_binding::decode_profile_manifest(
+            &decode_meta_bytes(&raw, &mut framed)?,
+        )?),
+        None => None,
+    };
 
-    Ok(Metadata {
+    let metadata = Metadata {
         schema_version,
         profile,
         replication,
         layout,
+    };
+    check_metadata_format(metadata, manifest.as_ref())?;
+    Ok(MetadataRead {
+        metadata,
+        manifest,
+        values_framed: framed,
     })
+}
+
+/// `schema_version` 2 exists only together with a value-framing profile manifest, and a
+/// manifest is re-validated against `__meta` on every read.
+fn check_metadata_format(
+    metadata: Metadata,
+    manifest: Option<&PersistedProfileManifest>,
+) -> Result<(), ConfigError> {
+    let value_framing = manifest.is_some_and(|manifest| manifest.storage_format.value_framing);
+    if metadata.schema_version == SCHEMA_VERSION_FRAMED && !value_framing {
+        return Err(ConfigError::ProfileManifestInvalid(
+            "schema_version 2 requires a profile manifest with storage_format.value_framing"
+                .to_owned(),
+        ));
+    }
+    if value_framing && metadata.schema_version != SCHEMA_VERSION_FRAMED {
+        return Err(ConfigError::ProfileManifestInvalid(format!(
+            "storage_format.value_framing requires schema_version 2, found {}",
+            metadata.schema_version
+        )));
+    }
+    if let Some(manifest) = manifest {
+        profile_binding::validate_manifest(manifest, metadata.profile)?;
+    }
+    Ok(())
+}
+
+fn required_meta_value<T: DeserializeOwned>(
+    get: &impl Fn(&[u8]) -> Result<Option<Bytes>, ConfigError>,
+    key: &[u8],
+    key_name: &'static str,
+    framed: &mut bool,
+) -> Result<T, ConfigError> {
+    let raw = get(key)?.ok_or(ConfigError::MissingMetadata { key: key_name })?;
+    decode_meta_value(&raw, key_name, framed)
+}
+
+/// Decodes one raw `__meta` value: strips a compression frame (recording it in `framed`), then
+/// parses the JSON. A frame that does not decode is storage corruption; JSON that does not parse
+/// is `MetadataUnreadable`.
+fn decode_meta_value<T: DeserializeOwned>(
+    raw: &[u8],
+    key: &'static str,
+    framed: &mut bool,
+) -> Result<T, ConfigError> {
+    let bytes = decode_meta_bytes(raw, framed)?;
+    serde_json::from_slice(&bytes).map_err(|error| ConfigError::MetadataUnreadable {
+        key,
+        reason: if bytes.starts_with(ENCRYPTED_FRAME_PREFIX) {
+            format!("the value carries an encryption frame (MDBE): {error}")
+        } else {
+            error.to_string()
+        },
+    })
+}
+
+fn decode_meta_bytes(raw: &[u8], framed: &mut bool) -> Result<Bytes, ConfigError> {
+    if is_framed(raw) {
+        *framed = true;
+    }
+    Ok(decode_stored_value(raw)?)
 }
 
 fn ensure_metadata_matches(config: &DbConfig, metadata: Metadata) -> Result<(), ConfigError> {
@@ -7101,31 +8187,22 @@ fn write_metadata_to_repl(repl: &dyn Replication, config: &DbConfig) -> Result<(
     Ok(())
 }
 
-fn read_metadata_from_repl(repl: &dyn Replication) -> Result<Metadata, ConfigError> {
-    let schema_version = read_json_from_repl(repl, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME)?;
+fn read_metadata_from_repl(repl: &dyn Replication) -> Result<MetadataRead, ConfigError> {
+    decode_metadata(|key| Ok(repl.read(META_TABLE, key, ReadConsistency::Strong)?))
+}
 
-    if schema_version != SCHEMA_VERSION {
-        return Err(ConfigError::SchemaVersionMismatch {
-            expected: SCHEMA_VERSION,
-            found: schema_version,
-        });
-    }
-
-    let profile = read_json_from_repl(repl, KEY_PROFILE, KEY_PROFILE_NAME)?;
-    let replication = read_json_from_repl(repl, KEY_REPLICATION, KEY_REPLICATION_NAME)?;
-    let layout = match repl.read(META_TABLE, KEY_LAYOUT, ReadConsistency::Strong)? {
-        Some(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))?
-        }
-        None => layout_for(profile),
-    };
-
-    Ok(Metadata {
-        schema_version,
-        profile,
-        replication,
-        layout,
-    })
+/// Reads one catalog entry straight from `__catalog__`.
+/// # Errors
+/// Fails when the read fails or the entry cannot be decoded.
+pub(crate) fn read_catalog_entry_from_repl(
+    repl: &dyn Replication,
+    name: &str,
+) -> Result<Option<CatalogEntry>, ConfigError> {
+    repl.read(CATALOG_TABLE, name.as_bytes(), ReadConsistency::Strong)?
+        .map(|value| {
+            serde_json::from_slice(&value).map_err(|error| ConfigError::Serde(error.to_string()))
+        })
+        .transpose()
 }
 
 fn read_catalog_from_repl(
@@ -7279,18 +8356,6 @@ fn audit_hex_value(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn read_json_from_repl<T: DeserializeOwned>(
-    repl: &dyn Replication,
-    key: &[u8],
-    key_name: &'static str,
-) -> Result<T, ConfigError> {
-    let bytes = repl
-        .read(META_TABLE, key, ReadConsistency::Strong)?
-        .ok_or(ConfigError::MissingMetadata { key: key_name })?;
-
-    serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))
-}
-
 fn catalog_put_op(name: &str, entry: &CatalogEntry) -> Result<Op, DbError> {
     let value = serde_json::to_vec(entry).map_err(|error| DbError::Serde(error.to_string()))?;
     Ok(Op::Put {
@@ -7349,18 +8414,6 @@ fn write_json<T: serde::Serialize>(
     let bytes = serde_json::to_vec(value).map_err(|error| ConfigError::Serde(error.to_string()))?;
     txn.put(META_TABLE, key, &bytes)?;
     Ok(())
-}
-
-fn read_json<T: DeserializeOwned>(
-    txn: &impl ReadTransaction,
-    key: &[u8],
-    key_name: &'static str,
-) -> Result<T, ConfigError> {
-    let bytes = txn
-        .get(META_TABLE, key)?
-        .ok_or(ConfigError::MissingMetadata { key: key_name })?;
-
-    serde_json::from_slice(&bytes).map_err(|error| ConfigError::Serde(error.to_string()))
 }
 
 #[cfg(test)]

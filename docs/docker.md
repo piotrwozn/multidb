@@ -49,22 +49,32 @@ Environment:
 | --- | --- | --- | --- |
 | `MULTIDB_RUNTIME_MODE` | no | `production` | Use `local-dev` only for local plaintext PG smoke. |
 | `MULTIDB_DB_PATH` | no | `/var/lib/multidb/multidb.redb` | Must live on the mounted volume. |
-| `MULTIDB_PROFILE` | no | `transactional` | Any existing CLI profile name. |
+| `MULTIDB_PROFILE` | no | `transactional` | Storage profile name, product slug, alias, or `auto` (probe the existing database; required for manifest databases built with a non-default profile). `auto` fails when the database does not exist yet, so the first start of a fresh volume needs an explicit profile. A database left by a stopped or killed container gets redb's crash recovery before `auto` reads it, as with a named profile. |
 | `MULTIDB_BIND` | no | `0.0.0.0:8080` | HTTP API and Studio bind. |
 | `MULTIDB_PG_BIND` | no | `0.0.0.0:5432` | PostgreSQL wire bind. |
 | `MULTIDB_STUDIO_DIR` | no | `/usr/share/multidb/studio` | Built Studio asset directory. |
 | `MULTIDB_ADMIN_PASSWORD` / `_FILE` | yes* | none | Bootstrap password for the durable `admin` credential. `_FILE` wins over the env var. |
 | `MULTIDB_ADMIN_PASSWORD_RESET` | no | unset | Set to `1` to overwrite an existing stored admin credential from env/file. |
 | `MULTIDB_ADMIN_SESSION_TTL_SECONDS` | no | `28800` | Browser session TTL, clamped to 60 seconds through 24 hours. |
-| `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` | no | `5` | Failed login attempts before lockout; clamped to at least 1. |
-| `MULTIDB_ADMIN_LOGIN_WINDOW_SECONDS` | no | `300` | Rolling failure window for login lockout; clamped to at least 1. |
-| `MULTIDB_ADMIN_LOGIN_LOCKOUT_SECONDS` | no | `300` | Neutral `401` lockout duration; clamped to at least 1. |
+| `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` | no | `5` | Failed `admin` password checks per client IP (IPv6 /64) before that client is locked out; the server-wide soft ceiling is 20x this per window. Clamped to at least 1. |
+| `MULTIDB_ADMIN_LOGIN_WINDOW_SECONDS` | no | `300` | Failure window for the per-client lockout and the soft ceiling; clamped to at least 1. |
+| `MULTIDB_ADMIN_LOGIN_LOCKOUT_SECONDS` | no | `300` | Neutral `401` per-client lockout duration; clamped to at least 1. |
 | `MULTIDB_ADMIN_TOKEN` / `_FILE` | no | none | Legacy Bearer token for automation and compatibility. |
 | `MULTIDB_PG_USER` | no | `multidb` | PostgreSQL SCRAM user. |
 | `MULTIDB_PG_PASSWORD` / `_FILE` | yes | none | PostgreSQL SCRAM password. |
 | `MULTIDB_PG_TLS_CERT` | production | none | PEM certificate path. |
 | `MULTIDB_PG_TLS_KEY` | production | none | PEM private key path. |
 | `MULTIDB_PG_TLS_MODE=disabled` | local only | unset | Accepted only with `MULTIDB_RUNTIME_MODE=local-dev`. |
+| `MULTIDB_MAX_CONCURRENT_QUERIES` | no | 4 x available CPUs | Statements the query governor runs at once, `1` to `4096`. PostgreSQL wire admits at most this many statements, and never more than 32, at a time. |
+| `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` | no | `100` | How long a statement waits for a free governor slot before it fails as busy, `1` to `60000`. |
+
+`MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` must be
+whole numbers in their range; any other non-empty value stops `multidb serve`
+at startup instead of falling back to the default. An empty value counts as
+unset and uses the default. For a database created with a custom profile the
+default is its profile manifest's `query.max_concurrent_queries` and
+`query.queue_timeout_ms` (see [Profiles](profiles.md)); a set value applies to
+that `serve` process only and is never written to the database.
 
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.
@@ -92,6 +102,81 @@ Studio is served from `/` and calls `/api` by default. `/studio` remains the
 capability manifest endpoint, not the HTML app. Browser sessions are
 stored only in server memory and React state; restarting the server signs
 Studio users out without changing the durable admin password hash.
+
+Control Plane login limits:
+
+- Failed `admin` password checks are counted per client IP address (IPv6
+  clients per /64). After `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` failures in the
+  window, that client gets a neutral `401` for the lockout duration, even with
+  the correct password. A successful login clears the client's failures.
+- Across all clients, at most 20x `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` failed
+  checks per window are allowed before the soft ceiling applies. Past it, only
+  clients without a failure in the current window may try. Clients with a
+  clean window are never refused.
+- Logins for any other username are rejected without a password check and
+  never lock anyone out.
+- The client address is the TCP peer. `X-Forwarded-For` is not trusted, so
+  behind a reverse proxy, an ingress, or a Kubernetes Service that rewrites
+  source addresses, all clients share one address and one lockout. Use a
+  strong admin password.
+- At most 2 password checks run at once. Additional login or change-password
+  requests get `503` with error code `auth_busy` and `Retry-After: 1`. These
+  requests are not counted as failures.
+- The username is limited to 256 bytes and passwords to 1024 bytes. Longer
+  values get `400` with error code `invalid_value`. The same password limit
+  applies to change-password and to `MULTIDB_ADMIN_PASSWORD`; a longer
+  bootstrap password stops startup when it would be stored (no stored
+  credential yet, or `MULTIDB_ADMIN_PASSWORD_RESET`).
+- Audit: every failed `admin` password check is recorded as `login`/`Failed`
+  with the client address. Refused attempts are recorded as
+  `login_rate_limited`/`Denied` once per client per lockout. Reaching the soft
+  ceiling records one `login_rate_limited` event with `scope: global`. Failed
+  logins for other usernames are recorded up to 20x
+  `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` per window, followed by one
+  `login_audit_coalesced` event.
+
+## Concurrency
+
+- One database is shared between PostgreSQL wire and the Control Plane
+  through a reader-writer lock. Statements and Control Plane data, catalog,
+  audit and advice reads run concurrently.
+- `/builder/*` and `/security` updates take an exclusive lock. They wait for
+  running statements, and new requests wait behind them. Admin login and
+  password change take it only when the bootstrap `admin` role or principal
+  is missing or was changed, for example by a `/security` update.
+- Admin login and password change read the stored credential under the
+  shared lock and release it before the Argon2id password check, which runs on
+  the blocking pool, so a check in progress never delays `/builder/*` or
+  `/security` updates. Password checks have their own concurrency limit,
+  separate from the query governor; see the login limits above.
+- By default at most 4 x available CPUs statements execute at once; a
+  container CPU limit lowers that number. `MULTIDB_MAX_CONCURRENT_QUERIES`
+  overrides it. PostgreSQL wire admits up to that many statements, and never
+  more than 32, and queues the rest. A statement that still finds no free
+  slot, for example because Control Plane `/sql` requests hold them, waits
+  `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` (100 ms by default) and then fails with
+  SQLSTATE 53200. Nothing ran, so it can be retried as is. The Control Plane
+  returns such failures as HTTP 503 with error code `busy` and
+  `Retry-After: 1`.
+- A plain `INSERT` that races another insert of the same primary key fails
+  with SQLSTATE 23505. `INSERT ... ON CONFLICT` and inserts into columnar
+  tables (the `analytical` profile) retry internally when another statement
+  commits first, and fail with SQLSTATE 40001 if 64 retries also conflict;
+  retry those. A columnar insert rewrites the whole table, so inserts into one
+  columnar table effectively run one at a time. Control Plane single-row,
+  single-document and time-series point writes also retry conflicts
+  internally. The Control Plane returns a conflict that outlasts the retries
+  as HTTP 409 with error code `conflict`. Retry single-statement requests; a
+  multi-statement `/sql` body runs its statements one after another without a
+  transaction, so statements before the conflicting one have already
+  committed.
+- A statement keeps running after its client disconnects, over PostgreSQL wire
+  and Control Plane `/sql` alike, until it finishes. Exclusive requests queued
+  behind it wait until then. The 30 s query timeout applies only to `SELECT`s
+  that DataFusion executes, and cannot interrupt a storage scan in progress.
+  Single-table `SELECT`s with an equality filter and writes have no time
+  limit.
+- `/catalog` row counts still scan every table and collection.
 
 ## Smoke Test
 

@@ -27,15 +27,18 @@ which claims are deliberately out of scope.
 | SDKs | Stable preview for API v1 client surface in repo packages | TypeScript, Python, Go and Rust package gates |
 | Metrics endpoint | Preview | Raw Prometheus text remains marked preview |
 | `config apply` | Audit/confirmation only | No physical data migration in v1 |
+| Composable profiles (`custom_profile`, spec v2) | Preview; single-node profile manifests through the Rust API only; compression is forward-only and needs `schema_version` 2; the encryption and audit floors are enforced at creation (audit also afterwards) and on restore, which refuses a backup whose unencrypted target or audit flag would miss them unless `RestoreConfig.allow_unmet_profile_floors` / `restore --allow-unmet-floors` opts in (hibernation resume has no opt-in); `profile show --db` and `restore --allow-unmet-floors` then warn, and every opener logs a `tracing` warning that only embedders with a subscriber see; the encryption floor covers the database file, while backup files are encrypted by backup encryption (by default the database's own encryption config); CLI `profile show/explain/knobs`, `config upgrade`, `init --override` and `--profile auto`; `GET /profiles` variants and knobs; Studio custom-profile builder (validate and dry-run only) | resolver, schema v2 snapshot, v1 compatibility corpus, profile manifest open/refusal and backup/restore tests, CLI profile command tests, Control Plane `/profiles` and Studio builder tests |
+| History GC (`multidb maintenance gc`, `Database::gc_history`) | Preview: manual and offline (CLI needs exclusive file access), local single-node only; no online/background GC in `serve` yet; MVCC pruned below min(current, AS OF pins, temporal `min_lsn`, current - `--history-retain-lsns` + 1), so without `--history-retain-lsns` plain tables lose `AS OF` history below the current LSN; commit log truncated only with explicit `--commit-log-retain-lsns`, never below durable consumer positions, and a new full backup is required afterwards (incremental backups fail with `CommitLogTruncated`); on encrypted engines one small `__enc_versions` row stays per pruned version and per truncated commit-log record | `txn::history`, `db::history`, cdc and CLI tests |
 
 ## Profiles And Domains
 
 | Area | Support Status |
 | --- | --- |
 | Certified local profiles and collection roles | Stable preview inside generated spec and smoke coverage |
-| `strong_cp` local/process cluster contract | Stable preview for local/process smoke semantics |
-| `eventual_ap` conflict policy | Experimental; workload review required |
+| `strong_cp` local/process cluster contract | Stable preview for local/process smoke semantics of the live `repl::start_cp_cluster` OpenRaft runtime (`scripts/cluster-smoke.ps1`); embedded `Database` cluster constructors (`create_cluster_database`, `open_cluster_database`, their `_with_ops` variants and sharded `Cp` shard backends) fail closed with `Unsupported` |
+| `eventual_ap` conflict policy | Experimental; workload review required. AP databases reject commit-log features with `Unsupported`: incremental backups (so no point-in-time restore beyond a full backup), changefeeds, CDC subscriptions, continuous queries, materialized views, after-commit hooks, system versioning and incremental full-text/geo refresh; full backups and `refresh_full` remain available |
 | Graph role | Experimental |
+| Full-text (`match`) and geo (`within_radius`) indexes | Experimental; backfilled on create and maintained synchronously with document writes through collection handles, transactions and Control Plane CRUD; raw key writes need `refresh_full`/`refresh_incremental`; searches need Read on the source collection and are denied under its row or masking policies |
 
 ## Out Of Scope
 

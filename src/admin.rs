@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -14,14 +14,14 @@ use argon2::{
     password_hash::SaltString,
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
-        DefaultBodyLimit, OriginalUri, Path as AxumPath, Query as AxumQuery, State,
+        ConnectInfo, DefaultBodyLimit, OriginalUri, Path as AxumPath, Query as AxumQuery, State,
         rejection::JsonRejection,
     },
     http::{
-        HeaderMap, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     },
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -29,28 +29,36 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::Mutex;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::{
     compat::SERVER_VERSION,
     config_spec::{
         ApplyCheckReport, ApplyStatus, DatabaseSpec, GuaranteeValidator, MigrationPlan,
-        MigrationPlanner, built_in_profiles, collection_role_definitions,
-        consistency_domain_definition, consistency_domain_definitions, extension_catalog_entries,
+        MigrationPlanner, ProfileKnobOverrides, ProfileKnobs, ValidationReport, built_in_profiles,
+        collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
+        extension_catalog_entries, profile_variants, resolve_named_profile,
+        spec_io::{self, SpecIoError},
     },
-    db::{AdminCredentialRecord, CatalogEntry, Database, DbError, Profile, ReplicationKind},
+    db::{
+        AdminCredentialRecord, CatalogEntry, Database, DbError, Profile, ReplicationKind,
+        bootstrap_admin_identity,
+    },
     geo::GeoIndexConfig,
     graph::GraphId,
     model::{CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, Value as ModelValue},
     observability,
-    query::{DocField, RelIndexExpression, RelIndexSpec, Row, SqlOutput, TableLayout, TableSchema},
+    query::{
+        DocField, QueryError, RelIndexExpression, RelIndexSpec, Row, SqlOutput, TableLayout,
+        TableSchema,
+    },
     runtime_advisor::{RuntimeAdviceDecisionRequest, RuntimeAdvicePlanRequest},
     security::{
         AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource,
         Role,
     },
     text::FullTextIndexConfig,
-    timeseries::{TimePoint, TimeSeriesConfig},
+    timeseries::{DEFAULT_MAX_FUTURE_SKEW_MILLIS, TimePoint, TimeSeriesConfig, TimeSeriesError},
     vector::{HnswParams, VectorCollectionConfig, VectorHit, VectorMetric},
 };
 
@@ -61,6 +69,15 @@ const MAX_DATA_PAGE_LIMIT: usize = 1_000;
 const ADMIN_USERNAME: &str = "admin";
 const ADMIN_ROLE: &str = "admin";
 const SESSION_TOKEN_PREFIX: &str = "mda1_session_";
+const MAX_LOGIN_USERNAME_BYTES: usize = 256;
+const MAX_ADMIN_PASSWORD_BYTES: usize = 1024;
+/// Concurrent Argon2id verifications (19 MiB each) allowed across the process.
+const ADMIN_PASSWORD_VERIFY_PERMITS: usize = 2;
+/// Server-wide soft ceiling on failed admin password checks per window, as a
+/// multiple of the per-client `max_failures`.
+const ADMIN_LOGIN_GLOBAL_FAILURE_FACTOR: u32 = 20;
+const MAX_ADMIN_LOGIN_RATE_KEYS: usize = 65_536;
+const AUDIT_LOGIN_USERNAME_CHARS: usize = 64;
 const CONTROL_PLANE_OPENAPI_JSON: &str =
     include_str!("../docs/openapi/control-plane-v1.openapi.json");
 pub const DEFAULT_ADMIN_SESSION_TTL_SECONDS: u64 = 8 * 60 * 60;
@@ -69,11 +86,28 @@ pub const MAX_ADMIN_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_ADMIN_LOGIN_MAX_FAILURES: u32 = 5;
 pub const DEFAULT_ADMIN_LOGIN_WINDOW_SECONDS: u64 = 5 * 60;
 pub const DEFAULT_ADMIN_LOGIN_LOCKOUT_SECONDS: u64 = 5 * 60;
+/// Retries for Control Plane single-item writes that hit an optimistic write conflict.
+///
+/// Every conflict means another writer committed, so the retries keep the
+/// last-writer-wins outcome the Control Plane had when requests were serialized.
+const CONTROL_PLANE_CONFLICT_RETRIES: u32 = 16;
+/// `Retry-After` for `503 busy`: the query governor queue waits milliseconds, so
+/// the shortest whole-second hint.
+const BUSY_RETRY_AFTER_SECONDS: &str = "1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AdminLoginRateLimitConfig {
+    /// Failed admin password checks allowed per client IP address (IPv6
+    /// addresses are grouped by /64) and username within one window before
+    /// that client is locked out. The server-wide soft ceiling is 20 times this
+    /// value per window; past it, only clients without failures in the window
+    /// may try again.
     pub max_failures: u32,
+    /// Window, in seconds, over which failed checks are counted. It starts at
+    /// the first failure and resets once it has elapsed.
     pub window_seconds: u64,
+    /// How long, in seconds, a client stays locked out once it reaches
+    /// `max_failures`.
     pub lockout_seconds: u64,
 }
 
@@ -521,10 +555,38 @@ struct AdminSessionStore {
     sessions: StdMutex<BTreeMap<String, SessionRecord>>,
 }
 
+/// Tracks failed admin password checks per client and username.
+///
+/// Only attempts that reach Argon2 verification are counted, and they are
+/// reserved before hashing starts, so concurrent requests cannot outrun the
+/// limit. Usernames that cannot authenticate never create entries and never
+/// lock anyone out; they only feed a per-window audit cap.
 #[derive(Debug)]
 struct AdminLoginRateLimiter {
     config: AdminLoginRateLimitConfig,
-    buckets: StdMutex<BTreeMap<String, AdminLoginRateLimitBucket>>,
+    global_max_failures: u32,
+    max_keys: usize,
+    state: StdMutex<AdminLoginRateLimitState>,
+}
+
+#[derive(Debug, Default)]
+struct AdminLoginRateLimitState {
+    keys: BTreeMap<AdminLoginRateKey, AdminLoginRateLimitBucket>,
+    /// Soft ceiling: reserved admin password checks across all clients. It
+    /// never locks; `limited_audited` marks that the crossing was reported.
+    global: AdminLoginRateLimitBucket,
+    /// Failed logins for usernames that cannot authenticate; bounds their
+    /// audit rows only.
+    unknown_users: AdminLoginRateLimitBucket,
+    last_prune_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AdminLoginRateKey {
+    /// Canonical client address, IPv6 masked to its /64. `None` when the
+    /// server runs without connection info: all such clients share one key.
+    client: Option<IpAddr>,
+    user_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -532,6 +594,20 @@ struct AdminLoginRateLimitBucket {
     failures: u32,
     window_started_millis: u64,
     locked_until_millis: u64,
+    limited_audited: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminLoginRateDecision {
+    Allowed { ceiling_crossed: bool },
+    Limited { audit: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminLoginAuditDecision {
+    Event,
+    Coalesced,
+    Skip,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,77 +662,202 @@ impl AdminSessionStore {
     }
 }
 
+impl AdminLoginRateKey {
+    fn new(client: Option<IpAddr>, username: &str) -> Self {
+        let username = username.trim().to_ascii_lowercase();
+        Self {
+            client: client.map(login_rate_client),
+            user_digest: *blake3::hash(username.as_bytes()).as_bytes(),
+        }
+    }
+}
+
 impl AdminLoginRateLimiter {
     fn new(config: AdminLoginRateLimitConfig) -> Self {
         Self {
             config,
-            buckets: StdMutex::new(BTreeMap::new()),
+            global_max_failures: config
+                .max_failures
+                .saturating_mul(ADMIN_LOGIN_GLOBAL_FAILURE_FACTOR),
+            max_keys: MAX_ADMIN_LOGIN_RATE_KEYS,
+            state: StdMutex::new(AdminLoginRateLimitState::default()),
         }
     }
 
-    fn is_limited(&self, username: &str) -> bool {
-        let now = now_millis();
-        let user_key = login_username_bucket(username);
-        let Ok(mut buckets) = self.buckets.lock() else {
-            return true;
+    #[cfg(test)]
+    fn with_limits(
+        config: AdminLoginRateLimitConfig,
+        max_keys: usize,
+        global_max_failures: u32,
+    ) -> Self {
+        Self {
+            max_keys: max_keys.max(1),
+            global_max_failures: global_max_failures.max(1),
+            ..Self::new(config)
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.state.lock().map_or(0, |state| state.keys.len())
+    }
+
+    fn check(&self, key: &AdminLoginRateKey) -> AdminLoginRateDecision {
+        self.check_at(key, now_millis())
+    }
+
+    fn reserve(&self, key: &AdminLoginRateKey) -> AdminLoginRateDecision {
+        self.reserve_at(key, now_millis())
+    }
+
+    fn record_success(&self, key: &AdminLoginRateKey) {
+        self.record_success_at(key, now_millis());
+    }
+
+    fn record_unknown_user(&self) -> AdminLoginAuditDecision {
+        self.record_unknown_user_at(now_millis())
+    }
+
+    /// Reports whether `key` may attempt a password check, without counting.
+    fn check_at(&self, key: &AdminLoginRateKey, now: u64) -> AdminLoginRateDecision {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("admin login rate limiter lock poisoned; refusing login");
+            return AdminLoginRateDecision::Limited { audit: false };
         };
-        self.bucket_locked(&mut buckets, "login", now)
-            || self.bucket_locked(&mut buckets, &user_key, now)
-    }
-
-    fn record_failure(&self, username: &str) {
-        let now = now_millis();
-        let user_key = login_username_bucket(username);
-        if let Ok(mut buckets) = self.buckets.lock() {
-            self.record_bucket_failure(&mut buckets, "login", now);
-            self.record_bucket_failure(&mut buckets, &user_key, now);
+        self.prune_if_due(&mut state, now);
+        match self.refusal(&mut state, key, now) {
+            Some(audit) => AdminLoginRateDecision::Limited { audit },
+            None => AdminLoginRateDecision::Allowed {
+                ceiling_crossed: false,
+            },
         }
     }
 
-    fn record_success(&self, username: &str) {
-        let user_key = login_username_bucket(username);
-        if let Ok(mut buckets) = self.buckets.lock() {
-            buckets.remove("login");
-            buckets.remove(&user_key);
-        }
-    }
-
-    fn bucket_locked(
-        &self,
-        buckets: &mut BTreeMap<String, AdminLoginRateLimitBucket>,
-        key: &str,
-        now: u64,
-    ) -> bool {
-        let Some(bucket) = buckets.get_mut(key) else {
-            return false;
+    /// Re-checks `key` and, when allowed, counts the attempt as a failure up
+    /// front. A later `record_success` takes it back.
+    fn reserve_at(&self, key: &AdminLoginRateKey, now: u64) -> AdminLoginRateDecision {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("admin login rate limiter lock poisoned; refusing login");
+            return AdminLoginRateDecision::Limited { audit: false };
         };
-        bucket.normalize(now, self.config.window_seconds);
-        if bucket.is_empty() {
-            buckets.remove(key);
-            return false;
+        self.prune_if_due(&mut state, now);
+        if let Some(audit) = self.refusal(&mut state, key, now) {
+            return AdminLoginRateDecision::Limited { audit };
         }
-        bucket.locked_until_millis > now
-    }
+        if !state.keys.contains_key(key) && state.keys.len() >= self.max_keys {
+            self.prune(&mut state, now);
+            if state.keys.len() >= self.max_keys {
+                evict_admin_login_rate_key(&mut state.keys, now);
+            }
+        }
 
-    fn record_bucket_failure(
-        &self,
-        buckets: &mut BTreeMap<String, AdminLoginRateLimitBucket>,
-        key: &str,
-        now: u64,
-    ) {
-        let bucket = buckets.entry(key.to_owned()).or_default();
-        bucket.normalize(now, self.config.window_seconds);
-        if bucket.locked_until_millis > now {
-            return;
-        }
-        if bucket.window_started_millis == 0 {
-            bucket.window_started_millis = now;
-        }
-        bucket.failures = bucket.failures.saturating_add(1);
+        let bucket = state.keys.entry(*key).or_default();
+        bucket.count_failure(now);
+        bucket.limited_audited = false;
         if bucket.failures >= self.config.max_failures {
             bucket.locked_until_millis =
                 now.saturating_add(seconds_to_millis(self.config.lockout_seconds));
         }
+
+        let global = &mut state.global;
+        global.count_failure(now);
+        let ceiling_crossed =
+            global.failures >= self.global_max_failures && !global.limited_audited;
+        if ceiling_crossed {
+            global.limited_audited = true;
+        }
+        AdminLoginRateDecision::Allowed { ceiling_crossed }
+    }
+
+    fn record_success_at(&self, key: &AdminLoginRateKey, now: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("admin login rate limiter lock poisoned; success not recorded");
+            return;
+        };
+        state.keys.remove(key);
+        state.global.normalize(now, self.config.window_seconds);
+        state.global.failures = state.global.failures.saturating_sub(1);
+    }
+
+    /// Counts a failed login for a username that cannot authenticate and
+    /// decides whether it still gets its own audit event in this window.
+    fn record_unknown_user_at(&self, now: u64) -> AdminLoginAuditDecision {
+        let Ok(mut state) = self.state.lock() else {
+            return AdminLoginAuditDecision::Event;
+        };
+        let bucket = &mut state.unknown_users;
+        bucket.normalize(now, self.config.window_seconds);
+        bucket.count_failure(now);
+        if bucket.failures <= self.global_max_failures {
+            AdminLoginAuditDecision::Event
+        } else if bucket.limited_audited {
+            AdminLoginAuditDecision::Skip
+        } else {
+            bucket.limited_audited = true;
+            AdminLoginAuditDecision::Coalesced
+        }
+    }
+
+    /// Returns `Some(audit)` when `key` must be refused; `audit` is true only
+    /// for the first refusal of the key in its current lockout or window.
+    fn refusal(
+        &self,
+        state: &mut AdminLoginRateLimitState,
+        key: &AdminLoginRateKey,
+        now: u64,
+    ) -> Option<bool> {
+        state.global.normalize(now, self.config.window_seconds);
+        let ceiling_reached = state.global.failures >= self.global_max_failures;
+        let bucket = state.keys.get_mut(key)?;
+        bucket.normalize(now, self.config.window_seconds);
+        if bucket.is_empty() {
+            state.keys.remove(key);
+            return None;
+        }
+        let limited = bucket.locked_until_millis > now || (ceiling_reached && bucket.failures > 0);
+        if !limited {
+            return None;
+        }
+        let audit = !bucket.limited_audited;
+        bucket.limited_audited = true;
+        Some(audit)
+    }
+
+    fn prune_if_due(&self, state: &mut AdminLoginRateLimitState, now: u64) {
+        if now.saturating_sub(state.last_prune_millis)
+            > seconds_to_millis(self.config.window_seconds)
+        {
+            self.prune(state, now);
+        }
+    }
+
+    fn prune(&self, state: &mut AdminLoginRateLimitState, now: u64) {
+        let window_seconds = self.config.window_seconds;
+        state.keys.retain(|_, bucket| {
+            bucket.normalize(now, window_seconds);
+            !bucket.is_empty()
+        });
+        state.last_prune_millis = now;
+    }
+}
+
+/// Drops one entry from a full map, preferring unlocked entries and then the
+/// oldest window, so active lockouts survive.
+fn evict_admin_login_rate_key(
+    keys: &mut BTreeMap<AdminLoginRateKey, AdminLoginRateLimitBucket>,
+    now: u64,
+) {
+    let victim = keys
+        .iter()
+        .min_by_key(|(_, bucket)| {
+            (
+                bucket.locked_until_millis > now,
+                bucket.window_started_millis,
+            )
+        })
+        .map(|(key, _)| *key);
+    if let Some(victim) = victim {
+        keys.remove(&victim);
     }
 }
 
@@ -673,6 +874,13 @@ impl AdminLoginRateLimitBucket {
         {
             *self = Self::default();
         }
+    }
+
+    fn count_failure(&mut self, now: u64) {
+        if self.window_started_millis == 0 {
+            self.window_started_millis = now;
+        }
+        self.failures = self.failures.saturating_add(1);
     }
 
     fn is_empty(&self) -> bool {
@@ -821,6 +1029,8 @@ pub struct CreateTimeSeriesRequest {
     pub name: String,
     pub chunk_millis: i64,
     pub retention_millis: Option<i64>,
+    #[serde(default)]
+    pub max_future_skew_millis: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -925,7 +1135,13 @@ pub struct AuditResponse {
 
 #[derive(Clone)]
 pub struct AdminState {
-    database: Arc<Mutex<Database>>,
+    /// Shared with `PostgreSQL` wire in `multidb serve`.
+    ///
+    /// Guard rules: read guards for `&Database` work, write guards only for the
+    /// `&mut Database` catalog, security and tuning methods. A task holds at most one
+    /// guard at a time and never nests or upgrades guards, because a queued writer
+    /// blocks new readers. Storage work runs through `run_blocking` with an owned guard.
+    database: Arc<RwLock<Database>>,
     started_at_millis: u64,
     status: AdminStatus,
     readiness_probe: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -933,6 +1149,7 @@ pub struct AdminState {
     admin_sessions: Arc<AdminSessionStore>,
     admin_session_ttl_seconds: u64,
     admin_login_rate_limiter: Arc<AdminLoginRateLimiter>,
+    admin_password_verifier: Arc<Semaphore>,
     insecure_local_admin: bool,
     studio_assets_dir: Option<Arc<PathBuf>>,
 }
@@ -943,7 +1160,7 @@ impl AdminState {
         let started_at_millis = now_millis();
         let status = status_from_database(&database, started_at_millis);
         Self {
-            database: Arc::new(Mutex::new(database)),
+            database: Arc::new(RwLock::new(database)),
             started_at_millis,
             status,
             readiness_probe: Arc::new(|| true),
@@ -953,15 +1170,16 @@ impl AdminState {
             admin_login_rate_limiter: Arc::new(AdminLoginRateLimiter::new(
                 AdminLoginRateLimitConfig::default(),
             )),
+            admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
         }
     }
 
     #[must_use]
-    pub fn from_database_handle(database: Arc<Mutex<Database>>) -> Self {
+    pub fn from_database_handle(database: Arc<RwLock<Database>>) -> Self {
         let started_at_millis = now_millis();
-        let status = database.try_lock().map_or_else(
+        let status = database.try_read().map_or_else(
             |_| empty_status(started_at_millis),
             |database| status_from_database(&database, started_at_millis),
         );
@@ -976,6 +1194,7 @@ impl AdminState {
             admin_login_rate_limiter: Arc::new(AdminLoginRateLimiter::new(
                 AdminLoginRateLimitConfig::default(),
             )),
+            admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
         }
@@ -989,7 +1208,7 @@ impl AdminState {
         let started_at_millis = now_millis();
         let status = status_from_database(&database, started_at_millis);
         Self {
-            database: Arc::new(Mutex::new(database)),
+            database: Arc::new(RwLock::new(database)),
             started_at_millis,
             status,
             readiness_probe: Arc::new(readiness_probe),
@@ -999,6 +1218,7 @@ impl AdminState {
             admin_login_rate_limiter: Arc::new(AdminLoginRateLimiter::new(
                 AdminLoginRateLimitConfig::default(),
             )),
+            admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
             insecure_local_admin: false,
             studio_assets_dir: None,
         }
@@ -1027,7 +1247,8 @@ impl AdminState {
     ///
     /// Existing credentials are preserved unless `reset` is true.
     /// # Errors
-    /// Fails when the password is empty, hashing fails, or persistence fails.
+    /// Fails when the password is empty or longer than 1024 bytes (even when an
+    /// existing credential would be kept), hashing fails, or persistence fails.
     pub async fn bootstrap_admin_password(
         &self,
         password: String,
@@ -1038,7 +1259,7 @@ impl AdminState {
         }
 
         let credential_exists = {
-            let database = self.database.lock().await;
+            let database = self.database.read().await;
             database
                 .admin_credential(ADMIN_USERNAME)
                 .map_err(|error| error.to_string())?
@@ -1046,11 +1267,16 @@ impl AdminState {
         };
 
         if credential_exists && !reset {
-            let mut database = self.database.lock().await;
+            let mut database = self.database.write().await;
             database
                 .ensure_bootstrap_admin_principal()
                 .map_err(|error| error.to_string())?;
             return Ok(());
+        }
+        if password.len() > MAX_ADMIN_PASSWORD_BYTES {
+            return Err(format!(
+                "admin password must be at most {MAX_ADMIN_PASSWORD_BYTES} bytes"
+            ));
         }
 
         let password_hash = hash_admin_password(password).await?;
@@ -1059,7 +1285,7 @@ impl AdminState {
             password_hash,
             updated_at_millis: now_millis(),
         };
-        let mut database = self.database.lock().await;
+        let mut database = self.database.write().await;
         database
             .set_admin_credential(&credential)
             .map_err(|error| error.to_string())?;
@@ -1089,9 +1315,13 @@ impl AdminState {
         self
     }
 
+    /// Reports whether any admin authentication method is configured.
+    ///
+    /// Waits for a read guard when the stored credential has to be checked, so the
+    /// answer does not depend on whether another request holds the database.
     #[must_use]
-    pub fn is_admin_auth_configured(&self) -> bool {
-        self.admin_token.is_some() || self.insecure_local_admin || self.has_admin_credential()
+    pub async fn is_admin_auth_configured(&self) -> bool {
+        self.admin_token.is_some() || self.insecure_local_admin || self.has_admin_credential().await
     }
 
     #[must_use]
@@ -1107,23 +1337,20 @@ impl AdminState {
     }
 
     fn bootstrap_insecure_local_admin(&self) {
-        let Ok(mut database) = self.database.try_lock() else {
+        let Ok(mut database) = self.database.try_write() else {
+            tracing::warn!("insecure local admin bootstrap skipped: database busy");
             return;
         };
-        let admin_role = Role::new("admin")
-            .grant(Resource::System, Permission::Admin)
-            .grant(Resource::Database, Permission::Read)
-            .grant(Resource::Database, Permission::Write)
-            .grant(Resource::Database, Permission::Admin);
-        let policy = database.authz_policy().clone().allow(admin_role);
+        let (admin_role, admin) = bootstrap_admin_identity();
         let mut principals = database.principal_registry().clone();
-        principals.insert("admin", Principal::new("admin").with_role("admin"));
-        principals.insert("root", Principal::new("root").with_role("admin"));
+        principals.insert("root", Principal::new("root").with_role(admin_role.name()));
+        principals.insert(admin.name().to_owned(), admin);
+        let policy = database.authz_policy().clone().allow(admin_role);
         database.set_authz_policy(policy);
         database.set_principal_registry(principals);
     }
 
-    fn principal_from_headers(&self, headers: &HeaderMap) -> Principal {
+    fn principal_from_headers(&self, database: &Database, headers: &HeaderMap) -> Principal {
         if let Some(principal) = self.session_principal_from_headers(headers) {
             return principal;
         }
@@ -1133,29 +1360,26 @@ impl AdminState {
             .map_or_else(
                 || {
                     if self.insecure_local_admin {
-                        Principal::new("admin").with_role("admin")
+                        admin_principal()
                     } else {
                         Principal::new("__missing_admin_principal__")
                     }
                 },
                 |name| {
-                    if self.insecure_local_admin && name == "admin" {
-                        Principal::new("admin").with_role("admin")
-                    } else if let Ok(database) = self.database.try_lock() {
-                        database.principal_for_user(name)
+                    if self.insecure_local_admin && name == ADMIN_USERNAME {
+                        admin_principal()
                     } else {
-                        Principal::new(name)
+                        database.principal_for_user(name)
                     }
                 },
             )
     }
 
-    fn has_admin_credential(&self) -> bool {
-        self.database.try_lock().is_ok_and(|database| {
-            database
-                .admin_credential(ADMIN_USERNAME)
-                .is_ok_and(|credential| credential.is_some())
-        })
+    async fn has_admin_credential(&self) -> bool {
+        let database = self.database.read().await;
+        database
+            .admin_credential(ADMIN_USERNAME)
+            .is_ok_and(|credential| credential.is_some())
     }
 
     fn session_from_headers(&self, headers: &HeaderMap) -> SessionValidation {
@@ -1177,10 +1401,19 @@ impl AdminState {
     }
 }
 
+/// Builds the Control Plane API router.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so the
+/// login lockout is tracked per client address; without connection info all
+/// clients share a single lockout.
 pub fn router(state: AdminState) -> Router {
     api_router().with_state(state)
 }
 
+/// Builds the Control Plane API router, also mounted under `/api`.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so the
+/// login lockout is tracked per client address.
 pub fn router_with_api_prefix(state: AdminState) -> Router {
     Router::new()
         .merge(api_router())
@@ -1188,6 +1421,11 @@ pub fn router_with_api_prefix(state: AdminState) -> Router {
         .with_state(state)
 }
 
+/// Builds the Control Plane API router, also mounted under `/api`, with
+/// Studio static assets as the fallback.
+///
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()` so the
+/// login lockout is tracked per client address.
 pub fn router_with_studio(state: AdminState) -> Router {
     Router::new()
         .merge(api_router())
@@ -1336,76 +1574,148 @@ async fn ready_handler(State(state): State<AdminState>) -> impl IntoResponse {
 
 async fn auth_login_handler(
     State(state): State<AdminState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(error) => return invalid_json(&error),
     };
-    let username = request.username.trim().to_owned();
-    if state.admin_login_rate_limiter.is_limited(&username) {
-        audit_auth_event(
-            &state,
-            None,
-            "login_rate_limited",
-            AuditOutcome::Denied,
-            Some("bucket: login"),
-        )
-        .await;
+    if request.username.len() > MAX_LOGIN_USERNAME_BYTES {
+        return invalid_json_value(format!(
+            "username must be at most {MAX_LOGIN_USERNAME_BYTES} bytes"
+        ));
+    }
+    if request.password.len() > MAX_ADMIN_PASSWORD_BYTES {
+        return invalid_json_value(format!(
+            "password must be at most {MAX_ADMIN_PASSWORD_BYTES} bytes"
+        ));
+    }
+    let client = login_client_ip(connect_info);
+    let username = request.username.trim();
+    if username != ADMIN_USERNAME {
+        return reject_unknown_login_user(&state, client, username).await;
+    }
+    let key = AdminLoginRateKey::new(client, username);
+    if let AdminLoginRateDecision::Limited { audit } = state.admin_login_rate_limiter.check(&key) {
+        if audit {
+            audit_login_refused(&state, client).await;
+        }
         return unauthorized_auth();
     }
+    if state.admin_password_verifier.available_permits() == 0 {
+        return auth_busy();
+    }
     let credential = {
-        let database = state.database.lock().await;
+        let database = state.database.read().await;
         match database.admin_credential(ADMIN_USERNAME) {
             Ok(credential) => credential,
             Err(error) => return db_error(&error),
         }
     };
-
     let Some(credential) = credential.filter(|credential| username == credential.username) else {
-        state.admin_login_rate_limiter.record_failure(&username);
-        audit_auth_event(
-            &state,
-            None,
-            "login",
-            AuditOutcome::Failed,
-            Some(&format!("username: {username}")),
-        )
-        .await;
-        return unauthorized_auth();
+        return reject_unknown_login_user(&state, client, username).await;
     };
 
-    let verified = verify_admin_password(credential.password_hash, request.password)
+    let Ok(permit) = Arc::clone(&state.admin_password_verifier).try_acquire_owned() else {
+        return auth_busy();
+    };
+    match state.admin_login_rate_limiter.reserve(&key) {
+        AdminLoginRateDecision::Allowed { ceiling_crossed } => {
+            if ceiling_crossed {
+                audit_auth_event(
+                    &state,
+                    None,
+                    "login_rate_limited",
+                    AuditOutcome::Denied,
+                    Some("scope: global"),
+                )
+                .await;
+            }
+        }
+        AdminLoginRateDecision::Limited { audit } => {
+            drop(permit);
+            if audit {
+                audit_login_refused(&state, client).await;
+            }
+            return unauthorized_auth();
+        }
+    }
+    let verified = verify_admin_password(permit, credential.password_hash, request.password)
         .await
         .unwrap_or(false);
     if !verified {
-        state.admin_login_rate_limiter.record_failure(&username);
-        audit_auth_event(
-            &state,
-            None,
-            "login",
-            AuditOutcome::Failed,
-            Some(&format!("username: {username}")),
-        )
-        .await;
+        audit_login_failure(&state, client, username).await;
         return unauthorized_auth();
     }
-    state.admin_login_rate_limiter.record_success(&username);
+    state.admin_login_rate_limiter.record_success(&key);
+    complete_admin_login(&state).await
+}
 
+/// Rejects a username that cannot authenticate without touching the lockout
+/// state, so junk usernames can never lock the admin out.
+async fn reject_unknown_login_user(
+    state: &AdminState,
+    client: Option<IpAddr>,
+    username: &str,
+) -> Response {
+    match state.admin_login_rate_limiter.record_unknown_user() {
+        AdminLoginAuditDecision::Event => audit_login_failure(state, client, username).await,
+        AdminLoginAuditDecision::Coalesced => {
+            audit_auth_event(
+                state,
+                None,
+                "login_audit_coalesced",
+                AuditOutcome::Failed,
+                Some("scope: unknown_user"),
+            )
+            .await;
+        }
+        AdminLoginAuditDecision::Skip => {}
+    }
+    unauthorized_auth()
+}
+
+async fn audit_login_failure(state: &AdminState, client: Option<IpAddr>, username: &str) {
+    let detail = format!(
+        "client: {} username: {}",
+        login_client_label(client),
+        audit_login_username(username)
+    );
+    audit_auth_event(state, None, "login", AuditOutcome::Failed, Some(&detail)).await;
+}
+
+async fn audit_login_refused(state: &AdminState, client: Option<IpAddr>) {
+    let detail = format!(
+        "scope: client client: {} username: {ADMIN_USERNAME}",
+        login_client_label(client)
+    );
+    audit_auth_event(
+        state,
+        None,
+        "login_rate_limited",
+        AuditOutcome::Denied,
+        Some(&detail),
+    )
+    .await;
+}
+
+async fn complete_admin_login(state: &AdminState) -> Response {
     let principal = admin_principal();
+    if let Some(response) = with_bootstrap_admin_principal(state, move |database| {
+        database
+            .record_admin_auth_event(
+                Some(&principal),
+                "login",
+                AuditOutcome::Succeeded,
+                Some("username: admin"),
+            )
+            .err()
+            .map(|error| db_error(&error))
+    })
+    .await
     {
-        let mut database = state.database.lock().await;
-        if let Err(error) = database.ensure_bootstrap_admin_principal() {
-            return db_error(&error);
-        }
-        if let Err(error) = database.record_admin_auth_event(
-            Some(&principal),
-            "login",
-            AuditOutcome::Succeeded,
-            Some("username: admin"),
-        ) {
-            return db_error(&error);
-        }
+        return response;
     }
 
     let (token, session) = match state.admin_sessions.issue(state.admin_session_ttl_seconds) {
@@ -1460,6 +1770,13 @@ async fn auth_change_password_handler(
         Ok(payload) => payload,
         Err(error) => return invalid_json(&error),
     };
+    if request.current_password.len() > MAX_ADMIN_PASSWORD_BYTES
+        || request.new_password.len() > MAX_ADMIN_PASSWORD_BYTES
+    {
+        return invalid_json_value(format!(
+            "passwords must be at most {MAX_ADMIN_PASSWORD_BYTES} bytes"
+        ));
+    }
     if request.new_password.trim().is_empty() {
         return invalid_json_value("new password must not be empty");
     }
@@ -1468,16 +1785,20 @@ async fn auth_change_password_handler(
     };
     let principal = session_principal(&session);
     let credential = {
-        let database = state.database.lock().await;
+        let database = state.database.read().await;
         match database.admin_credential(ADMIN_USERNAME) {
             Ok(Some(credential)) => credential,
             Ok(None) => return unauthorized_auth(),
             Err(error) => return db_error(&error),
         }
     };
-    let verified = verify_admin_password(credential.password_hash, request.current_password)
-        .await
-        .unwrap_or(false);
+    let Ok(permit) = Arc::clone(&state.admin_password_verifier).try_acquire_owned() else {
+        return auth_busy();
+    };
+    let verified =
+        verify_admin_password(permit, credential.password_hash, request.current_password)
+            .await
+            .unwrap_or(false);
     if !verified {
         audit_auth_event(
             &state,
@@ -1505,13 +1826,9 @@ async fn auth_change_password_handler(
         password_hash,
         updated_at_millis: now_millis(),
     };
-    {
-        let mut database = state.database.lock().await;
+    if let Some(response) = with_bootstrap_admin_principal(&state, move |database| {
         if let Err(error) = database.set_admin_credential(&credential) {
-            return db_error(&error);
-        }
-        if let Err(error) = database.ensure_bootstrap_admin_principal() {
-            return db_error(&error);
+            return Some(db_error(&error));
         }
         if let Err(error) = database.record_admin_auth_event(
             Some(&principal),
@@ -1519,18 +1836,23 @@ async fn auth_change_password_handler(
             AuditOutcome::Succeeded,
             Some("username: admin"),
         ) {
-            return db_error(&error);
+            return Some(db_error(&error));
         }
+        None
+    })
+    .await
+    {
+        return response;
     }
     api_ok(StatusCode::OK, json!({}))
 }
 
 async fn auth_me_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
+    let database = state.database.read().await;
+    let principal = state.principal_from_headers(&database, &headers);
     let system_admin = database
         .authz_policy()
         .authorize(&principal, &Resource::System, Permission::Admin)
@@ -1552,10 +1874,10 @@ async fn auth_me_handler(State(state): State<AdminState>, headers: HeaderMap) ->
 }
 
 async fn status_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let database = state.database.lock().await;
+    let database = state.database.read().await;
     api_ok(
         StatusCode::OK,
         status_from_database(&database, state.started_at_millis),
@@ -1563,7 +1885,7 @@ async fn status_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
 }
 
 async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     match observability::global_registry().render() {
@@ -1577,10 +1899,10 @@ async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) ->
 }
 
 async fn config_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let database = state.database.lock().await;
+    let database = state.database.read().await;
     api_ok(
         StatusCode::OK,
         DatabaseSpec::from_db_config("current", database.config()),
@@ -1588,14 +1910,15 @@ async fn config_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
 }
 
 async fn catalog_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let database = state.database.lock().await;
-    match catalog_response(&database) {
+    let database = Arc::clone(&state.database).read_owned().await;
+    run_blocking(move || match catalog_response(&database) {
         Ok(catalog) => api_ok(StatusCode::OK, catalog),
         Err(error) => db_error(&error),
-    }
+    })
+    .await
 }
 
 async fn sql_handler(
@@ -1603,24 +1926,31 @@ async fn sql_handler(
     headers: HeaderMap,
     body: Result<Json<SqlRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    match database.query_as(&principal, &request.sql).await {
-        Ok(output) => api_ok(
-            StatusCode::OK,
-            SqlResponse {
-                output: sql_output_json(output),
-            },
-        ),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    // Like pgwire, run the statement on a blocking thread: it does synchronous
+    // storage work and audit writes. The runtime handle still drives its timers
+    // and any tasks the query engine spawns.
+    let runtime = tokio::runtime::Handle::current();
+    run_blocking(
+        move || match runtime.block_on(database.query_as(&principal, &request.sql)) {
+            Ok(output) => api_ok(
+                StatusCode::OK,
+                SqlResponse {
+                    output: sql_output_json(output),
+                },
+            ),
+            Err(error) => db_error(&error),
+        },
+    )
+    .await
 }
 
 async fn table_rows_handler(
@@ -1629,41 +1959,44 @@ async fn table_rows_handler(
     AxumPath(name): AxumPath<String>,
     AxumQuery(query): AxumQuery<DataPageQuery>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Table(name.clone()),
-        Permission::Read,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    let page = data_page(&query);
-    match database.table(&name).and_then(|table| {
-        let mut rows = table.scan_page(page.offset, page.limit.saturating_add(1))?;
-        let has_more = rows.len() > page.limit;
-        if has_more {
-            rows.truncate(page.limit);
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Table(name.clone()),
+            Permission::Read,
+        ) {
+            return db_error(&DbError::from(error));
         }
-        let returned = rows.len();
-        Ok(TableRowsResponse {
-            table: name.clone(),
-            schema: table.schema().cloned(),
-            rows: rows.into_iter().map(model_row_to_json).collect(),
-            offset: page.offset,
-            limit: page.limit,
-            returned,
-            has_more,
-            next_offset: has_more.then_some(page.offset.saturating_add(returned)),
-            capped: page.capped,
-        })
-    }) {
-        Ok(rows) => api_ok(StatusCode::OK, rows),
-        Err(error) => db_error(&error),
-    }
+        let page = data_page(&query);
+        match database.table(&name).and_then(|table| {
+            let mut rows = table.scan_page(page.offset, page.limit.saturating_add(1))?;
+            let has_more = rows.len() > page.limit;
+            if has_more {
+                rows.truncate(page.limit);
+            }
+            let returned = rows.len();
+            Ok(TableRowsResponse {
+                table: name.clone(),
+                schema: table.schema().cloned(),
+                rows: rows.into_iter().map(model_row_to_json).collect(),
+                offset: page.offset,
+                limit: page.limit,
+                returned,
+                has_more,
+                next_offset: has_more.then_some(page.offset.saturating_add(returned)),
+                capped: page.capped,
+            })
+        }) {
+            Ok(rows) => api_ok(StatusCode::OK, rows),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn table_row_create_handler(
@@ -1690,7 +2023,7 @@ async fn table_row_delete_handler(
     AxumPath(name): AxumPath<String>,
     body: Result<Json<TableRowDeleteRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
@@ -1708,22 +2041,24 @@ async fn table_row_delete_handler(
         Ok(value) => value,
         Err(message) => return invalid_json_value(message),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Table(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database.begin_transaction().and_then(|mut txn| {
-        txn.delete_row(&name, &primary_key)?;
-        txn.commit()
-    }) {
-        Ok(()) => api_ok(StatusCode::OK, json!({ "deleted": true })),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Table(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database.transaction_with_retry(CONTROL_PLANE_CONFLICT_RETRIES, |txn| {
+            txn.delete_row(&name, &primary_key)
+        }) {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "deleted": true })),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn documents_handler(
@@ -1732,46 +2067,49 @@ async fn documents_handler(
     AxumPath(name): AxumPath<String>,
     AxumQuery(query): AxumQuery<DataPageQuery>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Collection(name.clone()),
-        Permission::Read,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    let page = data_page(&query);
-    match database.collection(&name).and_then(|collection| {
-        let mut documents = collection.scan_page(page.offset, page.limit.saturating_add(1))?;
-        let has_more = documents.len() > page.limit;
-        if has_more {
-            documents.truncate(page.limit);
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Collection(name.clone()),
+            Permission::Read,
+        ) {
+            return db_error(&DbError::from(error));
         }
-        let returned = documents.len();
-        Ok(DocumentListResponse {
-            collection: name.clone(),
-            documents: documents
-                .into_iter()
-                .map(|(id, document)| DocumentSummary {
-                    id: document_id_to_hex(id),
-                    document: model_value_to_json(&document),
-                })
-                .collect(),
-            offset: page.offset,
-            limit: page.limit,
-            returned,
-            has_more,
-            next_offset: has_more.then_some(page.offset.saturating_add(returned)),
-            capped: page.capped,
-        })
-    }) {
-        Ok(documents) => api_ok(StatusCode::OK, documents),
-        Err(error) => db_error(&error),
-    }
+        let page = data_page(&query);
+        match database.collection(&name).and_then(|collection| {
+            let mut documents = collection.scan_page(page.offset, page.limit.saturating_add(1))?;
+            let has_more = documents.len() > page.limit;
+            if has_more {
+                documents.truncate(page.limit);
+            }
+            let returned = documents.len();
+            Ok(DocumentListResponse {
+                collection: name.clone(),
+                documents: documents
+                    .into_iter()
+                    .map(|(id, document)| DocumentSummary {
+                        id: document_id_to_hex(id),
+                        document: model_value_to_json(&document),
+                    })
+                    .collect(),
+                offset: page.offset,
+                limit: page.limit,
+                returned,
+                has_more,
+                next_offset: has_more.then_some(page.offset.saturating_add(returned)),
+                capped: page.capped,
+            })
+        }) {
+            Ok(documents) => api_ok(StatusCode::OK, documents),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn document_create_handler(
@@ -1780,7 +2118,7 @@ async fn document_create_handler(
     AxumPath(name): AxumPath<String>,
     body: Result<Json<DocumentCreateRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
@@ -1791,28 +2129,29 @@ async fn document_create_handler(
         Ok(value) => value,
         Err(message) => return invalid_json_value(message),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Collection(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database.begin_transaction().and_then(|mut txn| {
-        let id = txn.insert_document(&name, &document)?;
-        txn.commit()?;
-        Ok(id)
-    }) {
-        Ok(id) => api_ok(
-            StatusCode::OK,
-            DocumentCreateResponse {
-                id: document_id_to_hex(id),
-            },
-        ),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Collection(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database.transaction_with_retry(CONTROL_PLANE_CONFLICT_RETRIES, |txn| {
+            txn.insert_document(&name, &document)
+        }) {
+            Ok(id) => api_ok(
+                StatusCode::OK,
+                DocumentCreateResponse {
+                    id: document_id_to_hex(id),
+                },
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn document_update_handler(
@@ -1821,7 +2160,7 @@ async fn document_update_handler(
     AxumPath((name, id)): AxumPath<(String, String)>,
     body: Result<Json<DocumentUpdateRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
@@ -1836,22 +2175,24 @@ async fn document_update_handler(
         Ok(value) => value,
         Err(message) => return invalid_json_value(message),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Collection(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database.begin_transaction().and_then(|mut txn| {
-        txn.update_document(&name, id, &document)?;
-        txn.commit()
-    }) {
-        Ok(()) => api_ok(StatusCode::OK, json!({ "updated": true })),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Collection(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database.transaction_with_retry(CONTROL_PLANE_CONFLICT_RETRIES, |txn| {
+            txn.update_document(&name, id, &document)
+        }) {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "updated": true })),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn document_delete_handler(
@@ -1860,7 +2201,7 @@ async fn document_delete_handler(
     AxumPath((name, id)): AxumPath<(String, String)>,
     body: Result<Json<ConfirmRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
@@ -1878,22 +2219,24 @@ async fn document_delete_handler(
         Ok(id) => id,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_document_id", message),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Collection(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database.begin_transaction().and_then(|mut txn| {
-        txn.delete_document(&name, id)?;
-        txn.commit()
-    }) {
-        Ok(()) => api_ok(StatusCode::OK, json!({ "deleted": true })),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Collection(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database.transaction_with_retry(CONTROL_PLANE_CONFLICT_RETRIES, |txn| {
+            txn.delete_document(&name, id)
+        }) {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "deleted": true })),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -1909,7 +2252,7 @@ async fn table_row_write(
     body: Result<Json<TableRowRequest>, JsonRejection>,
     mode: TableWriteMode,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
@@ -1920,26 +2263,27 @@ async fn table_row_write(
         Ok(row) => row,
         Err(message) => return invalid_json_value(message),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::Table(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    let result = database.begin_transaction().and_then(|mut txn| {
-        match mode {
-            TableWriteMode::Insert => txn.insert_row(&name, row)?,
-            TableWriteMode::Update => txn.update_row(&name, row)?,
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::Table(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
         }
-        txn.commit()
-    });
-    match result {
-        Ok(()) => api_ok(StatusCode::OK, json!({ "written": true })),
-        Err(error) => db_error(&error),
-    }
+        let result =
+            database.transaction_with_retry(CONTROL_PLANE_CONFLICT_RETRIES, |txn| match mode {
+                TableWriteMode::Insert => txn.insert_row(&name, row.clone()),
+                TableWriteMode::Update => txn.update_row(&name, row.clone()),
+            });
+        match result {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "written": true })),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn vector_insert_handler(
@@ -1948,7 +2292,7 @@ async fn vector_insert_handler(
     AxumPath(name): AxumPath<String>,
     body: Result<Json<VectorInsertRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
@@ -1959,27 +2303,30 @@ async fn vector_insert_handler(
         Ok(value) => value,
         Err(message) => return invalid_json_value(message),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::VectorCollection(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database
-        .vector_collection(&name)
-        .and_then(|vectors| Ok(vectors.insert_vector(&metadata, request.vector)?))
-    {
-        Ok(id) => api_ok(
-            StatusCode::OK,
-            DocumentCreateResponse {
-                id: document_id_to_hex(id),
-            },
-        ),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::VectorCollection(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database
+            .vector_collection(&name)
+            .and_then(|vectors| Ok(vectors.insert_vector(&metadata, request.vector)?))
+        {
+            Ok(id) => api_ok(
+                StatusCode::OK,
+                DocumentCreateResponse {
+                    id: document_id_to_hex(id),
+                },
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn vector_search_handler(
@@ -1988,29 +2335,32 @@ async fn vector_search_handler(
     AxumPath(name): AxumPath<String>,
     body: Result<Json<VectorSearchRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::VectorCollection(name.clone()),
-        Permission::Read,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database.vector_collection(&name).and_then(|vectors| {
-        let hits = vectors.knn(&request.vector, request.k)?;
-        vector_hits_with_metadata(&vectors, hits)
-    }) {
-        Ok(hits) => api_ok(StatusCode::OK, VectorSearchResponse { hits }),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::VectorCollection(name.clone()),
+            Permission::Read,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database.vector_collection(&name).and_then(|vectors| {
+            let hits = vectors.knn(&request.vector, request.k)?;
+            vector_hits_with_metadata(&vectors, hits)
+        }) {
+            Ok(hits) => api_ok(StatusCode::OK, VectorSearchResponse { hits }),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn time_series_insert_handler(
@@ -2019,29 +2369,29 @@ async fn time_series_insert_handler(
     AxumPath(name): AxumPath<String>,
     body: Result<Json<TimeSeriesPointRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::TimeSeries(name.clone()),
-        Permission::Write,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database
-        .time_series(&name)
-        .and_then(|series| Ok(series.insert_point(&request.series, request.point)?))
-    {
-        Ok(()) => api_ok(StatusCode::OK, json!({ "written": true })),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::TimeSeries(name.clone()),
+            Permission::Write,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match insert_time_series_point(&database, &name, &request.series, request.point) {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "written": true })),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn time_series_range_handler(
@@ -2050,25 +2400,28 @@ async fn time_series_range_handler(
     AxumPath(name): AxumPath<String>,
     AxumQuery(query): AxumQuery<TimeSeriesRangeQuery>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    if let Err(error) = database.authz_policy().authorize(
-        &principal,
-        &Resource::TimeSeries(name.clone()),
-        Permission::Read,
-    ) {
-        return db_error(&DbError::from(error));
-    }
-    match database
-        .time_series(&name)
-        .and_then(|series| Ok(series.range(&query.series, query.start, query.end)?))
-    {
-        Ok(points) => api_ok(StatusCode::OK, json!({ "points": points })),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        if let Err(error) = database.authz_policy().authorize(
+            &principal,
+            &Resource::TimeSeries(name.clone()),
+            Permission::Read,
+        ) {
+            return db_error(&DbError::from(error));
+        }
+        match database
+            .time_series(&name)
+            .and_then(|series| Ok(series.range(&query.series, query.start, query.end)?))
+        {
+            Ok(points) => api_ok(StatusCode::OK, json!({ "points": points })),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_table_handler(
@@ -2076,33 +2429,36 @@ async fn create_table_handler(
     headers: HeaderMap,
     body: Result<Json<CreateTableRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let indexes = request
-        .indexes
-        .into_iter()
-        .map(|index| RelIndexSpec {
-            id: index.id,
-            column: index.column,
-            expression: index.expression,
-            predicate: None,
-            include: index.include,
-        })
-        .collect();
-    match database.create_table_as(&principal, request.name, request.schema, indexes) {
-        Ok(table) => api_ok(
-            StatusCode::OK,
-            json!({ "created": true, "name": table.name(), "kind": "table" }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let indexes = request
+            .indexes
+            .into_iter()
+            .map(|index| RelIndexSpec {
+                id: index.id,
+                column: index.column,
+                expression: index.expression,
+                predicate: None,
+                include: index.include,
+            })
+            .collect();
+        match database.create_table_as(&principal, request.name, request.schema, indexes) {
+            Ok(table) => api_ok(
+                StatusCode::OK,
+                json!({ "created": true, "name": table.name(), "kind": "table" }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_collection_handler(
@@ -2110,41 +2466,44 @@ async fn create_collection_handler(
     headers: HeaderMap,
     body: Result<Json<CreateCollectionRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let indexes = request
-        .indexes
-        .into_iter()
-        .map(|index| IndexSpec::new(IndexId::new(index.id), FieldPath::new(index.path)))
-        .collect();
-    let collection_id = request
-        .collection_id
-        .unwrap_or_else(|| next_collection_id(&database));
-    match database.create_collection_as(
-        &principal,
-        request.name.clone(),
-        CollectionId::new(collection_id),
-        request.fields,
-        indexes,
-    ) {
-        Ok(collection) => api_ok(
-            StatusCode::OK,
-            json!({
-                "created": true,
-                "name": request.name,
-                "kind": "collection",
-                "collection_id": collection.collection_id().as_u32()
-            }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let indexes = request
+            .indexes
+            .into_iter()
+            .map(|index| IndexSpec::new(IndexId::new(index.id), FieldPath::new(index.path)))
+            .collect();
+        let collection_id = request
+            .collection_id
+            .unwrap_or_else(|| next_collection_id(&database));
+        match database.create_collection_as(
+            &principal,
+            request.name.clone(),
+            CollectionId::new(collection_id),
+            request.fields,
+            indexes,
+        ) {
+            Ok(collection) => api_ok(
+                StatusCode::OK,
+                json!({
+                    "created": true,
+                    "name": request.name,
+                    "kind": "collection",
+                    "collection_id": collection.collection_id().as_u32()
+                }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_vector_handler(
@@ -2152,33 +2511,36 @@ async fn create_vector_handler(
     headers: HeaderMap,
     body: Result<Json<CreateVectorRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let collection_id = request
-        .collection_id
-        .unwrap_or_else(|| next_collection_id(&database));
-    let config = VectorCollectionConfig::new(CollectionId::new(collection_id), request.dim)
-        .with_metric(request.metric)
-        .with_hnsw(request.hnsw);
-    match database.create_vector_collection_as(&principal, request.name.clone(), config) {
-        Ok(vectors) => api_ok(
-            StatusCode::OK,
-            json!({
-                "created": true,
-                "name": request.name,
-                "kind": "vector",
-                "collection_id": vectors.collection_id().as_u32()
-            }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let collection_id = request
+            .collection_id
+            .unwrap_or_else(|| next_collection_id(&database));
+        let config = VectorCollectionConfig::new(CollectionId::new(collection_id), request.dim)
+            .with_metric(request.metric)
+            .with_hnsw(request.hnsw);
+        match database.create_vector_collection_as(&principal, request.name.clone(), config) {
+            Ok(vectors) => api_ok(
+                StatusCode::OK,
+                json!({
+                    "created": true,
+                    "name": request.name,
+                    "kind": "vector",
+                    "collection_id": vectors.collection_id().as_u32()
+                }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_time_series_handler(
@@ -2186,27 +2548,33 @@ async fn create_time_series_handler(
     headers: HeaderMap,
     body: Result<Json<CreateTimeSeriesRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let config = TimeSeriesConfig {
-        name: request.name.clone(),
-        chunk_millis: request.chunk_millis,
-        retention_millis: request.retention_millis,
-    };
-    match database.create_time_series_as(&principal, &config) {
-        Ok(series) => api_ok(
-            StatusCode::OK,
-            json!({ "created": true, "name": series.config().name, "kind": "time_series" }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let config = TimeSeriesConfig {
+            name: request.name.clone(),
+            chunk_millis: request.chunk_millis,
+            retention_millis: request.retention_millis,
+            max_future_skew_millis: request
+                .max_future_skew_millis
+                .unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MILLIS),
+        };
+        match database.create_time_series_as(&principal, &config) {
+            Ok(series) => api_ok(
+                StatusCode::OK,
+                json!({ "created": true, "name": series.config().name, "kind": "time_series" }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_full_text_handler(
@@ -2214,29 +2582,32 @@ async fn create_full_text_handler(
     headers: HeaderMap,
     body: Result<Json<CreateFullTextRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let mut config = FullTextIndexConfig::collection(
-        request.name.clone(),
-        CollectionId::new(request.collection_id),
-        FieldPath::new(request.path),
-    );
-    config.language = request.language;
-    config.refresh_lag_target = request.refresh_lag_target;
-    match database.create_full_text_index_as(&principal, &config) {
-        Ok(index) => api_ok(
-            StatusCode::OK,
-            json!({ "created": true, "name": index.config().name, "kind": "full_text_index" }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let mut config = FullTextIndexConfig::collection(
+            request.name.clone(),
+            CollectionId::new(request.collection_id),
+            FieldPath::new(request.path),
+        );
+        config.language = request.language;
+        config.refresh_lag_target = request.refresh_lag_target;
+        match database.create_full_text_index_as(&principal, &config) {
+            Ok(index) => api_ok(
+                StatusCode::OK,
+                json!({ "created": true, "name": index.config().name, "kind": "full_text_index" }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_geo_index_handler(
@@ -2244,28 +2615,31 @@ async fn create_geo_index_handler(
     headers: HeaderMap,
     body: Result<Json<CreateGeoIndexRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let mut config = GeoIndexConfig::new(
-        request.name.clone(),
-        CollectionId::new(request.collection_id),
-        FieldPath::new(request.path),
-    );
-    config.precision = request.precision;
-    match database.create_geo_index_as(&principal, &config) {
-        Ok(_) => api_ok(
-            StatusCode::OK,
-            json!({ "created": true, "name": request.name, "kind": "geo_index" }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let mut config = GeoIndexConfig::new(
+            request.name.clone(),
+            CollectionId::new(request.collection_id),
+            FieldPath::new(request.path),
+        );
+        config.precision = request.precision;
+        match database.create_geo_index_as(&principal, &config) {
+            Ok(_) => api_ok(
+                StatusCode::OK,
+                json!({ "created": true, "name": request.name, "kind": "geo_index" }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn create_graph_handler(
@@ -2273,34 +2647,42 @@ async fn create_graph_handler(
     headers: HeaderMap,
     body: Result<Json<CreateGraphRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    match database.create_graph_as(
-        &principal,
-        request.name.clone(),
-        GraphId::new(request.graph_id),
-    ) {
-        Ok(_) => api_ok(
-            StatusCode::OK,
-            json!({ "created": true, "name": request.name, "kind": "graph", "graph_id": request.graph_id }),
-        ),
-        Err(error) => db_error(&error),
-    }
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        match database.create_graph_as(
+            &principal,
+            request.name.clone(),
+            GraphId::new(request.graph_id),
+        ) {
+            Ok(_) => api_ok(
+                StatusCode::OK,
+                json!({
+                    "created": true,
+                    "name": request.name,
+                    "kind": "graph",
+                    "graph_id": request.graph_id,
+                }),
+            ),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn security_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
+    let database = state.database.read().await;
+    let principal = state.principal_from_headers(&database, &headers);
     if let Err(error) =
         database
             .authz_policy()
@@ -2316,56 +2698,69 @@ async fn security_update_handler(
     headers: HeaderMap,
     body: Result<Json<SecurityStateRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let mut database = state.database.lock().await;
-    let policy = AuthzPolicy::new(request.roles.into_iter().map(role_from_summary));
-    let mut registry = PrincipalRegistry::new();
-    for principal in request.principals {
-        let mut mapped = Principal::new(principal.principal);
-        for role in principal.roles {
-            mapped = mapped.with_role(role);
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let policy = AuthzPolicy::new(request.roles.into_iter().map(role_from_summary));
+        let mut registry = PrincipalRegistry::new();
+        for principal in request.principals {
+            let mut mapped = Principal::new(principal.principal);
+            for role in principal.roles {
+                mapped = mapped.with_role(role);
+            }
+            registry.insert(principal.user, mapped);
         }
-        registry.insert(principal.user, mapped);
-    }
-    if let Err(error) = database.set_authz_policy_as(&principal, policy) {
-        return db_error(&error);
-    }
-    match database.set_principal_registry_as(&principal, registry) {
-        Ok(()) => api_ok(StatusCode::OK, security_state(&database)),
-        Err(error) => db_error(&error),
-    }
+        if let Err(error) = database.set_authz_policy_as(&principal, policy) {
+            return db_error(&error);
+        }
+        match database.set_principal_registry_as(&principal, registry) {
+            Ok(()) => api_ok(StatusCode::OK, security_state(&database)),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
 }
 
 async fn audit_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    match database.audit_events_as(&principal) {
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || match database.audit_events_as(&principal) {
         Ok(events) => api_ok(StatusCode::OK, AuditResponse { events }),
         Err(error) => db_error(&error),
-    }
+    })
+    .await
 }
 
 async fn config_validate_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<DatabaseSpec>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let Json(spec) = match body {
+    let Json(value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
+    };
+    let spec = match spec_io::decode_spec_value(value) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return match error.validation_report() {
+                Some(report) => api_ok(StatusCode::UNPROCESSABLE_ENTITY, report),
+                None => invalid_spec_json(&error),
+            };
+        }
     };
     let report = GuaranteeValidator::validate(&spec);
     let status = if report.valid {
@@ -2379,16 +2774,25 @@ async fn config_validate_handler(
 async fn config_plan_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
-    body: Result<Json<ConfigPlanRequest>, JsonRejection>,
+    body: Result<Json<JsonValue>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let Json(request) = match body {
+    let Json(mut value) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let plan = MigrationPlanner::plan(&request.current, &request.desired);
+    // The body is a ConfigPlanRequest; each side is decoded through spec_io.
+    let current = match decode_plan_side(&mut value, "current") {
+        Ok(spec) => spec,
+        Err(error) => return plan_side_error("current", error),
+    };
+    let desired = match decode_plan_side(&mut value, "desired") {
+        Ok(spec) => spec,
+        Err(error) => return plan_side_error("desired", error),
+    };
+    let plan = MigrationPlanner::plan(&current, &desired);
     let status = if plan.valid {
         StatusCode::OK
     } else {
@@ -2402,26 +2806,29 @@ async fn config_apply_handler(
     headers: HeaderMap,
     body: Result<Json<ConfigApplyRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    match database.confirm_config_apply_as(&principal, &request.plan, &request.confirm) {
-        Ok(report) => {
-            let status = status_for_apply_report(&report);
-            api_ok(status, report)
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        match database.confirm_config_apply_as(&principal, &request.plan, &request.confirm) {
+            Ok(report) => {
+                let status = status_for_apply_report(&report);
+                api_ok(status, report)
+            }
+            Err(error) => db_error(&error),
         }
-        Err(error) => db_error(&error),
-    }
+    })
+    .await
 }
 
 async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let profiles = built_in_profiles()
@@ -2444,14 +2851,33 @@ async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -
                             .map(|definition| definition.slug)
                     })
                     .collect::<Vec<_>>(),
+                "variants": profile_variants()
+                    .iter()
+                    .filter(|variant| variant.product == profile.slug)
+                    .map(|variant| {
+                        json!({
+                            "name": variant.name,
+                            "storage_profile": variant.storage_profile,
+                            "canonical": variant.canonical,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "knobs": canonical_profile_knobs(profile.slug),
             })
         })
         .collect::<Vec<_>>();
     api_ok(StatusCode::OK, profiles)
 }
 
+/// The preset knobs of a product profile's canonical variant, as `GET /profiles` lists them.
+fn canonical_profile_knobs(slug: &str) -> Option<ProfileKnobs> {
+    resolve_named_profile(slug, &ProfileKnobOverrides::default())
+        .resolved()
+        .map(|resolved| resolved.knobs.clone())
+}
+
 async fn roles_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let roles = collection_role_definitions()
@@ -2470,7 +2896,7 @@ async fn roles_handler(State(state): State<AdminState>, headers: HeaderMap) -> R
 }
 
 async fn domains_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let domains = consistency_domain_definitions()
@@ -2488,22 +2914,23 @@ async fn domains_handler(State(state): State<AdminState>, headers: HeaderMap) ->
 }
 
 async fn extensions_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     api_ok(StatusCode::OK, extension_catalog_entries())
 }
 
 async fn advice_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    match database.runtime_advice_as(&principal) {
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || match database.runtime_advice_as(&principal) {
         Ok(advice) => api_ok(StatusCode::OK, advice),
         Err(error) => db_error(&error),
-    }
+    })
+    .await
 }
 
 async fn advice_plan_handler(
@@ -2511,19 +2938,22 @@ async fn advice_plan_handler(
     headers: HeaderMap,
     body: Result<Json<RuntimeAdvicePlanRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    match database.runtime_advice_plan_as(&principal, &request.advice_id) {
-        Ok(plan) => api_ok(StatusCode::OK, plan),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.runtime_advice_plan_as(&principal, &request.advice_id) {
+            Ok(plan) => api_ok(StatusCode::OK, plan),
+            Err(error) => db_error(&error),
+        },
+    )
+    .await
 }
 
 async fn advice_decision_handler(
@@ -2531,23 +2961,26 @@ async fn advice_decision_handler(
     headers: HeaderMap,
     body: Result<Json<RuntimeAdviceDecisionRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     let Json(request) = match body {
         Ok(body) => body,
         Err(error) => return invalid_json(&error),
     };
-    let principal = state.principal_from_headers(&headers);
-    let database = state.database.lock().await;
-    match database.record_runtime_advice_decision_as(&principal, request) {
-        Ok(decision) => api_ok(StatusCode::OK, decision),
-        Err(error) => db_error(&error),
-    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.record_runtime_advice_decision_as(&principal, request) {
+            Ok(decision) => api_ok(StatusCode::OK, decision),
+            Err(error) => db_error(&error),
+        },
+    )
+    .await
 }
 
 async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin_token(&state, &headers) {
+    if let Some(response) = require_admin_token(&state, &headers).await {
         return response;
     }
     api_ok(
@@ -2592,6 +3025,29 @@ async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
             ],
         },
     )
+}
+
+/// Inserts one time-series point, retrying chunk compare-and-set conflicts.
+fn insert_time_series_point(
+    database: &Database,
+    name: &str,
+    series: &str,
+    point: TimePoint,
+) -> Result<(), DbError> {
+    let collection = database.time_series(name)?;
+    let mut attempts = 0;
+    loop {
+        match collection
+            .insert_point(series, point)
+            .map_err(DbError::from)
+        {
+            Err(error) if error.is_conflict() && attempts < CONTROL_PLANE_CONFLICT_RETRIES => {
+                attempts += 1;
+                std::thread::yield_now();
+            }
+            result => return result,
+        }
+    }
 }
 
 fn catalog_response(database: &Database) -> Result<CatalogResponse, DbError> {
@@ -2858,12 +3314,12 @@ fn empty_status(started_at_millis: u64) -> AdminStatus {
     }
 }
 
-fn require_admin_token(state: &AdminState, headers: &HeaderMap) -> Option<Response> {
+async fn require_admin_token(state: &AdminState, headers: &HeaderMap) -> Option<Response> {
     if state.insecure_local_admin {
         return None;
     }
     let Some(actual) = bearer_token(headers) else {
-        if !state.is_admin_auth_configured() {
+        if !state.is_admin_auth_configured().await {
             return Some(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "admin_auth_not_configured",
@@ -2891,7 +3347,7 @@ fn require_admin_token(state: &AdminState, headers: &HeaderMap) -> Option<Respon
     {
         return None;
     }
-    if state.admin_token.is_none() && !state.has_admin_credential() {
+    if state.admin_token.is_none() && !state.has_admin_credential().await {
         return Some(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "admin_auth_not_configured",
@@ -2917,8 +3373,35 @@ fn unauthorized_auth() -> Response {
     api_error(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
 }
 
+fn auth_busy() -> Response {
+    (
+        [(RETRY_AFTER, "1")],
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_busy",
+            "too many concurrent sign-in attempts; retry shortly",
+        ),
+    )
+        .into_response()
+}
+
+fn login_client_ip(connect_info: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
+    connect_info.map(|Extension(ConnectInfo(address))| address.ip())
+}
+
+fn login_client_label(client: Option<IpAddr>) -> String {
+    client.map_or_else(
+        || "unknown".to_owned(),
+        |address| address.to_canonical().to_string(),
+    )
+}
+
+fn audit_login_username(username: &str) -> String {
+    username.chars().take(AUDIT_LOGIN_USERNAME_CHARS).collect()
+}
+
 fn admin_principal() -> Principal {
-    Principal::new(ADMIN_USERNAME).with_role(ADMIN_ROLE)
+    bootstrap_admin_identity().1
 }
 
 fn session_principal(session: &SessionRecord) -> Principal {
@@ -2929,6 +3412,10 @@ fn session_principal(session: &SessionRecord) -> Principal {
     principal
 }
 
+/// Writes an admin auth audit event on the blocking pool.
+///
+/// Callers must not hold a database guard. The write is awaited so the event is
+/// durable before the response is returned.
 async fn audit_auth_event(
     state: &AdminState,
     principal: Option<&Principal>,
@@ -2936,9 +3423,18 @@ async fn audit_auth_event(
     outcome: AuditOutcome,
     detail: Option<&str>,
 ) {
-    let database = state.database.lock().await;
-    if let Err(error) = database.record_admin_auth_event(principal, action, outcome, detail) {
-        tracing::warn!("failed to write admin auth audit event: {error}");
+    let principal = principal.cloned();
+    let action = action.to_owned();
+    let detail = detail.map(str::to_owned);
+    let database = Arc::clone(&state.database).read_owned().await;
+    let result = tokio::task::spawn_blocking(move || {
+        database.record_admin_auth_event(principal.as_ref(), &action, outcome, detail.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("failed to write admin auth audit event: {error}"),
+        Err(error) => tracing::warn!("admin auth audit task failed: {error}"),
     }
 }
 
@@ -2958,8 +3454,16 @@ async fn hash_admin_password(password: String) -> Result<String, String> {
     .map_err(|error| error.to_string())?
 }
 
-async fn verify_admin_password(password_hash: String, password: String) -> Result<bool, String> {
+async fn verify_admin_password(
+    permit: OwnedSemaphorePermit,
+    password_hash: String,
+    password: String,
+) -> Result<bool, String> {
     tokio::task::spawn_blocking(move || {
+        // The permit lives in the blocking task, not in the request future: a
+        // client that disconnects drops the handler, but hashing keeps running
+        // and its Argon2 memory must stay counted until it finishes.
+        let _permit = permit;
         let parsed_hash = PasswordHash::new(&password_hash).map_err(|error| error.to_string())?;
         let params = Params::new(19 * 1_024, 2, 1, None).map_err(|error| error.to_string())?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -3009,18 +3513,144 @@ fn invalid_json(error: &JsonRejection) -> Response {
     )
 }
 
+/// A spec body that is valid JSON but not a `DatabaseSpec` keeps today's 400 `invalid_json`.
+fn invalid_spec_json(error: &SpecIoError) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+        format!("invalid JSON request body: {error}"),
+    )
+}
+
+/// Decodes one side of a `ConfigPlanRequest`; the error is `None` when the field is missing.
+fn decode_plan_side(
+    value: &mut JsonValue,
+    side: &str,
+) -> Result<DatabaseSpec, Option<SpecIoError>> {
+    let spec = value.get_mut(side).map(JsonValue::take).ok_or(None)?;
+    spec_io::decode_spec_value(spec).map_err(Some)
+}
+
+/// A missing side or a decode error is 400 `invalid_json`; a version error cannot become a
+/// `MigrationPlan`, so it is 422 `invalid_spec_version` carrying the report.
+fn plan_side_error(side: &str, error: Option<SpecIoError>) -> Response {
+    let Some(error) = error else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            format!("invalid JSON request body: missing field `{side}`"),
+        );
+    };
+    match error.validation_report() {
+        Some(report) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_spec_version",
+            format!("{side}: {}", describe_report(&report)),
+        ),
+        None => invalid_spec_json(&error),
+    }
+}
+
+fn describe_report(report: &ValidationReport) -> String {
+    report
+        .issues
+        .iter()
+        .map(|issue| format!("{} at {}: {}", issue.code, issue.path, issue.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn invalid_json_value(message: impl Into<String>) -> Response {
     api_error(StatusCode::BAD_REQUEST, "invalid_value", message)
 }
 
+/// Maps a database error to a Control Plane error response.
+///
+/// Query governor saturation is `503 busy` with `Retry-After`, and an optimistic
+/// write conflict that outlasted the internal retries is `409 conflict`; both
+/// can be retried as is. Authorization failures are `403 forbidden`, an invalid
+/// time-series config or point is `400 invalid_value`, and everything else is
+/// `500 internal_error`.
 fn db_error(error: &DbError) -> Response {
     if matches!(error, DbError::AuthzDenied(_)) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(error, DbError::Query(QueryError::Busy(_))) {
+        let mut response = api_error(StatusCode::SERVICE_UNAVAILABLE, "busy", error.to_string());
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from_static(BUSY_RETRY_AFTER_SECONDS),
+        );
+        return response;
+    }
+    if error.is_conflict() {
+        return api_error(StatusCode::CONFLICT, "conflict", error.to_string());
+    }
+    if matches!(
+        error,
+        DbError::TimeSeries(TimeSeriesError::InvalidConfig(_) | TimeSeriesError::InvalidPoint(_))
+    ) {
+        return invalid_json_value(error.to_string());
     }
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
         error.to_string(),
+    )
+}
+
+/// Runs Control Plane storage work on the blocking pool.
+///
+/// Keeps redb I/O, fsync'd audit writes, the database's std commit and audit locks
+/// and group-commit waits off the async workers. Callers move an owned database
+/// guard into `work`, so the guard is released when the work finishes.
+async fn run_blocking(work: impl FnOnce() -> Response + Send + 'static) -> Response {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(response) => response,
+        Err(error) => blocking_task_failed(&error),
+    }
+}
+
+/// Runs `work` on the blocking pool once the bootstrap admin principal exists.
+///
+/// The exclusive lock is taken only when the principal has to be added, so a
+/// login or password change does not queue every other request behind a long
+/// statement.
+async fn with_bootstrap_admin_principal(
+    state: &AdminState,
+    work: impl FnOnce(&Database) -> Option<Response> + Send + 'static,
+) -> Option<Response> {
+    let database = Arc::clone(&state.database).read_owned().await;
+    if database.has_bootstrap_admin_principal() {
+        return run_blocking_opt(move || work(&database)).await;
+    }
+    drop(database);
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    run_blocking_opt(move || {
+        if let Err(error) = database.ensure_bootstrap_admin_principal() {
+            return Some(db_error(&error));
+        }
+        work(&database)
+    })
+    .await
+}
+
+/// Like `run_blocking`, for work that only produces a response on failure.
+async fn run_blocking_opt(
+    work: impl FnOnce() -> Option<Response> + Send + 'static,
+) -> Option<Response> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(response) => response,
+        Err(error) => Some(blocking_task_failed(&error)),
+    }
+}
+
+fn blocking_task_failed(error: &tokio::task::JoinError) -> Response {
+    tracing::warn!("control plane blocking task failed: {error}");
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "blocking task failed",
     )
 }
 
@@ -3082,12 +3712,12 @@ fn seconds_to_millis(seconds: u64) -> u64 {
     seconds.saturating_mul(1_000)
 }
 
-fn login_username_bucket(username: &str) -> String {
-    let normalized = username.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        "user:__empty__".to_owned()
-    } else {
-        format!("user:{normalized}")
+/// Canonicalizes a client address for the login lockout; IPv6 clients are
+/// grouped by /64 because a single host usually controls the whole prefix.
+fn login_rate_client(address: IpAddr) -> IpAddr {
+    match address.to_canonical() {
+        IpAddr::V4(address) => IpAddr::V4(address),
+        IpAddr::V6(address) => IpAddr::V6(Ipv6Addr::from(u128::from(address) & (!0_u128 << 64))),
     }
 }
 
@@ -3116,28 +3746,50 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminLoginRateLimitConfig, AdminState, ConfigApplyRequest, ConfigPlanRequest,
-        local_insecure_admin_allowed,
+        ADMIN_PASSWORD_VERIFY_PERMITS, AdminLoginAuditDecision, AdminLoginRateDecision,
+        AdminLoginRateKey, AdminLoginRateLimitConfig, AdminLoginRateLimiter, AdminState,
+        ConfigApplyRequest, ConfigPlanRequest, local_insecure_admin_allowed, login_client_label,
     };
     use crate::{
-        config_spec::{ApplyStatus, DatabaseSpec, MigrationPlanner},
-        db::{DbConfig, Profile, create_database, open_database},
-        query::SqlOutput,
+        config_spec::{
+            ApplyStatus, DatabaseSpec, MigrationPlanner, ProfileKnobOverrides,
+            resolve_named_profile,
+        },
+        db::{
+            DbConfig, DbError, OperationalConfig, Profile, ReplicationKind, create_database,
+            create_database_with_profile, open_database,
+        },
+        query::{QueryError, SqlOutput},
+        repl::ReplError,
         runtime_advisor::{
             RuntimeAdviceDecisionRequest, RuntimeAdvicePlanRequest, RuntimeAdviceStatus,
         },
-        security::{AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role},
+        security::{
+            AuditOutcome, AuthzError, AuthzPolicy, Permission, Principal, PrincipalRegistry,
+            Resource, Role,
+        },
+        storage::StorageError,
+        timeseries::TimeSeriesError,
         tuning::WorkloadSample,
     };
     use axum::{
         body::{Body, to_bytes},
-        http::{Method, Request, StatusCode, header::AUTHORIZATION},
+        http::{
+            Method, Request, StatusCode,
+            header::{AUTHORIZATION, RETRY_AFTER},
+        },
     };
     use serde::Serialize;
     use serde_json::Value;
-    use std::{fs, net::SocketAddr, sync::Arc};
+    use std::{
+        convert::Infallible,
+        fs,
+        net::{IpAddr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     #[test]
@@ -3265,7 +3917,7 @@ mod tests {
     #[tokio::test]
     async fn password_login_failure_is_neutral_and_audited()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         let state = AdminState::from_database_handle(Arc::clone(&database));
         state
             .bootstrap_admin_password("correct".to_owned(), false)
@@ -3286,7 +3938,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = json_body(response).await?;
         assert_eq!(body["error"]["code"], "unauthorized");
-        let database = database.lock().await;
+        let database = database.read().await;
         assert!(database.audit_events()?.iter().any(|event| {
             event.action == "login" && event.outcome == crate::security::AuditOutcome::Failed
         }));
@@ -3296,7 +3948,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_login_failures_are_rate_limited_neutrally_and_audited()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         let state = AdminState::from_database_handle(Arc::clone(&database))
             .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
         state
@@ -3307,41 +3959,669 @@ mod tests {
         for _ in 0..2 {
             let response = app
                 .clone()
-                .oneshot(json_request(
-                    Method::POST,
-                    "/auth/login",
-                    &serde_json::json!({
-                        "username": "admin",
-                        "password": "wrong"
-                    }),
-                )?)
+                .oneshot(login_request("admin", "wrong", None)?)
                 .await?;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             let body = json_body(response).await?;
             assert_eq!(body["error"]["code"], "unauthorized");
         }
 
+        for _ in 0..3 {
+            let locked = app
+                .clone()
+                .oneshot(login_request("admin", "correct", None)?)
+                .await?;
+            assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+            assert!(locked.headers().get("retry-after").is_none());
+            let body = json_body(locked).await?;
+            assert_eq!(body["error"]["code"], "unauthorized");
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            2
+        );
+        assert_eq!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?,
+            vec!["scope: client client: unknown username: admin".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn junk_username_failures_do_not_lock_out_admin() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let client = "198.51.100.7:40000".parse::<SocketAddr>()?;
+
+        let mut usernames = (0..10)
+            .map(|index| format!("ghost-{index}"))
+            .collect::<Vec<_>>();
+        usernames.extend(std::iter::repeat_n("ghost".to_owned(), 3));
+        usernames.extend(std::iter::repeat_n("Admin".to_owned(), 3));
+        for username in &usernames {
+            let response = app
+                .clone()
+                .oneshot(login_request(username, "wrong", Some(client))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let same_client = app
+            .clone()
+            .oneshot(login_request("admin", "correct", Some(client))?)
+            .await?;
+        assert_eq!(same_client.status(), StatusCode::OK);
+        let without_connect_info = app
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(without_connect_info.status(), StatusCode::OK);
+        assert!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
+                .await?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_lockout_is_scoped_to_client_ip() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let attacker = "198.51.100.7:40000".parse::<SocketAddr>()?;
+        let other = "203.0.113.9:40000".parse::<SocketAddr>()?;
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(login_request("admin", "wrong", Some(attacker))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
         let locked = app
-            .oneshot(json_request(
-                Method::POST,
-                "/auth/login",
-                &serde_json::json!({
-                    "username": "admin",
-                    "password": "correct"
-                }),
-            )?)
+            .clone()
+            .oneshot(login_request("admin", "correct", Some(attacker))?)
             .await?;
         assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
-        assert!(locked.headers().get("retry-after").is_none());
-        let body = json_body(locked).await?;
-        assert_eq!(body["error"]["code"], "unauthorized");
-        let database = database.lock().await;
-        assert!(database.audit_events()?.iter().any(|event| {
-            event.action == "login_rate_limited"
-                && event.outcome == crate::security::AuditOutcome::Denied
-                && event.detail.as_deref() == Some("bucket: login")
-        }));
+        let other_client = app
+            .oneshot(login_request("admin", "correct", Some(other))?)
+            .await?;
+        assert_eq!(other_client.status(), StatusCode::OK);
+
+        let refused = audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?;
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused
+                .iter()
+                .all(|detail| detail.contains("client: 198.51.100.7"))
+        );
+        let failures = audit_details(&database, "login", AuditOutcome::Failed).await?;
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures
+                .iter()
+                .all(|detail| detail.starts_with("client: 198.51.100.7 username: admin"))
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_ceiling_tightens_failed_clients_but_admits_clean_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let mut state = AdminState::from_database_handle(Arc::clone(&database));
+        state.admin_login_rate_limiter = Arc::new(AdminLoginRateLimiter::with_limits(
+            AdminLoginRateLimitConfig::new(5, 300, 300),
+            64,
+            2,
+        ));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let first = "198.51.100.1:40000".parse::<SocketAddr>()?;
+        let second = "198.51.100.2:40000".parse::<SocketAddr>()?;
+        let clean = "198.51.100.3:40000".parse::<SocketAddr>()?;
+
+        for client in [first, second] {
+            let response = app
+                .clone()
+                .oneshot(login_request("admin", "wrong", Some(client))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            2
+        );
+        assert_eq!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?,
+            vec!["scope: global".to_owned()]
+        );
+
+        let tightened = app
+            .clone()
+            .oneshot(login_request("admin", "correct", Some(first))?)
+            .await?;
+        assert_eq!(tightened.status(), StatusCode::UNAUTHORIZED);
+        let admitted = app
+            .oneshot(login_request("admin", "correct", Some(clean))?)
+            .await?;
+        assert_eq!(admitted.status(), StatusCode::OK);
+
+        let refused = audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?;
+        assert_eq!(refused.len(), 2);
+        assert!(refused.contains(&"scope: global".to_owned()));
+        assert!(refused.contains(&"scope: client client: 198.51.100.1 username: admin".to_owned()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_user_login_audit_is_capped_per_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(1, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+
+        for index in 1..=25 {
+            let client = format!("192.0.2.{index}:40000").parse::<SocketAddr>()?;
+            let response = app
+                .clone()
+                .oneshot(login_request(
+                    &format!("ghost-{index}"),
+                    "wrong",
+                    Some(client),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            20
+        );
+        assert_eq!(
+            audit_details(&database, "login_audit_coalesced", AuditOutcome::Failed).await?,
+            vec!["scope: unknown_user".to_owned()]
+        );
+        assert!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
+                .await?
+                .is_empty(),
+            "expected an empty value, got {:?}",
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied).await?
+        );
+
+        let admin = app
+            .oneshot(login_request(
+                "admin",
+                "correct",
+                Some("192.0.2.1:40000".parse::<SocketAddr>()?),
+            )?)
+            .await?;
+        assert_eq!(admin.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_password_verifier_returns_busy_without_counting_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(1, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let verifier = Arc::clone(&state.admin_password_verifier);
+        let app = super::router(state);
+
+        let mut permits = Vec::new();
+        for _ in 0..ADMIN_PASSWORD_VERIFY_PERMITS {
+            permits.push(Arc::clone(&verifier).try_acquire_owned()?);
+        }
+        let busy = app
+            .clone()
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = busy
+            .headers()
+            .get("retry-after")
+            .map(|value| value.to_str())
+            .transpose()?;
+        assert_eq!(retry_after, Some("1"));
+        let body = json_body(busy).await?;
+        assert_eq!(body["error"]["code"], "auth_busy");
+        assert!(
+            login_audit_actions(&database).await?.is_empty(),
+            "expected an empty value, got {:?}",
+            login_audit_actions(&database).await?
+        );
+
+        drop(permits);
+        let admitted = app
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_wrong_password_burst_cannot_outrun_the_limiter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(2, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let client = "198.51.100.7:40000".parse::<SocketAddr>()?;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let app = app.clone();
+            let request = login_request("admin", "wrong", Some(client))?;
+            tasks.spawn(async move {
+                let response = app.oneshot(request).await?;
+                Ok::<StatusCode, Infallible>(response.status())
+            });
+        }
+        while let Some(status) = tasks.join_next().await {
+            let status = status??;
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::SERVICE_UNAVAILABLE,
+                "unexpected burst status {status}"
+            );
+        }
+        assert_eq!(
+            audit_details(&database, "login", AuditOutcome::Failed)
+                .await?
+                .len(),
+            2
+        );
+
+        let locked = app
+            .oneshot(login_request("admin", "correct", Some(client))?)
+            .await?;
+        assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            audit_details(&database, "login_rate_limited", AuditOutcome::Denied)
+                .await?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_login_fields_are_rejected_before_rate_limit_and_audit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database))
+            .with_admin_login_rate_limit(AdminLoginRateLimitConfig::new(1, 300, 300));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+
+        let long_username = app
+            .clone()
+            .oneshot(login_request(&"u".repeat(257), "wrong", None)?)
+            .await?;
+        assert_eq!(long_username.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(long_username).await?;
+        assert_eq!(body["error"]["code"], "invalid_value");
+
+        let long_password = app
+            .clone()
+            .oneshot(login_request("admin", &"p".repeat(1025), None)?)
+            .await?;
+        assert_eq!(long_password.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(long_password).await?;
+        assert_eq!(body["error"]["code"], "invalid_value");
+        assert!(
+            login_audit_actions(&database).await?.is_empty(),
+            "expected an empty value, got {:?}",
+            login_audit_actions(&database).await?
+        );
+
+        let admitted = app
+            .oneshot(login_request("admin", "correct", None)?)
+            .await?;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_failure_audit_keeps_client_with_long_username()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router(AdminState::from_database_handle(Arc::clone(&database)));
+        let client = "198.51.100.7:40000".parse::<SocketAddr>()?;
+
+        let response = app
+            .oneshot(login_request(&"u".repeat(256), "wrong", Some(client))?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let failures = audit_details(&database, "login", AuditOutcome::Failed).await?;
+        assert_eq!(failures.len(), 1);
+        let detail = failures.first().ok_or("missing login failure audit")?;
+        assert!(detail.len() <= 160);
+        assert_eq!(
+            detail.strip_prefix("client: 198.51.100.7 username: "),
+            Some("u".repeat(64).as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_password_length_is_capped_for_bootstrap_and_change_password()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        assert!(
+            state
+                .bootstrap_admin_password("x".repeat(1025), false)
+                .await
+                .is_err()
+        );
+        assert!(database.read().await.admin_credential("admin")?.is_none());
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        // With a stored credential and no reset, the bootstrap value is ignored, so its
+        // length must not stop startup; a reset would store it and is refused.
+        state
+            .bootstrap_admin_password("x".repeat(1025), false)
+            .await?;
+        assert!(
+            state
+                .bootstrap_admin_password("x".repeat(1025), true)
+                .await
+                .is_err()
+        );
+        let app = super::router(state);
+
+        for request in [
+            serde_json::json!({
+                "current_password": "correct",
+                "new_password": "x".repeat(1025)
+            }),
+            serde_json::json!({
+                "current_password": "x".repeat(1025),
+                "new_password": "new-secret"
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/auth/change-password",
+                    &request,
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "invalid_value");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_reads_client_ip_from_connect_info_service()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                super::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "ghost",
+            "password": "wrong"
+        }))?;
+        let exchange = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            let head = format!(
+                "POST /auth/login HTTP/1.1\r\nHost: {address}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.write_all(&body).await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            Ok::<Vec<u8>, std::io::Error>(response)
+        })
+        .await;
+        server.abort();
+        let response = String::from_utf8(exchange??)?;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+        let failures = audit_details(&database, "login", AuditOutcome::Failed).await?;
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures
+                .iter()
+                .all(|detail| detail.starts_with("client: 127.0.0.1 username: "))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_login_rate_key_normalizes_client_and_username()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let key =
+            |client: &str, username: &str| -> Result<AdminLoginRateKey, std::net::AddrParseError> {
+                Ok(AdminLoginRateKey::new(Some(client.parse()?), username))
+            };
+        assert_eq!(
+            key("2001:db8::1", "admin")?,
+            key("2001:db8::ffff", "admin")?
+        );
+        assert_ne!(
+            key("2001:db8::1", "admin")?,
+            key("2001:db8:0:1::1", "admin")?
+        );
+        assert_eq!(
+            key("::ffff:192.0.2.1", "admin")?,
+            key("192.0.2.1", "admin")?
+        );
+        assert_eq!(key("192.0.2.1", " Admin ")?, key("192.0.2.1", "admin")?);
+        assert_ne!(key("192.0.2.1", "admin")?, key("192.0.2.2", "admin")?);
+        assert_ne!(
+            AdminLoginRateKey::new(None, "admin"),
+            key("192.0.2.1", "admin")?
+        );
+        assert_eq!(
+            login_client_label(Some("::ffff:192.0.2.1".parse::<IpAddr>()?)),
+            "192.0.2.1"
+        );
+        assert_eq!(
+            login_client_label(Some("2001:db8::1".parse::<IpAddr>()?)),
+            "2001:db8::1"
+        );
+        assert_eq!(login_client_label(None), "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn admin_login_limiter_reserves_before_verification_and_resets_on_success() {
+        let limiter = AdminLoginRateLimiter::new(AdminLoginRateLimitConfig::new(2, 300, 300));
+        let key = AdminLoginRateKey::new(Some(IpAddr::from([198, 51, 100, 7])), "admin");
+        let allowed = AdminLoginRateDecision::Allowed {
+            ceiling_crossed: false,
+        };
+        let now = 1_000_000;
+
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(
+            limiter.check_at(&key, now),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        assert_eq!(
+            limiter.reserve_at(&key, now),
+            AdminLoginRateDecision::Limited { audit: false }
+        );
+
+        limiter.record_success_at(&key, now);
+        assert_eq!(limiter.check_at(&key, now), allowed);
+
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(limiter.reserve_at(&key, now), allowed);
+        assert_eq!(
+            limiter.check_at(&key, now + 1),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        assert_eq!(limiter.check_at(&key, now + 300_000 + 1), allowed);
+    }
+
+    #[test]
+    fn admin_login_global_ceiling_is_soft() -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = AdminLoginRateLimiter::new(AdminLoginRateLimitConfig::new(2, 300, 300));
+        let keys = (0..40_u8)
+            .map(|index| AdminLoginRateKey::new(Some(IpAddr::from([198, 51, 100, index])), "admin"))
+            .collect::<Vec<_>>();
+        let first = keys.first().ok_or("missing first key")?;
+        let second = keys.get(1).ok_or("missing second key")?;
+        let fresh = AdminLoginRateKey::new(Some(IpAddr::from([203, 0, 113, 9])), "admin");
+        let allowed = AdminLoginRateDecision::Allowed {
+            ceiling_crossed: false,
+        };
+        let now = 1_000_000;
+
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                limiter.reserve_at(key, now),
+                AdminLoginRateDecision::Allowed {
+                    ceiling_crossed: index == 39
+                }
+            );
+        }
+        assert_eq!(
+            limiter.check_at(first, now),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        assert_eq!(
+            limiter.check_at(first, now),
+            AdminLoginRateDecision::Limited { audit: false }
+        );
+        assert_eq!(limiter.check_at(&fresh, now), allowed);
+        assert_eq!(limiter.reserve_at(&fresh, now), allowed);
+
+        let later = now + 300_000 + 1;
+        assert_eq!(limiter.check_at(first, later), allowed);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                limiter.reserve_at(key, later),
+                AdminLoginRateDecision::Allowed {
+                    ceiling_crossed: index == 39
+                }
+            );
+        }
+        assert_eq!(
+            limiter.check_at(first, later),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+        limiter.record_success_at(second, later);
+        assert_eq!(limiter.check_at(first, later), allowed);
+        Ok(())
+    }
+
+    #[test]
+    fn admin_login_limiter_bounds_keys_and_keeps_locked_entries() {
+        let limiter = AdminLoginRateLimiter::with_limits(
+            AdminLoginRateLimitConfig::new(2, 300, 300),
+            8,
+            1_000,
+        );
+        let locked = AdminLoginRateKey::new(Some(IpAddr::from([203, 0, 113, 9])), "admin");
+        let allowed = AdminLoginRateDecision::Allowed {
+            ceiling_crossed: false,
+        };
+        let now = 1_000_000;
+
+        assert_eq!(limiter.reserve_at(&locked, now), allowed);
+        assert_eq!(limiter.reserve_at(&locked, now), allowed);
+        for index in 0..20_u8 {
+            let key = AdminLoginRateKey::new(Some(IpAddr::from([198, 51, 100, index])), "admin");
+            assert_eq!(limiter.reserve_at(&key, now), allowed);
+        }
+        assert!(limiter.tracked_keys() <= 8);
+        assert_eq!(
+            limiter.check_at(&locked, now),
+            AdminLoginRateDecision::Limited { audit: true }
+        );
+
+        assert_eq!(
+            limiter.check_at(&locked, now + 300_000 + 300_000 + 1),
+            allowed
+        );
+        assert_eq!(limiter.tracked_keys(), 0);
+    }
+
+    #[test]
+    fn unknown_user_audit_is_coalesced_per_window() {
+        let limiter =
+            AdminLoginRateLimiter::with_limits(AdminLoginRateLimitConfig::new(2, 300, 300), 8, 3);
+        let now = 1_000_000;
+
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.record_unknown_user_at(now),
+                AdminLoginAuditDecision::Event
+            );
+        }
+        assert_eq!(
+            limiter.record_unknown_user_at(now),
+            AdminLoginAuditDecision::Coalesced
+        );
+        assert_eq!(
+            limiter.record_unknown_user_at(now),
+            AdminLoginAuditDecision::Skip
+        );
+        assert_eq!(
+            limiter.record_unknown_user_at(now),
+            AdminLoginAuditDecision::Skip
+        );
+        assert_eq!(
+            limiter.record_unknown_user_at(now + 300_000 + 1),
+            AdminLoginAuditDecision::Event
+        );
+        assert_eq!(limiter.tracked_keys(), 0);
     }
 
     #[tokio::test]
@@ -3569,10 +4849,9 @@ mod tests {
         }
 
         // Second boot mirrors `multidb serve` with MULTIDB_ADMIN_PASSWORD set.
-        let database = Arc::new(Mutex::new(create_database(DbConfig::on_disk(
-            Profile::Transactional,
-            &db_path,
-        ))?));
+        let database = Arc::new(tokio::sync::RwLock::new(create_database(
+            DbConfig::on_disk(Profile::Transactional, &db_path),
+        )?));
         let state = AdminState::from_database_handle(Arc::clone(&database));
         state
             .bootstrap_admin_password("secret".to_owned(), false)
@@ -3607,7 +4886,7 @@ mod tests {
         })));
         assert_eq!(body["data"]["audit_enabled"], true);
 
-        let database = database.lock().await;
+        let database = database.read().await;
         let principal = database.principal_for_user("multidb");
         assert_eq!(principal, Principal::new("app").with_role("app_rw"));
         assert!(matches!(
@@ -3717,6 +4996,78 @@ mod tests {
                 .contains_key("text/plain")
         );
         Ok(())
+    }
+
+    /// Every 422 body that `/config/validate` and `/config/plan` send has an envelope shape the
+    /// `OpenAPI` snapshot documents for that status.
+    #[tokio::test]
+    async fn phase52_config_unprocessable_bodies_match_openapi()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let openapi: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        let current = DatabaseSpec::from_db_config(
+            "current",
+            &DbConfig::on_disk(Profile::Balanced, "current.redb"),
+        );
+        let mut invalid = current.clone();
+        invalid.guarantees.write_ack = crate::config_spec::WriteAck::Local;
+        let mut version_3 = serde_json::to_value(&current)?;
+        version_3["version"] = serde_json::json!(3);
+
+        let cases = [
+            ("/config/validate", serde_json::to_value(&invalid)?, true),
+            ("/config/validate", version_3.clone(), true),
+            (
+                "/config/plan",
+                serde_json::json!({ "current": current, "desired": invalid }),
+                true,
+            ),
+            (
+                "/config/plan",
+                serde_json::json!({ "current": current, "desired": version_3 }),
+                false,
+            ),
+        ];
+        for (path, request, ok) in cases {
+            let response = super::router(test_state()?)
+                .oneshot(authed_request(Method::POST, path, Some(&request))?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], ok, "{path}: {body}");
+            assert!(
+                openapi_documents_envelope(&openapi, path, "422", ok)?,
+                "OpenAPI {path} 422 does not document an ok={ok} envelope"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the documented `status` response of `POST path` admits an envelope with this
+    /// `ok` value: its schema, or one of its `oneOf` alternatives, fixes `ok` to it.
+    fn openapi_documents_envelope(
+        openapi: &Value,
+        path: &str,
+        status: &str,
+        ok: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let operation = resolve_openapi_operation(openapi, &openapi["paths"][path]["post"])?;
+        let response = resolve_openapi_operation(openapi, &operation["responses"][status])?;
+        let schema = &response["content"]["application/json"]["schema"];
+        let alternatives = match schema.get("oneOf").and_then(Value::as_array) {
+            Some(alternatives) => alternatives.iter().collect::<Vec<_>>(),
+            None => vec![schema],
+        };
+        for alternative in alternatives {
+            let resolved = resolve_openapi_operation(openapi, alternative)?;
+            if resolved["properties"]["ok"]["const"] == ok {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[tokio::test]
@@ -3962,6 +5313,32 @@ mod tests {
         Ok(())
     }
 
+    /// A spec body over the 1 MiB router body limit never reaches `spec_io`: it is HTTP 400
+    /// `invalid_json`, not a `SPEC_TOO_LARGE` report (docs/profiles.md, "Reading specs").
+    #[tokio::test]
+    async fn oversized_spec_bodies_are_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let padding = "x".repeat(super::MAX_CONTROL_PLANE_BODY_BYTES);
+        for uri in ["/config/validate", "/config/plan"] {
+            let body = serde_json::to_vec(&serde_json::json!({ "version": 1, "pad": padding }))?;
+            let response = super::router(test_state()?)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .header("x-multidb-principal", "root")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "invalid_json", "{uri}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn catalog_endpoints_return_enveloped_json() -> Result<(), Box<dyn std::error::Error>> {
         for path in [
@@ -3985,11 +5362,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profiles_endpoint_lists_variants_and_canonical_knobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = super::router(test_state()?)
+            .oneshot(authed_request(Method::GET, "/profiles", None::<&()>)?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let profiles = body["data"].as_array().ok_or("profiles is not an array")?;
+        assert_eq!(profiles.len(), 6);
+        for profile in profiles {
+            let variants = profile["variants"]
+                .as_array()
+                .ok_or("variants is not an array")?;
+            assert_eq!(
+                variants
+                    .iter()
+                    .filter(|variant| variant["canonical"] == true)
+                    .count(),
+                1,
+                "{}",
+                profile["slug"]
+            );
+            assert!(profile["knobs"].is_object(), "{}", profile["slug"]);
+        }
+
+        let find = |slug: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile["slug"] == slug)
+                .ok_or(format!("missing profile {slug}"))
+        };
+        let game = find("game_local_balanced")?;
+        assert_eq!(
+            game["variants"],
+            serde_json::json!([
+                { "name": "balanced", "storage_profile": "Balanced", "canonical": true },
+                { "name": "in_memory", "storage_profile": "InMemory", "canonical": false },
+            ])
+        );
+        assert_eq!(game["knobs"]["durability"]["commit"], "immediate");
+        assert_eq!(game["knobs"]["storage"]["medium"], "durable");
+        assert_eq!(game["knobs"]["limits"]["max_value_bytes"], "unlimited");
+
+        let secure = find("secure_app")?;
+        let high_durability = secure["variants"]
+            .as_array()
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find(|variant| variant["name"] == "high_durability")
+            })
+            .ok_or("missing high_durability variant")?;
+        assert_eq!(high_durability["storage_profile"], "HighDurability");
+        assert_eq!(high_durability["canonical"], false);
+        // The listed knobs are the canonical variant's: transactional commits immediately.
+        assert_eq!(secure["knobs"]["durability"]["commit"], "immediate");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn advice_endpoint_returns_runtime_advisor_report()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         {
-            let database = database.lock().await;
+            let database = database.read().await;
             database.record_workload_sample(
                 &WorkloadSample::new("SELECT * FROM users WHERE age = 37")
                     .with_observed_rows(1, 2_000)
@@ -4020,9 +5457,9 @@ mod tests {
     #[tokio::test]
     async fn advice_plan_and_decision_are_enveloped_and_audited()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         let advice = {
-            let database = database.lock().await;
+            let database = database.read().await;
             database.record_workload_sample(
                 &WorkloadSample::new("SELECT * FROM users WHERE age = 37")
                     .with_observed_rows(1, 2_000)
@@ -4070,7 +5507,7 @@ mod tests {
         assert_eq!(decision_response.status(), StatusCode::OK);
         let decision_body = json_body(decision_response).await?;
         assert_eq!(decision_body["data"]["status"], "rejected");
-        let database = database.lock().await;
+        let database = database.read().await;
         assert!(database.audit_events()?.iter().any(|event| {
             event.action == "runtime_advice_decision"
                 && event.outcome == crate::security::AuditOutcome::Succeeded
@@ -4143,11 +5580,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_accepts_v2_and_reports_version_problems_as_422()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        let mut custom = serde_json::to_value(&base)?;
+        custom["version"] = serde_json::json!(2);
+        custom["profile"] = serde_json::json!("orders_durable");
+        custom["custom_profile"] = serde_json::json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        });
+        let mut version_3 = serde_json::to_value(&base)?;
+        version_3["version"] = serde_json::json!(3);
+        let mut missing = serde_json::to_value(&base)?;
+        missing
+            .as_object_mut()
+            .ok_or("spec must be an object")?
+            .remove("version");
+        let mut unknown_field = serde_json::to_value(&base)?;
+        unknown_field["unexpected"] = serde_json::json!(true);
+
+        let post = |body: serde_json::Value| async move {
+            super::router(test_state()?)
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/config/validate",
+                    Some(&body),
+                )?)
+                .await
+                .map_err(Box::<dyn std::error::Error>::from)
+        };
+
+        let accepted = post(custom).await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = json_body(accepted).await?;
+        assert_eq!(body["data"]["valid"], true);
+        assert_eq!(body["data"]["status"], "custom");
+
+        for (body, code) in [
+            (version_3, "UNSUPPORTED_VERSION"),
+            (missing, "MISSING_VERSION"),
+        ] {
+            let response = post(body).await?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["data"]["valid"], false);
+            assert_eq!(body["data"]["issues"][0]["code"], code);
+        }
+
+        let rejected = post(unknown_field).await?;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(rejected).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_json");
+        Ok(())
+    }
+
+    /// The spec shape Studio's custom-profile builder posts (`studio/src/App.tsx`).
+    fn studio_custom_profile_spec(
+        extends: &str,
+        deployment: &serde_json::Value,
+        knobs: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut custom_profile = serde_json::json!({
+            "extends": extends,
+            "description": "Custom operator-managed profile for this environment.",
+        });
+        if let Some(knobs) = knobs {
+            custom_profile["knobs"] = knobs;
+        }
+        serde_json::json!({
+            "version": 2,
+            "name": "ops_custom_profile_example",
+            "profile": "ops_custom_profile",
+            "deployment": deployment,
+            "topology": { "replica_count": 1, "shard_count": 1 },
+            "defaults": { "consistency_domain": "primary", "replication": "cp" },
+            "guarantees": {
+                "write_ack": "quorum",
+                "conflict_resolution": "none",
+                "backup": { "enabled": false, "pitr": false },
+                "encryption": { "at_rest": false },
+                "audit": { "enabled": true },
+                "sensitive_data": false,
+                "strict_cross_domain_transactions": true
+            },
+            "domains": [{ "name": "primary", "mode": "strong_cp" }],
+            "collections": [],
+            "extensions": [],
+            "overrides": {},
+            "operation_hints": { "studio.builder": "custom_profile" },
+            "custom_profile": custom_profile
+        })
+    }
+
+    #[tokio::test]
+    async fn studio_custom_profile_builder_specs_validate() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let durable = studio_custom_profile_spec(
+            "balanced",
+            &serde_json::json!({ "mode": "single_node", "storage_path": "target/new-database.redb" }),
+            Some(serde_json::json!({
+                "durability": { "commit": "immediate" },
+                "compression": { "algorithm": "zstd" },
+                "cache": { "max_entries": 8192 }
+            })),
+        );
+        let in_memory = studio_custom_profile_spec(
+            "in_memory",
+            &serde_json::json!({ "mode": "embedded", "storage_path": null }),
+            None,
+        );
+        for spec in [durable, in_memory] {
+            let response = super::router(test_state()?)
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/config/validate",
+                    Some(&spec),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "{spec}");
+            let body = json_body(response).await?;
+            assert_eq!(body["data"]["valid"], true, "{body}");
+            assert_eq!(body["data"]["status"], "custom", "{body}");
+            let issues = body["data"]["issues"]
+                .as_array()
+                .ok_or("issues is not an array")?;
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue["code"] == "CUSTOM_PROFILE_DEFINED"),
+                "{body}"
+            );
+            assert!(
+                !issues.iter().any(|issue| issue["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("OVERRIDE_"))),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_reports_unsupported_versions_and_missing_sides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let current = DatabaseSpec::from_db_config(
+            "current",
+            &DbConfig::on_disk(Profile::Balanced, "current.redb"),
+        );
+        let mut desired = serde_json::to_value(&current)?;
+        desired["version"] = serde_json::json!(3);
+
+        let response = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&serde_json::json!({ "current": current, "desired": desired })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "invalid_spec_version");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("desired: UNSUPPORTED_VERSION"),
+            "{message}"
+        );
+
+        let missing = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&serde_json::json!({ "current": current })),
+            )?)
+            .await?;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(missing).await?;
+        assert_eq!(body["error"]["code"], "invalid_json");
+
+        let same = super::router(test_state()?)
+            .oneshot(authed_request(
+                Method::POST,
+                "/config/plan",
+                Some(&ConfigPlanRequest {
+                    current: current.clone(),
+                    desired: current,
+                }),
+            )?)
+            .await?;
+        assert_eq!(same.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn apply_confirms_and_audits_without_data_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         let current = {
-            let database = database.lock().await;
+            let database = database.read().await;
             DatabaseSpec::from_db_config("current", database.config())
         };
         let plan = MigrationPlanner::plan(&current, &current);
@@ -4169,7 +5805,7 @@ mod tests {
         assert_eq!(body["data"]["status"], "confirmed");
         assert_eq!(body["data"]["audit_recorded"], true);
         assert_eq!(body["data"]["data_mutated"], false);
-        let database = database.lock().await;
+        let database = database.read().await;
         let events = database.audit_events()?;
         assert!(events.iter().any(|event| {
             event.action == "config_apply"
@@ -4181,9 +5817,9 @@ mod tests {
     #[tokio::test]
     async fn apply_unsupported_plan_is_422_audited_noop() -> Result<(), Box<dyn std::error::Error>>
     {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         let current = {
-            let database = database.lock().await;
+            let database = database.read().await;
             DatabaseSpec::from_db_config("current", database.config())
         };
         let mut desired = current.clone();
@@ -4210,7 +5846,7 @@ mod tests {
         assert_eq!(body["data"]["status"], "unsupported");
         assert_eq!(body["data"]["audit_recorded"], true);
         assert_eq!(body["data"]["data_mutated"], false);
-        let database = database.lock().await;
+        let database = database.read().await;
         assert!(database.audit_events()?.iter().any(|event| {
             event.action == "config_apply" && event.outcome == crate::security::AuditOutcome::Failed
         }));
@@ -4219,9 +5855,9 @@ mod tests {
 
     #[tokio::test]
     async fn apply_requires_system_admin_principal() -> Result<(), Box<dyn std::error::Error>> {
-        let database = Arc::new(Mutex::new(admin_database()?));
+        let database = Arc::new(RwLock::new(admin_database()?));
         let current = {
-            let database = database.lock().await;
+            let database = database.read().await;
             DatabaseSpec::from_db_config("current", database.config())
         };
         let plan = MigrationPlanner::plan(&current, &current);
@@ -4242,7 +5878,7 @@ mod tests {
         .await?;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let database = database.lock().await;
+        let database = database.read().await;
         assert!(database.audit_events()?.iter().any(|event| {
             event.action == "config_apply" && event.outcome == crate::security::AuditOutcome::Denied
         }));
@@ -4658,6 +6294,222 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn full_text_and_geo_indexes_follow_document_crud_over_http()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+        let post = |path: &str, body: Value| {
+            authed_request(Method::POST, path, Some(&body))
+                .map(|request| app.clone().oneshot(request))
+        };
+
+        let response = post(
+            "/builder/collection",
+            serde_json::json!({
+                "name": "places",
+                "collection_id": 88,
+                "fields": [{ "name": "id", "source": "DocumentId", "ty": "Bytes" }],
+                "indexes": []
+            }),
+        )?
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // JSON integers become `Value::Int` coordinates.
+        let response = post(
+            "/data/collections/places/documents",
+            serde_json::json!({
+                "document": { "body": "rust database", "location": { "lon": 21, "lat": 52 } }
+            }),
+        )?
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let first = body["data"]["id"]
+            .as_str()
+            .ok_or("missing document id")?
+            .to_owned();
+
+        for (path, body) in [
+            (
+                "/builder/full-text",
+                serde_json::json!({ "name": "places_text", "collection_id": 88, "path": ["body"] }),
+            ),
+            (
+                "/builder/geo",
+                serde_json::json!({ "name": "places_geo", "collection_id": 88, "path": ["location"] }),
+            ),
+        ] {
+            let response = post(path, body)?.await?;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        // Creating the indexes backfilled the existing document.
+        assert_eq!(
+            sql_ids(&app, "SELECT * FROM match('places_text', 'rust', 10)").await?,
+            vec![first.clone()]
+        );
+        assert_eq!(
+            sql_ids(
+                &app,
+                "SELECT * FROM within_radius('places_geo', 21, 52, 1000)"
+            )
+            .await?,
+            vec![first.clone()]
+        );
+
+        let response = post(
+            "/data/collections/places/documents",
+            serde_json::json!({
+                "document": {
+                    "body": "rust tokio",
+                    "location": { "lon": -0.1276, "lat": 51.5072 }
+                }
+            }),
+        )?
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let second = body["data"]["id"]
+            .as_str()
+            .ok_or("missing document id")?
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::PUT,
+                &format!("/data/collections/places/documents/{first}"),
+                Some(&serde_json::json!({
+                    "document": { "body": "zig allocator", "location": { "lon": 2.35, "lat": 48.85 } }
+                })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::DELETE,
+                &format!("/data/collections/places/documents/{second}"),
+                Some(&serde_json::json!({ "confirm": second })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for (sql, expected) in [
+            (
+                "SELECT * FROM match('places_text', 'zig', 10)",
+                vec![first.clone()],
+            ),
+            ("SELECT * FROM match('places_text', 'rust', 10)", Vec::new()),
+            (
+                "SELECT * FROM within_radius('places_geo', 2.35, 48.85, 1000)",
+                vec![first.clone()],
+            ),
+            (
+                "SELECT * FROM within_radius('places_geo', 21, 52, 1000)",
+                Vec::new(),
+            ),
+        ] {
+            assert_eq!(sql_ids(&app, sql).await?, expected, "{sql}");
+        }
+
+        let response = post(
+            "/builder/full-text",
+            serde_json::json!({ "name": "orphan_text", "collection_id": 4242, "path": ["body"] }),
+        )?
+        .await?;
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], serde_json::json!(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn time_series_http_rejects_invalid_retention_and_future_points()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+
+        for body in [
+            serde_json::json!({ "name": "negative", "chunk_millis": 1000, "retention_millis": -1 }),
+            serde_json::json!({ "name": "short", "chunk_millis": 60000, "retention_millis": 1000 }),
+            serde_json::json!({
+                "name": "skew",
+                "chunk_millis": 1000,
+                "retention_millis": null,
+                "max_future_skew_millis": -1
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/builder/time-series",
+                    Some(&body),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = json_body(response).await?;
+            assert_eq!(error["error"]["code"], "invalid_value", "{body}");
+        }
+
+        let create = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/builder/time-series",
+                Some(&serde_json::json!({
+                    "name": "metrics",
+                    "chunk_millis": 1000,
+                    "retention_millis": 3_600_000
+                })),
+            )?)
+            .await?;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let now = i64::try_from(super::now_millis())?;
+        for (timestamp, expected) in [
+            (now, StatusCode::OK),
+            (now * 1_000, StatusCode::BAD_REQUEST),
+            (now - 7_200_000, StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/data/time-series/metrics/points",
+                    Some(&serde_json::json!({
+                        "series": "cpu",
+                        "point": { "timestamp_millis": timestamp, "value": 0.5 }
+                    })),
+                )?)
+                .await?;
+            assert_eq!(response.status(), expected, "{timestamp}");
+            if expected == StatusCode::BAD_REQUEST {
+                let error = json_body(response).await?;
+                assert_eq!(error["error"]["code"], "invalid_value", "{timestamp}");
+            }
+        }
+
+        let points = app
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/time-series/metrics/points?series=cpu\
+                 &start=-9223372036854775808&end=9223372036854775807",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(points.status(), StatusCode::OK);
+        let body = json_body(points).await?;
+        let points = body["data"]["points"]
+            .as_array()
+            .ok_or("time-series points must be an array")?;
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["timestamp_millis"], now);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rbac_denies_and_audits_builder_without_database_admin()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut database = create_database(DbConfig::new(Profile::InMemory))?;
@@ -4668,7 +6520,7 @@ mod tests {
             PrincipalRegistry::new()
                 .with_principal("root", Principal::new("root").with_role("reader")),
         );
-        let database = Arc::new(Mutex::new(database));
+        let database = Arc::new(RwLock::new(database));
         let response = super::router(
             AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
         )
@@ -4684,7 +6536,7 @@ mod tests {
         .await?;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let database = database.lock().await;
+        let database = database.read().await;
         assert!(database.audit_events()?.iter().any(|event| {
             event.action == "create_table" && event.outcome == crate::security::AuditOutcome::Denied
         }));
@@ -4729,6 +6581,722 @@ mod tests {
             message.contains("lacks Read on Table(\"orders\")"),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_plane_reads_run_while_another_reader_holds_the_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        create_users_table(&app).await?;
+        let insert = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/data/tables/users/rows",
+                Some(&serde_json::json!({ "row": [1, "Ada"] })),
+            )?)
+            .await?;
+        assert_eq!(insert.status(), StatusCode::OK);
+
+        let reader = database.read().await;
+        for (method, path, body) in [
+            (Method::GET, "/status", None),
+            (Method::GET, "/catalog", None),
+            (Method::GET, "/data/tables/users/rows", None),
+            (Method::GET, "/security", None),
+            (Method::GET, "/audit", None),
+            (Method::GET, "/auth/me", None),
+            (
+                Method::POST,
+                "/sql",
+                Some(serde_json::json!({ "sql": "SELECT * FROM users" })),
+            ),
+        ] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                app.clone()
+                    .oneshot(authed_request(method, path, body.as_ref())?),
+            )
+            .await??;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], true, "{path}");
+        }
+        drop(reader);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ddl_is_serialized_against_readers_without_deadlock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+
+        let reader = database.read().await;
+        let mut create = tokio::spawn(app.clone().oneshot(authed_request(
+            Method::POST,
+            "/builder/table",
+            Some(&serde_json::json!({ "name": "later", "schema": null, "indexes": [] })),
+        )?));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut create)
+                .await
+                .is_err()
+        );
+        // The queued builder holds back new readers until it has run.
+        assert!(database.try_read().is_err());
+        drop(reader);
+        let created = tokio::time::timeout(Duration::from_secs(10), create).await???;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let writer = database.write().await;
+        let mut catalog = tokio::spawn(app.clone().oneshot(authed_request(
+            Method::GET,
+            "/catalog",
+            None::<&()>,
+        )?));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut catalog)
+                .await
+                .is_err()
+        );
+        drop(writer);
+        let catalog = tokio::time::timeout(Duration::from_secs(10), catalog).await???;
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let body = json_body(catalog).await?;
+        assert!(
+            body["data"]["objects"]
+                .as_array()
+                .is_some_and(|objects| objects.iter().any(|object| object["name"] == "later"))
+        );
+        Ok(())
+    }
+
+    /// A database created with a custom profile and reopened through the manifest openers, as
+    /// `serve` opens it, keeps the manifest's runtime performance behind the shared lock: `/sql`
+    /// compatibility queries, writes and SELECTs run under the shared guard with the manifest's
+    /// `query.max_sql_bytes`. `/profiles` and `/config/validate` never touch the database, so
+    /// they answer while a writer holds the lock.
+    #[tokio::test]
+    async fn control_plane_sql_keeps_the_profile_manifest_parser_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let overrides: ProfileKnobOverrides = serde_json::from_value(serde_json::json!({
+            "query": { "max_sql_bytes": 1024 }
+        }))?;
+        let resolution = resolve_named_profile("high_durability", &overrides);
+        let resolved = resolution
+            .resolved()
+            .ok_or_else(|| format!("high_durability did not resolve: {:?}", resolution.issues()))?;
+        let binding =
+            resolved.bind(ReplicationKind::Cp, Some(temp.path().join("manifest.redb")))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::new(),
+        )?);
+        let mut database = open_database(binding.db_config.clone())?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        assert_eq!(database.performance_config().query.max_sql_bytes, 1_024);
+        database.set_authz_policy(AuthzPolicy::new([Role::new("admin")
+            .grant(Resource::System, Permission::Admin)
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Database, Permission::Write)
+            .grant(Resource::Database, Permission::Admin)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin")),
+        );
+        let database = Arc::new(RwLock::new(database));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        create_users_table(&app).await?;
+
+        let padding = " ".repeat(1_024);
+        for (sql, within_limit) in [
+            ("SELECT version()".to_owned(), true),
+            (format!("SELECT version(){padding}"), false),
+            (
+                "INSERT INTO users (id, name) VALUES (1, 'Ada')".to_owned(),
+                true,
+            ),
+            (
+                format!("INSERT INTO users (id, name) VALUES (2, 'Lin'){padding}"),
+                false,
+            ),
+            ("SELECT name FROM users".to_owned(), true),
+            (format!("SELECT name FROM users{padding}"), false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/sql",
+                    Some(&serde_json::json!({ "sql": sql })),
+                )?)
+                .await?;
+            let status = response.status();
+            let body = json_body(response).await?;
+            if within_limit {
+                assert_eq!(status, StatusCode::OK, "{body}");
+            } else {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("limit is 1024 bytes")),
+                    "{body}"
+                );
+            }
+        }
+        assert_eq!(sql_ids(&app, "SELECT name FROM users").await?, ["Ada"]);
+
+        let writer = database.write().await;
+        let spec = studio_custom_profile_spec(
+            "balanced",
+            &serde_json::json!({ "mode": "single_node", "storage_path": "target/new-database.redb" }),
+            None,
+        );
+        for request in [
+            authed_request(Method::GET, "/profiles", None::<&()>)?,
+            authed_request(Method::POST, "/config/validate", Some(&spec))?,
+        ] {
+            let response =
+                tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(request))
+                    .await??;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        drop(writer);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_takes_the_exclusive_lock_only_to_add_the_admin_principal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        state
+            .bootstrap_admin_password("secret".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let login = || {
+            json_request(
+                Method::POST,
+                "/auth/login",
+                &serde_json::json!({ "username": "admin", "password": "secret" }),
+            )
+        };
+
+        // With the bootstrap admin in place, a login runs beside a long reader.
+        let reader = database.read().await;
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(login()?)).await??;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(reader);
+
+        // Without it, the login waits for the reader before adding it.
+        database
+            .write()
+            .await
+            .set_principal_registry(PrincipalRegistry::new());
+        let reader = database.read().await;
+        let mut pending = tokio::spawn(app.clone().oneshot(login()?));
+        // The login queues for the exclusive lock, which holds back new readers.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while database.try_read().is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(reader);
+        let response = tokio::time::timeout(Duration::from_secs(10), pending).await???;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(database.read().await.has_bootstrap_admin_principal());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insecure_local_admin_installs_the_bootstrap_admin_principal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = AdminState::from_database(create_database(DbConfig::new(Profile::InMemory))?)
+            .with_insecure_local_admin();
+        let database = state.database.read().await;
+        // So login and change-password need only the read guard.
+        assert!(database.has_bootstrap_admin_principal());
+        assert_eq!(
+            database.principal_for_user("root").roles(),
+            super::admin_principal().roles()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_identity_matches_bootstrap_admin() {
+        let (role, principal) = crate::db::bootstrap_admin_identity();
+        assert_eq!(principal.name(), super::ADMIN_USERNAME);
+        assert_eq!(role.name(), super::ADMIN_ROLE);
+        assert!(principal.roles().contains(super::ADMIN_ROLE));
+    }
+
+    #[tokio::test]
+    async fn db_errors_map_busy_to_503_and_conflicts_to_409()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let busy = super::db_error(&DbError::Query(QueryError::Busy(
+            "query queue exceeded 100 ms".to_owned(),
+        )));
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = json_body(busy).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "busy");
+
+        for conflict in [
+            DbError::Storage(StorageError::Conflict),
+            DbError::Repl(ReplError::Conflict),
+            DbError::Query(QueryError::Repl(ReplError::Conflict)),
+            DbError::TimeSeries(TimeSeriesError::Repl(ReplError::Storage(
+                StorageError::Conflict,
+            ))),
+        ] {
+            let response = super::db_error(&conflict);
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{conflict}");
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+            let body = json_body(response).await?;
+            assert_eq!(body["error"]["code"], "conflict");
+        }
+
+        let forbidden = super::db_error(&DbError::AuthzDenied(AuthzError::Denied {
+            principal: "ada".to_owned(),
+            resource: Resource::System,
+            permission: Permission::Admin,
+        }));
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(forbidden).await?["error"]["code"], "forbidden");
+
+        // Other resource limits, such as a statement over its memory limit, would
+        // fail again on retry.
+        for other in [
+            DbError::Query(QueryError::ResourceLimit("memory".to_owned())),
+            DbError::Query(QueryError::DuplicatePrimaryKey),
+            DbError::Storage(StorageError::Corruption("bad page".to_owned())),
+        ] {
+            let response = super::db_error(&other);
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{other}"
+            );
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+            assert_eq!(
+                json_body(response).await?["error"]["code"],
+                "internal_error"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_concurrent_control_plane_traffic_does_not_deadlock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+        create_users_table(&app).await?;
+
+        let mut handles = Vec::new();
+        for index in 0..32_i64 {
+            // At most four concurrent SQL statements, so the query governor admits
+            // every statement even on a single-CPU runner.
+            let (label, request) = match index % 8 {
+                0 | 4 => (
+                    "row insert",
+                    authed_request(
+                        Method::POST,
+                        "/data/tables/users/rows",
+                        Some(&serde_json::json!({ "row": [index, format!("user-{index}")] })),
+                    )?,
+                ),
+                1 => (
+                    "catalog",
+                    authed_request(Method::GET, "/catalog", None::<&()>)?,
+                ),
+                2 => (
+                    "collection builder",
+                    authed_request(
+                        Method::POST,
+                        "/builder/collection",
+                        Some(&serde_json::json!({
+                            "name": format!("docs_{index}"),
+                            "fields": [{ "name": "id", "source": "DocumentId", "ty": "Bytes" }],
+                            "indexes": []
+                        })),
+                    )?,
+                ),
+                3 => (
+                    "status",
+                    authed_request(Method::GET, "/status", None::<&()>)?,
+                ),
+                5 => (
+                    "row page",
+                    authed_request(Method::GET, "/data/tables/users/rows", None::<&()>)?,
+                ),
+                6 => (
+                    "sql",
+                    authed_request(
+                        Method::POST,
+                        "/sql",
+                        Some(&serde_json::json!({ "sql": "SELECT * FROM users" })),
+                    )?,
+                ),
+                _ => (
+                    "security",
+                    authed_request(Method::GET, "/security", None::<&()>)?,
+                ),
+            };
+            handles.push((label, tokio::spawn(app.clone().oneshot(request))));
+        }
+
+        let (labels, handles): (Vec<_>, Vec<_>) = handles.into_iter().unzip();
+        let responses =
+            tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(handles))
+                .await?;
+        for (label, response) in labels.into_iter().zip(responses) {
+            let response = response??;
+            let status = response.status();
+            let body = json_body(response).await?;
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+        }
+
+        let catalog = app
+            .oneshot(authed_request(Method::GET, "/catalog", None::<&()>)?)
+            .await?;
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let body = json_body(catalog).await?;
+        let objects = body["data"]["objects"]
+            .as_array()
+            .ok_or("catalog objects must be an array")?;
+        for index in [2, 10, 18, 26] {
+            let name = format!("docs_{index}");
+            assert!(
+                objects.iter().any(|object| object["name"] == name.as_str()),
+                "{name}"
+            );
+        }
+        let users = objects
+            .iter()
+            .find(|object| object["name"] == "users")
+            .ok_or("missing users table")?;
+        assert_eq!(users["row_count"], 8);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_control_plane_writes_to_the_same_key_keep_serialized_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router(test_state()?);
+        let create = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/builder/time-series",
+                Some(&serde_json::json!({
+                    "name": "metrics",
+                    "chunk_millis": 60000,
+                    "retention_millis": null
+                })),
+            )?)
+            .await?;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        // Every point lands in the same chunk, so concurrent inserts race on one key.
+        let mut handles = Vec::new();
+        for index in 0..8_i64 {
+            handles.push(tokio::spawn(app.clone().oneshot(authed_request(
+                Method::POST,
+                "/data/time-series/metrics/points",
+                Some(&serde_json::json!({
+                    "series": "cpu",
+                    "point": { "timestamp_millis": 1000 + index, "value": index }
+                })),
+            )?)));
+        }
+        for handle in handles {
+            let response = tokio::time::timeout(Duration::from_secs(10), handle).await???;
+            let status = response.status();
+            let body = json_body(response).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let points = app
+            .clone()
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/time-series/metrics/points?series=cpu&start=0&end=2000",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(points.status(), StatusCode::OK);
+        let body = json_body(points).await?;
+        assert_eq!(body["data"]["points"].as_array().map(Vec::len), Some(8));
+
+        create_users_table(&app).await?;
+        let insert = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/data/tables/users/rows",
+                Some(&serde_json::json!({ "row": [1, "Ada"] })),
+            )?)
+            .await?;
+        assert_eq!(insert.status(), StatusCode::OK);
+
+        let names = (0..8)
+            .map(|index| format!("name-{index}"))
+            .collect::<Vec<_>>();
+        let mut handles = Vec::new();
+        for name in &names {
+            handles.push(tokio::spawn(app.clone().oneshot(authed_request(
+                Method::PUT,
+                "/data/tables/users/rows",
+                Some(&serde_json::json!({ "row": [1, name] })),
+            )?)));
+        }
+        for handle in handles {
+            let response = tokio::time::timeout(Duration::from_secs(10), handle).await???;
+            let status = response.status();
+            let body = json_body(response).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let rows = app
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/tables/users/rows",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(rows.status(), StatusCode::OK);
+        let body = json_body(rows).await?;
+        let rows = body["data"]["rows"]
+            .as_array()
+            .ok_or("rows must be an array")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], 1);
+        let name = rows[0][1].as_str().ok_or("row name must be a string")?;
+        assert!(names.iter().any(|candidate| candidate == name), "{name}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_checks_wait_for_a_busy_database_instead_of_degrading()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let state = AdminState::from_database_handle(Arc::clone(&database));
+        state
+            .bootstrap_admin_password("correct".to_owned(), false)
+            .await?;
+        let app = super::router(state);
+        let token = login_token(&app, "correct").await?;
+
+        let writer = database.write().await;
+        let mut missing = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/status")
+                    .body(Body::empty())?,
+            ),
+        );
+        let mut invalid = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/status")
+                    .header(AUTHORIZATION, "Bearer not-a-valid-token")
+                    .body(Body::empty())?,
+            ),
+        );
+        let mut session = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/status")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            ),
+        );
+        // A busy database delays the decision instead of reporting auth as unconfigured.
+        for pending in [&mut missing, &mut invalid, &mut session] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), pending)
+                    .await
+                    .is_err()
+            );
+        }
+        drop(writer);
+
+        let missing = tokio::time::timeout(Duration::from_secs(10), missing).await???;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(missing).await?["error"]["code"],
+            "missing_admin_token"
+        );
+        let invalid = tokio::time::timeout(Duration::from_secs(10), invalid).await???;
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(invalid).await?["error"]["code"],
+            "invalid_admin_token"
+        );
+        let session = tokio::time::timeout(Duration::from_secs(10), session).await???;
+        assert_eq!(session.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_roles_do_not_depend_on_lock_contention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+
+        let writer = database.write().await;
+        let mut security = tokio::spawn(app.clone().oneshot(authed_request(
+            Method::GET,
+            "/security",
+            None::<&()>,
+        )?));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut security)
+                .await
+                .is_err()
+        );
+        drop(writer);
+        let security = tokio::time::timeout(Duration::from_secs(10), security).await???;
+        assert_eq!(security.status(), StatusCode::OK);
+
+        let unknown = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/security")
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .header("x-multidb-principal", "nobody")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn columnar_table_row_crud_keeps_rows_beyond_first_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::query::{ColumnDef, ColumnType, TableSchema};
+
+        let dir = tempdir()?;
+        let mut database = create_database(DbConfig::on_disk(
+            Profile::Analytical,
+            dir.path().join("columnar-crud.redb"),
+        ))?;
+        database.set_authz_policy(AuthzPolicy::new([Role::new("admin")
+            .grant(Resource::System, Permission::Admin)
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Database, Permission::Write)
+            .grant(Resource::Database, Permission::Admin)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin")),
+        );
+        let table = database.create_table(
+            "events",
+            Some(TableSchema::new(
+                vec![
+                    ColumnDef::new("id", ColumnType::Int, false),
+                    ColumnDef::new("name", ColumnType::Str, false),
+                ],
+                0,
+            )),
+            Vec::new(),
+        )?;
+        let rows = (0..2_500)
+            .map(|id| {
+                vec![
+                    crate::model::Value::Int(id),
+                    crate::model::Value::Str(format!("event-{id}")),
+                ]
+            })
+            .collect();
+        crate::repl::Replication::propose_batch(&database, table.columnar_replace_ops(rows)?)?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+
+        for (method, body) in [
+            (
+                Method::POST,
+                serde_json::json!({ "row": [2_500, "event-2500"] }),
+            ),
+            (
+                Method::PUT,
+                serde_json::json!({ "row": [1_500, "updated"] }),
+            ),
+            (
+                Method::DELETE,
+                serde_json::json!({ "primary_key": 2_400, "confirm": "events" }),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authed_request(
+                    method,
+                    "/data/tables/events/rows",
+                    Some(&body),
+                )?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let updated = app
+            .clone()
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/tables/events/rows?offset=1500&limit=1",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(updated.status(), StatusCode::OK);
+        let body = json_body(updated).await?;
+        assert_eq!(
+            body["data"]["rows"][0],
+            serde_json::json!([1_500, "updated"])
+        );
+
+        let tail = app
+            .oneshot(authed_request(
+                Method::GET,
+                "/data/tables/events/rows?offset=2499&limit=10",
+                None::<&()>,
+            )?)
+            .await?;
+        assert_eq!(tail.status(), StatusCode::OK);
+        let body = json_body(tail).await?;
+        assert_eq!(body["data"]["returned"], serde_json::json!(1));
+        assert_eq!(
+            body["data"]["rows"][0],
+            serde_json::json!([2_500, "event-2500"])
+        );
+        assert_eq!(body["data"]["has_more"], serde_json::json!(false));
         Ok(())
     }
 
@@ -4795,6 +7363,53 @@ mod tests {
             .body(Body::from(serde_json::to_vec(body)?))?)
     }
 
+    fn login_request(
+        username: &str,
+        password: &str,
+        client: Option<SocketAddr>,
+    ) -> Result<Request<Body>, Box<dyn std::error::Error>> {
+        let mut request = json_request(
+            Method::POST,
+            "/auth/login",
+            &serde_json::json!({
+                "username": username,
+                "password": password
+            }),
+        )?;
+        if let Some(client) = client {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(client));
+        }
+        Ok(request)
+    }
+
+    async fn audit_details(
+        database: &Arc<RwLock<crate::db::Database>>,
+        action: &str,
+        outcome: AuditOutcome,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let database = database.read().await;
+        Ok(database
+            .audit_events()?
+            .into_iter()
+            .filter(|event| event.action == action && event.outcome == outcome)
+            .map(|event| event.detail.unwrap_or_default())
+            .collect())
+    }
+
+    async fn login_audit_actions(
+        database: &Arc<RwLock<crate::db::Database>>,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let database = database.read().await;
+        Ok(database
+            .audit_events()?
+            .into_iter()
+            .filter(|event| event.action.starts_with("login"))
+            .map(|event| event.action)
+            .collect())
+    }
+
     async fn login_token(
         app: &axum::Router,
         password: &str,
@@ -4816,6 +7431,54 @@ mod tests {
             .as_str()
             .ok_or("login token must be a string")?
             .to_owned())
+    }
+
+    async fn create_users_table(app: &axum::Router) -> Result<(), Box<dyn std::error::Error>> {
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/builder/table",
+                Some(&serde_json::json!({
+                    "name": "users",
+                    "schema": {
+                        "columns": [
+                            { "name": "id", "ty": "Int", "nullable": false },
+                            { "name": "name", "ty": "Str", "nullable": false }
+                        ],
+                        "primary_key": 0
+                    },
+                    "indexes": []
+                })),
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    /// Runs `/sql` and returns the first column of each row as a string.
+    async fn sql_ids(
+        app: &axum::Router,
+        sql: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let response = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/sql",
+                Some(&serde_json::json!({ "sql": sql })),
+            )?)
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("{sql} failed with {}", response.status()).into());
+        }
+        let body = json_body(response).await?;
+        Ok(body["data"]["output"]["rows"]
+            .as_array()
+            .ok_or("sql rows must be an array")?
+            .iter()
+            .map(|row| row[0].as_str().unwrap_or_default().to_owned())
+            .collect())
     }
 
     async fn json_body(

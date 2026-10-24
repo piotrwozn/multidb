@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, TableDefinition, TableError, TableHandle,
+    Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, TableDefinition,
+    TableError, TableHandle,
 };
 
 use crate::storage::{
@@ -14,6 +15,22 @@ type RedbReadOnlyTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
 pub struct RedbEngine {
     db: redb::Database,
     two_phase_commit: bool,
+}
+
+/// A redb file opened read-only. It never creates, repairs or writes the file; it only reads.
+pub(crate) struct RedbReadOnly {
+    db: redb::ReadOnlyDatabase,
+}
+
+/// The outcome of opening an existing redb file read-only.
+pub(crate) enum ExistingRedbOpen {
+    Opened(RedbReadOnly),
+    /// Another handle holds the file open for writing.
+    Locked,
+    /// The file was not closed cleanly. Only a read-write open, which runs redb's crash repair
+    /// and so writes the file (`RedbEngine::recover_existing`), can read it.
+    NeedsRepair,
+    Failed(StorageError),
 }
 
 pub struct RedbReadTxn {
@@ -42,6 +59,48 @@ impl RedbEngine {
         Ok(Self {
             db: Database::create(path).map_err(to_storage_err)?,
             two_phase_commit: true,
+        })
+    }
+
+    /// Reports whether the database already contains any table.
+    /// # Errors
+    /// Fails if redb cannot open a read snapshot or list its tables.
+    pub(crate) fn has_tables(&self) -> Result<bool, StorageError> {
+        let read = self.db.begin_read().map_err(to_storage_err)?;
+        Ok(read.list_tables().map_err(to_storage_err)?.next().is_some())
+    }
+
+    /// Opens an existing redb file read-write without ever creating one, which runs redb's crash
+    /// recovery when the file was not closed cleanly, and closes it again. The recovery restores
+    /// the last committed state, as every read-write open does first; nothing else is written.
+    /// # Errors
+    /// Fails if the file is missing, another handle holds it open, or redb cannot recover it.
+    pub(crate) fn recover_existing(path: impl AsRef<Path>) -> Result<(), StorageError> {
+        drop(Database::open(path).map_err(to_storage_err)?);
+        Ok(())
+    }
+}
+
+impl RedbReadOnly {
+    /// Opens an existing redb file read-only (`redb::ReadOnlyDatabase`): the file is opened
+    /// without write access and with a shared lock, never created, and never repaired, so a
+    /// file that needs crash recovery is `NeedsRepair`.
+    pub(crate) fn open(path: impl AsRef<Path>) -> ExistingRedbOpen {
+        match redb::ReadOnlyDatabase::open(path) {
+            Ok(db) => ExistingRedbOpen::Opened(Self { db }),
+            Err(DatabaseError::DatabaseAlreadyOpen) => ExistingRedbOpen::Locked,
+            Err(DatabaseError::RepairAborted) => ExistingRedbOpen::NeedsRepair,
+            // `DatabaseError` is non_exhaustive: every other failure is reported as is.
+            Err(error) => ExistingRedbOpen::Failed(to_storage_err(error)),
+        }
+    }
+
+    /// Begins a read transaction on the file.
+    /// # Errors
+    /// Fails if redb cannot start the read transaction.
+    pub(crate) fn begin_read(&self) -> Result<RedbReadTxn, StorageError> {
+        Ok(RedbReadTxn {
+            tx: self.db.begin_read().map_err(to_storage_err)?,
         })
     }
 }

@@ -2,16 +2,16 @@
 
 use std::collections::BTreeMap;
 
-use sqlparser::{
-    ast::{Expr, ObjectName, Query, SelectItem, SetExpr, Statement},
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
+use sqlparser::ast::{Expr, ObjectName, Query, SelectItem, SetExpr, Statement};
 
 use crate::{
+    cdc::HookError,
     db::{CatalogEntry, DbConfig, DbError},
     model::Value,
-    query::{ColumnType, QueryError, SqlOutput, SqlRows, TableLayout, TableSchema},
+    performance::QueryExecutionConfig,
+    query::{
+        ColumnType, QueryError, SqlOutput, SqlRows, TableLayout, TableSchema, parse_with_limits,
+    },
     repl::ReplError,
     storage::StorageError,
 };
@@ -162,12 +162,15 @@ impl PgCatalogSnapshot {
     }
 }
 
+/// Answers the `PostgreSQL` compatibility queries (`version()`, `pg_catalog`,
+/// `information_schema`, `system.*`). `limits` are the SQL parser limits of the query engine.
 pub fn execute_compat_sql(
     sql: &str,
     config: &DbConfig,
     snapshot: &PgCatalogSnapshot,
+    limits: &QueryExecutionConfig,
 ) -> Result<Option<SqlOutput>, QueryError> {
-    let Some(request) = parse_compat_request(sql)? else {
+    let Some(request) = parse_compat_request(sql, limits)? else {
         return Ok(None);
     };
 
@@ -195,8 +198,11 @@ pub fn execute_compat_sql(
     Ok(Some(output))
 }
 
-pub fn compat_sql_requirements(sql: &str) -> Result<bool, QueryError> {
-    parse_compat_request(sql).map(|request| request.is_some())
+pub fn compat_sql_requirements(
+    sql: &str,
+    limits: &QueryExecutionConfig,
+) -> Result<bool, QueryError> {
+    parse_compat_request(sql, limits).map(|request| request.is_some())
 }
 
 #[must_use]
@@ -211,7 +217,9 @@ pub fn sqlstate_for_db_error(error: &DbError) -> &'static str {
         DbError::CatalogObjectExists(_) => "42710",
         DbError::CatalogKindMismatch { .. } => "42809",
         DbError::Storage(error) => sqlstate_for_storage(error),
-        DbError::Repl(error) => sqlstate_for_repl(error),
+        DbError::Repl(error) | DbError::Hook(HookError::Repl(error)) => sqlstate_for_repl(error),
+        DbError::Hook(HookError::Rejected(_) | HookError::Timeout(_)) => "P0001",
+        DbError::Hook(HookError::InvalidTarget(_)) => "42704",
         DbError::Query(error) => sqlstate_for_query(error),
         DbError::Config(_) => "08004",
         _ => "XX000",
@@ -223,7 +231,7 @@ pub fn sqlstate_for_query(error: &QueryError) -> &'static str {
     match error {
         QueryError::Parse(_) | QueryError::InputLimit(_) => "42601",
         QueryError::Timeout(_) | QueryError::Cancelled(_) => "57014",
-        QueryError::ResourceLimit(_) => "53200",
+        QueryError::ResourceLimit(_) | QueryError::Busy(_) => "53200",
         QueryError::Unsupported(_) => "0A000",
         QueryError::InvalidSchema(_) | QueryError::InvalidRow(_) | QueryError::InvalidValue(_) => {
             "22023"
@@ -244,6 +252,7 @@ pub fn sqlstate_for_repl(error: &ReplError) -> &'static str {
         ReplError::Conflict | ReplError::Storage(StorageError::Conflict) => "40001",
         ReplError::NoQuorum | ReplError::Transport(_) => "08006",
         ReplError::Unsupported(_) => "0A000",
+        ReplError::Rejected(_) => "P0001",
         ReplError::QuotaExceeded { .. } => "53100",
         ReplError::Storage(error) => sqlstate_for_storage(error),
     }
@@ -274,7 +283,10 @@ enum CompatRequest {
     ServerStatus,
 }
 
-fn parse_compat_request(sql: &str) -> Result<Option<CompatRequest>, QueryError> {
+fn parse_compat_request(
+    sql: &str,
+    limits: &QueryExecutionConfig,
+) -> Result<Option<CompatRequest>, QueryError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if !trimmed
         .get(..trimmed.len().min(6))
@@ -282,8 +294,8 @@ fn parse_compat_request(sql: &str) -> Result<Option<CompatRequest>, QueryError> 
     {
         return Ok(None);
     }
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, trimmed)
-        .map_err(|error| QueryError::Parse(error.to_string()))?;
+    // The raw text, as the engine parses it, so padding counts toward `max_sql_bytes`.
+    let statements = parse_with_limits(sql, limits)?;
     let [Statement::Query(query)] = statements.as_slice() else {
         return Ok(None);
     };
@@ -572,11 +584,15 @@ mod tests {
     use super::{
         CatalogObject, CatalogObjectKind, PgCatalogSnapshot, SERVER_VERSION,
         compat_sql_requirements, execute_compat_sql, sqlstate_for_db_error, sqlstate_for_query,
+        sqlstate_for_repl,
     };
     use crate::{
+        cdc::HookError,
         db::{DbConfig, DbError, Profile},
         model::Value,
+        performance::QueryExecutionConfig,
         query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
+        repl::ReplError,
         security::{AuthzError, Permission, Resource},
     };
 
@@ -600,6 +616,7 @@ mod tests {
             "SELECT * FROM information_schema.columns",
             &DbConfig::new(Profile::InMemory),
             &snapshot,
+            &QueryExecutionConfig::default(),
         )?
         .ok_or("missing compat output")?;
         assert!(matches!(output, SqlOutput::Rows(rows) if rows.rows.len() == 2));
@@ -608,11 +625,13 @@ mod tests {
 
     #[test]
     fn version_and_requirements_are_detected() -> Result<(), Box<dyn std::error::Error>> {
-        assert!(compat_sql_requirements("SELECT version()")?);
+        let limits = QueryExecutionConfig::default();
+        assert!(compat_sql_requirements("SELECT version()", &limits)?);
         let output = execute_compat_sql(
             "SELECT version()",
             &DbConfig::new(Profile::InMemory),
             &PgCatalogSnapshot::default(),
+            &limits,
         )?;
         assert!(matches!(
             output,
@@ -636,6 +655,11 @@ mod tests {
             sqlstate_for_query(&QueryError::MissingTable("users".to_owned())),
             "42P01"
         );
+        // Governor saturation keeps the SQLSTATE it had as a resource limit.
+        assert_eq!(
+            sqlstate_for_query(&QueryError::Busy("queue".to_owned())),
+            "53200"
+        );
         let denied = || {
             QueryError::AuthzDenied(AuthzError::Denied {
                 principal: "alice".to_owned(),
@@ -647,6 +671,22 @@ mod tests {
         let db_error = DbError::from(denied());
         assert!(matches!(db_error, DbError::AuthzDenied(_)));
         assert_eq!(sqlstate_for_db_error(&db_error), "42501");
+    }
+
+    #[test]
+    fn write_rejections_do_not_map_to_connection_failures() {
+        let rejected = ReplError::Rejected("before trigger audit rejected write".to_owned());
+        assert_eq!(sqlstate_for_repl(&rejected), "P0001");
+        assert_eq!(sqlstate_for_query(&QueryError::Repl(rejected)), "P0001");
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Hook(HookError::Rejected("denied".to_owned()))),
+            "P0001"
+        );
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Hook(HookError::Timeout("slow".to_owned()))),
+            "P0001"
+        );
+        assert_eq!(sqlstate_for_repl(&ReplError::NoQuorum), "08006");
     }
 
     #[test]

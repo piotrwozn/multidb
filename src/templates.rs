@@ -390,6 +390,7 @@ fn template_database_spec(
         extensions: template_extensions(template)?,
         overrides: BTreeMap::new(),
         operation_hints: template_operation_hints(template),
+        custom_profile: None,
     })
 }
 

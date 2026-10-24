@@ -105,6 +105,9 @@ pub enum ReplError {
     #[error("unsupported replication operation: {0}")]
     Unsupported(String),
 
+    #[error("write rejected: {0}")]
+    Rejected(String),
+
     #[error(
         "quota exceeded for tenant {tenant}: requested {requested} bytes, remaining {remaining} bytes"
     )]
@@ -124,6 +127,7 @@ impl ReplError {
             Self::Storage(_) => "storage",
             Self::Transport(_) => "transport",
             Self::Unsupported(_) => "unsupported",
+            Self::Rejected(_) => "rejected",
             Self::QuotaExceeded { .. } => "quota_exceeded",
         }
     }
@@ -337,6 +341,51 @@ impl<S: StorageEngine> SingleNode<S> {
             .map_err(|_| StorageError::Backend("commit lock poisoned".to_owned()))?;
         let write = self.storage.begin_write()?;
         txn::commit_write_set_in_txn_with_preflight(write, snapshot_id, write_set, preflight)
+    }
+
+    /// Runs crate-internal storage maintenance under the commit lock.
+    ///
+    /// The closure gets a read snapshot opened after the backend writer, so it
+    /// equals the write transaction's base state; it must read through the
+    /// snapshot and stage writes on the writer. It returns its value and whether
+    /// the staged writes should be committed; on `false` or `Err` the writer is
+    /// rolled back. This bypasses the commit log, transaction ids and
+    /// reserved-keyspace validation, so it must stay crate-private.
+    /// # Errors
+    /// Fails when the commit lock is poisoned, a transaction cannot be opened,
+    /// the closure fails, or the backend commit fails.
+    pub(crate) fn maintenance_write<'a, T>(
+        &'a self,
+        f: impl FnOnce(&S::ReadTxn<'a>, &mut S::WriteTxn<'a>) -> Result<(T, bool), StorageError>,
+    ) -> Result<T, StorageError> {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| StorageError::Backend("commit lock poisoned".to_owned()))?;
+        let mut write = self.storage.begin_write()?;
+        let read = match self.storage.begin_read() {
+            Ok(read) => read,
+            Err(error) => {
+                write.rollback();
+                return Err(error);
+            }
+        };
+        let result = f(&read, &mut write);
+        drop(read);
+        match result {
+            Ok((value, true)) => {
+                write.commit()?;
+                Ok(value)
+            }
+            Ok((value, false)) => {
+                write.rollback();
+                Ok(value)
+            }
+            Err(error) => {
+                write.rollback();
+                Err(error)
+            }
+        }
     }
 
     fn commit_ops_at_current(&self, ops: Vec<Op>) -> Result<TxnId, StorageError> {
@@ -918,5 +967,63 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn maintenance_write_rolls_back_on_error() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::{StorageError, WriteTransaction};
+
+        let node = SingleNode::new(MemEngine::new());
+        let failed = node.maintenance_write(|_, write| -> Result<((), bool), StorageError> {
+            write.put("t", b"k", b"staged")?;
+            Err(StorageError::Backend("abort maintenance".to_owned()))
+        });
+        assert!(matches!(failed, Err(StorageError::Backend(_))));
+        assert_eq!(node.read("t", b"k", ReadConsistency::Strong)?, None);
+
+        node.maintenance_write(|_, write| {
+            write.put("t", b"k", b"skipped")?;
+            Ok(((), false))
+        })?;
+        assert_eq!(node.read("t", b"k", ReadConsistency::Strong)?, None);
+        assert_eq!(node.current_txn_id()?, 0);
+        Ok(())
+    }
+
+    fn assert_maintenance_snapshot_matches_write_base<S>(
+        node: &SingleNode<S>,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        S: crate::storage::StorageEngine,
+    {
+        use crate::storage::{ReadTransaction, WriteTransaction};
+
+        node.propose(Op::Put {
+            table: "t".to_owned(),
+            key: b"k".to_vec(),
+            value: b"before".to_vec(),
+        })?;
+        let seen = node.maintenance_write(|read, write| {
+            let seen = read.get("t", b"k")?;
+            write.put("t", b"k", b"after")?;
+            Ok((seen, true))
+        })?;
+
+        assert_eq!(seen, Some(b"before".to_vec()));
+        assert_eq!(
+            node.read("t", b"k", ReadConsistency::Strong)?,
+            Some(b"after".to_vec())
+        );
+        assert_eq!(node.current_txn_id()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_write_snapshot_matches_write_base() -> Result<(), Box<dyn std::error::Error>> {
+        assert_maintenance_snapshot_matches_write_base(&SingleNode::new(MemEngine::new()))?;
+
+        let temp_dir = tempfile::tempdir()?;
+        let engine = RedbEngine::open(temp_dir.path().join("maintenance.redb"))?;
+        assert_maintenance_snapshot_matches_write_base(&SingleNode::new(engine))
     }
 }

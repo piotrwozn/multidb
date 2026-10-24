@@ -43,7 +43,7 @@ use sqlparser::{
 };
 use tokio::{
     net::TcpListener,
-    sync::Mutex,
+    sync::RwLock,
     sync::Semaphore,
     task::{JoinError, spawn_blocking},
 };
@@ -182,7 +182,12 @@ struct AuthRateEntry {
     attempts: usize,
 }
 
-pub type SharedDatabase = Arc<Mutex<crate::db::Database>>;
+/// Database handle shared between `PostgreSQL` wire and other in-process servers.
+///
+/// Each statement holds a shared read guard while it runs, so statements execute
+/// concurrently. Embedders take the write guard only for `&mut Database` changes
+/// (catalog, security or tuning) and must not hold a guard while awaiting another one.
+pub type SharedDatabase = Arc<RwLock<crate::db::Database>>;
 
 #[derive(Clone)]
 enum DatabaseHandle {
@@ -469,6 +474,9 @@ impl PgServer {
     }
 
     /// Serves `PostgreSQL` wire connections from a shared database handle.
+    ///
+    /// Statements share a read guard; a held or queued write guard pauses new
+    /// statements until it is released.
     /// # Errors
     /// Fails when TLS setup fails or accepting a TCP connection fails.
     pub async fn serve_shared(
@@ -480,6 +488,9 @@ impl PgServer {
     }
 
     /// Serves `PostgreSQL` wire connections from a shared database handle until shutdown.
+    ///
+    /// Statements share a read guard; a held or queued write guard pauses new
+    /// statements until it is released.
     /// # Errors
     /// Fails when TLS setup fails or accepting a TCP connection fails.
     pub async fn serve_shared_until_shutdown<F>(
@@ -585,7 +596,7 @@ impl BlockingDbExecutor {
                         .enable_all()
                         .build()
                         .map_err(|error| error.to_string())?;
-                    let database = runtime.block_on(database.lock());
+                    let database = runtime.block_on(database.read());
                     fields_from_select_sql(&sql, &database).map_err(|error| error.to_string())
                 }
             }
@@ -626,7 +637,7 @@ impl BlockingDbExecutor {
                         Ok(runtime.block_on(database.query_as(&principal, &sql))?)
                     }
                     DatabaseHandle::Shared(database) => {
-                        let database = runtime.block_on(database.lock());
+                        let database = runtime.block_on(database.read());
                         let principal = database.principal_for_user(&user_for_query);
                         Ok(runtime.block_on(database.query_as(&principal, &sql))?)
                     }
@@ -635,7 +646,7 @@ impl BlockingDbExecutor {
                 match database {
                     DatabaseHandle::Direct(database) => Ok(runtime.block_on(database.query(&sql))?),
                     DatabaseHandle::Shared(database) => {
-                        let database = runtime.block_on(database.lock());
+                        let database = runtime.block_on(database.read());
                         Ok(runtime.block_on(database.query(&sql))?)
                     }
                 }
@@ -1378,7 +1389,7 @@ fn pg_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{io, sync::Arc};
+    use std::{io, sync::Arc, time::Duration};
 
     use super::{
         AuthConfig, NetworkConfig, NetworkError, PgServer, ScramCredential, TlsConfig, TlsMode,
@@ -1393,7 +1404,10 @@ mod tests {
     };
     use pgwire::api::Type;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
-    use tokio::{net::TcpListener, sync::oneshot};
+    use tokio::{
+        net::TcpListener,
+        sync::{RwLock, oneshot},
+    };
     use tokio_postgres::config::SslMode;
     use tokio_postgres_rustls::MakeRustlsConnect;
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -1602,6 +1616,92 @@ mod tests {
         );
         server.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_handle_runs_statements_while_a_reader_holds_it_and_waits_for_writers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let TestTls {
+            server,
+            client_cert,
+        } = test_tls()?;
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server =
+            start_shared_test_server(TlsMode::Require(server), Arc::clone(&database)).await?;
+
+        // Statements share the read guard, so a held reader does not block them.
+        let reader = database.read().await;
+        let client = connect_client(server.addr, client_cert, "secret").await?;
+        let rows = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.query("select name from users", &[]),
+        )
+        .await??;
+        assert_eq!(rows.len(), 1);
+        drop(reader);
+
+        // A held writer pauses new statements until it is released.
+        let writer = database.write().await;
+        let client = Arc::new(client);
+        let mut count = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.query_one("select count(*) from users", &[]).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut count)
+                .await
+                .is_err()
+        );
+        drop(writer);
+        let row = tokio::time::timeout(Duration::from_secs(10), count).await???;
+        let count: i64 = row.try_get(0)?;
+        assert_eq!(count, 1);
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    async fn start_shared_test_server(
+        tls: TlsMode,
+        database: super::SharedDatabase,
+    ) -> Result<TestServer, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let config = NetworkConfig::new(tls, test_auth()).with_max_blocking_tasks(4);
+        let handle = tokio::spawn(PgServer::serve_shared_until_shutdown(
+            listener,
+            database,
+            config,
+            async {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        Ok(TestServer {
+            addr,
+            shutdown,
+            handle,
+        })
+    }
+
+    fn shared_users_database() -> Result<crate::db::Database, Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let users = database.create_table("users", Some(user_schema()), Vec::new())?;
+        users.insert(vec![
+            Value::Int(1),
+            Value::Str("Ada".to_owned()),
+            Value::Int(37),
+            Value::Bool(true),
+        ])?;
+        let user_role = Role::new("user")
+            .grant(Resource::Table("users".to_owned()), Permission::Read)
+            .grant(Resource::Table("users".to_owned()), Permission::Write);
+        let mut principals = PrincipalRegistry::new();
+        principals.insert("alice", Principal::new("alice").with_role("user"));
+        database.set_authz_policy(AuthzPolicy::new([user_role]));
+        database.set_principal_registry(principals);
+        Ok(database)
     }
 
     struct TestTls {

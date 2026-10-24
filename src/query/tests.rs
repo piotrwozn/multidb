@@ -1,20 +1,28 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+use datafusion::error::DataFusionError;
+use sqlparser::parser::ParserError;
 
 use super::{
     AccessPath, AnalyzeMode, AnalyzeTarget, CardinalityEstimator, ColumnDef, ColumnType,
     ExplainOptions, MostCommonValue, QueryError, QueryFingerprint, REL_COLUMNAR_SEGMENTS_TABLE,
     REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexExpression, RelIndexSpec, RelPlanKind, RelPredicate,
     RelTable, SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, StatsCatalog, TableLayout,
-    TableSchema, Value, make_row_key, parse,
+    TableSchema, Value, datafusion_to_query_error, make_row_key, parse,
 };
 use crate::{
     db::{DbConfig, Profile, create_database, open_database},
     model::{CollectionId, FieldPath},
-    repl::{ReadConsistency, Replication},
+    repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication},
     security::{AuthzError, Permission, Resource},
+    storage::Bytes,
+    txn::WriteAuthorization,
 };
 
 fn user_schema() -> TableSchema {
@@ -188,13 +196,17 @@ fn columnar_table_round_trips_through_parquet() -> Result<(), Box<dyn std::error
 
     table.delete(&Value::Int(2))?;
     assert_eq!(table.get(&Value::Int(2))?, None);
+    let (start, end) = table.columnar_segment_bounds();
     assert!(
-        repl.read(
-            REL_COLUMNAR_SEGMENTS_TABLE,
-            &table.columnar_segment_key(),
-            ReadConsistency::Strong
-        )?
-        .is_some()
+        !repl
+            .range(
+                REL_COLUMNAR_SEGMENTS_TABLE,
+                &start,
+                &end,
+                ReadConsistency::Strong
+            )?
+            .is_empty(),
+        "expected a non-empty value"
     );
 
     Ok(())
@@ -238,6 +250,62 @@ fn columnar_rewrite_uses_multiple_segments() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn columnar_rewrite_conflicts_when_segments_change_after_the_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64, status: &str| vec![Value::Int(id), Value::Str(status.to_owned())];
+
+    // Another writer creates the first segment of an empty table.
+    let empty = table.columnar_segments()?;
+    table.insert(row(1, "a"))?;
+    let stale = table.columnar_rewrite_batch(&empty, vec![row(2, "b")])?;
+    assert!(matches!(
+        repl.propose_conditional_batch(stale),
+        Err(ReplError::Conflict)
+    ));
+
+    // Another writer rewrites a segment that was read.
+    let read = table.columnar_segments()?;
+    table.update(row(1, "changed"))?;
+    let stale = table.columnar_rewrite_batch(&read, vec![row(1, "a"), row(2, "b")])?;
+    assert!(matches!(
+        repl.propose_conditional_batch(stale),
+        Err(ReplError::Conflict)
+    ));
+
+    // Another writer only adds a segment after the ones that were read.
+    let read = table.columnar_segments()?;
+    let (_, first_segment) = read.first().cloned().ok_or("missing first segment")?;
+    repl.propose_batch(vec![Op::Put {
+        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+        key: super::columnar_segment_key("statuses", 1),
+        value: first_segment,
+    }])?;
+    let stale = table.columnar_rewrite_batch(&read, vec![row(1, "changed"), row(2, "b")])?;
+    assert!(matches!(
+        repl.propose_conditional_batch(stale),
+        Err(ReplError::Conflict)
+    ));
+
+    // A rewrite built from the current segments commits and replaces all of them.
+    let current = table.columnar_segments()?;
+    assert_eq!(current.len(), 2);
+    let fresh = table.columnar_rewrite_batch(&current, vec![row(1, "changed"), row(2, "b")])?;
+    repl.propose_conditional_batch(fresh)?;
+    assert_eq!(table.scan()?, vec![row(1, "changed"), row(2, "b")]);
+    assert_eq!(table.columnar_segments()?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
 fn columnar_zone_map_skips_segments_for_simple_filter() -> Result<(), Box<dyn std::error::Error>> {
     let repl = memory_repl()?;
     let table = RelTable::create_with_layout(
@@ -269,6 +337,205 @@ fn columnar_zone_map_skips_segments_for_simple_filter() -> Result<(), Box<dyn st
     assert_eq!(report.scanned_segments, 1);
     assert!(report.skipped_segments >= 1);
     assert!(report.skipped_bytes > 0);
+    Ok(())
+}
+
+/// Forwards to `inner`, but commits one queued write right after each read of
+/// `interleave_after`, the way a concurrent writer lands between the storage
+/// reads of one statement, and counts conditional batches that conflicted. With
+/// `conditional_writes` off it refuses conditional batches, like backends that
+/// cannot check conditions.
+struct ScriptedRepl {
+    inner: Arc<dyn Replication>,
+    interleave_after: &'static str,
+    writes: Mutex<VecDeque<Vec<Op>>>,
+    conflicts: AtomicUsize,
+    conditional_writes: bool,
+}
+
+impl ScriptedRepl {
+    fn new(
+        interleave_after: &'static str,
+        conditional_writes: bool,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Ok(Arc::new(Self {
+            inner: memory_repl()?,
+            interleave_after,
+            writes: Mutex::new(VecDeque::new()),
+            conflicts: AtomicUsize::new(0),
+            conditional_writes,
+        }))
+    }
+
+    fn queue(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        self.writes
+            .lock()
+            .map_err(|_| ReplError::Transport("write queue poisoned".to_owned()))?
+            .push_back(ops);
+        Ok(())
+    }
+
+    fn queued(&self) -> Result<usize, ReplError> {
+        Ok(self
+            .writes
+            .lock()
+            .map_err(|_| ReplError::Transport("write queue poisoned".to_owned()))?
+            .len())
+    }
+
+    fn conflicts(&self) -> usize {
+        self.conflicts.load(Ordering::SeqCst)
+    }
+
+    fn interleave(&self, table: &str) -> Result<(), ReplError> {
+        if table != self.interleave_after {
+            return Ok(());
+        }
+        let write = self
+            .writes
+            .lock()
+            .map_err(|_| ReplError::Transport("write queue poisoned".to_owned()))?
+            .pop_front();
+        match write {
+            Some(ops) => self.inner.propose_batch(ops),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Replication for ScriptedRepl {
+    fn propose(&self, op: Op) -> Result<(), ReplError> {
+        self.inner.propose(op)
+    }
+
+    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        self.inner.propose_batch(ops)
+    }
+
+    fn propose_authorized_batch(
+        &self,
+        ops: Vec<Op>,
+        authorization: WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.inner.propose_authorized_batch(ops, authorization)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        if !self.conditional_writes && !batch.conditions.is_empty() {
+            return Err(ReplError::Unsupported(
+                "conditional batches are not supported".to_owned(),
+            ));
+        }
+        let result = self.inner.propose_conditional_batch(batch);
+        if matches!(result, Err(ReplError::Conflict)) {
+            self.conflicts.fetch_add(1, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn read(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Option<Bytes>, ReplError> {
+        let value = self.inner.read(table, key, consistency)?;
+        self.interleave(table)?;
+        Ok(value)
+    }
+
+    fn range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+        let rows = self.inner.range(table, start, end, consistency)?;
+        self.interleave(table)?;
+        Ok(rows)
+    }
+}
+
+#[test]
+fn columnar_zone_maps_are_read_from_the_same_commit_as_the_segments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = ScriptedRepl::new(REL_COLUMNAR_SEGMENTS_TABLE, true)?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("s{id}"))];
+    let rows = |ids: std::ops::RangeInclusive<i64>| ids.map(row).collect::<Vec<_>>();
+    let boundary = i64::try_from(super::COLUMNAR_SEGMENT_ROWS)?;
+    let last = boundary * 2 - 48;
+    // Segment 0 holds 1..=boundary and segment 1 the rest.
+    repl.propose_batch(table.columnar_replace_ops(rows(1..=last))?)?;
+    let filter = RelPredicate::Eq {
+        expression: RelIndexExpression::Column(0),
+        value: Value::Int(boundary),
+    };
+
+    // Inserting id 0 between the segment read and the zone map read moves the
+    // boundary row into segment 1. Paired with the old segment bytes, the new
+    // zone maps would skip the only segment that holds it.
+    repl.queue(table.columnar_replace_ops(rows(0..=last))?)?;
+    let result = table.query_filter_columnar(&filter)?;
+    assert_eq!(repl.queued()?, 0);
+    assert_eq!(result.rows, vec![row(boundary)]);
+    // The re-read still prunes: only the new segment 1 (boundary..=last) is decoded.
+    assert_eq!(result.examined_rows, usize::try_from(last - boundary + 1)?);
+
+    // When commits keep landing between the reads, every segment is scanned.
+    // One commit more than there are attempts is queued: each segment read
+    // applies one, so the one left over shows that the unpruned scan reuses the
+    // segments the last attempt read instead of reading them again.
+    for key in 0..=u8::try_from(super::SEGMENT_PRUNING_READ_ATTEMPTS)? {
+        repl.queue(vec![Op::Put {
+            table: "unrelated".to_owned(),
+            key: vec![key],
+            value: vec![key],
+        }])?;
+    }
+    let result = table.query_filter_columnar(&filter)?;
+    assert_eq!(repl.queued()?, 1);
+    assert_eq!(result.rows, vec![row(boundary)]);
+    assert_eq!(result.examined_rows, usize::try_from(last + 1)?);
+    repl.interleave(REL_COLUMNAR_SEGMENTS_TABLE)?;
+    assert_eq!(repl.queued()?, 0);
+
+    let report = table.segment_skip_report(&filter)?;
+    assert_eq!(report.scanned_segments, 1);
+    assert_eq!(report.skipped_segments, 1);
+    Ok(())
+}
+
+#[test]
+fn columnar_writes_fall_back_to_plain_batches_without_conditional_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = ScriptedRepl::new(REL_COLUMNAR_SEGMENTS_TABLE, false)?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64, status: &str| vec![Value::Int(id), Value::Str(status.to_owned())];
+
+    table.insert(row(1, "a"))?;
+    table.insert(row(2, "b"))?;
+    assert!(matches!(
+        table.insert(row(2, "again")),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    table.update(row(1, "changed"))?;
+    table.delete(&Value::Int(2))?;
+
+    assert_eq!(table.scan()?, vec![row(1, "changed")]);
     Ok(())
 }
 
@@ -400,6 +667,44 @@ fn parser_enforces_phase28_input_limits() {
 }
 
 #[test]
+fn datafusion_sql_parser_errors_are_parse_errors() {
+    let recursion = DataFusionError::SQL(
+        Box::new(ParserError::RecursionLimitExceeded),
+        Some(" (current limit: 50)".to_owned()),
+    );
+    assert!(matches!(
+        datafusion_to_query_error(&recursion),
+        QueryError::Parse(message) if message.contains("RecursionLimitExceeded")
+    ));
+    let wrapped = DataFusionError::Context(
+        "planning".to_owned(),
+        Box::new(DataFusionError::SQL(
+            Box::new(ParserError::ParserError(
+                "Expected: an expression, found: memory".to_owned(),
+            )),
+            None,
+        )),
+    );
+    assert!(matches!(
+        datafusion_to_query_error(&wrapped),
+        QueryError::Parse(_)
+    ));
+
+    assert!(matches!(
+        datafusion_to_query_error(&DataFusionError::Internal("bug".to_owned())),
+        QueryError::DataFusion(_)
+    ));
+    assert!(matches!(
+        datafusion_to_query_error(&DataFusionError::Plan("bad plan".to_owned())),
+        QueryError::DataFusion(_)
+    ));
+    assert!(matches!(
+        datafusion_to_query_error(&DataFusionError::ResourcesExhausted("memory".to_owned())),
+        QueryError::ResourceLimit(_)
+    ));
+}
+
+#[test]
 fn query_fingerprint_keeps_identifier_digits() {
     assert_ne!(
         QueryFingerprint::new("select * from t1 where id = 1"),
@@ -478,6 +783,55 @@ async fn multi_row_insert_is_atomic_when_late_row_duplicates_primary_key()
         SqlOutput::Rows(rows) if rows.rows.is_empty()
     ));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn row_insert_that_loses_a_race_maps_its_conflict_by_on_conflict_clause()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = ScriptedRepl::new(REL_ROWS_TABLE, true)?;
+    let mut engine = SqlEngine::new(repl.clone());
+    engine.create_table("users", Some(user_schema()), Vec::new())?;
+    let table = RelTable::open(repl.clone(), "users", Vec::new())?;
+    let user = |id: i64, name: &str, age: i64| {
+        vec![
+            Value::Int(id),
+            Value::Str(name.to_owned()),
+            Value::Int(age),
+            Value::Bool(true),
+        ]
+    };
+
+    // Another writer inserts the key after the INSERT read it as missing: a
+    // plain INSERT reports the duplicate key instead of retrying.
+    repl.queue(table.insert_ops(user(1, "Ada", 36))?)?;
+    let result = engine
+        .execute("INSERT INTO users (id, name, age, active) VALUES (1, 'Mine', 1, true)")
+        .await;
+    assert!(matches!(result, Err(QueryError::DuplicatePrimaryKey)));
+    assert_eq!((repl.queued()?, repl.conflicts()), (0, 1));
+
+    // ON CONFLICT reads the row again and applies its action to the new version.
+    repl.queue(table.insert_ops(user(2, "Grace", 85))?)?;
+    engine
+        .execute(
+            "INSERT INTO users (id, name, age, active) VALUES (2, 'Mine', 1, true) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .await?;
+    repl.queue(table.update_ops(user(1, "Ada Lovelace", 36))?)?;
+    engine
+        .execute(
+            "INSERT INTO users (id, name, age, active) VALUES (1, 'Mine', 37, true) \
+             ON CONFLICT (id) DO UPDATE SET age = EXCLUDED.age",
+        )
+        .await?;
+    assert_eq!((repl.queued()?, repl.conflicts()), (0, 3));
+
+    assert_eq!(
+        table.scan()?,
+        vec![user(1, "Ada Lovelace", 37), user(2, "Grace", 85)]
+    );
     Ok(())
 }
 

@@ -74,6 +74,18 @@ multidb config validate --spec .\agent-memory\multidb.yaml
 multidb config explain --spec .\agent-memory\multidb.yaml
 ```
 
+Profiles have typed knobs. Inspect them, or write a version 2 spec with a
+custom profile that extends a built-in one:
+
+```powershell
+multidb profile show high_durability
+multidb profile show high_durability --override cache.max_entries=8192
+multidb init --guided --profile high_durability --name Orders --override cache.max_entries=8192 --out .\orders.yaml
+multidb profile explain --spec .\orders.yaml
+```
+
+See `docs/profiles.md` for the knob reference and the profile commands.
+
 Checked-in examples are under `examples/`, with SDK examples under
 `examples/sdk/`.
 
@@ -109,7 +121,12 @@ Release-sensitive gate:
 - MultiDB is a public-preview engine, not a mature production database.
 - The CP OpenRaft profile is covered by local/process smoke tests; it does not
   claim managed Kubernetes automation, multi-region placement or an enterprise
-  SLA.
+  SLA. Multi-node CP replication runs through `repl::start_cp_cluster`; the
+  embedded `Database` cluster constructors fail closed with `Unsupported`.
+- AP databases reject commit-log features (incremental backups, so no PITR,
+  changefeeds, subscriptions, continuous queries, materialized views,
+  after-commit hooks, system versioning and incremental full-text/geo refresh)
+  instead of returning empty results.
 - `config apply` is confirmation/audit-only for v1 and does not perform
   physical data migrations.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and

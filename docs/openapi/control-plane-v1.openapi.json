@@ -96,7 +96,15 @@
         },
         "responses": {
           "200": { "$ref": "#/components/responses/LoginEnvelope" },
-          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Invalid JSON (`invalid_json`), or a username over 256 bytes or password over 1024 bytes (`invalid_value`)."
+          },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" },
+          "503": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Too many concurrent password checks (`auth_busy`). The response carries `Retry-After: 1` and the attempt is not counted as a failure."
+          }
         }
       }
     },
@@ -130,7 +138,15 @@
         },
         "responses": {
           "200": { "$ref": "#/components/responses/JsonObjectEnvelope" },
-          "401": { "$ref": "#/components/responses/ErrorEnvelope" }
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Invalid JSON (`invalid_json`), an empty new password, or a password over 1024 bytes (`invalid_value`)."
+          },
+          "401": { "$ref": "#/components/responses/ErrorEnvelope" },
+          "503": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "Too many concurrent password checks (`auth_busy`). The response carries `Retry-After: 1`."
+          }
         }
       }
     },
@@ -415,8 +431,8 @@
         "type": "object",
         "required": ["username", "password"],
         "properties": {
-          "username": { "type": "string" },
-          "password": { "type": "string", "format": "password" }
+          "username": { "type": "string", "description": "At most 256 UTF-8 bytes." },
+          "password": { "type": "string", "format": "password", "description": "At most 1024 UTF-8 bytes." }
         }
       },
       "LoginResponse": {
@@ -445,8 +461,8 @@
         "type": "object",
         "required": ["current_password", "new_password"],
         "properties": {
-          "current_password": { "type": "string", "format": "password" },
-          "new_password": { "type": "string", "format": "password" }
+          "current_password": { "type": "string", "format": "password", "description": "At most 1024 UTF-8 bytes." },
+          "new_password": { "type": "string", "format": "password", "description": "At most 1024 UTF-8 bytes." }
         }
       }
     },
@@ -491,6 +507,23 @@
           "application/json": {
             "schema": { "$ref": "#/components/schemas/SuccessEnvelope" },
             "examples": { "success": { "$ref": "#/components/examples/SuccessEnvelope" } }
+          }
+        }
+      },
+      "JsonObjectOrErrorEnvelope": {
+        "description": "Enveloped JSON response or enveloped error response",
+        "content": {
+          "application/json": {
+            "schema": {
+              "oneOf": [
+                { "$ref": "#/components/schemas/SuccessEnvelope" },
+                { "$ref": "#/components/schemas/ErrorEnvelope" }
+              ]
+            },
+            "examples": {
+              "success": { "$ref": "#/components/examples/SuccessEnvelope" },
+              "error": { "$ref": "#/components/examples/ErrorEnvelope" }
+            }
           }
         }
       },
@@ -550,7 +583,7 @@
       "getAudit": { "operationId": "getAudit", "tags": ["Admin"], "summary": "Read audit events.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getConfig": { "operationId": "getConfig", "tags": ["Admin"], "summary": "Return current DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "validateConfig": { "operationId": "validateConfig", "tags": ["Admin"], "summary": "Validate a DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "planConfig": { "operationId": "planConfig", "tags": ["Admin"], "summary": "Plan a DatabaseSpec change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "planConfig": { "operationId": "planConfig", "tags": ["Admin"], "summary": "Plan a DatabaseSpec change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectOrErrorEnvelope" } } },
       "applyConfig": { "operationId": "applyConfig", "tags": ["Admin"], "summary": "Confirm and audit a planned config change.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getProfiles": { "operationId": "getProfiles", "tags": ["Admin"], "summary": "List built-in profiles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getRoles": { "operationId": "getRoles", "tags": ["Admin"], "summary": "List collection roles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },

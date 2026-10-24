@@ -10,22 +10,32 @@ use serde_json::json;
 
 use multidb::{
     backup::{
-        BackupConfig, BackupError, RestoreTarget, full_backup, incremental_backup, list_backups,
-        restore_backup, verify_backup,
+        BackupConfig, BackupError, RestoreConfig, RestoreTarget, full_backup, incremental_backup,
+        list_backups, restore_backup_with_config, verify_backup,
     },
     cdc::{
         ChangefeedFilter, ChangefeedOptions, ChangefeedTarget, MaterializedViewSpec, ResumeToken,
         SubscriptionConfig,
     },
     config_spec::{
-        ApplyCheckReport, ApplyStatus, ConfigExplainer, ConsistencyDomainSpec, ConsistencyMode,
+        ApplyCheckReport, ApplyStatus, ChangePolicy, CommitMode, CompressionKnob, ConfigExplainer,
+        ConsistencyDomainSpec, ConsistencyMode, CustomProfileSpec, DATABASE_SPEC_VERSION_V2,
         DatabaseDefaults, DatabaseSpec, DeploymentMode, DeploymentSpec, ExplainConfigReport,
-        GuaranteeSpec, GuaranteeValidator, MigrationPlan, MigrationPlanner, ProfileSpec,
-        ReplicationMode, TopologySpec, ValidationReport, ValidationSeverity, built_in_profile,
-        built_in_profiles, collection_role_definition, collection_role_definitions,
-        consistency_domain_definition, consistency_domain_definitions,
+        FloorOverrides, GuaranteeSpec, GuaranteeValidator, KNOB_REGISTRY, KnobDefinition,
+        KnobEnforcement, KnobSource, KnobTiming, LayoutKnob, MigrationPlan, MigrationPlanner,
+        ProfileKnobOverrides, ProfileKnobs, ProfileResolution, ProfileSpec, ProfileVariant,
+        RESERVED_KNOBS, ReplicationMode, ResolvedProfile, ResolvedProfileKind, RoleSetDelta,
+        StorageMedium, TopologySpec, ValidationIssue, ValidationReport, ValidationSeverity,
+        built_in_profile_normalized, built_in_profiles, collection_role_definition,
+        collection_role_definitions, consistency_domain_definition, consistency_domain_definitions,
+        parse_knob_assignment, profile_variants, resolve_named_profile, resolve_profile,
+        spec_io::{self, SpecFormat, SpecIoError},
+        suggest_profile_name,
     },
-    db::{DbConfig, DbError, Profile, create_database, open_database},
+    db::{
+        DbConfig, DbError, MetadataProbe, PersistedProfileManifest, Profile, create_database,
+        inspect_database_metadata, open_database, recover_database_file,
+    },
     migration::{
         ExportFormat, ImportOptions, MigrationError, export_table_csv, export_table_jsonl,
         import_pg_dump_plain, import_table_csv, import_table_jsonl, migrate_value_codec,
@@ -36,6 +46,7 @@ use multidb::{
         TemplateMaterialization, TemplateOutputFormat, built_in_template, built_in_templates,
         materialize_template,
     },
+    txn::history::HistoryGcOptions,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -97,7 +108,7 @@ struct ServeConfig {
     admin_bind: SocketAddr,
     pg_bind: SocketAddr,
     db_path: PathBuf,
-    profile: Profile,
+    profile: ProfileSelection,
     admin_token: Option<String>,
     admin_password: Option<String>,
     admin_password_reset: bool,
@@ -107,13 +118,42 @@ struct ServeConfig {
     pg_password: String,
     pg_tls: ServePgTls,
     studio_dir: PathBuf,
+    query_governor: ServeQueryGovernor,
 }
+
+/// What a `--profile` flag or `MULTIDB_PROFILE` selects: a storage profile, or `auto`, which
+/// reads the storage profile of an existing single-node CP database (see `cli_db_config`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileSelection {
+    Fixed(Profile),
+    Auto,
+}
+
+/// `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`; an
+/// unset value keeps the profile default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ServeQueryGovernor {
+    max_concurrent_queries: Option<usize>,
+    queue_timeout_ms: Option<u64>,
+}
+
+/// Upper bound for `MULTIDB_MAX_CONCURRENT_QUERIES`.
+const MAX_SERVE_CONCURRENT_QUERIES: usize = 4_096;
+/// Upper bound for `MULTIDB_QUERY_QUEUE_TIMEOUT_MS`.
+const MAX_SERVE_QUERY_QUEUE_TIMEOUT_MS: u64 = 60_000;
 
 impl CliRun {
     fn success(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             exit_code: 0,
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: 1,
         }
     }
 
@@ -172,6 +212,7 @@ fn run_command(args: &[String]) -> Result<String, CliError> {
         "import" => run_import(&args[1..]),
         "export" => run_export(&args[1..]),
         "migrate" => run_migrate(&args[1..]),
+        "maintenance" => run_maintenance(&args[1..]),
         "admin" => run_admin(&args[1..]),
         "config" => run_config(&args[1..]).map(|outcome| outcome.message),
         "template" => run_template(&args[1..]).map(|outcome| outcome.message),
@@ -190,6 +231,7 @@ fn run_config(args: &[String]) -> Result<CliRun, CliError> {
         "explain" => run_config_explain(&args[1..]),
         "plan" => run_config_plan(&args[1..]),
         "apply" => run_config_apply(&args[1..]),
+        "upgrade" => run_config_upgrade(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -197,7 +239,10 @@ fn run_config(args: &[String]) -> Result<CliRun, CliError> {
 fn run_config_validate(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
-    let spec = read_spec_file(&spec_path)?;
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
     let report = GuaranteeValidator::validate(&spec);
     let message = if output == "json" {
         serde_json::to_string_pretty(&report)?
@@ -211,7 +256,10 @@ fn run_config_validate(args: &[String]) -> Result<CliRun, CliError> {
 fn run_config_explain(args: &[String]) -> Result<CliRun, CliError> {
     let spec_path = PathBuf::from(required_value(args, "--spec")?);
     let output = output_format(args)?;
-    let spec = read_spec_file(&spec_path)?;
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
     let report = ConfigExplainer::explain(&spec);
     let message = if output == "json" {
         serde_json::to_string_pretty(&report)?
@@ -226,8 +274,26 @@ fn run_config_plan(args: &[String]) -> Result<CliRun, CliError> {
     let current_path = PathBuf::from(required_value(args, "--current")?);
     let desired_path = PathBuf::from(required_value(args, "--desired")?);
     let output = output_format(args)?;
-    let current = read_spec_file(&current_path)?;
-    let desired = read_spec_file(&desired_path)?;
+    let current = match read_spec_file(&current_path)? {
+        Ok(spec) => spec,
+        Err(report) => {
+            return spec_report_run(
+                &report,
+                &output,
+                Some(("--current", current_path.as_path())),
+            );
+        }
+    };
+    let desired = match read_spec_file(&desired_path)? {
+        Ok(spec) => spec,
+        Err(report) => {
+            return spec_report_run(
+                &report,
+                &output,
+                Some(("--desired", desired_path.as_path())),
+            );
+        }
+    };
     let plan = MigrationPlanner::plan(&current, &desired);
     let message = if let Some(out_path) = optional_value(args, "--out") {
         let out_path = PathBuf::from(out_path);
@@ -276,6 +342,251 @@ fn run_config_apply(args: &[String]) -> Result<CliRun, CliError> {
     ))
 }
 
+/// `config upgrade`: converts a spec to version 2 (see `upgrade_spec`) and validates it. A valid
+/// result goes to `--out`, in the format its extension names, or to stdout in the input's
+/// format. An invalid result exits 2 and is never written to `--out`. A result over
+/// `spec_io::MAX_SPEC_BYTES`, which multidb could not read back, exits 2 with `SPEC_TOO_LARGE`
+/// and is written nowhere, not even to stdout.
+fn run_config_upgrade(args: &[String]) -> Result<CliRun, CliError> {
+    let spec_path = PathBuf::from(required_value(args, "--spec")?);
+    let output = output_format(args)?;
+    let out_path = optional_value(args, "--out").map(PathBuf::from);
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
+    if let Some(out_path) = &out_path {
+        ensure_upgrade_target(&spec_path, out_path, has_flag(args, "--force"))?;
+    }
+
+    let (upgraded, notes) = upgrade_spec(spec);
+    let report = GuaranteeValidator::validate(&upgraded);
+    let format =
+        match spec_io::spec_format_for_path(out_path.as_deref().unwrap_or(spec_path.as_path())) {
+            SpecFormat::Yaml => "yaml",
+            SpecFormat::Json => "json",
+        };
+    let content = serialize_spec(&upgraded, format)?;
+    // Re-serializing can grow a compact spec past the size limit, and with `--force` the
+    // result would replace an input that multidb can read with one it refuses.
+    if content.len() > spec_io::MAX_SPEC_BYTES {
+        let too_large = SpecIoError::TooLarge {
+            limit: spec_io::MAX_SPEC_BYTES,
+            found: u64::try_from(content.len()).unwrap_or(u64::MAX),
+        };
+        let report = too_large
+            .validation_report()
+            .ok_or_else(|| CliError::Runtime(too_large.to_string()))?;
+        let source = out_path.as_deref().map(|out_path| ("--out", out_path));
+        return spec_report_run(&report, &output, source);
+    }
+    // An invalid result is not written: with `--force` it could replace a valid input.
+    let written = match &out_path {
+        Some(out_path) if report.valid => {
+            write_file_replacing(out_path, &content)?;
+            true
+        }
+        _ => false,
+    };
+
+    let message = if output == "json" {
+        let mut summary = json!({
+            "spec": upgraded,
+            "notes": notes,
+            "validation": report,
+        });
+        if let Some(out_path) = &out_path {
+            summary["path"] = json!(out_path.display().to_string());
+            summary["written"] = json!(written);
+        }
+        serde_json::to_string_pretty(&summary)?
+    } else if let Some(out_path) = &out_path {
+        let mut lines = vec![format!(
+            "{} path={} version={} profile={} status={:?} valid={}",
+            if written {
+                "upgraded config"
+            } else {
+                "upgraded config not written (invalid)"
+            },
+            out_path.display(),
+            upgraded.version,
+            upgraded.profile,
+            report.status,
+            report.valid
+        )];
+        lines.extend(notes.iter().map(|note| format!("note: {note}")));
+        lines.extend(report.issues.iter().map(format_issue));
+        lines.join("\n")
+    } else {
+        // stdout carries only the spec, so it can be redirected into a file. The warnings and
+        // advice of a valid result (PROFILE_NOT_PROVISIONABLE among them) go to stderr, as
+        // they go to the `--out` summary.
+        for note in &notes {
+            eprintln!("note: {note}");
+        }
+        if report.valid {
+            for issue in &report.issues {
+                eprintln!("{}", format_issue(issue));
+            }
+        } else {
+            eprintln!("{}", format_validation_report(&report));
+        }
+        content.trim_end_matches('\n').to_owned()
+    };
+    Ok(CliRun::validation(message, report.valid))
+}
+
+/// Studio's version 1 custom-profile convention, converted by `config upgrade`.
+const STUDIO_PROFILE_BASE: &str = "profile.custom.base";
+const STUDIO_PROFILE_DESCRIPTION: &str = "profile.custom.description";
+const STUDIO_PROFILE_SLUG: &str = "profile.custom.slug";
+
+/// Converts a spec to version 2. Studio's custom-profile convention
+/// (`overrides["profile.custom.base"]`, `overrides["profile.custom.description"]` and
+/// `operation_hints["profile.custom.slug"]`) becomes `custom_profile { extends, description }`
+/// with the slug as `profile`, and those three keys are removed. Every other key is left as it
+/// is. Deterministic and idempotent: upgrading an upgraded spec changes nothing.
+fn upgrade_spec(mut spec: DatabaseSpec) -> (DatabaseSpec, Vec<String>) {
+    let mut notes = Vec::new();
+    if spec.version == DATABASE_SPEC_VERSION_V2 {
+        notes.push("the spec is already version 2".to_owned());
+    } else {
+        notes.push(format!(
+            "version {} -> {DATABASE_SPEC_VERSION_V2}",
+            spec.version
+        ));
+        spec.version = DATABASE_SPEC_VERSION_V2;
+    }
+
+    if spec.custom_profile.is_none()
+        && let Some(extends) = spec.overrides.remove(STUDIO_PROFILE_BASE)
+    {
+        let description = spec
+            .overrides
+            .remove(STUDIO_PROFILE_DESCRIPTION)
+            .filter(|description| !description.trim().is_empty());
+        if let Some(slug) = spec.operation_hints.remove(STUDIO_PROFILE_SLUG) {
+            notes.push(format!(
+                "operation_hints[{STUDIO_PROFILE_SLUG}] = {slug} became profile"
+            ));
+            spec.profile = slug;
+        }
+        notes.push(format!(
+            "overrides[{STUDIO_PROFILE_BASE}] = {extends} became custom_profile.extends{}",
+            if description.is_some() {
+                format!(
+                    ", and overrides[{STUDIO_PROFILE_DESCRIPTION}] became custom_profile.description"
+                )
+            } else {
+                String::new()
+            }
+        ));
+        spec.custom_profile = Some(CustomProfileSpec {
+            extends,
+            description,
+            knobs: ProfileKnobOverrides::default(),
+            floors: FloorOverrides::default(),
+            compatible_roles: RoleSetDelta::default(),
+        });
+    } else if spec.overrides.contains_key(STUDIO_PROFILE_BASE)
+        || spec.overrides.contains_key(STUDIO_PROFILE_DESCRIPTION)
+        || spec.operation_hints.contains_key(STUDIO_PROFILE_SLUG)
+    {
+        notes.push(format!(
+            "{} so the profile.custom.* keys were left in place; move them into custom_profile \
+             by hand",
+            if spec.custom_profile.is_some() {
+                "custom_profile is already set,"
+            } else {
+                "there is no overrides[profile.custom.base],"
+            }
+        ));
+    }
+
+    notes.push(
+        "the spec is re-serialized: comments and formatting are not preserved, and defaulted \
+         fields such as topology are written out"
+            .to_owned(),
+    );
+    (spec, notes)
+}
+
+/// Refuses to replace an existing file, and in particular the input spec, without `--force`.
+fn ensure_upgrade_target(input: &Path, out: &Path, force: bool) -> Result<(), CliError> {
+    if force {
+        return Ok(());
+    }
+    let same_file = match (std::fs::canonicalize(input), std::fs::canonicalize(out)) {
+        (Ok(input), Ok(out)) => input == out,
+        _ => input == out,
+    };
+    if same_file {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite the input spec {}; pass --force to replace it",
+            out.display()
+        )));
+    }
+    if out.exists() {
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite {}; pass --force to replace it",
+            out.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Writes `content` to a new, randomly named file next to `path` and renames it into place, so
+/// a failed write never leaves a half-written file where the old one was (`config upgrade
+/// --force` may replace its input). See `write_through_temp_file`.
+fn write_file_replacing(path: &Path, content: &str) -> Result<(), CliError> {
+    let Some(file_name) = path.file_name() else {
+        return Err(CliError::Usage(format!(
+            "--out {} must name a file",
+            path.display()
+        )));
+    };
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{}.upgrade-tmp", uuid::Uuid::now_v7()));
+    Ok(write_through_temp_file(
+        path,
+        &path.with_file_name(temp_name),
+        content,
+    )?)
+}
+
+/// Writes `content` to `temp_path`, syncs it and renames it to `path`, then syncs the parent
+/// directory (best effort) so the rename survives a crash. `temp_path` is created with
+/// `create_new`, which never follows or reuses an existing path, so a symlink planted there
+/// fails the write with `AlreadyExists` instead of redirecting it; the rename replaces `path`
+/// itself, never the target of a symlink at `path`. The temporary file is removed on failure
+/// only when this call created it.
+fn write_through_temp_file(path: &Path, temp_path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written.and_then(|()| std::fs::rename(temp_path, path)) {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(error);
+    }
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
+}
+
 fn run_explain(args: &[String]) -> Result<CliRun, CliError> {
     let Some(command) = args.first() else {
         return Err(usage());
@@ -304,18 +615,36 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
             "use either --profile or --template, not both".to_owned(),
         ));
     }
+    let customize = has_flag(args, "--override");
     if let Some(template_name) = template_arg {
+        if customize || has_flag(args, "--profile-name") {
+            return Err(CliError::Usage(
+                "--override and --profile-name apply to init --guided --profile, not --template"
+                    .to_owned(),
+            ));
+        }
         return run_init_template(args, &template_name, &name);
+    }
+    if !customize && has_flag(args, "--profile-name") {
+        return Err(CliError::Usage(
+            "--profile-name names the custom profile that --override defines; pass at least one \
+             --override <knob>=<value>"
+                .to_owned(),
+        ));
     }
 
     let profile_name = profile_arg.ok_or_else(|| {
         CliError::Usage("missing --profile or --template for guided init".to_owned())
     })?;
-    let profile = resolve_built_in_profile(&profile_name).ok_or_else(|| {
-        CliError::Usage(format!(
-            "unknown profile {profile_name}; run multidb profile list"
-        ))
-    })?;
+    let (profile, base) = resolve_built_in_profile(&profile_name)
+        .zip(named_profile(&profile_name))
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "unknown profile {profile_name}{}; run multidb profile list",
+                did_you_mean(&profile_name)
+            ))
+        })?;
+    let (knobs, floors) = parse_knob_overrides(args)?;
     let file_format = init_file_format(args)?;
     let out_path = optional_value(args, "--out")
         .map(PathBuf::from)
@@ -327,32 +656,113 @@ fn run_init(args: &[String]) -> Result<CliRun, CliError> {
         )));
     }
 
-    let spec = guided_spec(profile, &name);
+    let (spec, warning) = if customize {
+        let slug = optional_value(args, "--profile-name")
+            .unwrap_or_else(|| format!("{}_custom", base.slug));
+        let spec = custom_guided_spec(
+            profile,
+            &base,
+            CustomProfileSpec {
+                extends: base.slug.clone(),
+                description: None,
+                knobs,
+                floors,
+                compatible_roles: RoleSetDelta::default(),
+            },
+            &slug,
+            &name,
+        );
+        (spec, None)
+    } else {
+        (
+            guided_spec(profile, &name),
+            variant_warning(&profile_name, &base, profile),
+        )
+    };
     let report = GuaranteeValidator::validate(&spec);
     let content = serialize_spec(&spec, &file_format)?;
     std::fs::write(&out_path, content.as_bytes())?;
 
     let output = output_format(args)?;
+    let extends = spec
+        .custom_profile
+        .as_ref()
+        .map(|custom| custom.extends.as_str());
     let message = if output == "json" {
-        serde_json::to_string_pretty(&json!({
+        let mut summary = json!({
             "path": out_path.display().to_string(),
             "name": spec.name,
             "profile": spec.profile,
             "status": report.status,
             "valid": report.valid,
-        }))?
+        });
+        if let Some(extends) = extends {
+            summary["version"] = json!(spec.version);
+            summary["extends"] = json!(extends);
+        }
+        if let Some(warning) = &warning {
+            summary["warnings"] = json!([warning.message]);
+            summary["variant"] = json!(warning.variant);
+            summary["storage_profile"] = json!(warning.storage_profile);
+        }
+        serde_json::to_string_pretty(&summary)?
     } else {
-        format!(
+        let mut message = format!(
             "created config path={} name={} profile={} status={:?} valid={}",
             out_path.display(),
             spec.name,
             spec.profile,
             report.status,
             report.valid
-        )
+        );
+        if let Some(extends) = extends {
+            message.push_str(&format!(" version={} extends={extends}", spec.version));
+        }
+        if let Some(warning) = &warning {
+            message.push_str("\nwarning: ");
+            message.push_str(&warning.message);
+        }
+        message
     };
 
     Ok(CliRun::validation(message, report.valid))
+}
+
+/// Warns that a version 1 guided spec records the product slug, so an alias that names a
+/// non-canonical variant (for example `high_durability`) does not select that variant.
+struct VariantWarning {
+    message: String,
+    /// The variant the written spec resolves to: the product's canonical one.
+    variant: &'static str,
+    storage_profile: Profile,
+}
+
+fn variant_warning(
+    typed: &str,
+    base: &ResolvedProfile,
+    product: &ProfileSpec,
+) -> Option<VariantWarning> {
+    let canonical = product_variants(product.slug).find(|variant| variant.canonical)?;
+    if canonical.name == base.variant {
+        return None;
+    }
+    Some(VariantWarning {
+        message: format!(
+            "profile {typed} is the {} variant (storage profile {:?}) of {}, but a version 1 \
+             spec records the product slug {}, whose canonical variant is {} (storage profile \
+             {:?}); pass --override <knob>=<value> to write a version 2 custom_profile that \
+             extends {}",
+            base.variant,
+            base.storage_profile,
+            product.slug,
+            product.slug,
+            canonical.name,
+            canonical.storage_profile,
+            base.variant
+        ),
+        variant: canonical.name,
+        storage_profile: canonical.storage_profile,
+    })
 }
 
 fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result<CliRun, CliError> {
@@ -396,7 +806,19 @@ fn run_init_template(args: &[String], template_name: &str, name: &str) -> Result
 }
 
 fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
-    require_list_command(args)?;
+    let Some(command) = args.first() else {
+        return Err(usage());
+    };
+    match command.as_str() {
+        "list" => run_profile_list(args),
+        "show" => run_profile_show(&args[1..]),
+        "explain" => run_profile_explain(&args[1..]),
+        "knobs" => run_profile_knobs(&args[1..]),
+        _ => Err(usage()),
+    }
+}
+
+fn run_profile_list(args: &[String]) -> Result<CliRun, CliError> {
     let message = if output_format(args)? == "json" {
         let profiles = built_in_profiles()
             .iter()
@@ -412,6 +834,16 @@ fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
                         .iter()
                         .map(|role| role_slug(*role))
                         .collect::<Vec<_>>(),
+                    "variants": product_variants(profile.slug)
+                        .map(|variant| {
+                            json!({
+                                "name": variant.name,
+                                "storage_profile": variant.storage_profile,
+                                "canonical": variant.canonical,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "knobs": named_profile(profile.slug).map(|resolved| resolved.knobs),
                 })
             })
             .collect::<Vec<_>>();
@@ -420,6 +852,185 @@ fn run_profile(args: &[String]) -> Result<CliRun, CliError> {
         format_profiles()
     };
     Ok(CliRun::success(message))
+}
+
+/// `profile show <name> [--override path=value]...` resolves a built-in slug or alias as a
+/// what-if; `profile show --db <path>` reports the profile persisted in a database. The name
+/// may stand anywhere among the flags.
+fn run_profile_show(args: &[String]) -> Result<CliRun, CliError> {
+    let output = output_format(args)?;
+    let names = positional_args(args, &["--db", "--output", "--override"]);
+    if let [first, second, ..] = names.as_slice() {
+        return Err(CliError::Usage(format!(
+            "profile show takes one profile name, found {first} and {second}"
+        )));
+    }
+    let name = names.first().copied();
+    match (name, optional_value(args, "--db")) {
+        (Some(_), Some(_)) => Err(CliError::Usage(
+            "use either a profile name or --db with profile show, not both".to_owned(),
+        )),
+        (None, Some(db)) => {
+            if has_flag(args, "--override") {
+                return Err(CliError::Usage(
+                    "--override applies to profile show <profile>, not to --db".to_owned(),
+                ));
+            }
+            run_profile_show_db(Path::new(&db), &output)
+        }
+        (Some(name), None) => {
+            let (knobs, floors) = parse_knob_overrides(args)?;
+            let resolution = resolve_what_if(name, &knobs, floors);
+            resolution_run(&resolution, &output)
+        }
+        (None, None) => Err(CliError::Usage(
+            "missing profile name or --db; run multidb profile list".to_owned(),
+        )),
+    }
+}
+
+fn run_profile_show_db(path: &Path, output: &str) -> Result<CliRun, CliError> {
+    let probe = inspect_database_metadata(path);
+    let initialized = matches!(probe, MetadataProbe::Initialized(_));
+    let message = if output == "json" {
+        serde_json::to_string_pretty(&probe)?
+    } else {
+        format_metadata_probe(path, &probe)?
+    };
+    Ok(if initialized {
+        CliRun::success(message)
+    } else {
+        CliRun::failure(message)
+    })
+}
+
+/// `profile explain --spec <file>`: the resolver result for a spec. Exit 2 when the profile is
+/// invalid, including a version 1 spec that sets `custom_profile`; a version 1 spec whose
+/// profile name is not built in is reported as unresolved, with exit 0.
+fn run_profile_explain(args: &[String]) -> Result<CliRun, CliError> {
+    let spec_path = PathBuf::from(required_value(args, "--spec")?);
+    let output = output_format(args)?;
+    let spec = match read_spec_file(&spec_path)? {
+        Ok(spec) => spec,
+        Err(report) => return spec_report_run(&report, &output, None),
+    };
+    resolution_run(&resolve_profile(&spec), &output)
+}
+
+/// `profile knobs`: every `KNOB_REGISTRY` entry, then the reserved knobs.
+fn run_profile_knobs(args: &[String]) -> Result<CliRun, CliError> {
+    let message = if output_format(args)? == "json" {
+        let mut knobs = Vec::with_capacity(KNOB_REGISTRY.len() + RESERVED_KNOBS.len());
+        for definition in KNOB_REGISTRY {
+            let mut entry = serde_json::to_value(definition)?;
+            entry["reserved"] = json!(false);
+            knobs.push(entry);
+        }
+        for reserved in RESERVED_KNOBS {
+            knobs.push(json!({
+                "path": reserved.path,
+                "reserved": true,
+                "reason": reserved.reason,
+            }));
+        }
+        serde_json::to_string_pretty(&knobs)?
+    } else {
+        let mut rows = vec![
+            [
+                "path",
+                "values",
+                "timing",
+                "enforcement",
+                "after creation",
+                "sink",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ];
+        rows.extend(KNOB_REGISTRY.iter().map(|definition| {
+            vec![
+                definition.path.to_owned(),
+                definition.value_type.describe(),
+                timing_label(definition.timing).to_owned(),
+                enforcement_label(definition.enforcement),
+                change_policy_label(definition.after_creation).to_owned(),
+                definition.sink.to_owned(),
+            ]
+        }));
+        rows.extend(RESERVED_KNOBS.iter().map(|reserved| {
+            vec![
+                reserved.path.to_owned(),
+                "reserved".to_owned(),
+                "-".to_owned(),
+                "not supported".to_owned(),
+                "-".to_owned(),
+                reserved.reason.to_owned(),
+            ]
+        }));
+        align_rows(&rows)
+    };
+    Ok(CliRun::success(message))
+}
+
+/// Resolves a what-if profile. Knob overrides go through `resolve_named_profile`; floors need a
+/// version 2 `custom_profile`, so with floors the same custom profile is resolved from a guided
+/// spec.
+fn resolve_what_if(
+    name: &str,
+    knobs: &ProfileKnobOverrides,
+    floors: FloorOverrides,
+) -> ProfileResolution {
+    if floors.is_empty() {
+        return resolve_named_profile(name, knobs);
+    }
+    let Some(product) = built_in_profile_normalized(name) else {
+        return resolve_named_profile(name, knobs);
+    };
+    let base = match resolve_named_profile(name, &ProfileKnobOverrides::default()) {
+        ProfileResolution::Resolved { profile, .. } => profile,
+        other => return other,
+    };
+    let custom = CustomProfileSpec {
+        extends: name.trim().to_owned(),
+        description: None,
+        knobs: knobs.clone(),
+        floors,
+        compatible_roles: RoleSetDelta::default(),
+    };
+    let slug = format!("{}_custom", base.slug);
+    resolve_profile(&custom_guided_spec(
+        product, &base, custom, &slug, "what_if",
+    ))
+}
+
+/// Prints a resolver result; exit 2 when it is invalid.
+fn resolution_run(resolution: &ProfileResolution, output: &str) -> Result<CliRun, CliError> {
+    let message = if output == "json" {
+        let value = match resolution {
+            ProfileResolution::Resolved { profile, issues } => json!({
+                "resolution": "resolved",
+                "profile": profile,
+                "rows": knob_rows_json(&profile.knobs, Some(&profile.provenance))?,
+                "issues": issues,
+            }),
+            ProfileResolution::Unresolved { reason, issues } => json!({
+                "resolution": "unresolved",
+                "reason": reason,
+                "issues": issues,
+            }),
+            ProfileResolution::Invalid(issues) => json!({
+                "resolution": "invalid",
+                "issues": issues,
+            }),
+        };
+        serde_json::to_string_pretty(&value)?
+    } else {
+        format_resolution(resolution)?
+    };
+    Ok(CliRun::validation(
+        message,
+        !matches!(resolution, ProfileResolution::Invalid(_)),
+    ))
 }
 
 fn run_role(args: &[String]) -> Result<CliRun, CliError> {
@@ -643,8 +1254,8 @@ fn run_backup(args: &[String]) -> Result<String, CliError> {
     };
     let db = PathBuf::from(required_value(args, "--db")?);
     let dest = PathBuf::from(required_value(args, "--dest")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
-    let database = open_database(DbConfig::on_disk(profile, db))?;
+    let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
+    let database = open_database(cli_db_config(selection, db)?)?;
     let config = BackupConfig::default();
 
     match kind.as_str() {
@@ -675,7 +1286,16 @@ fn run_backup(args: &[String]) -> Result<String, CliError> {
 fn run_restore(args: &[String]) -> Result<String, CliError> {
     let backup = PathBuf::from(required_value(args, "--backup")?);
     let dest_db = PathBuf::from(required_value(args, "--dest-db")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
+    let ProfileSelection::Fixed(profile) =
+        parse_profile_selection(&required_value(args, "--profile")?)?
+    else {
+        return Err(CliError::Usage(
+            "restore does not accept --profile auto: the restore target must be absent or \
+             empty, so there is no database to inspect; pass the storage profile the backed-up \
+             database was created with"
+                .to_owned(),
+        ));
+    };
     let target = match optional_value(args, "--to-lsn") {
         Some(value) => RestoreTarget::Lsn(
             value
@@ -684,12 +1304,30 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
         ),
         None => RestoreTarget::Latest,
     };
+    let allow_unmet_floors = has_flag(args, "--allow-unmet-floors");
 
-    let report = restore_backup(&backup, DbConfig::on_disk(profile, dest_db), target)?;
-    Ok(format!(
+    let report = restore_backup_with_config(
+        &backup,
+        DbConfig::on_disk(profile, &dest_db),
+        target,
+        &RestoreConfig::default().with_unmet_profile_floors_allowed(allow_unmet_floors),
+    )?;
+    let mut lines = vec![format!(
         "restored timeline={} lsn={} applied_commits={}",
         report.timeline_id, report.restored_lsn, report.applied_commits
-    ))
+    )];
+    // Without the flag, a restore that would miss a floor is refused.
+    if allow_unmet_floors
+        && let MetadataProbe::Initialized(metadata) = inspect_database_metadata(&dest_db)
+    {
+        lines.extend(
+            metadata
+                .unmet_floors
+                .iter()
+                .map(|floor| unmet_floor_warning(floor)),
+        );
+    }
+    Ok(lines.join("\n"))
 }
 
 fn run_verify(args: &[String]) -> Result<String, CliError> {
@@ -878,6 +1516,104 @@ fn run_migrate(args: &[String]) -> Result<String, CliError> {
     }
 }
 
+fn run_maintenance(args: &[String]) -> Result<String, CliError> {
+    let Some(command) = args.first() else {
+        return Err(maintenance_usage());
+    };
+    if command != "gc" {
+        return Err(CliError::Usage(format!(
+            "unsupported maintenance command {command}\n{MAINTENANCE_USAGE}"
+        )));
+    }
+    let options = history_gc_options(args)?;
+    let database = open_cli_database(args)?;
+    let report = database.gc_history(&options)?;
+    serde_json::to_string_pretty(&report).map_err(Into::into)
+}
+
+const MAINTENANCE_USAGE: &str = "multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]\n\
+     Runs offline and needs exclusive access to the database file: stop `multidb serve` first; serve does not run history GC in the background.\n\
+     Without --history-retain-lsns <n>, AS OF history below the GC watermark (the current LSN unless a temporal keep_history retention or an AS OF pin is older) is removed for every table without a temporal keep_history retention; with it the last <n> LSNs stay queryable unless an earlier run already pruned them.\n\
+     --commit-log-retain-lsns <n> truncates the commit log and breaks the incremental backup chain: take a new full backup afterwards.";
+
+fn maintenance_usage() -> CliError {
+    CliError::Usage(MAINTENANCE_USAGE.to_owned())
+}
+
+/// Flags `maintenance gc` accepts with a value. GC removes history, so a typo or
+/// a missing value must not fall back to the defaults.
+const MAINTENANCE_GC_VALUE_FLAGS: [&str; 6] = [
+    "--db",
+    "--profile",
+    "--batch-size",
+    "--max-batches",
+    "--history-retain-lsns",
+    "--commit-log-retain-lsns",
+];
+
+fn ensure_known_gc_args(args: &[String]) -> Result<(), CliError> {
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        if arg == "--dry-run" {
+            index += 1;
+        } else if MAINTENANCE_GC_VALUE_FLAGS.contains(&arg.as_str()) {
+            match args.get(index + 1) {
+                Some(value) if !value.starts_with("--") => index += 2,
+                _ => return Err(CliError::Usage(format!("{arg} requires a value"))),
+            }
+        } else {
+            return Err(CliError::Usage(format!(
+                "unknown maintenance gc argument {arg}\n{MAINTENANCE_USAGE}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn history_gc_options(args: &[String]) -> Result<HistoryGcOptions, CliError> {
+    ensure_known_gc_args(args)?;
+    let defaults = HistoryGcOptions::default();
+    let batch_size = optional_value(args, "--batch-size")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --batch-size: {error}")))?
+        .unwrap_or(defaults.batch_size);
+    let max_batches = optional_value(args, "--max-batches")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --max-batches: {error}")))?;
+    if max_batches == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --max-batches: must be at least 1".to_owned(),
+        ));
+    }
+    let mvcc_retain_lsns = optional_value(args, "--history-retain-lsns")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --history-retain-lsns: {error}")))?;
+    if mvcc_retain_lsns == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --history-retain-lsns: must be at least 1".to_owned(),
+        ));
+    }
+    let commit_log_retain_lsns = optional_value(args, "--commit-log-retain-lsns")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| CliError::Usage(format!("invalid --commit-log-retain-lsns: {error}")))?;
+    if commit_log_retain_lsns == Some(0) {
+        return Err(CliError::Usage(
+            "invalid --commit-log-retain-lsns: must be at least 1".to_owned(),
+        ));
+    }
+    Ok(HistoryGcOptions {
+        dry_run: has_flag(args, "--dry-run"),
+        batch_size,
+        max_batches,
+        mvcc_retain_lsns,
+        commit_log_retain_lsns,
+    })
+}
+
 fn run_serve(args: &[String]) -> Result<String, CliError> {
     if !args.is_empty() {
         return Err(CliError::Usage(
@@ -886,13 +1622,10 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     }
 
     let config = serve_config_from_env()?;
-    if let Some(parent) = config.db_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let database = create_database(DbConfig::on_disk(config.profile, &config.db_path))?;
-    let database = Arc::new(tokio::sync::Mutex::new(database));
+    let mut database = serve_database(&config)?;
+    apply_query_governor(&mut database, config.query_governor)?;
+    let max_concurrent_queries = database.performance_config().query.max_concurrent_queries;
+    let database = Arc::new(tokio::sync::RwLock::new(database));
 
     let mut admin_state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
         .with_admin_session_ttl_seconds(config.admin_session_ttl_seconds)
@@ -915,7 +1648,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         4096,
         ScramCredential::from_password(&config.pg_password, 4096)?,
     );
-    let pg_config = NetworkConfig::new(tls, pg_auth);
+    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries);
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -925,7 +1658,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
                 .await
                 .map_err(CliError::Runtime)?;
         }
-        if !admin_state.is_admin_auth_configured() {
+        if !admin_state.is_admin_auth_configured().await {
             return Err(CliError::Usage(
                 "multidb serve requires MULTIDB_ADMIN_PASSWORD(_FILE), \
                  MULTIDB_ADMIN_TOKEN(_FILE), or an existing stored admin credential"
@@ -938,9 +1671,12 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         let pg_database = Arc::clone(&database);
 
         let admin_task = tokio::spawn(async move {
-            axum::serve(admin_listener, admin_router)
-                .await
-                .map_err(CliError::Io)
+            axum::serve(
+                admin_listener,
+                admin_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(CliError::Io)
         });
         let pg_task = tokio::spawn(async move {
             PgServer::serve_shared(pg_listener, pg_database, pg_config)
@@ -957,6 +1693,19 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
     })?;
 
     Ok("serve stopped".to_owned())
+}
+
+/// Creates or opens the single-node CP database `serve` runs on. With `MULTIDB_PROFILE=auto`
+/// the database must already exist (see `cli_db_config`).
+fn serve_database(config: &ServeConfig) -> Result<multidb::db::Database, CliError> {
+    // Resolved first, so `auto` on a missing path fails before any directory is created.
+    let db_config = cli_db_config(config.profile, config.db_path.clone())?;
+    if let Some(parent) = config.db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(create_database(db_config)?)
 }
 
 fn run_admin(args: &[String]) -> Result<String, CliError> {
@@ -1008,7 +1757,7 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     "pass --insecure-local-admin only for loopback development binds".to_owned(),
                 ));
             }
-            let database = Arc::new(tokio::sync::Mutex::new(database));
+            let database = Arc::new(tokio::sync::RwLock::new(database));
             let mut state = multidb::admin::AdminState::from_database_handle(Arc::clone(&database))
                 .with_admin_session_ttl_seconds(admin_session_ttl_seconds)
                 .with_admin_login_rate_limit(admin_login_rate_limit);
@@ -1029,7 +1778,7 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                             std::io::Error::other(format!("admin password: {error}"))
                         })?;
                 }
-                if !state.is_admin_auth_configured() {
+                if !state.is_admin_auth_configured().await {
                     return Err(std::io::Error::other(
                         "admin serve requires --admin-password, \
                          MULTIDB_ADMIN_PASSWORD(_FILE), --admin-token, \
@@ -1038,7 +1787,12 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     ));
                 }
                 let listener = tokio::net::TcpListener::bind(bind).await?;
-                axum::serve(listener, multidb::admin::router(state)).await?;
+                axum::serve(
+                    listener,
+                    multidb::admin::router(state)
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await?;
                 Ok::<(), std::io::Error>(())
             })?;
             Ok(format!("admin server stopped on {bind}"))
@@ -1049,17 +1803,304 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
 
 fn format_validation_report(report: &ValidationReport) -> String {
     let mut lines = vec![format!("valid={} status={:?}", report.valid, report.status)];
-    for issue in &report.issues {
-        lines.push(format!(
-            "{} {} {}: {} suggestion: {}",
-            severity_label(issue.severity),
-            issue.code,
-            issue.path,
-            issue.message,
-            issue.suggestion
-        ));
-    }
+    lines.extend(report.issues.iter().map(format_issue));
     lines.join("\n")
+}
+
+fn format_issue(issue: &ValidationIssue) -> String {
+    format!(
+        "{} {} {}: {} suggestion: {}",
+        severity_label(issue.severity),
+        issue.code,
+        issue.path,
+        issue.message,
+        issue.suggestion
+    )
+}
+
+/// The text form of a resolver result: a header, one aligned row per knob and the issues.
+fn format_resolution(resolution: &ProfileResolution) -> Result<String, CliError> {
+    let mut lines = match resolution {
+        ProfileResolution::Resolved { profile, .. } => {
+            let identity = match (&profile.kind, &profile.extends) {
+                (ResolvedProfileKind::Custom, Some(extends)) => {
+                    format!("{} extends {extends}", profile.slug)
+                }
+                _ => profile.slug.clone(),
+            };
+            vec![
+                format!(
+                    "{identity} -> {} variant {} ({:?}), storage profile {:?} ({})",
+                    profile.product_profile,
+                    profile.variant,
+                    profile.status,
+                    profile.storage_profile,
+                    storage_summary(&profile.knobs)
+                ),
+                format!(
+                    "kind={} digest={}",
+                    kind_label(profile.kind),
+                    profile.digest
+                ),
+                knob_table(&profile.knobs, Some(&profile.provenance))?,
+            ]
+        }
+        ProfileResolution::Unresolved { reason, .. } => vec![format!("unresolved: {reason}")],
+        ProfileResolution::Invalid(_) => vec!["invalid profile".to_owned()],
+    };
+    lines.extend(resolution.issues().iter().map(format_issue));
+    Ok(lines.join("\n"))
+}
+
+/// The warning `profile show --db` and `restore --allow-unmet-floors` print for a manifest floor
+/// the database does not meet (`ProbedMetadata.unmet_floors`).
+fn unmet_floor_warning(floor: &str) -> String {
+    let reason = match floor {
+        "floors.encryption_at_rest" => {
+            "the metadata is readable without a key, so this file is not encrypted at rest (a \
+             restore target never is)"
+        }
+        "floors.audit" => {
+            "audit is switched off in this database (a restore keeps the backed-up audit flag)"
+        }
+        _ => "the database does not meet it",
+    };
+    format!("warning: {floor} is not met: {reason}; see docs/profiles.md, \"Backup and restore\"")
+}
+
+/// The text form of `profile show --db`.
+fn format_metadata_probe(path: &Path, probe: &MetadataProbe) -> Result<String, CliError> {
+    Ok(match probe {
+        MetadataProbe::Initialized(metadata) => {
+            let details = format!(
+                "schema_version={} replication={:?} layout={:?} values_framed={}",
+                metadata.schema_version,
+                metadata.replication,
+                metadata.layout,
+                metadata.values_framed
+            );
+            let mut lines = vec![match &metadata.manifest {
+                Some(manifest) => format_manifest(manifest, &details)?,
+                None => format!(
+                    "legacy database: storage profile {:?}, no manifest\n{details}",
+                    metadata.storage_profile
+                ),
+            }];
+            lines.extend(
+                metadata
+                    .unmet_floors
+                    .iter()
+                    .map(|floor| unmet_floor_warning(floor)),
+            );
+            lines.join("\n")
+        }
+        MetadataProbe::NotFound => format!("no database at {}", path.display()),
+        MetadataProbe::Uninitialized => {
+            format!("{} holds no database metadata", path.display())
+        }
+        MetadataProbe::Locked => format!(
+            "{} is locked: another handle holds the database open",
+            path.display()
+        ),
+        MetadataProbe::NeedsRecovery => format!(
+            "{} was not closed cleanly and needs crash recovery; profile show never writes the \
+             file, so open it once (any command with --profile auto or its profile) and retry",
+            path.display()
+        ),
+        MetadataProbe::Unreadable { reason } => {
+            format!("{} cannot be read: {reason}", path.display())
+        }
+    })
+}
+
+fn format_manifest(manifest: &PersistedProfileManifest, details: &str) -> Result<String, CliError> {
+    let identity = match (&manifest.kind, &manifest.extends) {
+        (ResolvedProfileKind::Custom, Some(extends)) => {
+            format!("{} extends {extends}", manifest.profile)
+        }
+        _ => manifest.profile.clone(),
+    };
+    Ok([
+        format!(
+            "profile manifest: {identity} -> {} variant {}, storage profile {:?} ({})",
+            manifest.product_profile,
+            manifest.variant,
+            manifest.storage_profile,
+            storage_summary(&manifest.knobs)
+        ),
+        format!(
+            "{details} kind={} digest={} written_by={}",
+            kind_label(manifest.kind),
+            manifest.digest,
+            manifest.written_by
+        ),
+        knob_table(&manifest.knobs, None)?,
+    ]
+    .join("\n"))
+}
+
+/// One row per `KNOB_REGISTRY` path: the value, where it came from (when known) and the
+/// registry's timing, sink and enforcement.
+fn knob_rows_json(
+    knobs: &ProfileKnobs,
+    provenance: Option<&std::collections::BTreeMap<String, KnobSource>>,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    let values = serde_json::to_value(knobs)?;
+    Ok(KNOB_REGISTRY
+        .iter()
+        .map(|definition| {
+            json!({
+                "path": definition.path,
+                "value": knob_value(&values, definition),
+                "source": provenance.and_then(|provenance| provenance.get(definition.path)),
+                "timing": definition.timing,
+                "sink": definition.sink,
+                "enforcement": definition.enforcement,
+            })
+        })
+        .collect())
+}
+
+fn knob_table(
+    knobs: &ProfileKnobs,
+    provenance: Option<&std::collections::BTreeMap<String, KnobSource>>,
+) -> Result<String, CliError> {
+    let values = serde_json::to_value(knobs)?;
+    let rows = KNOB_REGISTRY
+        .iter()
+        .map(|definition| {
+            let source = provenance
+                .and_then(|provenance| provenance.get(definition.path))
+                .map_or("-", |source| source_label(*source));
+            vec![
+                definition.path.to_owned(),
+                display_knob_value(&knob_value(&values, definition)),
+                source.to_owned(),
+                timing_label(definition.timing).to_owned(),
+                enforcement_label(definition.enforcement),
+                definition.sink.to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    Ok(align_rows(&rows))
+}
+
+fn knob_value(values: &serde_json::Value, definition: &KnobDefinition) -> serde_json::Value {
+    values
+        .pointer(&format!("/{}", definition.path.replace('.', "/")))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn display_knob_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(display_knob_value)
+            .collect::<Vec<_>>()
+            .join(","),
+        other => other.to_string(),
+    }
+}
+
+/// Pads every column but the last to its widest cell.
+fn align_rows(rows: &[Vec<String>]) -> String {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (column, cell) in row.iter().enumerate() {
+                if column + 1 == row.len() {
+                    line.push_str(cell);
+                } else {
+                    let width = widths.get(column).copied().unwrap_or(0);
+                    line.push_str(&format!("{cell:<width$}  "));
+                }
+            }
+            line.trim_end().to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The engine, layout, commit protocol and compression the knobs select, for example
+/// `redb, row, two-phase commit`.
+fn storage_summary(knobs: &ProfileKnobs) -> String {
+    let mut parts = vec![
+        match knobs.storage.medium {
+            StorageMedium::Durable => "redb",
+            StorageMedium::Volatile => "memory",
+        },
+        match knobs.storage.layout {
+            LayoutKnob::Row => "row",
+            LayoutKnob::Columnar => "columnar",
+        },
+        match knobs.durability.commit {
+            CommitMode::Immediate => "immediate commit",
+            CommitMode::TwoPhase => "two-phase commit",
+        },
+    ];
+    match knobs.compression.algorithm {
+        CompressionKnob::None => {}
+        CompressionKnob::Lz4 => parts.push("lz4 value framing"),
+        CompressionKnob::Zstd => parts.push("zstd value framing"),
+    }
+    parts.join(", ")
+}
+
+const fn kind_label(kind: ResolvedProfileKind) -> &'static str {
+    match kind {
+        ResolvedProfileKind::BuiltIn => "built_in",
+        ResolvedProfileKind::Variant => "variant",
+        ResolvedProfileKind::Custom => "custom",
+    }
+}
+
+const fn source_label(source: KnobSource) -> &'static str {
+    match source {
+        KnobSource::Preset => "preset",
+        KnobSource::Variant => "variant",
+        KnobSource::Override => "override",
+        KnobSource::Derived => "derived",
+    }
+}
+
+const fn timing_label(timing: KnobTiming) -> &'static str {
+    match timing {
+        KnobTiming::Creation => "creation",
+        KnobTiming::EveryOpen => "every open",
+        KnobTiming::Provisioning => "provisioning",
+        KnobTiming::GenerationDefault => "generation default",
+        KnobTiming::Validation => "validation",
+    }
+}
+
+fn enforcement_label(enforcement: KnobEnforcement) -> String {
+    match enforcement {
+        KnobEnforcement::Enforced => "enforced".to_owned(),
+        KnobEnforcement::Planned { tracking } => format!("planned ({tracking})"),
+        KnobEnforcement::Declarative => "declarative".to_owned(),
+    }
+}
+
+const fn change_policy_label(policy: ChangePolicy) -> &'static str {
+    match policy {
+        ChangePolicy::Unsupported => "unsupported",
+        ChangePolicy::Retune => "retune",
+        ChangePolicy::FormatUpgrade => "format upgrade",
+        ChangePolicy::Provisioning => "provisioning",
+        ChangePolicy::NotApplicable => "not applicable",
+    }
 }
 
 fn format_explain_report(report: &ExplainConfigReport) -> String {
@@ -1162,13 +2203,25 @@ fn format_profiles() -> String {
                 .map(|role| role_slug(*role))
                 .collect::<Vec<_>>()
                 .join(",");
+            let variants = product_variants(profile.slug)
+                .map(|variant| {
+                    format!(
+                        "{}({:?}{})",
+                        variant.name,
+                        variant.storage_profile,
+                        if variant.canonical { ",canonical" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "slug={} status={:?} aliases={} default_domain={} roles={} description={}",
+                "slug={} status={:?} aliases={} default_domain={} roles={} variants={} description={}",
                 profile.slug,
                 profile.status,
                 aliases,
                 domain_slug(profile.default_domain),
                 roles,
+                variants,
                 profile.description
             )
         })
@@ -1239,7 +2292,64 @@ fn format_domains() -> String {
 }
 
 fn guided_spec(profile: &ProfileSpec, name: &str) -> DatabaseSpec {
-    let replication = replication_for_domain(profile.default_domain);
+    guided_spec_for_domain(profile, name, profile.default_domain)
+}
+
+/// The guided spec for `init --override`: version 2 with `custom`, the profile it extends. The
+/// resolved storage medium and default domain shape the deployment, the domain and the
+/// replication, and every required floor raises the matching guarantee.
+fn custom_guided_spec(
+    product: &ProfileSpec,
+    base: &ResolvedProfile,
+    custom: CustomProfileSpec,
+    slug: &str,
+    name: &str,
+) -> DatabaseSpec {
+    let medium = custom
+        .knobs
+        .storage
+        .and_then(|storage| storage.medium)
+        .unwrap_or(base.knobs.storage.medium);
+    let domain = custom
+        .knobs
+        .consistency
+        .and_then(|consistency| consistency.default_domain)
+        .unwrap_or(base.knobs.consistency.default_domain);
+    let mut spec = guided_spec_for_domain(product, name, domain);
+    spec.version = DATABASE_SPEC_VERSION_V2;
+    spec.profile = slug.to_owned();
+    if medium == StorageMedium::Volatile {
+        spec.deployment = DeploymentSpec {
+            mode: DeploymentMode::Embedded,
+            storage_path: None,
+        };
+    }
+    let preset = base.knobs.floors;
+    let raised = custom.floors;
+    if preset.audit || raised.audit == Some(true) {
+        spec.guarantees.audit.enabled = true;
+    }
+    if preset.backup || raised.backup == Some(true) {
+        spec.guarantees.backup.enabled = true;
+    }
+    if preset.pitr || raised.pitr == Some(true) {
+        // Point-in-time recovery is restored from backups.
+        spec.guarantees.backup.enabled = true;
+        spec.guarantees.backup.pitr = true;
+    }
+    if preset.encryption_at_rest || raised.encryption_at_rest == Some(true) {
+        spec.guarantees.encryption.at_rest = true;
+    }
+    spec.custom_profile = Some(custom);
+    spec
+}
+
+fn guided_spec_for_domain(
+    profile: &ProfileSpec,
+    name: &str,
+    domain: ConsistencyMode,
+) -> DatabaseSpec {
+    let replication = replication_for_domain(domain);
     let mut guarantees = GuaranteeSpec::for_replication(replication);
     if profile.slug == "production_cp" {
         guarantees.backup.enabled = true;
@@ -1266,12 +2376,13 @@ fn guided_spec(profile: &ProfileSpec, name: &str) -> DatabaseSpec {
         guarantees,
         domains: vec![ConsistencyDomainSpec {
             name: "primary".to_owned(),
-            mode: profile.default_domain,
+            mode: domain,
         }],
         collections: Vec::new(),
         extensions: Vec::new(),
         overrides: std::collections::BTreeMap::new(),
         operation_hints: std::collections::BTreeMap::new(),
+        custom_profile: None,
     }
 }
 
@@ -1323,10 +2434,7 @@ const fn template_index_slug(index: multidb::config_spec::CollectionIndexKind) -
 }
 
 fn resolve_built_in_profile(value: &str) -> Option<&'static ProfileSpec> {
-    built_in_profile(value).or_else(|| {
-        let normalized = value.replace('-', "_");
-        built_in_profile(&normalized)
-    })
+    built_in_profile_normalized(value)
 }
 
 fn require_list_command(args: &[String]) -> Result<(), CliError> {
@@ -1438,13 +2546,42 @@ fn output_format(args: &[String]) -> Result<String, CliError> {
     Ok(output)
 }
 
-fn read_spec_file(path: &Path) -> Result<DatabaseSpec, CliError> {
-    let input = std::fs::read_to_string(path)?;
-    if is_yaml_path(path) {
-        serde_norway::from_str(&input).map_err(Into::into)
-    } else {
-        serde_json::from_str(&input).map_err(Into::into)
+/// Reads a spec through `config_spec::spec_io` (1 MiB cap, version peek, bounded YAML aliases).
+/// Size and version problems come back as a validation report (exit 2); I/O, syntax and decode
+/// errors stay CLI errors (exit 1), as before.
+fn read_spec_file(path: &Path) -> Result<Result<DatabaseSpec, ValidationReport>, CliError> {
+    match spec_io::read_spec_file(path) {
+        Ok(spec) => Ok(Ok(spec)),
+        Err(error) => {
+            if let Some(report) = error.validation_report() {
+                return Ok(Err(report));
+            }
+            Err(match error {
+                SpecIoError::Io(error) => CliError::Io(error),
+                SpecIoError::Yaml(error) => CliError::Yaml(error),
+                SpecIoError::Json(error) => CliError::Json(error),
+                other => CliError::Runtime(other.to_string()),
+            })
+        }
     }
+}
+
+/// Prints the report of a spec that could not be decoded, with exit code 2.
+fn spec_report_run(
+    report: &ValidationReport,
+    output: &str,
+    source: Option<(&str, &Path)>,
+) -> Result<CliRun, CliError> {
+    let message = if output == "json" {
+        serde_json::to_string_pretty(report)?
+    } else {
+        let text = format_validation_report(report);
+        match source {
+            Some((flag, path)) => format!("{flag} {}\n{text}", path.display()),
+            None => text,
+        }
+    };
+    Ok(CliRun::validation(message, false))
 }
 
 fn read_json_file<T>(path: &Path) -> Result<T, CliError>
@@ -1483,6 +2620,14 @@ fn flatten_serve_task(
     }
 }
 
+/// Runs at most as many `PostgreSQL` wire statements as the query governor admits,
+/// so a burst waits for a free statement slot instead of failing the governor queue timeout.
+fn serve_pg_config(tls: TlsMode, auth: AuthConfig, max_concurrent_queries: usize) -> NetworkConfig {
+    let config = NetworkConfig::new(tls, auth);
+    let max_blocking_tasks = config.max_blocking_tasks.min(max_concurrent_queries.max(1));
+    config.with_max_blocking_tasks(max_blocking_tasks)
+}
+
 fn serve_config_from_env() -> Result<ServeConfig, CliError> {
     serve_config_from_sources(|name| env::var(name).ok())
 }
@@ -1503,7 +2648,7 @@ where
         "MULTIDB_DB_PATH",
         "/var/lib/multidb/multidb.redb",
     ));
-    let profile = parse_profile(&env_or_default(
+    let profile = parse_profile_selection(&env_or_default(
         &get_env,
         "MULTIDB_PROFILE",
         "transactional",
@@ -1530,6 +2675,18 @@ where
         "/usr/share/multidb/studio",
     ));
     let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
+    let query_governor = ServeQueryGovernor {
+        max_concurrent_queries: bounded_positive_from_sources(
+            &get_env,
+            "MULTIDB_MAX_CONCURRENT_QUERIES",
+            MAX_SERVE_CONCURRENT_QUERIES,
+        )?,
+        queue_timeout_ms: bounded_positive_from_sources(
+            &get_env,
+            "MULTIDB_QUERY_QUEUE_TIMEOUT_MS",
+            MAX_SERVE_QUERY_QUEUE_TIMEOUT_MS,
+        )?,
+    };
 
     Ok(ServeConfig {
         admin_bind,
@@ -1545,7 +2702,48 @@ where
         pg_password,
         pg_tls,
         studio_dir,
+        query_governor,
     })
+}
+
+/// Reads an optional integer from 1 to `max`; any other set value fails startup.
+fn bounded_positive_from_sources<F, T>(
+    get_env: &F,
+    name: &str,
+    max: T,
+) -> Result<Option<T>, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+    T: Copy + PartialOrd + From<u8> + std::str::FromStr + std::fmt::Display,
+{
+    let Some(value) = get_env(name).filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match value.trim().parse::<T>() {
+        Ok(parsed) if parsed >= T::from(1) && parsed <= max => Ok(Some(parsed)),
+        _ => Err(CliError::Usage(format!(
+            "invalid {name} {value}; expected an integer from 1 to {max}"
+        ))),
+    }
+}
+
+/// Applies the `multidb serve` query governor overrides before the database is shared.
+fn apply_query_governor(
+    database: &mut multidb::db::Database,
+    governor: ServeQueryGovernor,
+) -> Result<(), CliError> {
+    if governor == ServeQueryGovernor::default() {
+        return Ok(());
+    }
+    let defaults = &database.performance_config().query;
+    let max_concurrent_queries = governor
+        .max_concurrent_queries
+        .unwrap_or(defaults.max_concurrent_queries);
+    let queue_timeout_ms = governor
+        .queue_timeout_ms
+        .unwrap_or(defaults.queue_timeout_ms);
+    database.set_query_governor(max_concurrent_queries, queue_timeout_ms)?;
+    Ok(())
 }
 
 fn env_or_default<F>(get_env: &F, name: &str, default: &str) -> String
@@ -1770,6 +2968,33 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|value| value == flag)
 }
 
+/// The arguments that are neither a `--flag` nor the value after one of `value_flags`, in order.
+fn positional_args<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a str> {
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if value_flags.contains(&arg.as_str()) {
+            iter.next();
+        } else if !arg.starts_with("--") {
+            positional.push(arg.as_str());
+        }
+    }
+    positional
+}
+
+/// Every value of a repeatable flag, in order. Each occurrence may also hold a comma-separated
+/// list, so `--override a=1 --override b=2` and `--override a=1,b=2` are the same.
+fn values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|window| window.first().is_some_and(|value| value == flag))
+        .filter_map(|window| window.get(1))
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn parse_export_format(value: &str) -> Result<ExportFormat, CliError> {
     match value {
         "csv" => Ok(ExportFormat::Csv),
@@ -1783,14 +3008,14 @@ fn parse_export_format(value: &str) -> Result<ExportFormat, CliError> {
 
 fn open_cli_database(args: &[String]) -> Result<multidb::db::Database, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
-    Ok(open_database(DbConfig::on_disk(profile, db))?)
+    let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
+    Ok(open_database(cli_db_config(selection, db)?)?)
 }
 
 fn create_cli_database(args: &[String]) -> Result<multidb::db::Database, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
-    let profile = parse_profile(&required_value(args, "--profile")?)?;
-    Ok(create_database(DbConfig::on_disk(profile, db))?)
+    let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
+    Ok(create_database(cli_db_config(selection, db)?)?)
 }
 
 fn resume_token(args: &[String]) -> Result<ResumeToken, CliError> {
@@ -1813,29 +3038,155 @@ fn changefeed_filter(args: &[String]) -> ChangefeedFilter {
     ChangefeedFilter { target }
 }
 
-fn parse_profile(value: &str) -> Result<Profile, CliError> {
-    match value {
-        "InMemory" | "in-memory" | "memory" => Ok(Profile::InMemory),
-        "Transactional" | "transactional" => Ok(Profile::Transactional),
-        "Analytical" | "analytical" => Ok(Profile::Analytical),
-        "Document" | "document" => Ok(Profile::Document),
-        "Vector" | "vector" => Ok(Profile::Vector),
-        "TimeSeries" | "time-series" | "time_series" => Ok(Profile::TimeSeries),
-        "HighDurability" | "high-durability" => Ok(Profile::HighDurability),
-        "Balanced" | "balanced" => Ok(Profile::Balanced),
-        _ => Err(CliError::Usage(format!("unknown profile {value}"))),
+/// Parses a `--profile` value or `MULTIDB_PROFILE`: today's storage profile spellings (unchanged),
+/// `auto`, then a built-in product slug (its canonical variant) or alias (its variant), in snake
+/// or kebab case.
+fn parse_profile_selection(value: &str) -> Result<ProfileSelection, CliError> {
+    if let Some(profile) = storage_profile_name(value) {
+        return Ok(ProfileSelection::Fixed(profile));
     }
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Ok(ProfileSelection::Auto);
+    }
+    if let Some(resolved) = named_profile(value) {
+        return Ok(ProfileSelection::Fixed(resolved.storage_profile));
+    }
+    Err(CliError::Usage(format!(
+        "unknown profile {value}{}; expected a storage profile (InMemory, Transactional, \
+         Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product profile \
+         slug or alias (run multidb profile list), or auto",
+        did_you_mean(value)
+    )))
+}
+
+/// The storage profile spellings `--profile` accepted before product slugs and aliases.
+fn storage_profile_name(value: &str) -> Option<Profile> {
+    match value {
+        "InMemory" | "in-memory" | "memory" => Some(Profile::InMemory),
+        "Transactional" | "transactional" => Some(Profile::Transactional),
+        "Analytical" | "analytical" => Some(Profile::Analytical),
+        "Document" | "document" => Some(Profile::Document),
+        "Vector" | "vector" => Some(Profile::Vector),
+        "TimeSeries" | "time-series" | "time_series" => Some(Profile::TimeSeries),
+        "HighDurability" | "high-durability" => Some(Profile::HighDurability),
+        "Balanced" | "balanced" => Some(Profile::Balanced),
+        _ => None,
+    }
+}
+
+/// The `DbConfig` of the database at `path`. The CLI and `serve` open single-node CP databases
+/// only, so the replication is always CP. `auto` reads only the storage profile of the existing
+/// database, without creating anything: a database whose metadata records another replication
+/// fails with `ReplicationMismatch`, exactly as it does with a named profile. `auto` is an error
+/// for anything but an initialized database. A file that was not closed cleanly (`serve` has no
+/// graceful shutdown, so every stop by a signal leaves one) first gets redb's crash recovery,
+/// which every opener runs anyway, also for a file that then fails the replication check; `auto`
+/// writes nothing else, and nothing at all to a cleanly closed file.
+fn cli_db_config(selection: ProfileSelection, path: PathBuf) -> Result<DbConfig, CliError> {
+    let ProfileSelection::Fixed(profile) = selection else {
+        let probe = match inspect_database_metadata(&path) {
+            MetadataProbe::NeedsRecovery => {
+                recover_database_file(&path)?;
+                inspect_database_metadata(&path)
+            }
+            probe => probe,
+        };
+        return match probe {
+            MetadataProbe::Initialized(metadata) => {
+                let config = DbConfig::on_disk(metadata.storage_profile, path);
+                if metadata.replication != config.replication {
+                    return Err(multidb::db::ConfigError::ReplicationMismatch {
+                        expected: config.replication,
+                        found: metadata.replication,
+                    }
+                    .into());
+                }
+                Ok(config)
+            }
+            MetadataProbe::NotFound => Err(CliError::Usage(format!(
+                "profile auto reads the profile of an existing database, but nothing exists at \
+                 {}; name a profile to create a database",
+                path.display()
+            ))),
+            MetadataProbe::Uninitialized => Err(CliError::Usage(format!(
+                "profile auto found no database metadata in {}; name a profile to initialize it",
+                path.display()
+            ))),
+            MetadataProbe::Locked => Err(CliError::Usage(format!(
+                "profile auto cannot inspect {}: another process holds the database open; stop \
+                 it or name the profile",
+                path.display()
+            ))),
+            MetadataProbe::NeedsRecovery => Err(CliError::Usage(format!(
+                "profile auto cannot read the metadata of {}: it still needs crash recovery \
+                 after recovering it; name the profile",
+                path.display()
+            ))),
+            MetadataProbe::Unreadable { reason } => Err(CliError::Usage(format!(
+                "profile auto cannot read the metadata of {}: {reason}; name the profile",
+                path.display()
+            ))),
+        };
+    };
+    Ok(DbConfig::on_disk(profile, path))
+}
+
+/// Resolves a built-in product slug or alias (snake or kebab case) without overrides.
+fn named_profile(name: &str) -> Option<ResolvedProfile> {
+    match resolve_named_profile(name, &ProfileKnobOverrides::default()) {
+        ProfileResolution::Resolved { profile, .. } => Some(*profile),
+        ProfileResolution::Unresolved { .. } | ProfileResolution::Invalid(_) => None,
+    }
+}
+
+fn product_variants(product: &'static str) -> impl Iterator<Item = &'static ProfileVariant> {
+    profile_variants()
+        .iter()
+        .filter(move |variant| variant.product == product)
+}
+
+/// ` (did you mean <slug>?)` for the closest built-in profile name, or nothing.
+fn did_you_mean(value: &str) -> String {
+    suggest_profile_name(value).map_or_else(String::new, |candidate| {
+        format!(" (did you mean {candidate}?)")
+    })
+}
+
+/// Parses every `--override path=value` into knob and floor overrides.
+fn parse_knob_overrides(
+    args: &[String],
+) -> Result<(ProfileKnobOverrides, FloorOverrides), CliError> {
+    let assignments = values(args, "--override");
+    if assignments.is_empty() && has_flag(args, "--override") {
+        return Err(CliError::Usage(
+            "missing value for --override; use --override <knob>=<value> (multidb profile knobs \
+             lists the knobs)"
+                .to_owned(),
+        ));
+    }
+    let mut knobs = ProfileKnobOverrides::default();
+    let mut floors = FloorOverrides::default();
+    for input in &assignments {
+        parse_knob_assignment(input)
+            .and_then(|assignment| assignment.apply(&mut knobs, &mut floors))
+            .map_err(|error| CliError::Usage(format!("--override {input}: {error}")))?;
+    }
+    Ok((knobs, floors))
 }
 
 fn usage() -> CliError {
     CliError::Usage(
         "multidb serve\n\
          multidb backup full --db <path> --profile <profile> --dest <dir>\n\
-         multidb init --guided --profile <profile> --name <name> [--out <path>] [--format yaml|json] [--force] [--json]\n\
+         multidb init --guided --profile <profile> --name <name> [--override <knob>=<value>]... [--profile-name <slug>] [--out <path>] [--format yaml|json] [--force] [--json]\n\
          multidb init --guided --template <template> --name <name> [--out <dir>] [--format yaml|json] [--force] [--json]\n\
          multidb template list [--json]\n\
          multidb template explain <template> [--name <name>] [--output text|json] [--json]\n\
          multidb profile list [--json]\n\
+         multidb profile show <profile> [--override <knob>=<value>]... [--output text|json] [--json]\n\
+         multidb profile show --db <path> [--output text|json] [--json]\n\
+         multidb profile explain --spec <json|yaml> [--output text|json] [--json]\n\
+         multidb profile knobs [--output text|json] [--json]\n\
          multidb role list [--json]\n\
          multidb domain list [--json]\n\
          multidb config validate --spec <json|yaml> [--output text|json] [--json]\n\
@@ -1843,11 +3194,12 @@ fn usage() -> CliError {
          multidb explain config --spec <json|yaml> [--output text|json] [--json]\n\
          multidb config plan --current <json|yaml> --desired <json|yaml> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb config apply --plan <json> --confirm <plan_id> [--output text|json]\n\
+         multidb config upgrade --spec <json|yaml> [--out <path>] [--force] [--output text|json] [--json]\n\
          multidb advice list --db <path> --profile <profile> [--output text|json] [--json]\n\
          multidb advice plan --db <path> --profile <profile> --advice-id <id> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb advice reject --db <path> --profile <profile> --advice-id <id> --reason <reason> [--output text|json] [--json]\n\
          multidb backup incr --db <path> --profile <profile> --dest <dir> --parent <backup-dir>\n\
-         multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>]\n\
+         multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>] [--allow-unmet-floors]\n\
          multidb verify --backup <backup-dir>\n\
          multidb list --backup-root <dir>\n\
          multidb cdc poll --db <path> --profile <profile> [--lsn <lsn>] [--table <name>] [--include-system]\n\
@@ -1860,7 +3212,10 @@ fn usage() -> CliError {
          multidb import <csv|jsonl|pg> --db <path> --profile <profile> --file <path> [--table <name>] [--batch-size <n>] [--resume-token <path>] [--reject-file <path>]\n\
          multidb admin status --db <path> --profile <profile>\n\
          multidb admin serve --db <path> --profile <profile> [--bind <addr>] [--admin-password <password>|--admin-password-file <path>|--admin-token <token>|--insecure-local-admin]\n\
-         multidb migrate value-codec --db <path> --profile <profile>"
+         multidb migrate value-codec --db <path> --profile <profile>\n\
+         multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]\n\
+         <profile> on --profile and MULTIDB_PROFILE: a storage profile (InMemory, Transactional, Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product slug or alias from multidb profile list (snake or kebab case), or auto to read an existing database (not accepted by restore)\n\
+         --override takes a knob path from multidb profile knobs; repeat it or separate assignments with commas"
             .to_owned(),
     )
 }
@@ -1869,15 +3224,33 @@ fn usage() -> CliError {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{CliError, ServePgTls, run, serve_config_from_sources};
+    #[cfg(unix)]
+    use super::write_through_temp_file;
+    use super::{
+        CliError, ProfileSelection, ServePgTls, ServeQueryGovernor, apply_query_governor,
+        cli_db_config, format_metadata_probe, parse_profile_selection, run,
+        serve_config_from_sources, serve_database, serve_pg_config, values,
+    };
     use multidb::{
-        config_spec::{
-            CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, MigrationPlanner,
-            WriteAck,
+        backup::{
+            BackupConfig, BackupError, RestoreConfig, RestoreTarget, full_backup,
+            restore_backup_with_config,
         },
-        db::{DbConfig, Profile, create_database},
+        config_spec::{
+            CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, DeploymentMode,
+            GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, PolicyCompiler, ProfileResolution,
+            RESERVED_KNOBS, WriteAck, resolve_named_profile,
+            spec_io::{MAX_SPEC_BYTES, SpecFormat, decode_spec_bytes},
+        },
+        db::{
+            ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
+            ReplicationKind, create_database, create_database_with_profile,
+            inspect_database_metadata, open_database,
+        },
+        network::{AuthConfig, NetworkConfig, ScramCredential, TlsMode},
         tuning::WorkloadSample,
     };
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
 
     fn write_spec(
@@ -1948,7 +3321,7 @@ mod tests {
 
         assert_eq!(config.admin_token.as_deref(), Some("admin-secret"));
         assert_eq!(config.pg_password, "pg-secret");
-        assert_eq!(config.profile, Profile::Balanced);
+        assert_eq!(config.profile, ProfileSelection::Fixed(Profile::Balanced));
         assert_eq!(config.pg_tls, ServePgTls::DisabledForLocalDev);
         assert_eq!(config.admin_bind.port(), 18_080);
         assert_eq!(config.pg_bind.port(), 15_432);
@@ -2001,6 +3374,189 @@ mod tests {
         assert_eq!(config.admin_login_rate_limit.max_failures, 1);
         assert_eq!(config.admin_login_rate_limit.window_seconds, 2);
         assert_eq!(config.admin_login_rate_limit.lockout_seconds, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_config_caps_statements_at_the_query_governor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let default_tasks =
+            NetworkConfig::new(TlsMode::DisabledForTests, auth.clone()).max_blocking_tasks;
+
+        let small = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 4);
+        assert_eq!(small.max_blocking_tasks, 4);
+        let zero = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 0);
+        assert_eq!(zero.max_blocking_tasks, 1);
+        let large = serve_pg_config(TlsMode::DisabledForTests, auth, default_tasks + 64);
+        assert_eq!(large.max_blocking_tasks, default_tasks);
+        Ok(())
+    }
+
+    fn local_dev_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+        ]);
+        env.extend(env_map(extra));
+        env
+    }
+
+    #[test]
+    fn serve_config_parses_query_governor_limits() -> Result<(), Box<dyn std::error::Error>> {
+        let env = local_dev_env(&[]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(config.query_governor, ServeQueryGovernor::default());
+
+        let env = local_dev_env(&[
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "8"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", " 2500 "),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(
+            config.query_governor,
+            ServeQueryGovernor {
+                max_concurrent_queries: Some(8),
+                queue_timeout_ms: Some(2_500),
+            }
+        );
+
+        let env = local_dev_env(&[
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "4096"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "60000"),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(config.query_governor.max_concurrent_queries, Some(4_096));
+        assert_eq!(config.query_governor.queue_timeout_ms, Some(60_000));
+        Ok(())
+    }
+
+    #[test]
+    fn serve_config_rejects_invalid_query_governor_limits() {
+        for (name, value) in [
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "0"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "-1"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "4097"),
+            ("MULTIDB_MAX_CONCURRENT_QUERIES", "many"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "0"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "60001"),
+            ("MULTIDB_QUERY_QUEUE_TIMEOUT_MS", "1.5"),
+        ] {
+            let env = local_dev_env(&[(name, value)]);
+            let error = serve_config_from_sources(|name| env.get(name).cloned());
+            assert!(
+                matches!(error, Err(CliError::Usage(ref message)) if message.contains(name)),
+                "{name}={value}: unexpected result {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_governor_overrides_apply_to_database_and_pg_wire_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let defaults = database.performance_config().query.clone();
+
+        apply_query_governor(&mut database, ServeQueryGovernor::default())?;
+        assert_eq!(database.performance_config().query, defaults);
+
+        apply_query_governor(
+            &mut database,
+            ServeQueryGovernor {
+                max_concurrent_queries: None,
+                queue_timeout_ms: Some(250),
+            },
+        )?;
+        let query = &database.performance_config().query;
+        assert_eq!(
+            query.max_concurrent_queries,
+            defaults.max_concurrent_queries
+        );
+        assert_eq!(query.queue_timeout_ms, 250);
+
+        apply_query_governor(
+            &mut database,
+            ServeQueryGovernor {
+                max_concurrent_queries: Some(3),
+                queue_timeout_ms: None,
+            },
+        )?;
+        let query = &database.performance_config().query;
+        assert_eq!(query.max_concurrent_queries, 3);
+        assert_eq!(query.queue_timeout_ms, 250);
+
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let pg_config = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth,
+            database.performance_config().query.max_concurrent_queries,
+        );
+        assert_eq!(pg_config.max_blocking_tasks, 3);
+        Ok(())
+    }
+
+    /// `serve` opens a profile-manifest database through the manifest openers and applies the
+    /// query governor overrides on top: unset, the manifest's governor knobs stay; set, only
+    /// those two change, for the process only, and the manifest's parser limits stay.
+    #[test]
+    fn serve_query_governor_overrides_a_profile_manifest_for_the_process_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("serve.redb");
+        let overrides = serde_json::from_value(json!({
+            "query": {
+                "max_concurrent_queries": 6,
+                "queue_timeout_ms": 900,
+                "max_sql_bytes": 2048
+            }
+        }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with query overrides must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(db_path.clone()))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::default(),
+        )?);
+
+        let db_arg = path_arg(&db_path);
+        let serve_env = |extra: &[(&str, &str)]| {
+            let mut env =
+                local_dev_env(&[("MULTIDB_PROFILE", "auto"), ("MULTIDB_DB_PATH", &db_arg)]);
+            env.extend(env_map(extra));
+            env
+        };
+        let env = serve_env(&[]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        assert_eq!(database.performance_config(), &binding.performance);
+        drop(database);
+
+        let env = serve_env(&[("MULTIDB_MAX_CONCURRENT_QUERIES", "3")]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let mut database = serve_database(&config)?;
+        apply_query_governor(&mut database, config.query_governor)?;
+        let mut expected = binding.performance.clone();
+        expected.query.max_concurrent_queries = 3;
+        assert_eq!(database.performance_config(), &expected);
+        assert_eq!(database.performance_config().query.queue_timeout_ms, 900);
+        assert_eq!(database.performance_config().query.max_sql_bytes, 2_048);
+        drop(database);
+
+        let reopened = open_database(binding.db_config.clone())?;
+        assert_eq!(reopened.performance_config(), &binding.performance);
         Ok(())
     }
 
@@ -2260,6 +3816,127 @@ mod tests {
         Ok(())
     }
 
+    fn run_validate(path: &std::path::Path, json: bool) -> Result<super::CliRun, CliError> {
+        let mut args = vec![
+            "config".to_owned(),
+            "validate".to_owned(),
+            "--spec".to_owned(),
+            path.display().to_string(),
+        ];
+        if json {
+            args.push("--json".to_owned());
+        }
+        run(args)
+    }
+
+    #[test]
+    fn config_validate_reports_oversized_specs_as_invalid() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("huge.yaml");
+        let mut yaml = serde_norway::to_string(&DatabaseSpec::from_db_config(
+            "huge",
+            &DbConfig::on_disk(Profile::Balanced, "huge.redb"),
+        ))?;
+        yaml.push_str(&"#".repeat(multidb::config_spec::spec_io::MAX_SPEC_BYTES));
+        std::fs::write(&spec_path, yaml)?;
+
+        let text = run_validate(&spec_path, false)?;
+        let json = run_validate(&spec_path, true)?;
+
+        assert_eq!(text.exit_code, 2);
+        assert!(text.message.contains("valid=false"), "{}", text.message);
+        assert!(text.message.contains("SPEC_TOO_LARGE"), "{}", text.message);
+        assert_eq!(json.exit_code, 2);
+        let report = serde_json::from_str::<serde_json::Value>(&json.message)?;
+        assert_eq!(report["valid"], false);
+        assert_eq!(report["issues"][0]["code"], "SPEC_TOO_LARGE");
+        Ok(())
+    }
+
+    #[test]
+    fn config_commands_report_unsupported_versions() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let current_path = temp.path().join("current.json");
+        let desired_path = temp.path().join("desired.json");
+        let current = DatabaseSpec::from_db_config(
+            "versions",
+            &DbConfig::on_disk(Profile::Balanced, "versions.redb"),
+        );
+        let mut desired = serde_json::to_value(&current)?;
+        desired["version"] = serde_json::json!(3);
+        write_spec(&current_path, &current)?;
+        std::fs::write(&desired_path, serde_json::to_string_pretty(&desired)?)?;
+
+        let validate = run_validate(&desired_path, true)?;
+        assert_eq!(validate.exit_code, 2);
+        let report = serde_json::from_str::<serde_json::Value>(&validate.message)?;
+        assert_eq!(report["issues"][0]["code"], "UNSUPPORTED_VERSION");
+
+        let explain = run(vec![
+            "explain".to_owned(),
+            "config".to_owned(),
+            "--spec".to_owned(),
+            desired_path.display().to_string(),
+        ])?;
+        assert_eq!(explain.exit_code, 2);
+        assert!(explain.message.contains("UNSUPPORTED_VERSION"));
+
+        let plan = run(vec![
+            "config".to_owned(),
+            "plan".to_owned(),
+            "--current".to_owned(),
+            current_path.display().to_string(),
+            "--desired".to_owned(),
+            desired_path.display().to_string(),
+        ])?;
+        assert_eq!(plan.exit_code, 2);
+        assert!(plan.message.starts_with("--desired "), "{}", plan.message);
+        assert!(
+            plan.message.contains("UNSUPPORTED_VERSION"),
+            "{}",
+            plan.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_validate_accepts_v2_custom_profiles() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("custom.yaml");
+        let mut spec = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        spec.version = 2;
+        spec.profile = "orders_durable".to_owned();
+        spec.custom_profile = Some(serde_json::from_value(serde_json::json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        }))?);
+        write_yaml_spec(&spec_path, &spec)?;
+
+        let outcome = run_validate(&spec_path, false)?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        assert!(outcome.message.contains("valid=true status=Custom"));
+        assert!(outcome.message.contains("CUSTOM_PROFILE_DEFINED"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_validate_keeps_yaml_syntax_errors_as_cli_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("broken.yaml");
+        std::fs::write(&spec_path, "version: 1\nname: [unclosed\n")?;
+
+        let error = run_validate(&spec_path, false);
+
+        assert!(matches!(error, Err(CliError::Yaml(_))), "{error:?}");
+        Ok(())
+    }
+
     #[test]
     fn advice_list_plan_and_reject_support_json_and_out_file()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2460,6 +4137,15 @@ mod tests {
         let report = serde_json::from_str::<serde_json::Value>(&outcome.message)?;
         assert_eq!(report["profile"], "analytics_columnar");
         assert_eq!(report["valid"], true);
+        // `time-series` names the non-canonical time_series variant: the warning is a JSON field.
+        assert_eq!(report["variant"], "analytical");
+        assert_eq!(report["storage_profile"], "Analytical");
+        assert!(
+            report["warnings"][0]
+                .as_str()
+                .is_some_and(|warning| warning.contains("time_series variant")),
+            "{report}"
+        );
         let spec = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(spec_path)?)?;
         assert_eq!(spec.profile, "analytics_columnar");
         Ok(())
@@ -2635,6 +4321,1790 @@ mod tests {
         assert!(
             matches!(error, Err(CliError::Usage(ref message)) if message.contains("profile list")),
             "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn path_arg(path: &std::path::Path) -> String {
+        path.display().to_string()
+    }
+
+    fn json_message(outcome: &super::CliRun) -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_str::<Value>(&outcome.message)?)
+    }
+
+    fn knob_row<'a>(
+        report: &'a Value,
+        path: &str,
+    ) -> Result<&'a Value, Box<dyn std::error::Error>> {
+        report["rows"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["path"] == path))
+            .ok_or_else(|| format!("missing knob row {path}: {report}").into())
+    }
+
+    fn has_issue(report: &Value, code: &str) -> bool {
+        report["issues"]
+            .as_array()
+            .is_some_and(|issues| issues.iter().any(|issue| issue["code"] == code))
+    }
+
+    #[test]
+    fn values_collects_repeated_and_comma_separated_flags() {
+        let args = strings(&[
+            "show",
+            "secure_app",
+            "--override",
+            "cache.max_entries=1,query.timeout_ms=2",
+            "--json",
+            "--override",
+            " floors.audit=true ",
+        ]);
+
+        assert_eq!(
+            values(&args, "--override"),
+            strings(&[
+                "cache.max_entries=1",
+                "query.timeout_ms=2",
+                "floors.audit=true"
+            ])
+        );
+        assert!(values(&args, "--missing").is_empty());
+    }
+
+    #[test]
+    fn parse_profile_selection_keeps_storage_names_and_adds_slugs_aliases_and_auto()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage_names = [
+            ("InMemory", Profile::InMemory),
+            ("in-memory", Profile::InMemory),
+            ("memory", Profile::InMemory),
+            ("Transactional", Profile::Transactional),
+            ("transactional", Profile::Transactional),
+            ("Analytical", Profile::Analytical),
+            ("analytical", Profile::Analytical),
+            ("Document", Profile::Document),
+            ("document", Profile::Document),
+            ("Vector", Profile::Vector),
+            ("vector", Profile::Vector),
+            ("TimeSeries", Profile::TimeSeries),
+            ("time-series", Profile::TimeSeries),
+            ("time_series", Profile::TimeSeries),
+            ("HighDurability", Profile::HighDurability),
+            ("high-durability", Profile::HighDurability),
+            ("Balanced", Profile::Balanced),
+            ("balanced", Profile::Balanced),
+        ];
+        let aliases = [
+            ("in_memory", Profile::InMemory),
+            ("high_durability", Profile::HighDurability),
+            ("High-Durability", Profile::HighDurability),
+        ];
+        for (value, profile) in storage_names.into_iter().chain(aliases) {
+            assert_eq!(
+                parse_profile_selection(value)?,
+                ProfileSelection::Fixed(profile),
+                "{value}"
+            );
+        }
+
+        let products = [
+            ("game_local_balanced", Profile::Balanced),
+            ("desktop_app_embedded", Profile::Document),
+            ("ai_agent_memory", Profile::Vector),
+            ("secure_app", Profile::Transactional),
+            ("production_cp", Profile::Transactional),
+            ("analytics_columnar", Profile::Analytical),
+        ];
+        for (slug, profile) in products {
+            for value in [slug.to_owned(), slug.replace('_', "-")] {
+                assert_eq!(
+                    parse_profile_selection(&value)?,
+                    ProfileSelection::Fixed(profile),
+                    "{value}"
+                );
+            }
+        }
+
+        assert_eq!(parse_profile_selection("auto")?, ProfileSelection::Auto);
+        let unknown = parse_profile_selection("secure_ap");
+        assert!(
+            matches!(unknown, Err(CliError::Usage(ref message))
+                if message.starts_with("unknown profile secure_ap")
+                    && message.contains("did you mean secure_app?")),
+            "unexpected result: {unknown:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_auto_reads_an_existing_database_and_refuses_missing_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("vectors.redb");
+        let config = DbConfig::on_disk(Profile::Vector, &db_path);
+        drop(create_database(config.clone())?);
+
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, db_path.clone())?,
+            config
+        );
+        let advice = run(strings(&[
+            "advice",
+            "list",
+            "--db",
+            &path_arg(&db_path),
+            "--profile",
+            "auto",
+            "--json",
+        ]))?;
+        assert_eq!(advice.exit_code, 0, "{}", advice.message);
+
+        let missing = temp.path().join("missing.redb");
+        let error = cli_db_config(ProfileSelection::Auto, missing.clone());
+        assert!(
+            matches!(error, Err(CliError::Usage(ref message)) if message.contains("nothing exists")),
+            "unexpected result: {error:?}"
+        );
+        let admin = run(strings(&[
+            "admin",
+            "status",
+            "--db",
+            &path_arg(&missing),
+            "--profile",
+            "auto",
+        ]));
+        assert!(
+            matches!(admin, Err(CliError::Usage(_))),
+            "unexpected result: {admin:?}"
+        );
+        assert!(!missing.exists());
+
+        // `serve` resolves `auto` before it creates the parent directories of the path.
+        let nested = temp.path().join("volume");
+        let nested_db = nested.join("data").join("missing.redb");
+        let env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+            ("MULTIDB_PROFILE", "auto"),
+            ("MULTIDB_DB_PATH", &path_arg(&nested_db)),
+        ]);
+        let serve = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let database = serve_database(&serve);
+        assert!(
+            matches!(database, Err(CliError::Usage(ref message)) if message.contains("nothing exists")),
+            "unexpected result: {:?}",
+            database.err()
+        );
+        assert!(!nested.exists());
+        Ok(())
+    }
+
+    /// The CLI and `serve` open single-node CP files only. `auto` reads the storage profile but
+    /// never adopts AP replication: an AP file fails exactly as it does with a named profile.
+    #[test]
+    fn profile_auto_refuses_ap_databases_like_a_named_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn is_ap_mismatch<T>(result: &Result<T, CliError>) -> bool {
+            matches!(
+                result,
+                Err(CliError::Config(ConfigError::ReplicationMismatch {
+                    expected: ReplicationKind::Cp,
+                    found: ReplicationKind::Ap,
+                }))
+            )
+        }
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("ap.redb");
+        let ap_config =
+            DbConfig::on_disk(Profile::Document, &db_path).with_replication(ReplicationKind::Ap);
+        drop(create_database(ap_config.clone())?);
+        let before = std::fs::read(&db_path)?;
+
+        let config = cli_db_config(ProfileSelection::Auto, db_path.clone());
+        assert!(is_ap_mismatch(&config), "unexpected result: {config:?}");
+        let csv = temp.path().join("rows.csv");
+        std::fs::write(&csv, "id,name\n1,a\n")?;
+        let csv_arg = path_arg(&csv);
+        let db_arg = path_arg(&db_path);
+        // `auto` fails before anything opens the file; a named profile fails in the opener.
+        for profile in ["auto", "document"] {
+            for mut args in [
+                vec!["admin", "status"],
+                vec!["advice", "list"],
+                vec!["migrate", "value-codec"],
+                vec!["import", "csv", "--file", &csv_arg, "--table", "t"],
+            ] {
+                args.extend(["--db", &db_arg, "--profile", profile]);
+                let outcome = run(strings(&args));
+                assert!(
+                    is_ap_mismatch(&outcome),
+                    "{args:?}: unexpected result: {outcome:?}"
+                );
+            }
+
+            let env = env_map(&[
+                ("MULTIDB_RUNTIME_MODE", "local-dev"),
+                ("MULTIDB_PG_TLS_MODE", "disabled"),
+                ("MULTIDB_PG_PASSWORD", "pg-secret"),
+                ("MULTIDB_PROFILE", profile),
+                ("MULTIDB_DB_PATH", &db_arg),
+            ]);
+            let serve = serve_config_from_sources(|name| env.get(name).cloned())?;
+            let database = serve_database(&serve);
+            assert!(
+                is_ap_mismatch(&database),
+                "serve {profile}: unexpected result: {:?}",
+                database.err()
+            );
+            if profile == "auto" {
+                assert_eq!(
+                    std::fs::read(&db_path)?,
+                    before,
+                    "auto wrote to the AP file"
+                );
+            }
+        }
+
+        let reopened = open_database(ap_config)?;
+        assert_eq!(reopened.replication_kind(), ReplicationKind::Ap);
+        Ok(())
+    }
+
+    /// `serve` stops only when it is killed, so the file it leaves behind needs crash recovery.
+    /// `profile show --db` still never writes it, while `--profile auto` and
+    /// `MULTIDB_PROFILE=auto` recover it, as every opener would, before reading its profile.
+    /// Unix only: the crash is simulated by copying the file while the database holds it open,
+    /// and Windows refuses to read a file that redb has locked.
+    #[cfg(unix)]
+    #[test]
+    fn profile_auto_recovers_a_database_that_was_not_closed_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let live = temp.path().join("live.redb");
+        let overrides = serde_json::from_value(json!({ "cache": { "max_entries": 8192 } }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with a cache override must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(live.clone()))?;
+        let database = create_database_with_profile(&binding, OperationalConfig::default())?;
+        // A copy taken while the database is open is what a killed process leaves behind.
+        let shown_path = temp.path().join("shown.redb");
+        let cli_path = temp.path().join("cli.redb");
+        let serve_path = temp.path().join("serve.redb");
+        for path in [&shown_path, &cli_path, &serve_path] {
+            std::fs::copy(&live, path)?;
+        }
+        drop(database);
+
+        let before = std::fs::read(&shown_path)?;
+        let shown = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&shown_path),
+        ]))?;
+        assert_eq!(shown.exit_code, 1);
+        assert!(
+            shown.message.contains("needs crash recovery"),
+            "{}",
+            shown.message
+        );
+        let shown = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&shown_path),
+            "--json",
+        ]))?;
+        assert_eq!(shown.exit_code, 1);
+        assert_eq!(json_message(&shown)?["state"], "needs_recovery");
+        assert_eq!(
+            std::fs::read(&shown_path)?,
+            before,
+            "profile show wrote the file"
+        );
+
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, shown_path.clone())?,
+            DbConfig::on_disk(Profile::HighDurability, &shown_path)
+        );
+        let shown = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&shown_path),
+        ]))?;
+        assert_eq!(shown.exit_code, 0, "{}", shown.message);
+
+        let status = run(strings(&[
+            "admin",
+            "status",
+            "--db",
+            &path_arg(&cli_path),
+            "--profile",
+            "auto",
+        ]))?;
+        assert_eq!(status.exit_code, 0, "{}", status.message);
+
+        let serve_arg = path_arg(&serve_path);
+        let env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "pg-secret"),
+            ("MULTIDB_PROFILE", "auto"),
+            ("MULTIDB_DB_PATH", &serve_arg),
+        ]);
+        let serve = serve_config_from_sources(|name| env.get(name).cloned())?;
+        let database = serve_database(&serve)?;
+        assert_eq!(database.profile(), Profile::HighDurability);
+        drop(database);
+
+        // Recovery runs before the replication check, so a crashed AP file is recovered and
+        // then refused; it keeps its replication.
+        let ap_live = temp.path().join("ap-live.redb");
+        let ap_crashed = temp.path().join("ap-crashed.redb");
+        let database = create_database(
+            DbConfig::on_disk(Profile::Document, &ap_live).with_replication(ReplicationKind::Ap),
+        )?;
+        std::fs::copy(&ap_live, &ap_crashed)?;
+        drop(database);
+        let config = cli_db_config(ProfileSelection::Auto, ap_crashed.clone());
+        assert!(
+            matches!(
+                config,
+                Err(CliError::Config(ConfigError::ReplicationMismatch {
+                    expected: ReplicationKind::Cp,
+                    found: ReplicationKind::Ap,
+                }))
+            ),
+            "unexpected result: {config:?}"
+        );
+        let reopened = open_database(
+            DbConfig::on_disk(Profile::Document, &ap_crashed).with_replication(ReplicationKind::Ap),
+        )?;
+        assert_eq!(reopened.replication_kind(), ReplicationKind::Ap);
+        Ok(())
+    }
+
+    #[test]
+    fn backup_accepts_profile_auto_and_restore_refuses_it() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("source.redb");
+        drop(create_database(DbConfig::on_disk(
+            Profile::Document,
+            &db_path,
+        ))?);
+
+        let backup = run(strings(&[
+            "backup",
+            "full",
+            "--db",
+            &path_arg(&db_path),
+            "--profile",
+            "auto",
+            "--dest",
+            &path_arg(&temp.path().join("backups")),
+        ]))?;
+        assert_eq!(backup.exit_code, 0);
+        let backup_dir = backup
+            .message
+            .split("path=")
+            .nth(1)
+            .ok_or("missing backup path")?
+            .trim()
+            .to_owned();
+
+        let restored = temp.path().join("restored.redb");
+        let refused = run(strings(&[
+            "restore",
+            "--backup",
+            &backup_dir,
+            "--dest-db",
+            &path_arg(&restored),
+            "--profile",
+            "auto",
+        ]));
+        assert!(
+            matches!(refused, Err(CliError::Usage(ref message))
+                if message.contains("restore does not accept --profile auto")),
+            "unexpected result: {refused:?}"
+        );
+        assert!(!restored.exists());
+
+        let restore = run(strings(&[
+            "restore",
+            "--backup",
+            &backup_dir,
+            "--dest-db",
+            &path_arg(&restored),
+            "--profile",
+            "desktop-app-embedded",
+        ]))?;
+        assert_eq!(restore.exit_code, 0, "{}", restore.message);
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, restored.clone())?,
+            DbConfig::on_disk(Profile::Document, &restored)
+        );
+        Ok(())
+    }
+
+    /// A restore target is never encrypted, so `restore` refuses a backup whose manifest sets
+    /// `floors.encryption_at_rest` unless `--allow-unmet-floors` is given, and then warns.
+    #[test]
+    fn restore_refuses_unmet_profile_floors_without_allow_unmet_floors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let mut spec = decode_spec_bytes(
+            include_str!("../../examples/custom-profile/multidb.yaml").as_bytes(),
+            SpecFormat::Yaml,
+        )?;
+        spec.custom_profile
+            .as_mut()
+            .ok_or("the example sets custom_profile")?
+            .floors
+            .encryption_at_rest = Some(true);
+        spec.guarantees.encryption.at_rest = true;
+        let compiled = PolicyCompiler::compile(&spec).map_err(|report| format!("{report:?}"))?;
+        let source = temp.path().join("source.redb");
+        let binding = compiled.binding(&spec.deployment, Some(source.clone()))?;
+        let key_path = temp.path().join("key.bin");
+        std::fs::write(&key_path, [3_u8; 32])?;
+        let encryption = EncryptionConfig::file_key(&key_path);
+        let database = create_database_with_profile(
+            &binding,
+            OperationalConfig::new().with_encryption(encryption.clone()),
+        )?;
+        let encrypted_backup = full_backup(
+            &database,
+            temp.path().join("encrypted-backups"),
+            &BackupConfig::default(),
+        )?;
+        drop(database);
+        // The library restore with the opt-in gives an unencrypted database whose manifest
+        // still sets the floor; the CLI backs it up without encryption.
+        let restored = temp.path().join("restored.redb");
+        restore_backup_with_config(
+            &encrypted_backup.path,
+            DbConfig::on_disk(Profile::HighDurability, &restored),
+            RestoreTarget::Latest,
+            &RestoreConfig::default()
+                .with_encryption(encryption)
+                .with_unmet_profile_floors_allowed(true),
+        )?;
+        let backup = run(strings(&[
+            "backup",
+            "full",
+            "--db",
+            &path_arg(&restored),
+            "--profile",
+            "auto",
+            "--dest",
+            &path_arg(&temp.path().join("backups")),
+        ]))?;
+        assert_eq!(backup.exit_code, 0, "{}", backup.message);
+        let backup_dir = backup
+            .message
+            .split("path=")
+            .nth(1)
+            .ok_or("missing backup path")?
+            .trim()
+            .to_owned();
+
+        let target = temp.path().join("target.redb");
+        let restore_args = [
+            "restore",
+            "--backup",
+            &backup_dir,
+            "--dest-db",
+            &path_arg(&target),
+            "--profile",
+            "high_durability",
+        ];
+        let refused = run(strings(&restore_args));
+        assert!(
+            matches!(
+                &refused,
+                Err(CliError::Backup(BackupError::ProfileFloorsNotMet { floors }))
+                    if floors == &["floors.encryption_at_rest"]
+            ),
+            "unexpected result: {refused:?}"
+        );
+        assert!(!target.exists(), "a refused restore creates nothing");
+
+        let mut allowed_args = restore_args.to_vec();
+        allowed_args.push("--allow-unmet-floors");
+        let allowed = run(strings(&allowed_args))?;
+        assert_eq!(allowed.exit_code, 0, "{}", allowed.message);
+        assert!(
+            allowed.message.starts_with("restored timeline=")
+                && allowed
+                    .message
+                    .contains("\nwarning: floors.encryption_at_rest is not met"),
+            "{}",
+            allowed.message
+        );
+        let shown = run(strings(&["profile", "show", "--db", &path_arg(&target)]))?;
+        assert!(
+            shown
+                .message
+                .contains("\nwarning: floors.encryption_at_rest is not met"),
+            "{}",
+            shown.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serve_config_accepts_product_slugs_aliases_and_auto()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (value, expected) in [
+            (
+                "secure_app",
+                ProfileSelection::Fixed(Profile::Transactional),
+            ),
+            (
+                "high_durability",
+                ProfileSelection::Fixed(Profile::HighDurability),
+            ),
+            ("auto", ProfileSelection::Auto),
+        ] {
+            let env = env_map(&[
+                ("MULTIDB_RUNTIME_MODE", "local-dev"),
+                ("MULTIDB_PG_TLS_MODE", "disabled"),
+                ("MULTIDB_PG_PASSWORD", "pg-secret"),
+                ("MULTIDB_PROFILE", value),
+            ]);
+
+            let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+
+            assert_eq!(config.profile, expected, "{value}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_list_json_adds_variants_and_knobs() -> Result<(), Box<dyn std::error::Error>> {
+        let outcome = run(strings(&["profile", "list", "--json"]))?;
+        let report = json_message(&outcome)?;
+        let profiles = report.as_array().ok_or("profile list is not an array")?;
+
+        assert_eq!(profiles.len(), 6);
+        for profile in profiles {
+            let variants = profile["variants"].as_array().ok_or("missing variants")?;
+            assert_eq!(
+                variants
+                    .iter()
+                    .filter(|variant| variant["canonical"] == true)
+                    .count(),
+                1,
+                "{profile}"
+            );
+            assert!(
+                profile["knobs"]["durability"]["commit"].is_string(),
+                "{profile}"
+            );
+        }
+        let game = profiles
+            .iter()
+            .find(|profile| profile["slug"] == "game_local_balanced")
+            .ok_or("missing game_local_balanced")?;
+        assert_eq!(
+            game["variants"],
+            json!([
+                { "name": "balanced", "storage_profile": "Balanced", "canonical": true },
+                { "name": "in_memory", "storage_profile": "InMemory", "canonical": false },
+            ])
+        );
+        assert_eq!(game["knobs"]["storage"]["medium"], "durable");
+
+        let text = run(strings(&["profile", "list"]))?;
+        assert!(
+            text.message
+                .contains("variants=balanced(Balanced,canonical),in_memory(InMemory)"),
+            "{}",
+            text.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_reports_resolved_knobs_with_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let json = run(strings(&["profile", "show", "high_durability", "--json"]))?;
+        assert_eq!(json.exit_code, 0);
+        let report = json_message(&json)?;
+        assert_eq!(report["resolution"], "resolved");
+        assert_eq!(report["profile"]["storage_profile"], "HighDurability");
+        assert_eq!(report["profile"]["product_profile"], "secure_app");
+        assert_eq!(report["profile"]["kind"], "variant");
+        assert_eq!(
+            report["rows"].as_array().map(Vec::len),
+            Some(KNOB_REGISTRY.len())
+        );
+        let commit = knob_row(&report, "durability.commit")?;
+        assert_eq!(commit["value"], "two_phase");
+        assert_eq!(commit["source"], "variant");
+        assert_eq!(commit["timing"], "creation");
+        assert_eq!(
+            knob_row(&report, "limits.max_value_bytes")?["enforcement"]["planned"]["tracking"],
+            "write pipeline limit check"
+        );
+
+        let text = run(strings(&["profile", "show", "high_durability"]))?;
+        assert_eq!(text.exit_code, 0);
+        assert!(
+            text.message.starts_with(
+                "high_durability -> secure_app variant high_durability (Stable), storage profile \
+                 HighDurability (redb, row, two-phase commit)"
+            ),
+            "{}",
+            text.message
+        );
+        for needle in ["HighDurability", "two_phase", "planned"] {
+            assert!(text.message.contains(needle), "{needle}: {}", text.message);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_overrides_are_a_what_if() -> Result<(), Box<dyn std::error::Error>> {
+        let custom = run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "cache.max_entries=8192",
+            "--json",
+        ]))?;
+        assert_eq!(custom.exit_code, 0);
+        let report = json_message(&custom)?;
+        assert_eq!(report["profile"]["kind"], "custom");
+        assert_eq!(report["profile"]["slug"], "high_durability_custom");
+        let cache = knob_row(&report, "cache.max_entries")?;
+        assert_eq!(cache["value"], 8192);
+        assert_eq!(cache["source"], "override");
+
+        let typo = run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "cache.max_entires=1",
+        ]));
+        assert!(
+            matches!(typo, Err(CliError::Usage(ref message)) if message.contains("cache.max_entries")),
+            "unexpected result: {typo:?}"
+        );
+
+        let volatile = run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "storage.medium=volatile",
+            "--json",
+        ]))?;
+        assert_eq!(volatile.exit_code, 2);
+        let report = json_message(&volatile)?;
+        assert_eq!(report["resolution"], "invalid");
+        assert!(
+            has_issue(&report, "PROFILE_KNOB_COMBINATION_UNSUPPORTED"),
+            "{report}"
+        );
+
+        let floors = run(strings(&[
+            "profile",
+            "show",
+            "secure-app",
+            "--override",
+            "floors.audit=true,cache.max_entries=4096",
+            "--json",
+        ]))?;
+        assert_eq!(floors.exit_code, 0, "{}", floors.message);
+        let report = json_message(&floors)?;
+        assert_eq!(report["profile"]["slug"], "secure_app_custom");
+        assert_eq!(report["profile"]["knobs"]["floors"]["audit"], true);
+        assert_eq!(knob_row(&report, "floors.audit")?["source"], "override");
+        assert_eq!(knob_row(&report, "cache.max_entries")?["value"], 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_finds_the_name_anywhere_among_the_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = json_message(&run(strings(&[
+            "profile",
+            "show",
+            "high_durability",
+            "--override",
+            "cache.max_entries=8192",
+            "--json",
+        ]))?)?;
+        for args in [
+            vec![
+                "--json",
+                "--override",
+                "cache.max_entries=8192",
+                "high_durability",
+            ],
+            vec![
+                "--override",
+                "cache.max_entries=8192",
+                "high_durability",
+                "--output",
+                "json",
+            ],
+        ] {
+            let mut full = vec!["profile", "show"];
+            full.extend(args);
+            let outcome = run(strings(&full))?;
+            assert_eq!(outcome.exit_code, 0, "{full:?}: {}", outcome.message);
+            assert_eq!(json_message(&outcome)?, first, "{full:?}");
+        }
+
+        let two = run(strings(&[
+            "profile",
+            "show",
+            "secure_app",
+            "--json",
+            "balanced",
+        ]));
+        assert!(
+            matches!(two, Err(CliError::Usage(ref message))
+                if message.contains("one profile name") && message.contains("balanced")),
+            "unexpected result: {two:?}"
+        );
+        let both = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            "x.redb",
+            "secure_app",
+        ]));
+        assert!(
+            matches!(both, Err(CliError::Usage(ref message)) if message.contains("not both")),
+            "unexpected result: {both:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_show_db_prints_the_manifest_or_legacy() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let manifest_path = temp.path().join("orders.redb");
+        let overrides = serde_json::from_value(json!({ "cache": { "max_entries": 8192 } }))?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with a cache override must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(manifest_path.clone()))?;
+        drop(create_database_with_profile(
+            &binding,
+            OperationalConfig::default(),
+        )?);
+
+        let json = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&manifest_path),
+            "--json",
+        ]))?;
+        assert_eq!(json.exit_code, 0);
+        let report = json_message(&json)?;
+        assert_eq!(report["state"], "initialized");
+        assert_eq!(report["manifest"]["profile"], "high_durability_custom");
+        assert_eq!(report["manifest"]["knobs"]["cache"]["max_entries"], 8192);
+        let text = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&manifest_path),
+        ]))?;
+        assert!(
+            text.message.starts_with(
+                "profile manifest: high_durability_custom extends high_durability -> secure_app"
+            ),
+            "{}",
+            text.message
+        );
+        assert!(text.message.contains("HighDurability"), "{}", text.message);
+        assert_eq!(report["unmet_floors"], json!([]));
+        assert!(!text.message.contains("warning:"), "{}", text.message);
+        // Every floor the probe sees unmet (a restore that was allowed to miss a floor, covered
+        // in the backup tests) is printed as a warning.
+        let MetadataProbe::Initialized(mut probed) = inspect_database_metadata(&manifest_path)
+        else {
+            return Err("the manifest database is not initialized".into());
+        };
+        probed.unmet_floors = vec!["floors.audit", "floors.encryption_at_rest"];
+        let warned = format_metadata_probe(&manifest_path, &MetadataProbe::Initialized(probed))?;
+        assert!(
+            warned.contains("\nwarning: floors.audit is not met: audit is switched off")
+                && warned.contains("\nwarning: floors.encryption_at_rest is not met"),
+            "{warned}"
+        );
+        assert_eq!(
+            cli_db_config(ProfileSelection::Auto, manifest_path.clone())?,
+            DbConfig::on_disk(Profile::HighDurability, &manifest_path)
+        );
+
+        let legacy_path = temp.path().join("legacy.redb");
+        drop(create_database(DbConfig::on_disk(
+            Profile::Transactional,
+            &legacy_path,
+        ))?);
+        let legacy = run(strings(&[
+            "profile",
+            "show",
+            "--db",
+            &path_arg(&legacy_path),
+        ]))?;
+        assert_eq!(legacy.exit_code, 0);
+        assert!(
+            legacy
+                .message
+                .starts_with("legacy database: storage profile Transactional, no manifest"),
+            "{}",
+            legacy.message
+        );
+
+        let missing = temp.path().join("missing.redb");
+        let not_found = run(strings(&["profile", "show", "--db", &path_arg(&missing)]))?;
+        assert_eq!(not_found.exit_code, 1);
+        assert!(not_found.message.starts_with("no database at"));
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn profile_explain_reports_the_resolver_result_of_a_spec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("custom.yaml");
+        let mut spec = DatabaseSpec::from_db_config(
+            "orders",
+            &DbConfig::on_disk(Profile::Transactional, "orders.redb"),
+        );
+        spec.version = 2;
+        spec.profile = "orders_durable".to_owned();
+        spec.custom_profile = Some(serde_json::from_value(json!({
+            "extends": "high_durability",
+            "knobs": { "cache": { "max_entries": 8192 } }
+        }))?);
+        write_yaml_spec(&spec_path, &spec)?;
+        let explain = |json: bool| {
+            let mut args = strings(&["profile", "explain", "--spec", &path_arg(&spec_path)]);
+            if json {
+                args.push("--json".to_owned());
+            }
+            run(args)
+        };
+
+        let resolved = explain(true)?;
+        assert_eq!(resolved.exit_code, 0);
+        let report = json_message(&resolved)?;
+        assert_eq!(report["resolution"], "resolved");
+        assert_eq!(report["profile"]["kind"], "custom");
+        assert_eq!(report["profile"]["storage_profile"], "HighDurability");
+
+        spec.custom_profile = Some(serde_json::from_value(
+            json!({ "extends": "high_durabilty" }),
+        )?);
+        write_yaml_spec(&spec_path, &spec)?;
+        let invalid = explain(true)?;
+        assert_eq!(invalid.exit_code, 2);
+        let report = json_message(&invalid)?;
+        assert_eq!(report["resolution"], "invalid");
+        assert!(
+            has_issue(&report, "CUSTOM_PROFILE_EXTENDS_UNKNOWN"),
+            "{report}"
+        );
+        let text = explain(false)?;
+        assert_eq!(text.exit_code, 2);
+        assert!(
+            text.message.starts_with("invalid profile"),
+            "{}",
+            text.message
+        );
+
+        spec.version = 1;
+        write_yaml_spec(&spec_path, &spec)?;
+        let v1_custom = explain(true)?;
+        assert_eq!(v1_custom.exit_code, 2);
+        let report = json_message(&v1_custom)?;
+        assert_eq!(report["resolution"], "invalid");
+        assert!(has_issue(&report, "FIELD_REQUIRES_SPEC_V2"), "{report}");
+        let v1_custom_text = explain(false)?;
+        assert_eq!(v1_custom_text.exit_code, 2);
+        assert!(
+            v1_custom_text.message.contains("FIELD_REQUIRES_SPEC_V2"),
+            "{}",
+            v1_custom_text.message
+        );
+
+        let mut legacy = DatabaseSpec::from_db_config(
+            "legacy",
+            &DbConfig::on_disk(Profile::Transactional, "legacy.redb"),
+        );
+        legacy.profile = "ops_custom_profile".to_owned();
+        write_yaml_spec(&spec_path, &legacy)?;
+        let unresolved = explain(true)?;
+        assert_eq!(unresolved.exit_code, 0);
+        let report = json_message(&unresolved)?;
+        assert_eq!(report["resolution"], "unresolved");
+        assert!(has_issue(&report, "PROFILE_NOT_PROVISIONABLE"), "{report}");
+
+        let mut future = serde_json::to_value(&legacy)?;
+        future["version"] = json!(3);
+        std::fs::write(&spec_path, serde_norway::to_string(&future)?)?;
+        let unsupported = explain(false)?;
+        assert_eq!(unsupported.exit_code, 2);
+        assert!(unsupported.message.contains("UNSUPPORTED_VERSION"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_knobs_lists_the_registry_and_reserved_knobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let json = run(strings(&["profile", "knobs", "--json"]))?;
+        let report = json_message(&json)?;
+        let knobs = report.as_array().ok_or("profile knobs is not an array")?;
+
+        assert_eq!(knobs.len(), KNOB_REGISTRY.len() + RESERVED_KNOBS.len());
+        assert_eq!(
+            knobs.iter().filter(|knob| knob["reserved"] == true).count(),
+            RESERVED_KNOBS.len()
+        );
+        assert!(knobs.iter().any(|knob| knob["path"] == "cache.max_entries"));
+        let medium = knobs
+            .iter()
+            .find(|knob| knob["path"] == "storage.medium")
+            .ok_or("missing storage.medium")?;
+        assert_eq!(medium["after_creation"], "unsupported");
+
+        let text = run(strings(&["profile", "knobs"]))?;
+        assert!(text.message.contains("history.mvcc_retention_millis"));
+        assert!(text.message.contains("reserved"));
+        // The text output names ChangePolicy::Unsupported as the docs and --json do, in the
+        // after-creation column (aligned to its header; cells are padded by characters).
+        let header = text.message.lines().next().ok_or("missing header row")?;
+        let column = header
+            .find("after creation")
+            .ok_or("missing after creation column")?;
+        let after_creation =
+            |line: &str| -> String { line.chars().skip(column).collect::<String>() };
+        let medium_row = text
+            .message
+            .lines()
+            .find(|line| line.starts_with("storage.medium "))
+            .ok_or("missing storage.medium row")?;
+        assert!(
+            after_creation(medium_row).starts_with("unsupported "),
+            "{medium_row}"
+        );
+        assert!(
+            text.message
+                .lines()
+                .all(|line| !after_creation(line).starts_with("fixed ")),
+            "{}",
+            text.message
+        );
+        Ok(())
+    }
+
+    fn studio_style_spec() -> DatabaseSpec {
+        let mut spec = DatabaseSpec::from_db_config(
+            "ops_custom_profile_example",
+            &DbConfig::on_disk(Profile::Transactional, "ops.redb"),
+        );
+        spec.profile = "ops_custom_profile".to_owned();
+        spec.overrides
+            .insert("profile.custom.base".to_owned(), "secure_app".to_owned());
+        spec.overrides.insert(
+            "profile.custom.description".to_owned(),
+            "Ops profile".to_owned(),
+        );
+        spec.operation_hints
+            .insert("studio.builder".to_owned(), "custom_profile".to_owned());
+        spec.operation_hints.insert(
+            "profile.custom.slug".to_owned(),
+            "ops_custom_profile".to_owned(),
+        );
+        spec
+    }
+
+    #[test]
+    fn config_upgrade_converts_studio_custom_profiles_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("studio.yaml");
+        write_yaml_spec(&input, &studio_style_spec())?;
+        let first_out = temp.path().join("v2.yaml");
+
+        let first = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&first_out),
+        ]))?;
+        assert_eq!(first.exit_code, 0, "{}", first.message);
+        assert!(first.message.contains("valid=true"), "{}", first.message);
+        let written = std::fs::read_to_string(&first_out)?;
+        let upgraded = serde_norway::from_str::<DatabaseSpec>(&written)?;
+        assert_eq!(upgraded.version, 2);
+        assert_eq!(upgraded.profile, "ops_custom_profile");
+        let custom = upgraded
+            .custom_profile
+            .as_ref()
+            .ok_or("missing custom_profile")?;
+        assert_eq!(custom.extends, "secure_app");
+        assert_eq!(custom.description.as_deref(), Some("Ops profile"));
+        assert!(upgraded.overrides.is_empty(), "{:?}", upgraded.overrides);
+        assert_eq!(
+            upgraded.operation_hints,
+            BTreeMap::from([("studio.builder".to_owned(), "custom_profile".to_owned())])
+        );
+        assert!(GuaranteeValidator::validate(&upgraded).valid);
+
+        let second_out = temp.path().join("v2-again.yaml");
+        let second = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&first_out),
+            "--out",
+            &path_arg(&second_out),
+        ]))?;
+        assert_eq!(second.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&second_out)?, written);
+
+        let stdout = run(strings(&["config", "upgrade", "--spec", &path_arg(&input)]))?;
+        assert_eq!(stdout.exit_code, 0);
+        assert_eq!(stdout.message, written.trim_end());
+
+        let json = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--json",
+        ]))?;
+        let report = json_message(&json)?;
+        assert_eq!(report["validation"]["valid"], true);
+        assert_eq!(report["spec"]["custom_profile"]["extends"], "secure_app");
+        assert!(
+            report["notes"]
+                .as_array()
+                .is_some_and(|notes| !notes.is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_refuses_to_overwrite_without_force() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let input = temp.path().join("spec.json");
+        write_spec(&input, &studio_style_spec())?;
+        let original = std::fs::read_to_string(&input)?;
+
+        let same = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&input),
+        ]));
+        assert!(
+            matches!(same, Err(CliError::Usage(ref message))
+                if message.contains("input spec") && message.contains("--force")),
+            "unexpected result: {same:?}"
+        );
+        let existing = temp.path().join("existing.json");
+        std::fs::write(&existing, "{}")?;
+        let other = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&existing),
+        ]));
+        assert!(
+            matches!(other, Err(CliError::Usage(ref message)) if message.contains("--force")),
+            "unexpected result: {other:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&input)?, original);
+        assert_eq!(std::fs::read_to_string(&existing)?, "{}");
+
+        let forced = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&input),
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 0, "{}", forced.message);
+        let upgraded = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&input)?)?;
+        assert_eq!(upgraded.version, 2);
+        assert!(upgraded.custom_profile.is_some());
+        assert_eq!(upgrade_temp_files(temp.path())?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// Pretty-printing can grow a compact spec past `MAX_SPEC_BYTES`. Such a result is written
+    /// nowhere, so `--force` never replaces an input multidb reads with one it refuses.
+    #[test]
+    fn config_upgrade_refuses_results_over_the_spec_size_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("compact.json");
+        let mut spec = studio_style_spec();
+        spec.operation_hints
+            .extend((0..70_000).map(|index| (format!("h{index}"), String::new())));
+        let compact = serde_json::to_string(&spec)?;
+        assert!(compact.len() < MAX_SPEC_BYTES, "{}", compact.len());
+        assert!(serde_json::to_string_pretty(&spec)?.len() > MAX_SPEC_BYTES);
+        std::fs::write(&input, &compact)?;
+        let out = temp.path().join("upgraded.json");
+        let (input_arg, out_arg) = (path_arg(&input), path_arg(&out));
+
+        for extra in [
+            vec![],
+            vec!["--json"],
+            vec!["--out", out_arg.as_str()],
+            vec!["--out", out_arg.as_str(), "--json"],
+            vec!["--out", input_arg.as_str(), "--force"],
+        ] {
+            let mut args = vec!["config", "upgrade", "--spec", input_arg.as_str()];
+            args.extend(extra);
+            let outcome = run(strings(&args))?;
+            assert_eq!(outcome.exit_code, 2, "{args:?}: {}", outcome.message);
+            assert!(
+                outcome.message.contains("SPEC_TOO_LARGE")
+                    && !outcome.message.contains("operation_hints"),
+                "{args:?}: {}",
+                outcome.message
+            );
+        }
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_to_string(&input)?, compact);
+        assert_eq!(upgrade_temp_files(temp.path())?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// The names of `config upgrade` temporary files left in `dir`.
+    fn upgrade_temp_files(dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".upgrade-tmp") {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// A symlink planted at the temporary name, or at `--out` itself, never redirects the
+    /// write: the temporary file is created exclusively (a planted link fails it with
+    /// `AlreadyExists`), and the rename replaces the link at `--out`, not its target.
+    #[cfg(unix)]
+    #[test]
+    fn config_upgrade_out_never_writes_through_a_planted_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("spec.json");
+        write_spec(&input, &studio_style_spec())?;
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, "keep")?;
+        let out = temp.path().join("upgraded.json");
+        // A symlink planted at the exact temporary name fails the write instead of redirecting
+        // it, and is left in place.
+        let planted = temp.path().join(".upgraded.json.planted.upgrade-tmp");
+        std::os::unix::fs::symlink(&victim, &planted)?;
+        let refused = write_through_temp_file(&out, &planted, "{}");
+        assert!(
+            matches!(&refused, Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "unexpected result: {refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+        assert!(!out.exists());
+
+        let outcome = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&out),
+        ]))?;
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+        assert!(
+            std::fs::symlink_metadata(&planted)?
+                .file_type()
+                .is_symlink()
+        );
+        let upgraded = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&out)?)?;
+        assert_eq!(upgraded.version, 2);
+
+        let linked_out = temp.path().join("linked.json");
+        std::os::unix::fs::symlink(&victim, &linked_out)?;
+        let forced = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&linked_out),
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 0, "{}", forced.message);
+        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+        assert!(
+            !std::fs::symlink_metadata(&linked_out)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            upgrade_temp_files(temp.path())?,
+            vec![".upgraded.json.planted.upgrade-tmp".to_owned()]
+        );
+        Ok(())
+    }
+
+    /// A spec that is not UTF-8 is an I/O error (exit 1) for every spec reader, as before
+    /// `spec_io`, not a validation report (exit 2).
+    #[test]
+    fn spec_files_that_are_not_utf8_keep_exit_code_1() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec = temp.path().join("latin1.yaml");
+        std::fs::write(&spec, b"version: 1\nname: caf\xe9\n")?;
+        let spec_arg = path_arg(&spec);
+        for args in [
+            vec!["config", "validate", "--spec", &spec_arg],
+            vec!["config", "explain", "--spec", &spec_arg, "--json"],
+            vec!["config", "upgrade", "--spec", &spec_arg],
+            vec!["profile", "explain", "--spec", &spec_arg],
+            vec![
+                "config",
+                "plan",
+                "--current",
+                &spec_arg,
+                "--desired",
+                &spec_arg,
+            ],
+        ] {
+            let outcome = run(strings(&args));
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(error @ CliError::Io(io))
+                        if io.kind() == std::io::ErrorKind::InvalidData
+                            && error.to_string() == "io: stream did not contain valid UTF-8"
+                ),
+                "{args:?}: unexpected result: {outcome:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_reports_unknown_profiles_without_a_base()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let input = temp.path().join("unknown.yaml");
+        let mut spec = DatabaseSpec::from_db_config(
+            "unknown",
+            &DbConfig::on_disk(Profile::Balanced, "unknown.redb"),
+        );
+        spec.profile = "ops_custom_profile".to_owned();
+        write_yaml_spec(&input, &spec)?;
+
+        let outcome = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 2);
+        let report = json_message(&outcome)?;
+        assert_eq!(report["validation"]["valid"], false);
+        assert!(
+            has_issue(&report["validation"], "PROFILE_UNKNOWN"),
+            "{report}"
+        );
+
+        // An invalid result never replaces a file, not even the input with --force.
+        let original = std::fs::read_to_string(&input)?;
+        let forced = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&input),
+            "--force",
+        ]))?;
+        assert_eq!(forced.exit_code, 2);
+        assert!(
+            forced.message.contains("not written") && forced.message.contains("PROFILE_UNKNOWN"),
+            "{}",
+            forced.message
+        );
+        assert_eq!(std::fs::read_to_string(&input)?, original);
+        let out = temp.path().join("upgraded.yaml");
+        let json = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&out),
+            "--json",
+        ]))?;
+        assert_eq!(json.exit_code, 2);
+        assert_eq!(json_message(&json)?["written"], false);
+        assert!(!out.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn config_upgrade_writes_the_format_of_the_out_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let input = temp.path().join("studio.yaml");
+        write_yaml_spec(&input, &studio_style_spec())?;
+        let json_out = temp.path().join("v2.json");
+
+        let upgraded = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&input),
+            "--out",
+            &path_arg(&json_out),
+        ]))?;
+        assert_eq!(upgraded.exit_code, 0, "{}", upgraded.message);
+        let written = serde_json::from_str::<DatabaseSpec>(&std::fs::read_to_string(&json_out)?)?;
+        assert_eq!(written.version, 2);
+        let validated = run(strings(&[
+            "config",
+            "validate",
+            "--spec",
+            &path_arg(&json_out),
+        ]))?;
+        assert_eq!(validated.exit_code, 0, "{}", validated.message);
+
+        let yaml_out = temp.path().join("v2-again.yml");
+        let again = run(strings(&[
+            "config",
+            "upgrade",
+            "--spec",
+            &path_arg(&json_out),
+            "--out",
+            &path_arg(&yaml_out),
+        ]))?;
+        assert_eq!(again.exit_code, 0, "{}", again.message);
+        assert_eq!(
+            serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&yaml_out)?)?,
+            written
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_override_writes_a_v2_custom_profile() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+
+        let outcome = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "secure_app",
+            "--name",
+            "Orders",
+            "--override",
+            "cache.max_entries=8192",
+            "--out",
+            &path_arg(&spec_path),
+            "--json",
+        ]))?;
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.message);
+        let summary = json_message(&outcome)?;
+        assert_eq!(summary["valid"], true);
+        assert_eq!(summary["profile"], "secure_app_custom");
+        assert_eq!(summary["extends"], "secure_app");
+        assert_eq!(summary["version"], 2);
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        assert_eq!(spec.version, 2);
+        assert_eq!(spec.profile, "secure_app_custom");
+        let custom = spec
+            .custom_profile
+            .as_ref()
+            .ok_or("missing custom_profile")?;
+        assert_eq!(custom.extends, "secure_app");
+        assert_eq!(
+            serde_json::to_value(&custom.knobs)?,
+            json!({ "cache": { "max_entries": 8192 } })
+        );
+        assert!(GuaranteeValidator::validate(&spec).valid);
+
+        let game_path = temp.path().join("game.yaml");
+        let game = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "In-Memory",
+            "--name",
+            "Game",
+            "--override",
+            "floors.backup=true,query.timeout_ms=1000",
+            "--profile-name",
+            "game_fast",
+            "--out",
+            &path_arg(&game_path),
+        ]))?;
+        assert_eq!(game.exit_code, 0, "{}", game.message);
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&game_path)?)?;
+        assert_eq!(spec.profile, "game_fast");
+        assert_eq!(
+            spec.custom_profile
+                .as_ref()
+                .map(|custom| custom.extends.as_str()),
+            Some("in_memory")
+        );
+        assert_eq!(spec.deployment.mode, DeploymentMode::Embedded);
+        assert_eq!(spec.deployment.storage_path, None);
+        assert!(spec.guarantees.backup.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_profile_name_and_override_need_a_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+
+        let named = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "secure_app",
+            "--name",
+            "Orders",
+            "--profile-name",
+            "orders_custom",
+            "--out",
+            &path_arg(&spec_path),
+        ]));
+        assert!(
+            matches!(named, Err(CliError::Usage(ref message)) if message.contains("--override")),
+            "unexpected result: {named:?}"
+        );
+        assert!(!spec_path.exists());
+
+        let template = run(strings(&[
+            "init",
+            "--guided",
+            "--template",
+            "game-save",
+            "--name",
+            "Game",
+            "--override",
+            "cache.max_entries=1",
+        ]));
+        assert!(
+            matches!(template, Err(CliError::Usage(ref message)) if message.contains("not --template")),
+            "unexpected result: {template:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_guided_warns_when_an_alias_names_a_non_canonical_variant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let init = |profile: &str| {
+            run(strings(&[
+                "init",
+                "--guided",
+                "--profile",
+                profile,
+                "--name",
+                "Orders",
+                "--out",
+                &path_arg(&spec_path),
+                "--force",
+            ]))
+        };
+
+        let alias = init("high_durability")?;
+        assert_eq!(alias.exit_code, 0);
+        let mut lines = alias.message.lines();
+        assert!(
+            lines
+                .next()
+                .is_some_and(|line| line.starts_with("created config"))
+        );
+        assert!(
+            lines.next().is_some_and(|line| line
+                .starts_with("warning: profile high_durability is the high_durability variant")),
+            "{}",
+            alias.message
+        );
+        let spec = serde_norway::from_str::<DatabaseSpec>(&std::fs::read_to_string(&spec_path)?)?;
+        assert_eq!(spec.version, 1);
+        assert_eq!(spec.profile, "secure_app");
+
+        for canonical in ["secure_app", "transactional"] {
+            let outcome = init(canonical)?;
+            assert!(!outcome.message.contains("warning"), "{}", outcome.message);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_gc_dry_run_and_prune_report_json() -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::{
+            db::open_database,
+            repl::{Op, ReadConsistency, Replication},
+        };
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("maintenance.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        for value in 0..5_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: vec![value],
+            })?;
+        }
+        drop(database);
+        let gc_args = |extra: &[&str]| {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "gc".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let dry_run = run(gc_args(&["--dry-run"]))?;
+        assert_eq!(dry_run.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&dry_run.message)?;
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["mvcc_versions_pruned"], 0);
+        assert!(
+            report["pending_commits"]
+                .as_u64()
+                .is_some_and(|pending| pending > 0)
+        );
+
+        let pruned = run(gc_args(&["--batch-size", "2"]))?;
+        assert_eq!(pruned.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&pruned.message)?;
+        assert_eq!(report["dry_run"], false);
+        assert!(
+            report["mvcc_versions_pruned"]
+                .as_u64()
+                .is_some_and(|count| count >= 4)
+        );
+        assert_eq!(report["complete"], true);
+
+        let reopened = open_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        assert_eq!(
+            reopened.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(vec![4])
+        );
+        drop(reopened);
+
+        let mut bogus = gc_args(&[]);
+        bogus[1] = "bogus".to_owned();
+        for args in [
+            gc_args(&["--commit-log-retain-lsns", "0"]),
+            gc_args(&["--history-retain-lsns", "0"]),
+            gc_args(&["--history-retain-lsns", "-1"]),
+            gc_args(&["--max-batches", "0"]),
+            gc_args(&["--batch-size", "abc"]),
+            gc_args(&["--history-retain-lsns"]),
+            gc_args(&["--history-retain-lsns", "--dry-run"]),
+            gc_args(&["--history-retain-lsn", "100"]),
+            gc_args(&["--dryrun"]),
+            bogus,
+        ] {
+            let result = run(args);
+            assert!(
+                matches!(result, Err(CliError::Usage(_))),
+                "unexpected result: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_gc_history_retain_lsns_keeps_recent_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::repl::{Op, Replication};
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("retain.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        for value in 0..6_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: vec![value],
+            })?;
+        }
+        drop(database);
+        let gc_args = |extra: &[&str]| {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "gc".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let retained = run(gc_args(&["--history-retain-lsns", "3"]))?;
+        assert_eq!(retained.exit_code, 0);
+        let report = serde_json::from_str::<serde_json::Value>(&retained.message)?;
+        let current = report["current_lsn"]
+            .as_u64()
+            .ok_or("missing current_lsn")?;
+        assert_eq!(report["watermark"].as_u64(), Some(current - 2));
+        assert_eq!(report["history_horizon"].as_u64(), Some(current - 2));
+        assert_eq!(report["limited_by"], "MvccRetainLsns");
+        assert!(report["note"].is_null());
+
+        let default = run(gc_args(&["--dry-run"]))?;
+        let report = serde_json::from_str::<serde_json::Value>(&default.message)?;
+        assert_eq!(report["limited_by"], "CurrentLsn");
+        assert!(
+            report["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("--history-retain-lsns"))
+        );
+
+        let Err(CliError::Usage(help)) = run(vec!["maintenance".to_owned()]) else {
+            return Err("maintenance without a command should print its usage".into());
+        };
+        for expected in [
+            "--history-retain-lsns",
+            "AS OF history",
+            "new full backup",
+            "serve",
+        ] {
+            assert!(help.contains(expected), "{expected} missing from {help}");
+        }
+        Ok(())
+    }
+
+    /// `maintenance gc` opens a profile-manifest database like every other opener: a
+    /// `--profile` whose storage profile differs from the database is refused before anything
+    /// is pruned, `auto` and a product slug open it with the persisted manifest, and GC prunes
+    /// the zstd-framed MVCC history it decodes without breaking the framed values.
+    #[test]
+    fn maintenance_gc_opens_profile_manifest_databases_like_every_opener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::repl::{Op, ReadConsistency, Replication};
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("framed.redb");
+        let overrides = serde_json::from_value(
+            json!({ "compression": { "algorithm": "zstd", "min_bytes": 64 } }),
+        )?;
+        let ProfileResolution::Resolved { profile, .. } =
+            resolve_named_profile("high_durability", &overrides)
+        else {
+            return Err("high_durability with zstd must resolve".into());
+        };
+        let binding = profile.bind(ReplicationKind::Cp, Some(db_path.clone()))?;
+        assert!(binding.manifest.storage_format.value_framing);
+        let value = |version: u8| vec![version; 512];
+        let database = create_database_with_profile(&binding, OperationalConfig::default())?;
+        for version in 0..5_u8 {
+            database.propose(Op::Put {
+                table: "user_data".to_owned(),
+                key: b"k".to_vec(),
+                value: value(version),
+            })?;
+        }
+        drop(database);
+        let gc = |profile: &str, extra: &[&str]| {
+            let mut args = strings(&["maintenance", "gc", "--db"]);
+            args.push(path_arg(&db_path));
+            args.extend(strings(&["--profile", profile]));
+            args.extend(strings(extra));
+            run(args)
+        };
+
+        let refused = gc("balanced", &["--history-retain-lsns", "1"]);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::Config(ConfigError::ProfileMismatch {
+                    expected: Profile::Balanced,
+                    found: Profile::HighDurability,
+                }))
+            ),
+            "{refused:?}"
+        );
+        let pending = json_message(&gc("auto", &["--dry-run"])?)?;
+        assert_eq!(pending["history_horizon"], 0);
+        assert!(
+            pending["pending_commits"]
+                .as_u64()
+                .is_some_and(|pending| pending > 0)
+        );
+
+        let pruned = json_message(&gc("high_durability", &["--history-retain-lsns", "1"])?)?;
+        assert!(
+            pruned["mvcc_versions_pruned"]
+                .as_u64()
+                .is_some_and(|count| count >= 4),
+            "{pruned}"
+        );
+        assert_eq!(pruned["complete"], true);
+        assert_eq!(pruned["history_horizon"], pruned["current_lsn"]);
+
+        let reopened = open_database(DbConfig::on_disk(Profile::HighDurability, &db_path))?;
+        assert_eq!(reopened.performance_config(), &binding.performance);
+        assert_eq!(
+            reopened.read("user_data", b"k", ReadConsistency::Strong)?,
+            Some(value(4))
         );
         Ok(())
     }

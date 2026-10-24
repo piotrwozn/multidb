@@ -4,7 +4,7 @@ use crate::performance::CompressionConfig;
 
 use super::compressed::{CompressedEngine, CompressedReadTxn, CompressedWriteTxn};
 use super::encrypted::{
-    ConfiguredKeyProvider, EncryptedEngine, EncryptedReadTxn, EncryptedWriteTxn,
+    ConfiguredKeyProvider, EncryptedEngine, EncryptedReadTxn, EncryptedWriteTxn, ReencryptionReport,
 };
 use super::memory::{MemEngine, MemReadTxn, MemWriteTxn};
 use super::redb::{RedbEngine, RedbReadTxn, RedbWriteTxn};
@@ -125,17 +125,19 @@ impl AnyEngine {
     }
 
     /// Opens an encrypted redb-backed engine using a local envelope keyring.
+    ///
+    /// A keyring is created only for an empty database file.
     /// # Errors
-    /// Fails if redb, the keyring, or the KEK cannot be opened.
+    /// Fails if redb, the keyring, or the KEK cannot be opened, or the keyring
+    /// is missing for a database that already contains tables.
     pub fn encrypted_redb_envelope(
         path: impl AsRef<Path>,
         keyring_path: impl Into<std::path::PathBuf>,
         kek_path: impl Into<std::path::PathBuf>,
     ) -> Result<Self, StorageError> {
-        let engine = EncryptedEngine::new(
-            RedbEngine::open(path)?,
-            ConfiguredKeyProvider::local_envelope(keyring_path, kek_path)?,
-        );
+        let inner = RedbEngine::open(path)?;
+        let provider = local_envelope_for(&inner, keyring_path, kek_path)?;
+        let engine = EncryptedEngine::new(inner, provider);
         let _ = engine.begin_read()?;
         Ok(Self::EncryptedRedb(engine))
     }
@@ -156,17 +158,19 @@ impl AnyEngine {
     }
 
     /// Opens an encrypted high-durability redb-backed engine using a local envelope keyring.
+    ///
+    /// A keyring is created only for an empty database file.
     /// # Errors
-    /// Fails if redb, the keyring, or the KEK cannot be opened.
+    /// Fails if redb, the keyring, or the KEK cannot be opened, or the keyring
+    /// is missing for a database that already contains tables.
     pub fn encrypted_redb_high_durability_envelope(
         path: impl AsRef<Path>,
         keyring_path: impl Into<std::path::PathBuf>,
         kek_path: impl Into<std::path::PathBuf>,
     ) -> Result<Self, StorageError> {
-        let engine = EncryptedEngine::new(
-            RedbEngine::open_high_durability(path)?,
-            ConfiguredKeyProvider::local_envelope(keyring_path, kek_path)?,
-        );
+        let inner = RedbEngine::open_high_durability(path)?;
+        let provider = local_envelope_for(&inner, keyring_path, kek_path)?;
+        let engine = EncryptedEngine::new(inner, provider);
         let _ = engine.begin_read()?;
         Ok(Self::EncryptedRedb(engine))
     }
@@ -251,18 +255,20 @@ impl AnyEngine {
     }
 
     /// Opens a compressed and encrypted redb-backed engine using a local envelope keyring.
+    ///
+    /// A keyring is created only for an empty database file.
     /// # Errors
-    /// Fails if redb, the keyring, or the KEK cannot be opened.
+    /// Fails if redb, the keyring, or the KEK cannot be opened, or the keyring
+    /// is missing for a database that already contains tables.
     pub fn compressed_encrypted_redb_envelope(
         path: impl AsRef<Path>,
         keyring_path: impl Into<std::path::PathBuf>,
         kek_path: impl Into<std::path::PathBuf>,
         config: CompressionConfig,
     ) -> Result<Self, StorageError> {
-        let encrypted = EncryptedEngine::new(
-            RedbEngine::open(path)?,
-            ConfiguredKeyProvider::local_envelope(keyring_path, kek_path)?,
-        );
+        let inner = RedbEngine::open(path)?;
+        let provider = local_envelope_for(&inner, keyring_path, kek_path)?;
+        let encrypted = EncryptedEngine::new(inner, provider);
         let engine = CompressedEngine::new(encrypted, config);
         let _ = engine.begin_read()?;
         Ok(Self::CompressedEncryptedRedb(engine))
@@ -286,18 +292,20 @@ impl AnyEngine {
     }
 
     /// Opens a compressed and encrypted high-durability redb engine using an envelope keyring.
+    ///
+    /// A keyring is created only for an empty database file.
     /// # Errors
-    /// Fails if redb, the keyring, or the KEK cannot be opened.
+    /// Fails if redb, the keyring, or the KEK cannot be opened, or the keyring
+    /// is missing for a database that already contains tables.
     pub fn compressed_encrypted_redb_high_durability_envelope(
         path: impl AsRef<Path>,
         keyring_path: impl Into<std::path::PathBuf>,
         kek_path: impl Into<std::path::PathBuf>,
         config: CompressionConfig,
     ) -> Result<Self, StorageError> {
-        let encrypted = EncryptedEngine::new(
-            RedbEngine::open_high_durability(path)?,
-            ConfiguredKeyProvider::local_envelope(keyring_path, kek_path)?,
-        );
+        let inner = RedbEngine::open_high_durability(path)?;
+        let provider = local_envelope_for(&inner, keyring_path, kek_path)?;
+        let encrypted = EncryptedEngine::new(inner, provider);
         let engine = CompressedEngine::new(encrypted, config);
         let _ = engine.begin_read()?;
         Ok(Self::CompressedEncryptedRedb(engine))
@@ -317,6 +325,49 @@ impl AnyEngine {
         }
     }
 
+    /// Reports whether every value this engine writes carries a compression frame.
+    #[must_use]
+    pub const fn is_value_framed(&self) -> bool {
+        matches!(
+            self,
+            Self::CompressedMemory(_)
+                | Self::CompressedRedb(_)
+                | Self::CompressedEncryptedMemory(_)
+                | Self::CompressedEncryptedRedb(_)
+        )
+    }
+
+    /// Wraps this engine so every value it writes is compression-framed with `config`.
+    ///
+    /// The underlying handle is moved, never dropped and reopened. An already framed engine
+    /// keeps its inner engine and takes the new `config`; frames are self-describing, so values
+    /// written with another algorithm stay readable.
+    #[must_use]
+    pub fn with_value_framing(self, config: CompressionConfig) -> Self {
+        match self {
+            Self::Memory(engine) => Self::CompressedMemory(CompressedEngine::new(engine, config)),
+            Self::Redb(engine) => Self::CompressedRedb(CompressedEngine::new(engine, config)),
+            Self::EncryptedMemory(engine) => {
+                Self::CompressedEncryptedMemory(CompressedEngine::new(engine, config))
+            }
+            Self::EncryptedRedb(engine) => {
+                Self::CompressedEncryptedRedb(CompressedEngine::new(engine, config))
+            }
+            Self::CompressedMemory(engine) => {
+                Self::CompressedMemory(CompressedEngine::new(engine.into_inner(), config))
+            }
+            Self::CompressedRedb(engine) => {
+                Self::CompressedRedb(CompressedEngine::new(engine.into_inner(), config))
+            }
+            Self::CompressedEncryptedMemory(engine) => {
+                Self::CompressedEncryptedMemory(CompressedEngine::new(engine.into_inner(), config))
+            }
+            Self::CompressedEncryptedRedb(engine) => {
+                Self::CompressedEncryptedRedb(CompressedEngine::new(engine.into_inner(), config))
+            }
+        }
+    }
+
     /// Rotates the current data encryption key for encrypted engines.
     /// # Errors
     /// Fails when the engine is not encrypted or the provider cannot rotate.
@@ -333,14 +384,42 @@ impl AnyEngine {
     }
 
     /// Destroys one data encryption key version for encrypted engines.
+    ///
+    /// Refuses the current key, the last live key, and any key still protecting
+    /// stored values; see [`EncryptedEngine::destroy_dek`].
     /// # Errors
-    /// Fails when the engine is not encrypted or the key id is unknown.
+    /// Fails when the engine is not encrypted, the key id is unknown, or the
+    /// key is current, last, or still in use.
     pub fn destroy_dek(&self, key_id: u64) -> Result<(), StorageError> {
         match self {
             Self::EncryptedMemory(engine) => engine.destroy_dek(key_id),
             Self::EncryptedRedb(engine) => engine.destroy_dek(key_id),
             Self::CompressedEncryptedMemory(engine) => engine.inner().destroy_dek(key_id),
             Self::CompressedEncryptedRedb(engine) => engine.inner().destroy_dek(key_id),
+            _ => Err(StorageError::Backend(
+                "storage engine is not encrypted".to_owned(),
+            )),
+        }
+    }
+
+    /// Re-encrypts stored values under the current data encryption key in
+    /// bounded batches; see [`EncryptedEngine::reencrypt_existing_values`].
+    /// # Errors
+    /// Fails when the engine is not encrypted, `batch_size` is zero, or a batch
+    /// cannot be read, decrypted, or committed.
+    pub fn reencrypt_existing_values(
+        &self,
+        batch_size: usize,
+    ) -> Result<ReencryptionReport, StorageError> {
+        match self {
+            Self::EncryptedMemory(engine) => engine.reencrypt_existing_values(batch_size),
+            Self::EncryptedRedb(engine) => engine.reencrypt_existing_values(batch_size),
+            Self::CompressedEncryptedMemory(engine) => {
+                engine.inner().reencrypt_existing_values(batch_size)
+            }
+            Self::CompressedEncryptedRedb(engine) => {
+                engine.inner().reencrypt_existing_values(batch_size)
+            }
             _ => Err(StorageError::Backend(
                 "storage engine is not encrypted".to_owned(),
             )),
@@ -360,6 +439,20 @@ impl AnyEngine {
                 "storage engine is not encrypted".to_owned(),
             )),
         }
+    }
+}
+
+/// Opens the envelope keyring for a redb file, creating one only when the file
+/// holds no tables yet so existing encrypted data never gets a fresh keyring.
+fn local_envelope_for(
+    inner: &RedbEngine,
+    keyring_path: impl Into<std::path::PathBuf>,
+    kek_path: impl Into<std::path::PathBuf>,
+) -> Result<ConfiguredKeyProvider, StorageError> {
+    if inner.has_tables()? {
+        ConfiguredKeyProvider::open_local_envelope(keyring_path, kek_path)
+    } else {
+        ConfiguredKeyProvider::local_envelope(keyring_path, kek_path)
     }
 }
 
