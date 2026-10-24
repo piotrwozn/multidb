@@ -183,7 +183,8 @@ All notable public changes will be recorded here.
   rest, so wire clients see 53200 only while Control Plane `/sql` requests
   hold slots. A plain `INSERT` that races another
   insert of the same primary key fails with SQLSTATE 23505, as it would if the
-  statements ran one after another. `INSERT ... ON CONFLICT` and inserts into
+  statements ran one after another (or with P0001 if a before trigger rejects
+  the insert itself). `INSERT ... ON CONFLICT` and inserts into
   columnar tables read again and retry when another statement commits first,
   and fail with retryable SQLSTATE 40001 only if 64 retries also conflict.
   Control Plane single-row, single-document and time-series point writes also
@@ -232,6 +233,40 @@ All notable public changes will be recorded here.
   columnar segment of the table: from their snapshot under snapshot and
   serializable isolation, and from current committed data under read
   committed.
+- WASM triggers no longer see the wrong event when writes race. Since
+  statements and Control Plane requests run concurrently, an `INSERT` whose key
+  another statement inserted after the `INSERT` read it was seen as an update
+  (and a write whose row was deleted in between as an insert). A before
+  trigger for that event could then reject it with SQLSTATE P0001 before the
+  commit reported the conflict, so `INSERT ... ON CONFLICT` failed instead of
+  retrying, and a plain `INSERT` failed with P0001 instead of 23505.
+  Conditional writes (SQL `INSERT`, `RelTable` handles) now take each
+  trigger's event and `old` value from the row values their commit checks, and
+  `MultiModelTxn` commits (including Control Plane row and document writes)
+  take them from the transaction snapshot, so triggers see each row as the
+  write read it. A write whose row another writer changed after that read
+  fails with the commit's conflict, which is handled as before, unless a
+  before trigger rejects it for the event it has. At every isolation level, a
+  transaction commit that writes a key another writer changed after the
+  transaction began fails with that conflict before any trigger runs, or, if
+  the change is made once the commit has started running triggers, after
+  them, as before. Stored procedure (`CALL`) writes and direct
+  `Database::propose` and `propose_batch` writes check nothing at commit: they
+  are last-writer-wins, and under concurrent writes the event and `old` value
+  their triggers see are best effort.
+- Breaking for embedders: with a tenant set (`OperationalConfig::with_tenant`)
+  whose `max_concurrent_writes` or `max_concurrent_queries` is limited, Control
+  Plane requests (including row and document writes) and PostgreSQL wire
+  statements can now exceed those limits, because they run concurrently.
+  Tenant write and query slots are taken without waiting, so the extra
+  requests fail. Writes and single-table equality `SELECT`s fail with
+  `ReplError::QuotaExceeded { requested: 1, remaining: 0, .. }`, which
+  PostgreSQL wire reports as SQLSTATE 53100. Other `SELECT`s, which DataFusion
+  executes, can instead fail with a `QueryError::DataFusion` whose message
+  contains the quota error, which PostgreSQL wire reports as SQLSTATE XX000.
+  The Control Plane returns HTTP 500 `internal_error` in both cases. Size the
+  limits for the concurrent load or retry such failures. `multidb serve` sets
+  no tenant.
 
 ### Added
 

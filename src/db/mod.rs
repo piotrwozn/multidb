@@ -69,7 +69,7 @@ use crate::repl::{
     HealingBackend, HealingMode, HealingPolicy, HealthConfig, HealthProbe, HealthView,
     ManualHealthProbe, NodeId, Op, PartitionStrategy, RaftNode, ReadConsistency, ReplError,
     Replication, SelfHealingController, ShardId, ShardMap, ShardedReplication, SingleNode,
-    VectorClock, VersionedBytes, propose_system_batch, validate_ap_cluster_config,
+    VectorClock, VersionedBytes, WriteCondition, propose_system_batch, validate_ap_cluster_config,
     validate_cp_cluster_config,
 };
 use crate::runtime_advisor::{
@@ -5087,6 +5087,7 @@ impl MultiModelTxn<'_> {
         let write_set = self.write_set;
         let read_keys = self.read_keys.into_inner();
         let read_ranges = self.read_ranges.into_inner();
+        let snapshot_read = self.read;
 
         let storage = database.repl.storage().ok_or_else(|| {
             ConfigError::Unsupported("replication backend has no local snapshot storage".to_owned())
@@ -5106,10 +5107,20 @@ impl MultiModelTxn<'_> {
             return Ok(());
         }
 
+        // The commit fails if a written key changed after the snapshot. When
+        // triggers fire, the pipeline checks that before any of them runs, so they
+        // take each key's old value from the snapshot, which then holds what the
+        // transaction read at every isolation level.
+        let batch = ConditionalBatch::new(Vec::new(), ops_from_write_set(&write_set));
+        let snapshot = TxnSnapshot {
+            id: snapshot_id,
+            read: &snapshot_read,
+            storage,
+        };
         database
             .write_pipeline()
-            .execute(ops_from_write_set(&write_set), |final_ops| {
-                let write_set = txn::ops_to_write_set(final_ops);
+            .execute(batch, Some(snapshot), |batch| {
+                let write_set = txn::ops_to_write_set(batch.ops);
                 let write_keys = write_set.keys().cloned().collect::<BTreeSet<_>>();
                 if isolation == IsolationLevel::Serializable {
                     database.repl.commit_write_set_with_preflight(
@@ -5208,7 +5219,7 @@ fn validate_serializable_reads(
 ///
 /// Stages run in this order:
 /// 1. before triggers, which may reject the write or replace a row;
-/// 2. the after-trigger snapshot (old values are read before the commit);
+/// 2. the after-trigger snapshot (old values are taken before the commit);
 /// 3. before-commit hooks;
 /// 4. the tenant write permit and storage reservation;
 /// 5. the backend commit;
@@ -5261,6 +5272,85 @@ struct WasmTriggerInvocation {
     old: Option<Bytes>,
 }
 
+/// The old values a write's commit asserts. Triggers take a written key's event
+/// and `old` value from here, so they see the row the commit checks.
+///
+/// A conditional batch asserts the value of each key it has a condition on, and a
+/// `MultiModelTxn` commit asserts that no key it writes changed after the
+/// transaction's snapshot. When another writer changes such a row after the
+/// caller read it, or before a read-committed transaction read it, the write
+/// fails with a conflict, which callers retry, instead of a before trigger running
+/// for an event the write does not have. A key without an assertion is read when
+/// the pipeline runs, so the events of unconditional writes are best effort under
+/// concurrent writes.
+struct AssertedOldValues<'a> {
+    conditions: BTreeMap<(&'a str, &'a [u8]), Option<&'a [u8]>>,
+    snapshot: Option<TxnSnapshot<'a>>,
+}
+
+impl<'a> AssertedOldValues<'a> {
+    /// Fails with the conflict the commit would report when `snapshot` is set and a
+    /// key `ops` writes changed after it, so no trigger runs for such a commit.
+    fn new(
+        conditions: &'a [WriteCondition],
+        snapshot: Option<TxnSnapshot<'a>>,
+        ops: &[Op],
+    ) -> Result<Self, DbError> {
+        if let Some(snapshot) = &snapshot {
+            snapshot.check_unchanged(ops)?;
+        }
+        let conditions = conditions
+            .iter()
+            .map(|condition| match condition {
+                WriteCondition::KeyMissing { table, key } => {
+                    ((table.as_str(), key.as_slice()), None)
+                }
+                WriteCondition::ValueEquals {
+                    table,
+                    key,
+                    expected,
+                } => ((table.as_str(), key.as_slice()), expected.as_deref()),
+            })
+            .collect();
+        Ok(Self {
+            conditions,
+            snapshot,
+        })
+    }
+}
+
+/// The storage snapshot a `MultiModelTxn` began with. Its commit fails with a
+/// conflict when a key it writes changed after `id`, at every isolation level.
+struct TxnSnapshot<'a> {
+    id: TxnId,
+    read: &'a AnyReadTxn,
+    storage: &'a AnyEngine,
+}
+
+impl TxnSnapshot<'_> {
+    /// Fails with the conflict the commit would report when a key `ops` writes
+    /// changed after the snapshot. A read-committed transaction reads current
+    /// values, so it may have read a later value of such a key than the snapshot
+    /// holds.
+    fn check_unchanged(&self, ops: &[Op]) -> Result<(), DbError> {
+        let current = self.storage.begin_read()?;
+        for op in ops {
+            let (table, key) = op_table_key(op);
+            if txn::last_key_version_from(&current, table, key)? > self.id {
+                return Err(StorageError::Conflict.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The value `key` held at the snapshot. Once `check_unchanged` passed for the
+    /// written keys, each of them held that value at every read the transaction
+    /// made, at every isolation level.
+    fn old_value(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, DbError> {
+        Ok(self.read.get(table, key)?)
+    }
+}
+
 /// An enabled trigger with the catalog entry of its target, read once per write.
 struct ResolvedTrigger {
     spec: TriggerSpec,
@@ -5271,6 +5361,12 @@ struct ResolvedTrigger {
 struct ResolvedTriggers {
     before: Vec<ResolvedTrigger>,
     after: Vec<ResolvedTrigger>,
+}
+
+impl ResolvedTriggers {
+    fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
+    }
 }
 
 /// A relational row replaced by a before trigger. Its index entries are rebuilt.
@@ -5285,18 +5381,32 @@ struct ReplacedRow {
 const AFTER_COMMIT_HOOKS_FAILURE_NAME: &str = "after_commit_hooks";
 
 impl WritePipeline {
+    /// Runs `batch` through every stage; `commit` writes it to the backend. The
+    /// before triggers may change `batch.ops`, never its conditions. `snapshot` is
+    /// the snapshot of a `MultiModelTxn`, whose commit asserts that no written key
+    /// changed after it; when triggers fire, that is checked before any of them
+    /// runs.
     fn execute<E: PipelineError>(
         &self,
-        ops: Vec<Op>,
-        commit: impl FnOnce(Vec<Op>) -> Result<(), E>,
+        batch: ConditionalBatch,
+        snapshot: Option<TxnSnapshot<'_>>,
+        commit: impl FnOnce(ConditionalBatch) -> Result<(), E>,
     ) -> Result<(), E> {
+        let ConditionalBatch { conditions, ops } = batch;
         let triggers = self.resolved_triggers(&ops).map_err(E::trigger)?;
-        let ops = self
-            .apply_before_triggers(&triggers.before, ops)
-            .map_err(E::trigger)?;
-        let invocations = self
-            .after_trigger_invocations(&triggers.after, &ops)
-            .map_err(E::trigger)?;
+        let (ops, invocations) = if triggers.is_empty() {
+            (ops, Vec::new())
+        } else {
+            let asserted =
+                AssertedOldValues::new(&conditions, snapshot, &ops).map_err(E::trigger)?;
+            let ops = self
+                .apply_before_triggers(&triggers.before, ops, &asserted)
+                .map_err(E::trigger)?;
+            let invocations = self
+                .after_trigger_invocations(&triggers.after, &ops, &asserted)
+                .map_err(E::trigger)?;
+            (ops, invocations)
+        };
         cdc::validate_before_hooks(self.backend.as_ref(), &ops).map_err(E::hook)?;
         let start_lsn = current_lsn_from_repl(self.backend.as_ref())?;
         let write_permit = self
@@ -5312,7 +5422,7 @@ impl WritePipeline {
             )),
             None => None,
         };
-        if let Err(error) = commit(ops) {
+        if let Err(error) = commit(ConditionalBatch::new(conditions, ops)) {
             if let Some((tenant, reservation, _)) = &reservation {
                 tenant.release(reservation);
             }
@@ -5414,6 +5524,7 @@ impl WritePipeline {
         &self,
         triggers: &[ResolvedTrigger],
         ops: Vec<Op>,
+        asserted: &AssertedOldValues<'_>,
     ) -> Result<Vec<Op>, DbError> {
         if triggers.is_empty() || ops.is_empty() {
             return Ok(ops);
@@ -5430,7 +5541,7 @@ impl WritePipeline {
                 continue;
             }
             let mut current = op;
-            let old = self.old_value_for_op(&current)?;
+            let old = self.old_value_for_op(&current, asserted)?;
             let Some(event) = event_for_op(&current, old.as_deref()) else {
                 transformed.push(current);
                 continue;
@@ -5572,6 +5683,7 @@ impl WritePipeline {
         &self,
         triggers: &[ResolvedTrigger],
         ops: &[Op],
+        asserted: &AssertedOldValues<'_>,
     ) -> Result<Vec<WasmTriggerInvocation>, DbError> {
         if triggers.is_empty() || ops.is_empty() {
             return Ok(Vec::new());
@@ -5585,7 +5697,7 @@ impl WritePipeline {
             {
                 continue;
             }
-            let old = self.old_value_for_op(op)?;
+            let old = self.old_value_for_op(op, asserted)?;
             let Some(event) = event_for_op(op, old.as_deref()) else {
                 continue;
             };
@@ -5605,8 +5717,20 @@ impl WritePipeline {
         Ok(invocations)
     }
 
-    fn old_value_for_op(&self, op: &Op) -> Result<Option<Bytes>, DbError> {
+    /// The value `op`'s key holds before the write: the value the commit asserts,
+    /// or the current value when the commit asserts none.
+    fn old_value_for_op(
+        &self,
+        op: &Op,
+        asserted: &AssertedOldValues<'_>,
+    ) -> Result<Option<Bytes>, DbError> {
         let (table, key) = op_table_key(op);
+        if let Some(value) = asserted.conditions.get(&(table, key)) {
+            return Ok(value.map(<[u8]>::to_vec));
+        }
+        if let Some(snapshot) = &asserted.snapshot {
+            return snapshot.old_value(table, key);
+        }
         Ok(self.backend.read(table, key, ReadConsistency::Strong)?)
     }
 
@@ -5638,7 +5762,9 @@ impl Replication for WritePipeline {
     }
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
-        self.execute(ops, |ops| self.backend.propose_batch(ops))
+        self.execute(ConditionalBatch::new(Vec::new(), ops), None, |batch| {
+            self.backend.propose_batch(batch.ops)
+        })
     }
 
     fn propose_authorized_batch(
@@ -5650,10 +5776,8 @@ impl Replication for WritePipeline {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let ConditionalBatch { conditions, ops } = batch;
-        self.execute(ops, |ops| {
-            self.backend
-                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        self.execute(batch, None, |batch| {
+            self.backend.propose_conditional_batch(batch)
         })
     }
 
@@ -5937,7 +6061,9 @@ impl Replication for Database {
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
         self.write_pipeline()
-            .execute(ops, |ops| self.repl.propose_batch(ops))
+            .execute(ConditionalBatch::new(Vec::new(), ops), None, |batch| {
+                self.repl.propose_batch(batch.ops)
+            })
     }
 
     fn propose_authorized_batch(
@@ -5949,10 +6075,8 @@ impl Replication for Database {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
-        let ConditionalBatch { conditions, ops } = batch;
-        self.write_pipeline().execute(ops, |ops| {
-            self.repl
-                .propose_conditional_batch(ConditionalBatch::new(conditions, ops))
+        self.write_pipeline().execute(batch, None, |batch| {
+            self.repl.propose_conditional_batch(batch)
         })
     }
 

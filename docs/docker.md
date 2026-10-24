@@ -159,7 +159,8 @@ Control Plane login limits:
   returns such failures as HTTP 503 with error code `busy` and
   `Retry-After: 1`.
 - A plain `INSERT` that races another insert of the same primary key fails
-  with SQLSTATE 23505. `INSERT ... ON CONFLICT` and inserts into columnar
+  with SQLSTATE 23505, or with P0001 if a before trigger rejects the insert
+  itself. `INSERT ... ON CONFLICT` and inserts into columnar
   tables (the `analytical` profile) retry internally when another statement
   commits first, and fail with SQLSTATE 40001 if 64 retries also conflict;
   retry those. A columnar insert rewrites the whole table, so inserts into one
@@ -170,6 +171,11 @@ Control Plane login limits:
   multi-statement `/sql` body runs its statements one after another without a
   transaction, so statements before the conflicting one have already
   committed.
+- WASM triggers see the event and old row that the write's commit checks, so a
+  race ends in the conflict handling above, never in a trigger rejection for an
+  event the statement does not have. Stored procedure (`CALL`) writes check
+  nothing at commit: they are last-writer-wins, and under concurrent writes
+  the event and old row their triggers see are best effort.
 - A statement keeps running after its client disconnects, over PostgreSQL wire
   and Control Plane `/sql` alike, until it finishes. Exclusive requests queued
   behind it wait until then. The 30 s query timeout applies only to `SELECT`s

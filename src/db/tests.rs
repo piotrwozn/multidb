@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -53,7 +53,7 @@ use crate::phase30::{InternalTransportConfig, InternalTransportSecurity};
 use crate::query::{
     ColumnDef, ColumnType, DocField, ExplainOptions, QueryError, QueryFingerprint,
     REL_COLUMNAR_SEGMENT_META_TABLE, REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE,
-    RelIndexSpec, RelPlanKind, Row, SqlOutput, SqlRows, TableLayout, TableSchema,
+    RelIndexSpec, RelPlanKind, Row, SqlEngine, SqlOutput, SqlRows, TableLayout, TableSchema,
 };
 use crate::repl::{
     ApClusterConfig, ConditionalBatch, CpClusterConfig, HealingBackend, HealingPolicy,
@@ -3634,9 +3634,34 @@ fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
         Some(Value::Int(0..=3))
     ));
 
+    // An insert that loses the race is never seen as an update by triggers, so a
+    // before trigger that rejects updates rejects none of these statements.
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    database.register_wasm_trigger(
+        wasm_trigger(
+            "reject_counters_update",
+            "counters",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+        ),
+        &wasm,
+    )?;
+    let results = run_concurrent_statements(&database, 4, 8, |worker, index| {
+        format!(
+            "INSERT INTO counters (id, value) VALUES ({}, {worker}) \
+             ON CONFLICT (id) DO NOTHING",
+            200 + index
+        )
+    })?;
+    for completed in &results {
+        assert_eq!(completed, &(0..8).collect::<Vec<_>>());
+    }
+    assert_eq!(database.table("counters")?.scan()?.len(), 17);
+
     // Plain INSERTs of one new key from several threads: all but one report the
-    // duplicate primary key. query::tests covers the lost-race path
-    // deterministically.
+    // duplicate primary key. query::tests and
+    // sql_insert_that_loses_a_race_is_not_seen_as_an_update cover the lost-race
+    // path deterministically.
     let results = run_concurrent_statements(&database, 4, 1, |worker, _| {
         format!("INSERT INTO counters (id, value) VALUES (500, {worker})")
     });
@@ -3646,6 +3671,434 @@ fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
     };
     assert!(message.contains("duplicate primary key"), "{message}");
 
+    Ok(())
+}
+
+/// Commits a queued write right after the next relational row read, as a statement
+/// that commits between another statement's read and its commit would.
+struct RowReadRace {
+    database: Arc<Database>,
+    queued: Mutex<Option<Vec<Op>>>,
+}
+
+impl RowReadRace {
+    fn new(database: &Arc<Database>) -> Arc<Self> {
+        Arc::new(Self {
+            database: Arc::clone(database),
+            queued: Mutex::new(None),
+        })
+    }
+
+    fn queue(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        *self.queued_ops()? = Some(ops);
+        Ok(())
+    }
+
+    fn is_pending(&self) -> Result<bool, ReplError> {
+        Ok(self.queued_ops()?.is_some())
+    }
+
+    fn queued_ops(&self) -> Result<std::sync::MutexGuard<'_, Option<Vec<Op>>>, ReplError> {
+        self.queued
+            .lock()
+            .map_err(|_| ReplError::Transport("race queue poisoned".to_owned()))
+    }
+}
+
+impl Replication for RowReadRace {
+    fn propose(&self, op: Op) -> Result<(), ReplError> {
+        self.database.propose(op)
+    }
+
+    fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+        self.database.propose_batch(ops)
+    }
+
+    fn propose_authorized_batch(
+        &self,
+        ops: Vec<Op>,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.database.propose_authorized_batch(ops, authorization)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        self.database.propose_conditional_batch(batch)
+    }
+
+    fn read(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Option<Bytes>, ReplError> {
+        let value = self.database.read(table, key, consistency)?;
+        if table == REL_ROWS_TABLE {
+            let queued = self.queued_ops()?.take();
+            if let Some(ops) = queued {
+                self.database.propose_batch(ops)?;
+            }
+        }
+        Ok(value)
+    }
+
+    fn range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+        self.database.range(table, start, end, consistency)
+    }
+}
+
+#[test]
+fn conditional_write_that_loses_a_race_conflicts_before_triggers_see_another_event()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let ledger = database.create_table("ledger", Some(account_schema()), Vec::new())?;
+    ledger.insert(account_row(1, "Ada", 36))?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    database.register_wasm_trigger(
+        wasm_trigger(
+            "reject_ledger_insert",
+            "ledger",
+            TriggerTiming::Before,
+            TriggerEvent::Insert,
+        ),
+        &wasm,
+    )?;
+    let handle = database.replication_handle();
+    let writers: [&dyn Replication; 2] = [&database, handle.as_ref()];
+
+    // An insert that read the key as missing; another writer inserts it first.
+    let row_key = accounts.row_key_for_primary_key(&Value::Int(1))?;
+    let insert = ConditionalBatch::new(
+        vec![WriteCondition::KeyMissing {
+            table: REL_ROWS_TABLE.to_owned(),
+            key: row_key,
+        }],
+        accounts.insert_ops(account_row(1, "Mine", 1))?,
+    );
+    accounts.insert(account_row(1, "Ada", 36))?;
+    for writer in writers {
+        assert!(matches!(
+            writer.propose_conditional_batch(insert.clone()),
+            Err(ReplError::Conflict)
+        ));
+    }
+
+    // An update that read the row; another writer deletes it first.
+    let row_key = ledger.row_key_for_primary_key(&Value::Int(1))?;
+    let expected = database.read(REL_ROWS_TABLE, &row_key, ReadConsistency::Strong)?;
+    let update = ConditionalBatch::new(
+        vec![WriteCondition::ValueEquals {
+            table: REL_ROWS_TABLE.to_owned(),
+            key: row_key,
+            expected,
+        }],
+        ledger.update_ops(account_row(1, "Mine", 1))?,
+    );
+    ledger.delete(&Value::Int(1))?;
+    for writer in writers {
+        assert!(matches!(
+            writer.propose_conditional_batch(update.clone()),
+            Err(ReplError::Conflict)
+        ));
+    }
+
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 36)]);
+    assert_eq!(ledger.scan()?, Vec::<Row>::new());
+    // Without a race the triggers still see the event the write has.
+    assert_rejected(
+        "update",
+        accounts.update(account_row(1, "Mine", 1)),
+        "rejected write",
+    );
+    assert_rejected(
+        "insert",
+        ledger.insert(account_row(1, "Mine", 1)),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_insert_that_loses_a_race_is_not_seen_as_an_update()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+    let database = Arc::new(database);
+    let race = RowReadRace::new(&database);
+    let mut engine = SqlEngine::new(race.clone());
+    engine.open_table("accounts", Vec::new())?;
+
+    // Another statement inserts the key after this one read it as missing: ON
+    // CONFLICT reads the row again and does nothing.
+    race.queue(accounts.insert_ops(account_row(1, "Ada", 36))?)?;
+    engine
+        .execute(
+            "INSERT INTO accounts (id, name, age) VALUES (1, 'Mine', 1) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .await?;
+    assert!(!race.is_pending()?);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 36)]);
+
+    // A plain INSERT reports the duplicate key, as it would after the other one.
+    race.queue(accounts.insert_ops(account_row(2, "Grace", 85))?)?;
+    let error = match engine
+        .execute("INSERT INTO accounts (id, name, age) VALUES (2, 'Mine', 1)")
+        .await
+    {
+        Ok(output) => return Err(format!("expected a duplicate key, got {output:?}").into()),
+        Err(error) => DbError::Query(error),
+    };
+    assert!(!race.is_pending()?);
+    assert!(
+        matches!(error, DbError::Query(QueryError::DuplicatePrimaryKey)),
+        "{error}"
+    );
+    assert_eq!(crate::compat::sqlstate_for_db_error(&error), "23505");
+
+    assert_eq!(
+        accounts.scan()?,
+        vec![account_row(1, "Ada", 36), account_row(2, "Grace", 85)]
+    );
+    assert_rejected(
+        "ON CONFLICT DO UPDATE",
+        engine
+            .execute(
+                "INSERT INTO accounts (id, name, age) VALUES (1, 'Mine', 1) \
+                 ON CONFLICT (id) DO UPDATE SET age = EXCLUDED.age",
+            )
+            .await,
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+
+    let mut attempts = 0;
+    database.transaction_with_retry(4, |txn| {
+        attempts += 1;
+        if txn.get_row("accounts", &Value::Int(1))?.is_some() {
+            return Ok(());
+        }
+        if attempts == 1 {
+            // Another writer inserts the row after this transaction's snapshot.
+            accounts.insert(account_row(1, "Ada", 36))?;
+        }
+        txn.insert_row("accounts", account_row(1, "Mine", 1))
+    })?;
+
+    // The first commit conflicts; the retry sees the row and writes nothing.
+    assert_eq!(attempts, 2);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 36)]);
+    assert_rejected(
+        "transaction update",
+        database.transaction(|txn| txn.update_row("accounts", account_row(1, "Mine", 1))),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_that_loses_a_race_on_a_later_row_conflicts_before_any_trigger_runs()
+-> Result<(), Box<dyn std::error::Error>> {
+    for isolation in [
+        txn::IsolationLevel::Snapshot,
+        txn::IsolationLevel::ReadCommitted,
+        txn::IsolationLevel::SnapshotIsolation,
+        txn::IsolationLevel::Serializable,
+    ] {
+        let options = txn::TxnOptions {
+            isolation,
+            ..txn::TxnOptions::default()
+        };
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+        accounts.insert(account_row(1, "Ada", 36))?;
+        register_accounts_trigger(
+            &database,
+            "reject_accounts_update",
+            TriggerTiming::Before,
+            TriggerEvent::Update,
+            &trigger_response("reject", None),
+        )?;
+
+        // The transaction updates row 1, which no other writer changes, and inserts
+        // row 2, which another writer inserts before the commit. Row 1 is written
+        // first, so its trigger would reject the write before the pipeline reached
+        // row 2.
+        let mut attempts = 0;
+        database.transaction_with_retry_with_options(options, |txn| {
+            attempts += 1;
+            if txn.get_row("accounts", &Value::Int(2))?.is_some() {
+                return Ok(());
+            }
+            txn.update_row("accounts", account_row(1, "Ada", 37))?;
+            txn.insert_row("accounts", account_row(2, "Mine", 1))?;
+            if attempts == 1 {
+                accounts.insert(account_row(2, "Grace", 85))?;
+            }
+            Ok(())
+        })?;
+
+        // The first commit conflicts before any trigger runs; the retry sees row 2
+        // and writes nothing.
+        assert_eq!(attempts, 2, "{isolation:?}");
+        assert_eq!(
+            accounts.scan()?,
+            vec![account_row(1, "Ada", 36), account_row(2, "Grace", 85)],
+            "{isolation:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn read_committed_insert_that_loses_a_race_retries_instead_of_firing_an_update_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_committed = txn::TxnOptions {
+        isolation: txn::IsolationLevel::ReadCommitted,
+        ..txn::TxnOptions::default()
+    };
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    accounts.insert(account_row(1, "Ada", 36))?;
+    accounts.insert(account_row(2, "Grace", 85))?;
+    register_accounts_trigger(
+        &database,
+        "reject_accounts_update",
+        TriggerTiming::Before,
+        TriggerEvent::Update,
+        &trigger_response("reject", None),
+    )?;
+
+    // Another writer deletes the row after this transaction's snapshot, before the
+    // transaction reads it as missing and inserts it.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.delete(&Value::Int(1))?;
+        }
+        if txn.get_row("accounts", &Value::Int(1))?.is_some() {
+            return Ok(());
+        }
+        txn.insert_row("accounts", account_row(1, "Mine", 1))
+    })?;
+    // The first commit conflicts before the trigger sees the snapshot's row; the
+    // retry inserts.
+    assert_eq!(attempts, 2);
+
+    // Another writer deletes the row before the transaction reads it and inserts it
+    // again before the commit, so the row holds its snapshot value again.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.delete(&Value::Int(2))?;
+        }
+        if txn.get_row("accounts", &Value::Int(2))?.is_some() {
+            return Ok(());
+        }
+        txn.insert_row("accounts", account_row(2, "Mine", 1))?;
+        if attempts == 1 {
+            accounts.insert(account_row(2, "Grace", 85))?;
+        }
+        Ok(())
+    })?;
+    // The first commit still conflicts; the retry sees the row and writes nothing.
+    assert_eq!(attempts, 2);
+
+    assert_eq!(
+        accounts.scan()?,
+        vec![account_row(1, "Mine", 1), account_row(2, "Grace", 85)]
+    );
+    assert_rejected(
+        "transaction update",
+        database.transaction_with_options(read_committed, |txn| {
+            txn.update_row("accounts", account_row(1, "Mine", 2))
+        }),
+        "rejected write",
+    );
+    Ok(())
+}
+
+#[test]
+fn read_committed_update_that_loses_a_race_retries_instead_of_firing_an_insert_trigger()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_committed = txn::TxnOptions {
+        isolation: txn::IsolationLevel::ReadCommitted,
+        ..txn::TxnOptions::default()
+    };
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let accounts = database.create_table("accounts", Some(account_schema()), Vec::new())?;
+    let wasm = constant_value_wasm(&trigger_response("reject", None))?;
+    let reject_insert = wasm_trigger(
+        "reject_accounts_insert",
+        "accounts",
+        TriggerTiming::Before,
+        TriggerEvent::Insert,
+    );
+
+    // Another writer inserts the row after this transaction's snapshot, and a
+    // trigger that rejects inserts is added after that insert. The transaction
+    // reads the row and updates it.
+    let mut attempts = 0;
+    database.transaction_with_retry_with_options(read_committed, |txn| {
+        attempts += 1;
+        if attempts == 1 {
+            accounts.insert(account_row(1, "Ada", 36))?;
+            database.register_wasm_trigger(reject_insert.clone(), &wasm)?;
+        }
+        if txn.get_row("accounts", &Value::Int(1))?.is_none() {
+            return Err(DbError::TransactionAborted("row 1 is missing".to_owned()));
+        }
+        txn.update_row("accounts", account_row(1, "Ada", 37))
+    })?;
+
+    // The first commit conflicts before the trigger sees the snapshot's missing
+    // row; the retry updates.
+    assert_eq!(attempts, 2);
+    assert_eq!(accounts.scan()?, vec![account_row(1, "Ada", 37)]);
+    assert_rejected(
+        "transaction insert",
+        database.transaction_with_options(read_committed, |txn| {
+            txn.insert_row("accounts", account_row(2, "Grace", 85))
+        }),
+        "rejected write",
+    );
     Ok(())
 }
 
