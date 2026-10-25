@@ -271,7 +271,7 @@ All notable public changes will be recorded here.
   and `Database::poll_changefeed_page_as` checked only the filter target, so a
   principal with `Database:Read` could poll the `All` target with
   `ChangefeedOptions { include_system: true }` and read every system write
-  still in the commit log, from LSN 0 up to what history GC has truncated:
+  still in the commit log (every record history GC has not yet truncated):
   the Control Plane admin credentials (`__admin_auth`, the Argon2id hash of
   every password set, which can be cracked offline), the RBAC policy and
   principal registry (`__authz_policy`), the audit log and its hash-chain
@@ -286,9 +286,11 @@ All notable public changes will be recorded here.
   returned to any principal without `System:Admin`. Only applications that
   embed the crate and let callers choose the options were affected:
   `multidb serve` has no changefeed endpoint on PostgreSQL wire or the Control
-  Plane, and SQL cannot name system keyspaces. Subscriptions, continuous
-  queries and outbox connectors never include system rows and are unchanged.
-  The trusted `Database::poll_changefeed`, `poll_changefeed_page` and
+  Plane, and SQL cannot name system keyspaces (the `system.*` SQL views, which
+  show query fingerprints and tuning data and need `System:Read`, are
+  unchanged). Subscriptions, continuous queries and outbox connectors never
+  include system rows and are unchanged. The trusted
+  `Database::poll_changefeed`, `poll_changefeed_page` and
   `multidb cdc poll --include-system` still return system rows to the local
   operator, credential hashes included, so treat their output like the
   database file.

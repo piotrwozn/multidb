@@ -2854,8 +2854,8 @@ mod tests {
             assert_denied_both_ways(&database, &alice(), &all(), &include_system());
             assert_eq!(denied_poll_events(&database, "alice")?, 2);
 
-            // The options are checked whatever the filter target: `Read` on the table does not
-            // reach the system rows of the commits that wrote it.
+            // A table filter never matched system rows, but `include_system` is now refused with
+            // it too: the options are checked before the filter target is looked at.
             let users_reader = Principal::new("bob").with_role("users_reader");
             let users = ChangefeedFilter {
                 target: ChangefeedTarget::Table("users".to_owned()),

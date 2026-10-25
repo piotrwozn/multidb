@@ -2970,9 +2970,10 @@ impl Database {
 
     /// Polls committed change events after checking RBAC and applying policies.
     ///
-    /// The principal needs `Read` on the filter target, and `System:Admin` when
-    /// `options.include_system` is set or the target is `ChangefeedTarget::System`: system rows
-    /// carry credential hashes, the RBAC state, the audit log and raw index keys. A denied
+    /// The principal needs `Read` on the filter target. A poll that can return system rows
+    /// (`options.include_system` set, or a `ChangefeedTarget::System` target) also needs
+    /// `System:Admin`, which for a `System` target covers that `Read`: system rows carry
+    /// credential hashes, the RBAC state, the audit log and raw index keys. A denied
     /// `System:Admin` check is audited as `poll_changefeed`. System rows are never returned to a
     /// principal without `System:Admin`.
     /// # Errors
