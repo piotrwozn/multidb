@@ -328,27 +328,35 @@ All notable public changes will be recorded here.
   the row policy's column, an aggregate, a subquery over the same table, or a
   filter or sort key on a masked column. Collection policies were matched to SQL
   column names, so a policy on the document path `profile.city` did not mask the
-  SQL column `city` that reads it. Row and masking policies are now applied
+  SQL column `city` that reads it, and a row policy that shows documents whose
+  field is null also showed documents without the field or with a value of
+  another type, which SQL reads as NULL. A table's `*_history` table was read
+  without the table's policies. Row and masking policies are now applied
   where SQL scans the table: the scan returns only the rows the row policies let
   through, with masked values replaced, before any filter, sort, join, aggregate
   or subquery of the query reads them, so a predicate that fails on some value
   (such as a division by zero) cannot reveal a hidden row either. Collection
-  policies match the document path each SQL column reads: a mask covers the
-  columns that read its path or a path below it, and a row policy whose path no
-  column reads hides every row. A query that joins a policy-protected table with
-  other tables now runs with the policies applied instead of being rejected. A
-  masked column takes the type of its replacement (a `'***'` mask makes an
-  integer column a string column), and SQL reads of a table whose mask
-  replacement is not a scalar (an array, object, vector or point) fail. A row
-  policy value that is not a scalar matches no SQL row. `EXPLAIN` of a table
-  with row or masking policies and `INSERT ... RETURNING` into one return
-  `Unsupported`, since both report stored rows. Each SQL scan of such a table
-  reads all of the rows its row policies let through before the query filters
-  them, so single-table equality `SELECT`s on it run through DataFusion
-  instead of the direct lookup path. A policy covers only the resource it
-  names, so a table's `*_history` table or a materialized view over it needs
-  policies of its own. These policies apply to SQL run as a principal, not to
-  `Database::query`.
+  row policies are decided on the stored document, as for changefeeds: a
+  document is visible when its value at the policy's path equals the policy's
+  value or the principal's name, so a document without the path, or with a
+  value of another type, stays hidden. A collection mask covers the SQL
+  columns that read its path or a path below it. A query that joins a
+  policy-protected table with other tables now runs with the policies applied
+  instead of being rejected. A masked column takes the type of its
+  replacement (a `'***'` mask makes an integer column a string column), and
+  SQL reads of a table whose mask replacement is not a scalar (an array,
+  object, vector or point) fail. On tables and other relations, whose SQL
+  columns hold only scalars, a row policy value that is not a scalar matches
+  no row. `EXPLAIN` of a table with row or masking policies and
+  `INSERT ... RETURNING` into one return `Unsupported`, since both report
+  stored rows. Each SQL scan of such a table reads all of the rows its row
+  policies let through before the query filters them, so single-table
+  equality `SELECT`s on it run through DataFusion instead of the direct lookup
+  path. A table's policies also apply to its `*_history` table, matched to
+  its columns by name, together with the history table's own: a row must pass
+  both, and the history table's own masks win. A materialized view over a
+  protected table needs policies of its own.
+  These policies apply to SQL run as a principal, not to `Database::query`.
 
 ### Added
 

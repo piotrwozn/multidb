@@ -303,9 +303,10 @@ pub enum SqlReadTarget {
 /// ever reads the rows they let through, with the masked values already replaced.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SqlRelationPolicy {
-    /// When set, a row is visible only if its value at one of these paths equals the paired
-    /// value. An empty list hides every row.
-    pub visible_when: Option<Vec<(FieldPath, Value)>>,
+    /// A row is visible only if, for every list, its value at one of the list's paths equals
+    /// the paired value. An empty list hides every row; no lists show every row. Collections
+    /// decide this on the stored document.
+    pub visible_when: Vec<Vec<(FieldPath, Value)>>,
     /// Values at or below each path are replaced with the paired value, later entries last.
     pub masks: Vec<(FieldPath, Value)>,
 }
@@ -389,6 +390,8 @@ pub struct DocCollectionProvider {
     fields: Vec<DocField>,
     indexes: Vec<IndexSpec>,
     arrow_schema: SchemaRef,
+    /// Row policies decided on each stored document, as in `SqlRelationPolicy::visible_when`.
+    visible_when: Arc<[Vec<(FieldPath, Value)>]>,
 }
 
 #[derive(Clone)]
@@ -2221,11 +2224,12 @@ impl SqlEngine {
 
         for (name, provider) in &mut providers {
             if let Some(policy) = policies.get(name) {
-                let fields = self
-                    .collections
-                    .get(name)
-                    .map(|collection| collection.fields.as_slice());
-                *provider = policy_table_provider(name, Arc::clone(provider), fields, policy)?;
+                *provider = policy_table_provider(
+                    name,
+                    Arc::clone(provider),
+                    self.collections.get(name),
+                    policy,
+                )?;
             }
         }
 
@@ -2567,7 +2571,16 @@ impl DocCollectionProvider {
             arrow_schema: doc_fields_to_arrow(&fields),
             fields,
             indexes,
+            visible_when: Arc::from(Vec::new()),
         })
+    }
+
+    /// The same collection, scanning only the documents `visible_when` lets through.
+    fn with_visible_when(&self, visible_when: &[Vec<(FieldPath, Value)>]) -> Self {
+        Self {
+            visible_when: Arc::from(visible_when),
+            ..self.clone()
+        }
     }
 
     fn scan_record_batches(
@@ -2581,6 +2594,15 @@ impl DocCollectionProvider {
             self.indexes.clone(),
         );
         let mut documents = collection.scan()?;
+        // The same test as `PolicyConfig::row_visible`: a document without the path, or
+        // holding a value of another type, never matches, although its column reads NULL.
+        documents.retain(|(_, doc)| {
+            self.visible_when.iter().all(|any_of| {
+                any_of
+                    .iter()
+                    .any(|(path, value)| extract_path(doc, path) == Some(value))
+            })
+        });
         if let Some(limit) = limit {
             documents.truncate(limit);
         }
@@ -4861,16 +4883,27 @@ impl TableProvider for PolicyTableProvider {
     }
 }
 
-/// Puts `provider` behind `policy`. `fields` are the SQL fields of a document
-/// collection, whose columns read the paths the fields name; every other
-/// relation's column `c` reads the path `c`. A mask SQL cannot represent
-/// refuses the queries that read the relation, not every query.
+/// Puts `provider` behind `policy`. When the relation is the document
+/// `collection`, its columns read the paths its fields name and its row
+/// policies are decided on the stored documents; every other relation's column
+/// `c` reads the path `c`. A mask SQL cannot represent refuses the queries that
+/// read the relation, not every query.
 fn policy_table_provider(
     name: &str,
     provider: Arc<dyn TableProvider>,
-    fields: Option<&[DocField]>,
+    collection: Option<&DocCollectionProvider>,
     policy: &SqlRelationPolicy,
 ) -> Result<Arc<dyn TableProvider>, QueryError> {
+    // A collection column reads NULL where a document lacks its path or holds
+    // a value of another type, so SQL predicates cannot decide its row policies.
+    let (provider, fields, row_filters): (Arc<dyn TableProvider>, _, _) = match collection {
+        Some(collection) => (
+            Arc::new(collection.with_visible_when(&policy.visible_when)),
+            Some(collection.fields.as_slice()),
+            &[][..],
+        ),
+        None => (provider, None, policy.visible_when.as_slice()),
+    };
     let table_type = provider.table_type();
     let schema = provider.schema();
     let qualifier = TableReference::bare(name);
@@ -4891,9 +4924,9 @@ fn policy_table_provider(
 
     let mut plan = LogicalPlanBuilder::scan(qualifier.clone(), provider_as_source(provider), None)
         .map_err(|error| datafusion_to_query_error(&error))?;
-    if let Some(visible_when) = &policy.visible_when {
+    for any_of in row_filters {
         let mut predicate = None::<DfExpr>;
-        for (path, value) in visible_when {
+        for (path, value) in any_of {
             // Columns hold scalars, so no row equals any other value.
             let Some(scalar) = policy_scalar(value) else {
                 continue;

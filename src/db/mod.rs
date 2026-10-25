@@ -7264,7 +7264,8 @@ impl SqlReadGuard for SqlReadAuthorizer<'_> {
 
 /// Translates the row and masking policies of every catalog object SQL can scan into what
 /// the engine applies for `principal`. A row policy shows a row whose value at its path
-/// equals the policy's value or the principal's name.
+/// equals the policy's value or the principal's name. A table's history holds the table's
+/// own rows, so it is read under the table's policies as well as under its own.
 fn sql_relation_policies(
     catalog: &BTreeMap<String, CatalogEntry>,
     policy: &PolicyConfig,
@@ -7278,29 +7279,18 @@ fn sql_relation_policies(
         if !is_sql_relation(entry) {
             continue;
         }
-        let resource = resource_for_catalog_name(catalog, name);
-        let row_policies = policy
-            .row_policies
-            .iter()
-            .filter(|row_policy| row_policy.resource == resource)
-            .collect::<Vec<_>>();
-        let masks = policy
-            .masking
-            .iter()
-            .filter(|masking| masking.resource == resource)
-            .flat_map(|masking| {
-                masking
-                    .paths
-                    .iter()
-                    .map(|path| (path.clone(), masking.replacement.clone()))
-            })
-            .collect::<Vec<_>>();
-        if row_policies.is_empty() && masks.is_empty() {
-            continue;
+        let mut resources = Vec::with_capacity(2);
+        if let CatalogEntry::TemporalTable { base_table, .. } = entry {
+            resources.push(resource_for_catalog_name(catalog, base_table));
         }
-        let visible_when = (!row_policies.is_empty()).then(|| {
-            row_policies
+        // The relation's own masks come last, so they win over the base table's.
+        resources.push(resource_for_catalog_name(catalog, name));
+        let mut relation = SqlRelationPolicy::default();
+        for resource in &resources {
+            let any_of = policy
+                .row_policies
                 .iter()
+                .filter(|row_policy| &row_policy.resource == resource)
                 .flat_map(|row_policy| {
                     [
                         (row_policy.path.clone(), row_policy.equals.clone()),
@@ -7310,15 +7300,26 @@ fn sql_relation_policies(
                         ),
                     ]
                 })
-                .collect()
-        });
-        policies.insert(
-            name.clone(),
-            SqlRelationPolicy {
-                visible_when,
-                masks,
-            },
-        );
+                .collect::<Vec<_>>();
+            if !any_of.is_empty() {
+                relation.visible_when.push(any_of);
+            }
+            relation.masks.extend(
+                policy
+                    .masking
+                    .iter()
+                    .filter(|masking| &masking.resource == resource)
+                    .flat_map(|masking| {
+                        masking
+                            .paths
+                            .iter()
+                            .map(|path| (path.clone(), masking.replacement.clone()))
+                    }),
+            );
+        }
+        if relation != SqlRelationPolicy::default() {
+            policies.insert(name.clone(), relation);
+        }
     }
     policies
 }

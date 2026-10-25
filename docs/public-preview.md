@@ -294,17 +294,20 @@ Consistency status:
   closed as unsupported SQL.
 - Row and masking policies apply to SQL run as a principal where the query scans
   each table, before any filter, join, aggregate or subquery reads it, so they
-  hold whatever the query computes from the table. Collection policies match the
-  document path each SQL column reads: a mask covers the columns that read its
-  path or a path below it, and a row policy whose path no column reads hides
-  every row. A masked column takes the type of its replacement; a replacement
-  that is not a scalar makes SQL reads of the table fail. `EXPLAIN` of a
-  table with such policies, `INSERT ... RETURNING` into one, and `match()` /
-  `within_radius()` searches over a collection with them are refused. Each scan
+  hold whatever the query computes from the table. Collection row policies
+  are decided on each stored document, as for changefeeds, so a document
+  without the policy's path or with a value of another type stays hidden
+  although SQL reads it as NULL; a collection mask covers the columns that
+  read its path or a path below it. A masked column takes the type of its
+  replacement; a replacement that is not a scalar makes SQL reads of the
+  table fail. `EXPLAIN` of a table with such policies,
+  `INSERT ... RETURNING` into one, and `match()` / `within_radius()` searches
+  over a collection with them are refused. Each scan
   of such a table reads all of the rows its row policies let through before
-  the query filters them, primary-key lookups included. A policy covers only
-  the resource it names: a table's `*_history` table or a materialized view
-  over it needs policies of its own.
+  the query filters them, primary-key lookups included. A table's policies
+  also apply to its `*_history` table, by column name, on top of the history
+  table's own; a materialized view over a protected table needs policies of
+  its own.
 
 ## Migration Guide
 

@@ -1481,6 +1481,172 @@ async fn sql_policies_follow_collection_field_paths() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
+async fn sql_collection_row_policies_decide_on_the_stored_document()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let docs = database.create_collection(
+        "docs",
+        CollectionId::new(7),
+        vec![
+            DocField::path("k", FieldPath::new(["k"]), ColumnType::Int),
+            DocField::path("deleted", FieldPath::new(["deleted"]), ColumnType::Str),
+            DocField::path("secret", FieldPath::new(["secret"]), ColumnType::Str),
+        ],
+        Vec::new(),
+    )?;
+    // SQL reads `deleted` as NULL in the first three documents, but only the
+    // first one stores null there.
+    let documents = [
+        vec![
+            ("deleted", Value::Null),
+            ("tags", Value::Array(vec![Value::Str("public".to_owned())])),
+        ],
+        vec![(
+            "tags",
+            Value::Array(vec![Value::Str("internal".to_owned())]),
+        )],
+        vec![("deleted", Value::Int(5))],
+        vec![
+            ("deleted", Value::Str("2026-01-01".to_owned())),
+            ("owner", Value::Str("alice".to_owned())),
+        ],
+    ]
+    .into_iter()
+    .zip(1_i64..)
+    .map(|(fields, k)| {
+        let mut doc = fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect::<BTreeMap<_, _>>();
+        doc.insert("k".to_owned(), Value::Int(k));
+        doc.insert("secret".to_owned(), Value::Str(format!("s{k}")));
+        Value::Object(doc)
+    })
+    .collect::<Vec<_>>();
+    for document in &documents {
+        docs.insert(document)?;
+    }
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Collection("docs".to_owned()), Permission::Read)
+    ]));
+    let alice = Principal::new("alice").with_role("reader");
+    let resource = Resource::Collection("docs".to_owned());
+
+    // A null value, a value no SQL column holds, and a path no SQL column
+    // reads, where only the principal's name matches.
+    for (path, equals, visible) in [
+        ("deleted", Value::Null, vec![1]),
+        (
+            "tags",
+            Value::Array(vec![Value::Str("public".to_owned())]),
+            vec![1],
+        ),
+        ("owner", Value::Str("public".to_owned()), vec![4]),
+    ] {
+        let policy = PolicyConfig {
+            validations: Vec::new(),
+            masking: Vec::new(),
+            row_policies: vec![RowPolicy {
+                resource: resource.clone(),
+                path: FieldPath::new([path]),
+                equals,
+            }],
+            limits: LimitPolicy::default(),
+        };
+        database.set_policy_config(&policy)?;
+        let expected = documents
+            .iter()
+            .zip(1_i64..)
+            .filter(|(document, _)| policy.row_visible(&alice, &resource, document))
+            .map(|(_, k)| vec![Value::Int(k)])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected,
+            visible
+                .into_iter()
+                .map(|k| vec![Value::Int(k)])
+                .collect::<Vec<_>>(),
+            "{path}"
+        );
+        for sql in [
+            "SELECT k FROM docs ORDER BY k",
+            "SELECT k FROM docs WHERE deleted IS NULL OR secret <> '' ORDER BY k",
+            "SELECT k FROM docs WHERE k IN (SELECT k FROM docs) ORDER BY k",
+        ] {
+            assert_eq!(
+                query_rows(&database, &alice, sql).await?,
+                expected,
+                "{path}: {sql}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_history_tables_read_under_the_table_policies() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut database, alice) = people_policy_database()?;
+    database.enable_system_versioning("people", TemporalRetention::default())?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("reader").grant(
+        Resource::Table("people_history".to_owned()),
+        Permission::Read,
+    )]));
+    let alice = Principal::new(alice.name()).with_role("reader");
+    let people = || Resource::Table("people".to_owned());
+    let history = || Resource::Table("people_history".to_owned());
+    let base_policies = PolicyConfig {
+        validations: Vec::new(),
+        masking: vec![MaskingPolicy {
+            resource: people(),
+            paths: vec![FieldPath::new(["ssn"])],
+            replacement: Value::Str("***".to_owned()),
+        }],
+        row_policies: vec![RowPolicy {
+            resource: people(),
+            path: FieldPath::new(["owner"]),
+            equals: Value::Str("public".to_owned()),
+        }],
+        limits: LimitPolicy::default(),
+    };
+    let sql = "SELECT id, owner, ssn FROM people_history ORDER BY id";
+    let alice_row = |ssn: &str| {
+        vec![vec![
+            Value::Int(1),
+            Value::Str("alice".to_owned()),
+            Value::Str(ssn.to_owned()),
+        ]]
+    };
+
+    // The history holds both rows, so the table's policies apply to it.
+    database.set_policy_config(&base_policies)?;
+    assert_eq!(query_rows(&database, &alice, sql).await?, alice_row("***"));
+    assert!(matches!(
+        database.query_as(&alice, &format!("EXPLAIN {sql}")).await,
+        Err(DbError::Query(QueryError::Unsupported(_)))
+    ));
+
+    // The history table's own policies apply as well: a row must pass both,
+    // and its own masks win.
+    for (id, expected) in [(1, alice_row("hidden")), (2, Vec::new())] {
+        let mut policies = base_policies.clone();
+        policies.masking.push(MaskingPolicy {
+            resource: history(),
+            paths: vec![FieldPath::new(["ssn"])],
+            replacement: Value::Str("hidden".to_owned()),
+        });
+        policies.row_policies.push(RowPolicy {
+            resource: history(),
+            path: FieldPath::new(["id"]),
+            equals: Value::Int(id),
+        });
+        database.set_policy_config(&policies)?;
+        assert_eq!(query_rows(&database, &alice, sql).await?, expected, "{id}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn sql_read_authz_keys_unquoted_names_like_the_planner()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, reader) = public_reader_database()?;
