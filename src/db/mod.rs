@@ -62,8 +62,8 @@ use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
-    SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, SqlRows, StatsCatalog, TableLayout,
-    TableSchema, decode_row_bytes, parse_with_limits,
+    SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, SqlRelationPolicy, SqlRows, StatsCatalog,
+    TableLayout, TableSchema, decode_row_bytes, parse_with_limits,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -3834,11 +3834,10 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query")?;
         }
 
-        let mut authorizer = SqlReadAuthorizer::new(self, principal, "query");
-        let result = self.query_with_read_guard(sql, Some(&mut authorizer)).await;
-        let policy_requirements = authorizer.policy_requirements(&requirements);
-        let result = result
-            .and_then(|output| self.apply_query_policies(principal, output, &policy_requirements));
+        let result = match self.sql_read_authorizer(principal, "query", &requirements) {
+            Ok(mut authorizer) => self.query_with_read_guard(sql, Some(&mut authorizer)).await,
+            Err(error) => Err(error),
+        };
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3868,13 +3867,13 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
 
-        let mut authorizer = SqlReadAuthorizer::new(self, principal, "query_as_of");
-        let result = self
-            .query_as_of_with_read_guard(sql, point, Some(&mut authorizer))
-            .await;
-        let policy_requirements = authorizer.policy_requirements(&requirements);
-        let result = result
-            .and_then(|output| self.apply_query_policies(principal, output, &policy_requirements));
+        let result = match self.sql_read_authorizer(principal, "query_as_of", &requirements) {
+            Ok(mut authorizer) => {
+                self.query_as_of_with_read_guard(sql, point, Some(&mut authorizer))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3890,24 +3889,22 @@ impl Database {
         result
     }
 
-    fn apply_query_policies(
-        &self,
-        principal: &Principal,
-        output: SqlOutput,
+    /// Builds the read guard of SQL run as `principal`, carrying the row and masking policies
+    /// the engine applies where it scans each catalog object.
+    /// Index searches return source documents without going through the engine, so they are
+    /// refused while the source collection has row or masking policies.
+    fn sql_read_authorizer<'a>(
+        &'a self,
+        principal: &'a Principal,
+        action: &'static str,
         requirements: &[(Resource, Permission)],
-    ) -> Result<SqlOutput, DbError> {
-        let SqlOutput::Rows(rows) = output else {
-            return Ok(output);
-        };
+    ) -> Result<SqlReadAuthorizer<'a>, DbError> {
         let policy = self.policy_config()?;
-        let resources = policy_resources(requirements);
-        // Index search rows do not carry the source document's field names, so the source
-        // collection's row and masking policies cannot be applied to them.
         let searches_index = requirements.iter().any(|(resource, _)| {
             matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
         });
         if searches_index
-            && resources
+            && policy_resources(requirements)
                 .iter()
                 .any(|resource| policy_has_row_or_masking(&policy, resource))
         {
@@ -3917,33 +3914,12 @@ impl Database {
             )
             .into());
         }
-        if resources.len() != 1 {
-            if resources
-                .iter()
-                .any(|resource| policy_has_row_or_masking(&policy, resource))
-            {
-                return Err(ExtensionError::PolicyDenied(
-                    "multi-resource queries with row or masking policies require column lineage"
-                        .to_owned(),
-                )
-                .into());
-            }
-            return Ok(SqlOutput::Rows(rows));
-        }
-        let resource = resources[0];
-        let mut filtered = Vec::new();
-        for row in rows.rows {
-            let object = row_to_policy_object(&rows.columns, &row);
-            if !policy.row_visible(principal, resource, &object) {
-                continue;
-            }
-            let masked = policy.mask_value(resource, &object);
-            filtered.push(policy_object_to_row(&rows.columns, &masked, row));
-        }
-        Ok(SqlOutput::Rows(crate::query::SqlRows {
-            columns: rows.columns,
-            rows: filtered,
-        }))
+        Ok(SqlReadAuthorizer {
+            database: self,
+            principal,
+            action,
+            policies: sql_relation_policies(&self.catalog, &policy, principal),
+        })
     }
 
     fn apply_changefeed_policy(
@@ -4475,6 +4451,7 @@ impl Database {
             }
         }
         for name in names {
+            let name = sql_relation_catalog_name(&self.catalog, &name);
             for entry in self.catalog.values() {
                 if let CatalogEntry::TemporalTable {
                     base_table,
@@ -7209,42 +7186,13 @@ pub fn profile_validation_report(
     })
 }
 
-/// Authorizes the relations of a planned SQL statement for one principal.
-/// It records every authorized resource so row and masking policies can see
-/// the tables the plan actually reads.
+/// Authorizes the relations of a planned SQL statement for one principal and
+/// hands the engine that principal's row and masking policies.
 struct SqlReadAuthorizer<'a> {
     database: &'a Database,
     principal: &'a Principal,
     action: &'static str,
-    resources: BTreeSet<Resource>,
-}
-
-impl<'a> SqlReadAuthorizer<'a> {
-    const fn new(database: &'a Database, principal: &'a Principal, action: &'static str) -> Self {
-        Self {
-            database,
-            principal,
-            action,
-            resources: BTreeSet::new(),
-        }
-    }
-
-    /// Returns the pre-check requirements plus a `Read` for every resource
-    /// the plan read, sorted and deduplicated.
-    fn policy_requirements(
-        &self,
-        requirements: &[(Resource, Permission)],
-    ) -> Vec<(Resource, Permission)> {
-        let mut combined = requirements.to_vec();
-        combined.extend(
-            self.resources
-                .iter()
-                .map(|resource| (resource.clone(), Permission::Read)),
-        );
-        combined.sort();
-        combined.dedup();
-        combined
-    }
+    policies: BTreeMap<String, SqlRelationPolicy>,
 }
 
 impl SqlReadGuard for SqlReadAuthorizer<'_> {
@@ -7269,10 +7217,86 @@ impl SqlReadGuard for SqlReadAuthorizer<'_> {
                 Permission::Read,
                 self.action,
             )?;
-            self.resources.insert(resource);
         }
         Ok(())
     }
+
+    fn relation_policies(&self) -> BTreeMap<String, SqlRelationPolicy> {
+        self.policies.clone()
+    }
+}
+
+/// Translates the row and masking policies of every catalog object SQL can scan into what
+/// the engine applies for `principal`. A row policy shows a row whose value at its path
+/// equals the policy's value or the principal's name.
+fn sql_relation_policies(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    policy: &PolicyConfig,
+    principal: &Principal,
+) -> BTreeMap<String, SqlRelationPolicy> {
+    let mut policies = BTreeMap::new();
+    if policy.row_policies.is_empty() && policy.masking.is_empty() {
+        return policies;
+    }
+    for (name, entry) in catalog {
+        if !is_sql_relation(entry) {
+            continue;
+        }
+        let resource = resource_for_catalog_name(catalog, name);
+        let row_policies = policy
+            .row_policies
+            .iter()
+            .filter(|row_policy| row_policy.resource == resource)
+            .collect::<Vec<_>>();
+        let masks = policy
+            .masking
+            .iter()
+            .filter(|masking| masking.resource == resource)
+            .flat_map(|masking| {
+                masking
+                    .paths
+                    .iter()
+                    .map(|path| (path.clone(), masking.replacement.clone()))
+            })
+            .collect::<Vec<_>>();
+        if row_policies.is_empty() && masks.is_empty() {
+            continue;
+        }
+        let visible_when = (!row_policies.is_empty()).then(|| {
+            row_policies
+                .iter()
+                .flat_map(|row_policy| {
+                    [
+                        (row_policy.path.clone(), row_policy.equals.clone()),
+                        (
+                            row_policy.path.clone(),
+                            Value::Str(principal.name().to_owned()),
+                        ),
+                    ]
+                })
+                .collect()
+        });
+        policies.insert(
+            name.clone(),
+            SqlRelationPolicy {
+                visible_when,
+                masks,
+            },
+        );
+    }
+    policies
+}
+
+/// Whether the SQL engine registers `entry` as a relation queries can scan.
+const fn is_sql_relation(entry: &CatalogEntry) -> bool {
+    matches!(
+        entry,
+        CatalogEntry::Table { .. }
+            | CatalogEntry::Collection { .. }
+            | CatalogEntry::ForeignTable { .. }
+            | CatalogEntry::MaterializedView { .. }
+            | CatalogEntry::TemporalTable { .. }
+    )
 }
 
 fn sql_requirements(
@@ -7323,11 +7347,10 @@ fn sql_requirements(
                 if names.is_empty() {
                     requirements.push((Resource::Database, Permission::Read));
                 } else {
-                    requirements.extend(
-                        names.into_iter().map(|name| {
-                            (resource_for_catalog_name(catalog, &name), Permission::Read)
-                        }),
-                    );
+                    requirements.extend(names.into_iter().map(|name| {
+                        let name = sql_relation_catalog_name(catalog, &name);
+                        (resource_for_catalog_name(catalog, &name), Permission::Read)
+                    }));
                 }
             }
             Statement::Insert(insert) => {
@@ -7335,10 +7358,12 @@ fn sql_requirements(
                     SqlTableObject::TableName(name) => object_name_to_string(name)?,
                     other => return Err(QueryError::Unsupported(other.to_string()).into()),
                 };
-                requirements.push((
-                    resource_for_catalog_name(catalog, &table_name),
-                    Permission::Write,
-                ));
+                let resource = resource_for_catalog_name(catalog, &table_name);
+                // RETURNING hands back stored rows, as PostgreSQL's SELECT privilege rule says.
+                if insert.returning.is_some() {
+                    requirements.push((resource.clone(), Permission::Read));
+                }
+                requirements.push((resource, Permission::Write));
             }
             Statement::Analyze(analyze) => {
                 if let Some(name) = analyze.table_name {
@@ -7389,7 +7414,7 @@ fn phase19_requirements(
 }
 
 /// Index searches return source document text, ids and points, so they also need Read on the
-/// source collection; its row and masking policies then deny the multi-resource result.
+/// source collection, and are refused while it has row or masking policies.
 fn index_with_source_requirements(
     index: Resource,
     name: &str,
@@ -7748,8 +7773,9 @@ impl Visitor for NestedTableCollector<'_> {
                 let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
                     return ControlFlow::Break(Box::new(QueryError::Unsupported(name.to_string())));
                 };
-                if !self.cte_names.contains(&normalized_ident(ident)) {
-                    self.names.insert(ident.value.clone());
+                let name = normalized_ident(ident);
+                if !self.cte_names.contains(&name) {
+                    self.names.insert(name);
                 }
                 ControlFlow::Continue(())
             }
@@ -7770,6 +7796,23 @@ fn normalized_ident(ident: &Ident) -> String {
     } else {
         ident.value.to_ascii_lowercase()
     }
+}
+
+/// Maps a relation name as `DataFusion` resolves it (see `normalized_ident`) to the catalog
+/// object the planner reads under that name. The engine registers every SQL relation under
+/// its lowercased catalog name, so `orders`, `ORDERS` and `"orders"` all read the object
+/// `ORDERS`, while `"ORDERS"` reads nothing. A name that reads no object is returned as is;
+/// planning then fails.
+fn sql_relation_catalog_name(catalog: &BTreeMap<String, CatalogEntry>, resolved: &str) -> String {
+    if resolved.bytes().any(|byte| byte.is_ascii_uppercase())
+        || catalog.get(resolved).is_some_and(is_sql_relation)
+    {
+        return resolved.to_owned();
+    }
+    catalog
+        .iter()
+        .find(|(name, entry)| is_sql_relation(entry) && name.eq_ignore_ascii_case(resolved))
+        .map_or_else(|| resolved.to_owned(), |(name, _)| name.clone())
 }
 
 fn apply_procedure_commands(

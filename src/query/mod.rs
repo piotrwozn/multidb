@@ -17,17 +17,23 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     catalog::Session,
-    common::{Statistics, stats::Precision, tree_node::TreeNodeRecursion},
+    common::{
+        Column as DfColumn, ScalarValue, Statistics, TableReference, stats::Precision,
+        tree_node::TreeNodeRecursion,
+    },
     datasource::{
-        MemTable, TableProvider, TableType, cte_worktable::CteWorkTable, source_as_provider,
+        MemTable, TableProvider, TableType, cte_worktable::CteWorkTable, provider_as_source,
+        source_as_provider,
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{
         disk_manager::DiskManagerBuilder, memory_pool::GreedyMemoryPool,
         runtime_env::RuntimeEnvBuilder,
     },
-    logical_expr::{Expr as DfExpr, LogicalPlan, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
+    logical_expr::{
+        Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, lit,
+    },
+    physical_plan::{ExecutionPlan, collect},
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
@@ -290,6 +296,20 @@ pub enum SqlReadTarget {
     Builtin(String),
 }
 
+/// The row and masking policies a caller's SQL sees on one catalog relation.
+///
+/// Paths name document fields for collections and columns for every other relation. The
+/// engine applies the policies where it scans the relation, so the rest of the query only
+/// ever reads the rows they let through, with the masked values already replaced.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SqlRelationPolicy {
+    /// When set, a row is visible only if its value at one of these paths equals the paired
+    /// value. An empty list hides every row.
+    pub visible_when: Option<Vec<(FieldPath, Value)>>,
+    /// Values at or below each path are replaced with the paired value, later entries last.
+    pub masks: Vec<(FieldPath, Value)>,
+}
+
 /// Authorizes the relations of each SQL statement before any statement runs.
 pub trait SqlReadGuard: Send {
     /// Checks every relation one planned statement reads.
@@ -297,6 +317,12 @@ pub trait SqlReadGuard: Send {
     /// # Errors
     /// Fails when the caller may not read one of `reads`.
     fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError>;
+
+    /// Returns the row and masking policies of the caller, keyed by catalog name. Relations
+    /// without an entry are read as stored.
+    fn relation_policies(&self) -> BTreeMap<String, SqlRelationPolicy> {
+        BTreeMap::new()
+    }
 }
 
 enum PreparedStatement {
@@ -1978,7 +2004,8 @@ impl SqlEngine {
 
     /// Executes SQL after `guard` authorizes the relations each statement reads.
     /// Every statement is planned and authorized before any statement runs, and
-    /// the plan that was authorized is the plan that executes.
+    /// the plan that was authorized is the plan that executes. The guard's row and
+    /// masking policies are applied where each relation is scanned.
     /// # Errors
     /// Fails when the guard denies a read, SQL is unsupported, storage fails, or
     /// `DataFusion` fails.
@@ -2000,9 +2027,13 @@ impl SqlEngine {
         }
 
         let statements = parse_with_limits(sql, &self.performance.query)?;
+        let policies = guard
+            .as_deref()
+            .map(SqlReadGuard::relation_policies)
+            .unwrap_or_default();
         let mut prepared = Vec::with_capacity(statements.len());
         for statement in statements {
-            let (statement, reads) = self.prepare_statement(statement).await?;
+            let (statement, reads) = self.prepare_statement(statement, &policies).await?;
             if let Some(reads) = reads
                 && let Some(guard) = guard.as_deref_mut()
             {
@@ -2027,10 +2058,13 @@ impl SqlEngine {
     async fn prepare_statement(
         &self,
         statement: Statement,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
     ) -> Result<(PreparedStatement, Option<BTreeSet<SqlReadTarget>>), QueryError> {
         match statement {
             Statement::Query(_) => {
-                let (select, reads) = self.prepare_select(&statement.to_string()).await?;
+                let (select, reads) = self
+                    .prepare_select(&statement.to_string(), policies)
+                    .await?;
                 Ok((PreparedStatement::Select(select), Some(reads)))
             }
             Statement::Analyze(analyze) => {
@@ -2049,6 +2083,13 @@ impl SqlEngine {
                 let simple = self
                     .simple_select_plan(&sql)?
                     .ok_or_else(explain_unsupported)?;
+                // EXPLAIN reports the stored rows the plan touches, before any policy.
+                if policies.contains_key(&simple.table) {
+                    return Err(QueryError::Unsupported(format!(
+                        "EXPLAIN over {} is unsupported while it has row or masking policies",
+                        simple.table
+                    )));
+                }
                 let reads = BTreeSet::from([SqlReadTarget::Catalog(simple.table.clone())]);
                 Ok((
                     PreparedStatement::Explain {
@@ -2059,7 +2100,25 @@ impl SqlEngine {
                     Some(reads),
                 ))
             }
-            Statement::Insert(insert) => Ok((PreparedStatement::Insert(Box::new(insert)), None)),
+            Statement::Insert(insert) => {
+                // RETURNING hands back stored rows, the existing row of an
+                // ON CONFLICT DO UPDATE included, so it reads the table.
+                let reads = if insert.returning.is_some() {
+                    let table = match &insert.table {
+                        SqlTableObject::TableName(name) => object_name_to_string(name)?,
+                        other => return Err(QueryError::Unsupported(other.to_string())),
+                    };
+                    if policies.contains_key(&table) {
+                        return Err(QueryError::Unsupported(format!(
+                            "INSERT ... RETURNING into {table} is unsupported while it has row or masking policies"
+                        )));
+                    }
+                    Some(BTreeSet::from([SqlReadTarget::Catalog(table)]))
+                } else {
+                    None
+                };
+                Ok((PreparedStatement::Insert(Box::new(insert)), reads))
+            }
             other => Err(QueryError::Unsupported(other.to_string())),
         }
     }
@@ -2089,9 +2148,13 @@ impl SqlEngine {
     async fn prepare_select(
         &self,
         sql: &str,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
     ) -> Result<(PreparedSelect, BTreeSet<SqlReadTarget>), QueryError> {
+        // The simple path reads stored rows directly, so a relation with policies
+        // is always planned through `DataFusion`, where they are applied.
         if self.snapshot_lsn.is_none()
             && let Some(simple) = self.simple_select_plan(sql)?
+            && !policies.contains_key(&simple.table)
         {
             let reads = BTreeSet::from([SqlReadTarget::Catalog(simple.table.clone())]);
             return Ok((
@@ -2103,7 +2166,7 @@ impl SqlEngine {
             ));
         }
 
-        let (ctx, providers) = self.datafusion_catalog_context()?;
+        let (ctx, providers) = self.datafusion_catalog_context(policies)?;
         let started = std::time::Instant::now();
         let plan = self.plan_datafusion_select(&ctx, sql).await?;
         let planning = started.elapsed();
@@ -2120,9 +2183,11 @@ impl SqlEngine {
 
     /// Registers every catalog object in a fresh `DataFusion` context and
     /// returns the registered providers, so plan scans can be mapped back to
-    /// catalog names by provider identity.
+    /// catalog names by provider identity. An object with policies is
+    /// registered behind them.
     fn datafusion_catalog_context(
         &self,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
     ) -> Result<(SessionContext, RegisteredProviders), QueryError> {
         let ctx = self.datafusion_context()?;
         let mut providers: RegisteredProviders = Vec::new();
@@ -2152,6 +2217,16 @@ impl SqlEngine {
 
         for (name, provider) in &self.temporal_tables {
             providers.push((name.clone(), Arc::new(provider.clone())));
+        }
+
+        for (name, provider) in &mut providers {
+            if let Some(policy) = policies.get(name) {
+                let fields = self
+                    .collections
+                    .get(name)
+                    .map(|collection| collection.fields.as_slice());
+                *provider = policy_table_provider(name, Arc::clone(provider), fields, policy)?;
+            }
         }
 
         for (name, provider) in &providers {
@@ -4741,6 +4816,149 @@ fn planned_read_targets(
         )));
     }
     Ok(reads)
+}
+
+/// A catalog relation as one caller's row and masking policies let it be seen.
+///
+/// The scan runs the policies to completion and serves only the rows they let
+/// through, already masked. No predicate of the query, wherever an optimizer
+/// rule pushes it, is therefore evaluated on a hidden row or an unmasked value:
+/// a predicate that fails on some value cannot reveal that a hidden row holds it.
+#[derive(Debug)]
+struct PolicyTableProvider {
+    plan: LogicalPlan,
+    schema: SchemaRef,
+    table_type: TableType,
+}
+
+#[async_trait]
+impl TableProvider for PolicyTableProvider {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table_type
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[DfExpr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let plan = state.create_physical_plan(&self.plan).await?;
+        let batches = collect(plan, state.task_ctx()).await?;
+        let mem = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
+        mem.scan(state, projection, &[], limit).await
+    }
+}
+
+/// Puts `provider` behind `policy`. `fields` are the SQL fields of a document
+/// collection, whose columns read the paths the fields name; every other
+/// relation's column `c` reads the path `c`.
+fn policy_table_provider(
+    name: &str,
+    provider: Arc<dyn TableProvider>,
+    fields: Option<&[DocField]>,
+    policy: &SqlRelationPolicy,
+) -> Result<Arc<dyn TableProvider>, QueryError> {
+    let table_type = provider.table_type();
+    let schema = provider.schema();
+    let qualifier = TableReference::bare(name);
+    let column_paths = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| match fields {
+            Some(fields) => match fields.get(index).map(|field| &field.source) {
+                Some(DocFieldSource::Path(path)) => Some(path.segments().to_vec()),
+                Some(DocFieldSource::DocumentId) | None => None,
+            },
+            None => Some(vec![field.name().clone()]),
+        })
+        .collect::<Vec<_>>();
+    let column =
+        |field: &Field| DfExpr::Column(DfColumn::new(Some(qualifier.clone()), field.name()));
+
+    let mut plan = LogicalPlanBuilder::scan(qualifier.clone(), provider_as_source(provider), None)
+        .map_err(|error| datafusion_to_query_error(&error))?;
+    if let Some(visible_when) = &policy.visible_when {
+        let mut predicate = None::<DfExpr>;
+        for (path, value) in visible_when {
+            for (field, column_path) in schema.fields().iter().zip(&column_paths) {
+                if column_path.as_deref() != Some(path.segments()) {
+                    continue;
+                }
+                // A value of another type never equals what the column holds.
+                let condition = match policy_scalar(value)? {
+                    ScalarValue::Null => column(field).is_null(),
+                    scalar if &scalar.data_type() == field.data_type() => {
+                        column(field).eq(lit(scalar))
+                    }
+                    _ => continue,
+                };
+                predicate = Some(match predicate {
+                    Some(predicate) => predicate.or(condition),
+                    None => condition,
+                });
+            }
+        }
+        plan = plan
+            .filter(predicate.unwrap_or_else(|| lit(false)))
+            .map_err(|error| datafusion_to_query_error(&error))?;
+    }
+    if !policy.masks.is_empty() {
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (field, column_path) in schema.fields().iter().zip(&column_paths) {
+            let mask = policy.masks.iter().rev().find(|(path, _)| {
+                column_path
+                    .as_deref()
+                    .is_some_and(|column_path| column_path.starts_with(path.segments()))
+            });
+            columns.push(match mask {
+                Some((_, replacement)) => {
+                    let scalar = match policy_scalar(replacement)? {
+                        ScalarValue::Null => ScalarValue::try_from(field.data_type())
+                            .map_err(|error| datafusion_to_query_error(&error))?,
+                        scalar => scalar,
+                    };
+                    lit(scalar).alias(field.name())
+                }
+                None => column(field),
+            });
+        }
+        plan = plan
+            .project(columns)
+            .map_err(|error| datafusion_to_query_error(&error))?;
+    }
+    let plan = plan
+        .build()
+        .map_err(|error| datafusion_to_query_error(&error))?;
+    let schema = Arc::clone(plan.schema().inner());
+    Ok(Arc::new(PolicyTableProvider {
+        plan,
+        schema,
+        table_type,
+    }))
+}
+
+/// The SQL literal of a policy value, typed the way a column holding it is.
+fn policy_scalar(value: &Value) -> Result<ScalarValue, QueryError> {
+    Ok(match value {
+        Value::Null => ScalarValue::Null,
+        Value::Bool(value) => ScalarValue::Boolean(Some(*value)),
+        Value::Int(value) => ScalarValue::Int64(Some(*value)),
+        Value::Float(value) => ScalarValue::Float64(Some(*value)),
+        Value::Str(value) => ScalarValue::Utf8(Some(value.clone())),
+        Value::Bytes(value) => ScalarValue::Binary(Some(value.clone())),
+        Value::Array(_) | Value::Object(_) | Value::Vector(_) | Value::GeoPoint { .. } => {
+            return Err(QueryError::Unsupported(
+                "row and masking policy values over SQL must be scalars".to_owned(),
+            ));
+        }
+    })
 }
 
 fn datafusion_to_query_error(error: &DataFusionError) -> QueryError {

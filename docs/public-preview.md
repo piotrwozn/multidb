@@ -285,13 +285,21 @@ Consistency status:
   subquery and CTE, before anything executes; a multi-statement batch runs
   nothing until all of its reads are authorized. Collections need Collection
   read; tables, foreign tables, materialized views and `*_history` tables need
-  Table read, keyed by the catalog name the query resolves to. Queries that
-  scan no catalog object (`SELECT 1`, `VALUES`), relations outside the catalog
+  Table read, keyed by the catalog name the query resolves to (unquoted names
+  are lowercased, so `ORDERS` reads `orders`). Queries that scan no catalog
+  object (`SELECT 1`, `VALUES`), relations outside the catalog
   (`information_schema`, table functions such as `generate_series`) and
-  recursive CTEs need Database read. SQL shapes the RBAC pre-check cannot
-  analyse fail closed as unsupported SQL, and row/masking policies cover every
-  table the plan reads, so a query touching a policy-protected resource plus
-  any other table is rejected.
+  recursive CTEs need Database read; `INSERT ... RETURNING` needs Read as well
+  as Write on its table. SQL shapes the RBAC pre-check cannot analyse fail
+  closed as unsupported SQL.
+- Row and masking policies apply to SQL run as a principal where the query scans
+  each table, before any filter, join, aggregate or subquery reads it, so they
+  hold whatever the query computes from the table. Collection policies match the
+  document path each SQL column reads: a mask covers the columns that read its
+  path or a path below it, and a row policy whose path no column reads hides
+  every row. A masked column takes the type of its replacement. `EXPLAIN` of a
+  table with such policies, `INSERT ... RETURNING` into one, and `match()` /
+  `within_radius()` searches over a collection with them are refused.
 
 ## Migration Guide
 

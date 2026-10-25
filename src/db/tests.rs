@@ -37,7 +37,7 @@ use crate::continuous::{
     TriggerTiming,
 };
 use crate::extension::{
-    AbiVersion, ExtensionError, LimitPolicy, MaskingPolicy, PolicyConfig, UdfBudget,
+    AbiVersion, ExtensionError, LimitPolicy, MaskingPolicy, PolicyConfig, RowPolicy, UdfBudget,
 };
 use crate::federation::{ForeignSource, ForeignTableOptions};
 use crate::geo::{GeoError, GeoIndexConfig, GeoPoint};
@@ -785,8 +785,8 @@ async fn phase20_query_as_applies_masking_policy() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-async fn multi_resource_query_with_masking_policy_fails_closed()
--> Result<(), Box<dyn std::error::Error>> {
+async fn multi_resource_query_masks_the_protected_table() -> Result<(), Box<dyn std::error::Error>>
+{
     let mut database = create_database(DbConfig::new(Profile::InMemory))?;
     seed_orders(&mut database)?;
     database.set_authz_policy(AuthzPolicy::new([Role::new("reader")
@@ -804,23 +804,22 @@ async fn multi_resource_query_with_masking_policy_fails_closed()
     })?;
     let reader = Principal::new("alice").with_role("reader");
 
-    let error = match database
+    let SqlOutput::Rows(rows) = database
         .query_as(
             &reader,
             "SELECT users.name, orders.amount \
-             FROM users JOIN orders ON users.id = orders.user_id",
+             FROM users JOIN orders ON users.id = orders.user_id ORDER BY orders.id",
         )
-        .await
-    {
-        Ok(output) => panic!("join with protected resources should fail closed: {output:?}"),
-        Err(error) => error,
+        .await?
+    else {
+        return Err("expected rows".into());
     };
-
-    assert!(matches!(
-        error,
-        DbError::Extension(ExtensionError::PolicyDenied(message))
-            if message.contains("multi-resource queries")
-    ));
+    assert_eq!(
+        rows.rows,
+        [5.5, 7.0, 3.0]
+            .map(|amount| vec![Value::Str("***".to_owned()), Value::Float(amount)])
+            .to_vec()
+    );
     Ok(())
 }
 
@@ -1132,22 +1131,20 @@ async fn sql_read_policies_see_subquery_tables() -> Result<(), Box<dyn std::erro
         })
     );
 
-    // `orders` is read only in a clause the old AST walk ignored.
-    let error = match database
-        .query_as(
-            &reader,
-            "SELECT name FROM users WHERE age = 37 ORDER BY (SELECT count(*) FROM orders)",
-        )
-        .await
-    {
-        Ok(output) => panic!("subquery read of another table should fail closed: {output:?}"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        error,
-        DbError::Extension(ExtensionError::PolicyDenied(message))
-            if message.contains("multi-resource queries")
-    ));
+    // `orders` is read only in a clause the old AST walk ignored, and the
+    // name still comes back masked.
+    assert_eq!(
+        database
+            .query_as(
+                &reader,
+                "SELECT name FROM users WHERE age = 37 ORDER BY (SELECT count(*) FROM orders)",
+            )
+            .await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["name".to_owned()],
+            rows: vec![vec![Value::Str("***".to_owned())]],
+        })
+    );
     Ok(())
 }
 
@@ -1165,6 +1162,350 @@ async fn sql_read_authz_pre_check_fails_closed_on_unknown_relations()
             .await,
         Err(DbError::Query(QueryError::Unsupported(_)))
     ));
+    Ok(())
+}
+
+/// `people` holds rows of `alice` and `bob`; `alice` may read the table, sees
+/// only her own row and gets `ssn` masked.
+fn people_policy_database() -> Result<(Database, Principal), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let schema = TableSchema::new(
+        vec![
+            ColumnDef::new("id", ColumnType::Int, false),
+            ColumnDef::new("owner", ColumnType::Str, false),
+            ColumnDef::new("ssn", ColumnType::Str, false),
+        ],
+        0,
+    );
+    let people = database.create_table("people", Some(schema), Vec::new())?;
+    for (id, owner, ssn) in [(1, "alice", "111"), (2, "bob", "222")] {
+        people.insert(vec![
+            Value::Int(id),
+            Value::Str(owner.to_owned()),
+            Value::Str(ssn.to_owned()),
+        ])?;
+    }
+    let notes = database.create_table("notes", Some(public_schema()), Vec::new())?;
+    for (id, x) in [(1, "first"), (2, "second")] {
+        notes.insert(vec![Value::Int(id), Value::Str(x.to_owned())])?;
+    }
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader")
+            .grant(Resource::Table("people".to_owned()), Permission::Read)
+            .grant(Resource::Table("notes".to_owned()), Permission::Read),
+        Role::new("writer")
+            .grant(Resource::Table("people".to_owned()), Permission::Read)
+            .grant(Resource::Table("people".to_owned()), Permission::Write),
+    ]));
+    database.set_policy_config(&PolicyConfig {
+        validations: Vec::new(),
+        masking: vec![MaskingPolicy {
+            resource: Resource::Table("people".to_owned()),
+            paths: vec![FieldPath::new(["ssn"])],
+            replacement: Value::Str("***".to_owned()),
+        }],
+        row_policies: vec![RowPolicy {
+            resource: Resource::Table("people".to_owned()),
+            path: FieldPath::new(["owner"]),
+            equals: Value::Str("public".to_owned()),
+        }],
+        limits: LimitPolicy::default(),
+    })?;
+    Ok((
+        database,
+        Principal::new("alice")
+            .with_role("reader")
+            .with_role("writer"),
+    ))
+}
+
+async fn query_rows(
+    database: &Database,
+    principal: &Principal,
+    sql: &str,
+) -> Result<Vec<Row>, Box<dyn std::error::Error>> {
+    match database.query_as(principal, sql).await {
+        Ok(SqlOutput::Rows(rows)) => Ok(rows.rows),
+        Ok(SqlOutput::AffectedRows(rows)) => Err(format!("{sql}: {rows} affected rows").into()),
+        Err(error) => Err(format!("{sql}: {error}").into()),
+    }
+}
+
+#[tokio::test]
+async fn sql_policies_hold_for_every_query_shape() -> Result<(), Box<dyn std::error::Error>> {
+    let (database, alice) = people_policy_database()?;
+    let masked = || Value::Str("***".to_owned());
+    let alice_name = || Value::Str("alice".to_owned());
+    let own_row = vec![vec![Value::Int(1), alice_name(), masked()]];
+
+    for (sql, expected) in [
+        ("SELECT id, owner, ssn FROM people", own_row.clone()),
+        ("SELECT * FROM people", own_row.clone()),
+        // Shapes the simple primary-key path would serve from stored rows.
+        ("SELECT * FROM people WHERE id = 1", own_row.clone()),
+        ("SELECT ssn FROM people WHERE id = 2", Vec::new()),
+        // Renamed, computed and literal columns.
+        (
+            "SELECT ssn AS x, 'alice' AS owner FROM people",
+            vec![vec![masked(), alice_name()]],
+        ),
+        ("SELECT id, owner, upper(ssn) FROM people", own_row.clone()),
+        // Subqueries over the protected table see the same rows.
+        (
+            "SELECT owner, (SELECT max(ssn) FROM people WHERE owner = 'bob') AS x \
+             FROM people WHERE owner = 'alice'",
+            vec![vec![alice_name(), Value::Null]],
+        ),
+        (
+            "WITH c AS (SELECT owner, ssn FROM people) SELECT ssn FROM c WHERE owner = 'bob'",
+            Vec::new(),
+        ),
+        // Predicates and sort keys read masked values and visible rows only.
+        ("SELECT owner FROM people WHERE ssn LIKE '1%'", Vec::new()),
+        (
+            "SELECT id FROM people ORDER BY ssn DESC, id",
+            vec![vec![Value::Int(1)]],
+        ),
+        (
+            "SELECT count(*), count(DISTINCT ssn) FROM people",
+            vec![vec![Value::Int(1), Value::Int(1)]],
+        ),
+        (
+            "SELECT id FROM people ORDER BY id LIMIT 1 OFFSET 1",
+            Vec::new(),
+        ),
+        // Bob's hidden row would divide by zero.
+        (
+            "SELECT id FROM people WHERE 10 / (id - 2) = -10",
+            vec![vec![Value::Int(1)]],
+        ),
+        // Joins, with the table itself and with an unprotected table.
+        (
+            "SELECT p.id, q.ssn FROM people AS p JOIN people AS q ON p.id = q.id",
+            vec![vec![Value::Int(1), masked()]],
+        ),
+        (
+            "SELECT notes.x, people.ssn FROM notes LEFT JOIN people ON people.id = notes.id \
+             ORDER BY notes.id",
+            vec![
+                vec![Value::Str("first".to_owned()), masked()],
+                vec![Value::Str("second".to_owned()), Value::Null],
+            ],
+        ),
+    ] {
+        assert_eq!(query_rows(&database, &alice, sql).await?, expected, "{sql}");
+    }
+
+    let lsn = latest_lsn(&database)?;
+    assert_eq!(
+        database
+            .query_as_of_as(
+                &alice,
+                "SELECT id, owner, ssn FROM people WHERE owner <> 'alice' OR ssn <> '***'",
+                TemporalPoint::Lsn(lsn),
+            )
+            .await?,
+        SqlOutput::Rows(SqlRows {
+            columns: ["id", "owner", "ssn"].map(str::to_owned).to_vec(),
+            rows: Vec::new(),
+        })
+    );
+
+    // Results that would come from stored rows without the policies are refused.
+    for sql in [
+        "EXPLAIN SELECT ssn FROM people WHERE id = 2",
+        "EXPLAIN ANALYZE SELECT ssn FROM people WHERE id = 2",
+        "INSERT INTO people (id, owner, ssn) VALUES (3, 'alice', '333') RETURNING *",
+        "INSERT INTO people (id, owner, ssn) VALUES (2, 'bob', '222') \
+         ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING ssn",
+    ] {
+        assert!(
+            matches!(
+                database.query_as(&alice, sql).await,
+                Err(DbError::Query(QueryError::Unsupported(message)))
+                    if message.contains("row or masking policies")
+            ),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        database.query("SELECT count(*) FROM people").await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["count(*)".to_owned()],
+            rows: vec![vec![Value::Int(2)]],
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_masked_columns_take_the_replacement_type() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_orders(&mut database)?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read)
+    ]));
+    let reader = Principal::new("alice").with_role("reader");
+
+    for (replacement, sql, expected) in [
+        (
+            Value::Str("hidden".to_owned()),
+            "SELECT age, age = 'hidden' FROM users ORDER BY id",
+            [Value::Str("hidden".to_owned()), Value::Bool(true)],
+        ),
+        (
+            Value::Null,
+            "SELECT age, age IS NULL FROM users ORDER BY id",
+            [Value::Null, Value::Bool(true)],
+        ),
+    ] {
+        database.set_policy_config(&PolicyConfig {
+            validations: Vec::new(),
+            masking: vec![MaskingPolicy {
+                resource: Resource::Table("users".to_owned()),
+                paths: vec![FieldPath::new(["age"])],
+                replacement,
+            }],
+            row_policies: Vec::new(),
+            limits: LimitPolicy::default(),
+        })?;
+        assert_eq!(
+            query_rows(&database, &reader, sql).await?,
+            vec![expected.to_vec(), expected.to_vec()],
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_policies_follow_collection_field_paths() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let profiles = database.create_collection(
+        "profiles",
+        CollectionId::new(7),
+        user_doc_fields(),
+        Vec::new(),
+    )?;
+    profiles.insert(&user_document(1, Some(Value::Str("Warsaw".to_owned()))))?;
+    profiles.insert(&user_document(2, Some(Value::Str("Paris".to_owned()))))?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("reader").grant(
+        Resource::Collection("profiles".to_owned()),
+        Permission::Read,
+    )]));
+    let reader = Principal::new("alice").with_role("reader");
+
+    // The SQL column `city` reads the document path `profile.city`; masking
+    // that path or its parent masks the column.
+    for masked_path in [city_path(), FieldPath::new(["profile"])] {
+        database.set_policy_config(&PolicyConfig {
+            validations: Vec::new(),
+            masking: vec![MaskingPolicy {
+                resource: Resource::Collection("profiles".to_owned()),
+                paths: vec![masked_path],
+                replacement: Value::Str("***".to_owned()),
+            }],
+            row_policies: vec![RowPolicy {
+                resource: Resource::Collection("profiles".to_owned()),
+                path: FieldPath::new(["user_id"]),
+                equals: Value::Int(1),
+            }],
+            limits: LimitPolicy::default(),
+        })?;
+        assert_eq!(
+            query_rows(&database, &reader, "SELECT user_id, city FROM profiles").await?,
+            vec![vec![Value::Int(1), Value::Str("***".to_owned())]]
+        );
+        assert_eq!(
+            query_rows(
+                &database,
+                &reader,
+                "SELECT city AS c FROM profiles WHERE user_id = 2 OR city = 'Warsaw'"
+            )
+            .await?,
+            Vec::<Row>::new()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_read_authz_keys_unquoted_names_like_the_planner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, reader) = public_reader_database()?;
+    let hello = vec![vec![Value::Str("hello".to_owned())]];
+
+    for sql in [
+        "SELECT x FROM Public_T",
+        "SELECT x FROM PUBLIC_T WHERE id = 1",
+        "SELECT x FROM \"public_t\"",
+        "WITH c AS (SELECT x FROM PUBLIC_T) SELECT x FROM C",
+    ] {
+        assert_eq!(query_rows(&database, &reader, sql).await?, hello, "{sql}");
+    }
+    // A quoted name keeps its case and names no object the role may read.
+    assert!(matches!(
+        database.query_as(&reader, "SELECT x FROM \"PUBLIC_T\"").await,
+        Err(DbError::AuthzDenied(AuthzError::Denied {
+            resource: Resource::Table(name),
+            permission: Permission::Read,
+            ..
+        })) if name == "PUBLIC_T"
+    ));
+
+    // A grant on a case variant of `secrets` is checked against `secrets`
+    // before planning, so planning errors never describe its columns.
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_sql_authz_tables(&mut database)?;
+    let ledger = database.create_table("LEDGER", Some(public_schema()), Vec::new())?;
+    ledger.insert(vec![Value::Int(1), Value::Str("hello".to_owned())])?;
+    database.set_authz_policy(AuthzPolicy::new([Role::new("spelled")
+        .grant(Resource::Table("SECRETS".to_owned()), Permission::Read)
+        .grant(Resource::Table("LEDGER".to_owned()), Permission::Read)]));
+    let spelled = Principal::new("alice").with_role("spelled");
+    let result = database
+        .query_as(&spelled, "SELECT nofield FROM SECRETS")
+        .await;
+    assert_secrets_read_denied("SELECT nofield FROM SECRETS", result);
+
+    // The engine registers the catalog object `LEDGER` as `ledger`.
+    for sql in [
+        "SELECT x FROM ledger",
+        "SELECT x FROM LEDGER",
+        "SELECT x FROM \"ledger\"",
+    ] {
+        assert_eq!(query_rows(&database, &spelled, sql).await?, hello, "{sql}");
+    }
+    assert!(
+        database
+            .query_as(&spelled, "SELECT x FROM \"LEDGER\"")
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_insert_returning_needs_read() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_sql_authz_tables(&mut database)?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("writer").grant(Resource::Table("secrets".to_owned()), Permission::Write)
+    ]));
+    let writer = Principal::new("bob").with_role("writer");
+
+    // ON CONFLICT DO UPDATE hands back the stored row through RETURNING.
+    let upsert = "INSERT INTO secrets (id, ssn) VALUES (1, 'x') \
+                  ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING *";
+    assert_secrets_read_denied(upsert, database.query_as(&writer, upsert).await);
+    let insert = "INSERT INTO secrets (id, ssn) VALUES (2, 'x') RETURNING id";
+    assert_secrets_read_denied(insert, database.query_as(&writer, insert).await);
+    assert_eq!(
+        database
+            .query_as(&writer, "INSERT INTO secrets (id, ssn) VALUES (2, 'x')")
+            .await?,
+        SqlOutput::AffectedRows(1)
+    );
     Ok(())
 }
 

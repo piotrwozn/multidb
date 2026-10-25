@@ -278,10 +278,12 @@ principals the spec does not name are left alone.
 - **SQL grants.** SQL run as a principal (`query_as`, pgwire with RBAC, the
   Control Plane `/sql`) needs `read` on every object the planned query reads,
   including subqueries, CTE bodies and a table's history object, keyed by the
-  catalog name the query resolves to. A query that reads no object
-  (`SELECT 1`), reads relations outside the catalog (`information_schema`,
-  table functions) or uses a recursive CTE needs `read` on
-  `resource: database`.
+  catalog name the query resolves to: unquoted names are lowercased, so
+  `SELECT ... FROM LEDGER` reads the object `ledger`. A query that reads no
+  object (`SELECT 1`), reads relations outside the catalog
+  (`information_schema`, table functions) or uses a recursive CTE needs `read`
+  on `resource: database`. `INSERT ... RETURNING` needs `read` as well as
+  `write` on its table.
 - Duplicate roles, users, grant targets, permissions and role assignments are
   `SECURITY_DUPLICATE`.
 

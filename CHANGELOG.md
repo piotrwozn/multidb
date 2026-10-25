@@ -278,22 +278,43 @@ All notable public changes will be recorded here.
   name as spelled, so a grant on `ORDERS` authorized reads of `orders`. A
   principal with `Read` on any one table could therefore read every other
   table, collection, foreign table, materialized view and `*_history` table.
-  Row and masking policies were not applied to tables read this way either,
-  so a principal with `Read` on a policy-protected table could also see the
-  rows its row policies hide and the values its masking policies mask. Reads
-  are now authorized against every table the planned DataFusion query reads,
-  including subqueries in any position, before anything runs, and the plan
-  that was authorized is the plan that runs. A multi-statement batch runs
-  nothing until all of its reads are authorized. Row and masking policies
-  cover every table the plan reads, so a query that reads a policy-protected
-  table and any other table is rejected. Table reads are matched to the
-  catalog name the planner resolves (unquoted identifiers are lowercased). SQL
-  shapes the check cannot analyse fail closed with `Unsupported`,
-  `SELECT ... INTO` returns `Unsupported`, and recursive CTEs need Database
-  read. Not covered by this fix: extended-protocol Describe over PostgreSQL
-  wire still returns the column names and types of catalog tables (no rows)
+  Reads are now authorized against every table the planned DataFusion query
+  reads, including subqueries in any position, before anything runs, and the
+  plan that was authorized is the plan that runs. A multi-statement batch runs
+  nothing until all of its reads are authorized. Table reads are matched to
+  the catalog object the planner resolves: unquoted names are lowercased, so
+  `ORDERS` and `Orders` read `orders` and need `Read` on it, and a quoted
+  `"ORDERS"` names no table. SQL shapes the check cannot analyse fail closed
+  with `Unsupported`, `SELECT ... INTO` returns `Unsupported`, and recursive
+  CTEs need Database read. `INSERT ... RETURNING` returns stored rows (for
+  `ON CONFLICT DO UPDATE`, the existing row), so it now needs `Read` on the
+  table as well as `Write`; before, `Write` alone could read any row by key.
+  Not covered by this fix: extended-protocol Describe over PostgreSQL wire
+  still returns the column names and types of catalog tables (no rows)
   without an RBAC check; the separate PostgreSQL wire extended-protocol fix
   closes it.
+- Fixed SQL bypasses of row and masking policies. SQL run as a principal applied
+  them to the query result, matched to its columns by name, so a principal with
+  `Read` on a policy-protected table could see the rows its row policies hide
+  and the values its masking policies mask: through an alias
+  (`SELECT ssn AS x`), an expression (`upper(ssn)`), a literal column named like
+  the row policy's column, an aggregate, a subquery over the same table, or a
+  filter or sort key on a masked column. Collection policies were matched to SQL
+  column names, so a policy on the document path `profile.city` did not mask the
+  SQL column `city` that reads it. Row and masking policies are now applied
+  where SQL scans the table: the scan returns only the rows the row policies let
+  through, with masked values replaced, before any filter, sort, join, aggregate
+  or subquery of the query reads them, so a predicate that fails on some value
+  (such as a division by zero) cannot reveal a hidden row either. Collection
+  policies match the document path each SQL column reads: a mask covers the
+  columns that read its path or a path below it, and a row policy whose path no
+  column reads hides every row. A query that joins a policy-protected table with
+  other tables now runs with the policies applied instead of being rejected. A
+  masked column takes the type of its replacement (a `'***'` mask makes an
+  integer column a string column). `EXPLAIN` of a table with row or masking
+  policies and `INSERT ... RETURNING` into one return `Unsupported`, since both
+  report stored rows. These policies apply to SQL run as a principal, not to
+  `Database::query`.
 
 ### Added
 
