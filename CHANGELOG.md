@@ -312,8 +312,10 @@ All notable public changes will be recorded here.
   the catalog object the planner resolves: unquoted names are lowercased, so
   `ORDERS` and `Orders` read `orders` and need `Read` on it, and a quoted
   `"ORDERS"` names no table. SQL shapes the check cannot analyse fail closed
-  with `Unsupported`, `SELECT ... INTO` returns `Unsupported`, and recursive
-  CTEs need Database read. `INSERT ... RETURNING` returns stored rows (for
+  with `Unsupported` and `SELECT ... INTO` returns `Unsupported`. The check
+  counts a recursive CTE's reference to itself as a read of a table named
+  like the CTE, so recursive CTEs need Database read (or `Read` on that name),
+  and a denial names the CTE. `INSERT ... RETURNING` returns stored rows (for
   `ON CONFLICT DO UPDATE`, the existing row), so it now needs `Read` on the
   table as well as `Write`; before, `Write` alone could read any row by key.
   Not covered by this fix: extended-protocol Describe over PostgreSQL wire
@@ -357,6 +359,10 @@ All notable public changes will be recorded here.
   both, and the history table's own masks win. A materialized view over a
   protected table needs policies of its own.
   These policies apply to SQL run as a principal, not to `Database::query`.
+  This fix does not cover the Control Plane data routes
+  `GET /data/tables/{name}/rows` and `GET /data/collections/{name}/documents`,
+  or the SDK and Studio calls that use them: they still return stored rows
+  and documents, unfiltered and unmasked, to any principal with `Read`.
 
 ### Added
 

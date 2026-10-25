@@ -280,10 +280,15 @@ principals the spec does not name are left alone.
   including subqueries, CTE bodies and a table's history object, keyed by the
   catalog name the query resolves to: unquoted names are lowercased, so
   `SELECT ... FROM LEDGER` reads the object `ledger`. A query that reads no
-  object (`SELECT 1`), reads relations outside the catalog
-  (`information_schema`, table functions) or uses a recursive CTE needs `read`
-  on `resource: database`. `INSERT ... RETURNING` needs `read` as well as
-  `write` on its table.
+  object (`SELECT 1`), calls a table function or uses a recursive CTE needs
+  `read` on `resource: database`; the RBAC pre-check counts a recursive CTE's
+  reference to itself as a read of a table named like the CTE, and a denial
+  names it. Of `information_schema`, only
+  `SELECT * FROM information_schema.tables` and
+  `SELECT * FROM information_schema.columns` run under RBAC, with the same
+  `read` on `resource: database`; other queries of it are refused as
+  unsupported. `INSERT ... RETURNING` needs `read` as well as `write` on its
+  table.
 - Duplicate roles, users, grant targets, permissions and role assignments are
   `SECURITY_DUPLICATE`.
 

@@ -287,11 +287,16 @@ Consistency status:
   read; tables, foreign tables, materialized views and `*_history` tables need
   Table read, keyed by the catalog name the query resolves to (unquoted names
   are lowercased, so `ORDERS` reads `orders`). Queries that scan no catalog
-  object (`SELECT 1`, `VALUES`), relations outside the catalog
-  (`information_schema`, table functions such as `generate_series`) and
-  recursive CTEs need Database read; `INSERT ... RETURNING` needs Read as well
-  as Write on its table. SQL shapes the RBAC pre-check cannot analyse fail
-  closed as unsupported SQL.
+  object (`SELECT 1`, `VALUES`) or call table functions such as
+  `generate_series` need Database read. The RBAC pre-check counts a recursive
+  CTE's reference to itself as a read of a table named like the CTE, so
+  recursive CTEs need Database read too (a denial names the CTE).
+  `information_schema` is readable under RBAC only as
+  `SELECT * FROM information_schema.tables` or
+  `SELECT * FROM information_schema.columns`, with Database read; other
+  queries of it are refused as unsupported. `INSERT ... RETURNING` needs Read
+  as well as Write on its table. SQL shapes the RBAC pre-check cannot analyse
+  fail closed as unsupported SQL.
 - Row and masking policies apply to SQL run as a principal where the query scans
   each table, before any filter, join, aggregate or subquery reads it, so they
   hold whatever the query computes from the table. Collection row policies
@@ -307,7 +312,10 @@ Consistency status:
   the query filters them, primary-key lookups included. A table's policies
   also apply to its `*_history` table, by column name, on top of the history
   table's own; a materialized view over a protected table needs policies of
-  its own.
+  its own. The Control Plane data routes `GET /data/tables/{name}/rows` and
+  `GET /data/collections/{name}/documents`, and the SDK and Studio calls that
+  use them, do not apply row or masking policies: they return stored rows and
+  documents to any principal with Read.
 
 ## Migration Guide
 
