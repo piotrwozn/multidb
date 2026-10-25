@@ -1379,6 +1379,57 @@ async fn sql_masked_columns_take_the_replacement_type() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn sql_policies_with_non_scalar_values_refuse_only_their_table()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, alice) = people_policy_database()?;
+    database.set_policy_config(&PolicyConfig {
+        validations: Vec::new(),
+        masking: vec![MaskingPolicy {
+            resource: Resource::Table("people".to_owned()),
+            paths: vec![FieldPath::new(["ssn"])],
+            replacement: Value::Array(vec![Value::Str("***".to_owned())]),
+        }],
+        row_policies: Vec::new(),
+        limits: LimitPolicy::default(),
+    })?;
+    // SQL cannot return the replacement, so reads of `people` are refused and
+    // other tables stay readable.
+    assert_eq!(
+        query_rows(&database, &alice, "SELECT x FROM notes ORDER BY id").await?,
+        vec![
+            vec![Value::Str("first".to_owned())],
+            vec![Value::Str("second".to_owned())],
+        ]
+    );
+    let result = database.query_as(&alice, "SELECT id FROM people").await;
+    assert!(
+        matches!(
+            &result,
+            Err(DbError::Query(QueryError::DataFusion(message))) if message.contains("not a scalar")
+        ),
+        "{result:?}"
+    );
+
+    // No SQL column holds an array, so this row policy value matches no row
+    // and only the principal's own row stays visible.
+    database.set_policy_config(&PolicyConfig {
+        validations: Vec::new(),
+        masking: Vec::new(),
+        row_policies: vec![RowPolicy {
+            resource: Resource::Table("people".to_owned()),
+            path: FieldPath::new(["owner"]),
+            equals: Value::Array(vec![Value::Str("bob".to_owned())]),
+        }],
+        limits: LimitPolicy::default(),
+    })?;
+    assert_eq!(
+        query_rows(&database, &alice, "SELECT id, ssn FROM people").await?,
+        vec![vec![Value::Int(1), Value::Str("111".to_owned())]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn sql_policies_follow_collection_field_paths() -> Result<(), Box<dyn std::error::Error>> {
     let mut database = create_database(DbConfig::new(Profile::InMemory))?;
     let profiles = database.create_collection(

@@ -297,11 +297,14 @@ Consistency status:
   hold whatever the query computes from the table. Collection policies match the
   document path each SQL column reads: a mask covers the columns that read its
   path or a path below it, and a row policy whose path no column reads hides
-  every row. A masked column takes the type of its replacement. `EXPLAIN` of a
+  every row. A masked column takes the type of its replacement; a replacement
+  that is not a scalar makes SQL reads of the table fail. `EXPLAIN` of a
   table with such policies, `INSERT ... RETURNING` into one, and `match()` /
-  `within_radius()` searches over a collection with them are refused. A policy
-  covers only the resource it names: a table's `*_history` table or a
-  materialized view over it needs policies of its own.
+  `within_radius()` searches over a collection with them are refused. Each scan
+  of such a table reads all of the rows its row policies let through before
+  the query filters them, primary-key lookups included. A policy covers only
+  the resource it names: a table's `*_history` table or a materialized view
+  over it needs policies of its own.
 
 ## Migration Guide
 

@@ -4826,7 +4826,8 @@ fn planned_read_targets(
 /// a predicate that fails on some value cannot reveal that a hidden row holds it.
 #[derive(Debug)]
 struct PolicyTableProvider {
-    plan: LogicalPlan,
+    /// The policies over the stored relation, or why SQL cannot apply them.
+    plan: Result<LogicalPlan, String>,
     schema: SchemaRef,
     table_type: TableType,
 }
@@ -4848,7 +4849,12 @@ impl TableProvider for PolicyTableProvider {
         _filters: &[DfExpr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let plan = state.create_physical_plan(&self.plan).await?;
+        let plan = match &self.plan {
+            Ok(plan) => state.create_physical_plan(plan).await?,
+            Err(reason) => {
+                return Err(query_to_datafusion(QueryError::Unsupported(reason.clone())));
+            }
+        };
         let batches = collect(plan, state.task_ctx()).await?;
         let mem = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         mem.scan(state, projection, &[], limit).await
@@ -4857,7 +4863,8 @@ impl TableProvider for PolicyTableProvider {
 
 /// Puts `provider` behind `policy`. `fields` are the SQL fields of a document
 /// collection, whose columns read the paths the fields name; every other
-/// relation's column `c` reads the path `c`.
+/// relation's column `c` reads the path `c`. A mask SQL cannot represent
+/// refuses the queries that read the relation, not every query.
 fn policy_table_provider(
     name: &str,
     provider: Arc<dyn TableProvider>,
@@ -4887,15 +4894,19 @@ fn policy_table_provider(
     if let Some(visible_when) = &policy.visible_when {
         let mut predicate = None::<DfExpr>;
         for (path, value) in visible_when {
+            // Columns hold scalars, so no row equals any other value.
+            let Some(scalar) = policy_scalar(value) else {
+                continue;
+            };
             for (field, column_path) in schema.fields().iter().zip(&column_paths) {
                 if column_path.as_deref() != Some(path.segments()) {
                     continue;
                 }
                 // A value of another type never equals what the column holds.
-                let condition = match policy_scalar(value)? {
+                let condition = match &scalar {
                     ScalarValue::Null => column(field).is_null(),
                     scalar if &scalar.data_type() == field.data_type() => {
-                        column(field).eq(lit(scalar))
+                        column(field).eq(lit(scalar.clone()))
                     }
                     _ => continue,
                 };
@@ -4919,10 +4930,19 @@ fn policy_table_provider(
             });
             columns.push(match mask {
                 Some((_, replacement)) => {
-                    let scalar = match policy_scalar(replacement)? {
-                        ScalarValue::Null => ScalarValue::try_from(field.data_type())
+                    let scalar = match policy_scalar(replacement) {
+                        Some(ScalarValue::Null) => ScalarValue::try_from(field.data_type())
                             .map_err(|error| datafusion_to_query_error(&error))?,
-                        scalar => scalar,
+                        Some(scalar) => scalar,
+                        None => {
+                            return Ok(Arc::new(PolicyTableProvider {
+                                plan: Err(format!(
+                                    "{name} has a masking policy whose replacement is not a scalar, which SQL cannot return"
+                                )),
+                                schema: Arc::clone(&schema),
+                                table_type,
+                            }));
+                        }
                     };
                     lit(scalar).alias(field.name())
                 }
@@ -4938,15 +4958,16 @@ fn policy_table_provider(
         .map_err(|error| datafusion_to_query_error(&error))?;
     let schema = Arc::clone(plan.schema().inner());
     Ok(Arc::new(PolicyTableProvider {
-        plan,
+        plan: Ok(plan),
         schema,
         table_type,
     }))
 }
 
-/// The SQL literal of a policy value, typed the way a column holding it is.
-fn policy_scalar(value: &Value) -> Result<ScalarValue, QueryError> {
-    Ok(match value {
+/// The SQL literal of a policy value, typed the way a column holding it is, or
+/// `None` for a value no SQL column holds.
+fn policy_scalar(value: &Value) -> Option<ScalarValue> {
+    Some(match value {
         Value::Null => ScalarValue::Null,
         Value::Bool(value) => ScalarValue::Boolean(Some(*value)),
         Value::Int(value) => ScalarValue::Int64(Some(*value)),
@@ -4954,9 +4975,7 @@ fn policy_scalar(value: &Value) -> Result<ScalarValue, QueryError> {
         Value::Str(value) => ScalarValue::Utf8(Some(value.clone())),
         Value::Bytes(value) => ScalarValue::Binary(Some(value.clone())),
         Value::Array(_) | Value::Object(_) | Value::Vector(_) | Value::GeoPoint { .. } => {
-            return Err(QueryError::Unsupported(
-                "row and masking policy values over SQL must be scalars".to_owned(),
-            ));
+            return None;
         }
     })
 }

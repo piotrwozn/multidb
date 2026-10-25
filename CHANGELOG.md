@@ -311,13 +311,17 @@ All notable public changes will be recorded here.
   column reads hides every row. A query that joins a policy-protected table with
   other tables now runs with the policies applied instead of being rejected. A
   masked column takes the type of its replacement (a `'***'` mask makes an
-  integer column a string column). `EXPLAIN` of a table with row or masking
-  policies and `INSERT ... RETURNING` into one return `Unsupported`, since both
-  report stored rows, and single-table equality `SELECT`s on such a table run
-  through DataFusion instead of the direct lookup path. A policy covers only
-  the resource it names, so a table's `*_history` table or a materialized view
-  over it needs policies of its own. These policies apply to SQL run as a
-  principal, not to `Database::query`.
+  integer column a string column), and SQL reads of a table whose mask
+  replacement is not a scalar (an array, object, vector or point) fail. A row
+  policy value that is not a scalar matches no SQL row. `EXPLAIN` of a table
+  with row or masking policies and `INSERT ... RETURNING` into one return
+  `Unsupported`, since both report stored rows. Each SQL scan of such a table
+  reads all of the rows its row policies let through before the query filters
+  them, so single-table equality `SELECT`s on it run through DataFusion
+  instead of the direct lookup path. A policy covers only the resource it
+  names, so a table's `*_history` table or a materialized view over it needs
+  policies of its own. These policies apply to SQL run as a principal, not to
+  `Database::query`.
 
 ### Added
 
