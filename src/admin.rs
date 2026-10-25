@@ -8448,6 +8448,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_plane_serves_system_rows_only_to_system_admins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$marker-salt$marker-hash";
+        let mut database = admin_database()?;
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("admin")
+                .grant(Resource::System, Permission::Admin)
+                .grant(Resource::Database, Permission::Read)
+                .grant(Resource::Database, Permission::Admin),
+            Role::new("reader").grant(Resource::Database, Permission::Read),
+        ]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("admin"))
+                .with_principal("ada", Principal::new("ada").with_role("reader")),
+        );
+        database.set_audit_enabled_as(&Principal::new("root").with_role("admin"), true)?;
+        database.set_admin_credential(&crate::db::AdminCredentialRecord {
+            username: super::ADMIN_USERNAME.to_owned(),
+            password_hash: PASSWORD_HASH.to_owned(),
+            updated_at_millis: 1,
+        })?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+
+        // The security state and the audit log are System:Admin endpoints.
+        for path in ["/security", "/audit"] {
+            let (status, body) = get_as(&app, path, "ada").await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+            assert_eq!(body["error"]["code"], "forbidden", "{path}");
+            let (status, body) = get_as(&app, path, "root").await?;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        }
+        // System keyspaces are not catalog objects, so the data and SQL routes cannot name them.
+        for table in [
+            "__admin_auth",
+            "__authz_policy",
+            "__audit_log",
+            "rel_indexes",
+        ] {
+            for principal in ["ada", "root"] {
+                let (status, body) =
+                    get_as(&app, &format!("/data/tables/{table}/rows"), principal).await?;
+                assert_ne!(
+                    status,
+                    StatusCode::OK,
+                    "{table} rows as {principal}: {body}"
+                );
+                assert!(!body.to_string().contains(PASSWORD_HASH), "{body}");
+                let (status, body) = post_as(
+                    &app,
+                    "/sql",
+                    &serde_json::json!({ "sql": format!("SELECT * FROM {table}") }),
+                    principal,
+                )
+                .await?;
+                assert_ne!(status, StatusCode::OK, "{table} SQL as {principal}: {body}");
+                assert!(!body.to_string().contains(PASSWORD_HASH), "{body}");
+            }
+        }
+        for path in ["/status", "/catalog"] {
+            let (status, body) = get_as(&app, path, "ada").await?;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert!(!body.to_string().contains(PASSWORD_HASH), "{path}: {body}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ddl_is_serialized_against_readers_without_deadlock()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = Arc::new(RwLock::new(admin_database()?));

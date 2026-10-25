@@ -94,6 +94,10 @@ pub struct ChangeEvent {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ChangefeedOptions {
+    /// Also returns writes to system keyspaces (`LogicalTarget::System`): admin password hashes
+    /// (`__admin_auth`), the RBAC policy and principal registry, the audit log, policy
+    /// definitions and raw index keys, which carry values that masking and row policies hide.
+    /// [`crate::db::Database::poll_changefeed_as`] requires `System:Admin` for it.
     pub include_system: bool,
 }
 
@@ -962,6 +966,29 @@ pub(crate) fn authorize_filter_access(
     authorize_filter(authz, principal, filter)
 }
 
+/// Reports whether a changefeed read can return system rows, which need `System:Admin` on top
+/// of the filter's own permission.
+pub(crate) fn reads_system_rows(filter: &ChangefeedFilter, options: &ChangefeedOptions) -> bool {
+    options.include_system || matches!(filter.target, ChangefeedTarget::System(_))
+}
+
+/// Drops the system rows from `events` unless `principal` holds `System:Admin`, so that a read
+/// whose options went unchecked still cannot return them.
+pub(crate) fn retain_events_visible_to(
+    authz: &AuthzPolicy,
+    principal: &Principal,
+    mut events: Vec<ChangeEvent>,
+) -> Vec<ChangeEvent> {
+    if authorize_system_rows(authz, principal).is_err() {
+        events.retain(|event| !matches!(event.target, LogicalTarget::System(_)));
+    }
+    events
+}
+
+fn authorize_system_rows(authz: &AuthzPolicy, principal: &Principal) -> Result<(), AuthzError> {
+    authz.authorize(principal, &Resource::System, Permission::Admin)
+}
+
 pub(crate) fn validate_before_hooks(repl: &dyn Replication, ops: &[Op]) -> Result<(), HookError> {
     let hooks = read_hooks(repl)?;
     for hook in hooks
@@ -1406,9 +1433,7 @@ fn authorize_filter(
             &Resource::GeoIndex(name.clone()),
             Permission::Read,
         ),
-        ChangefeedTarget::System(_) => {
-            authz.authorize(principal, &Resource::System, Permission::Admin)
-        }
+        ChangefeedTarget::System(_) => authorize_system_rows(authz, principal),
     }
 }
 
@@ -2624,6 +2649,445 @@ mod tests {
             assert_eq!(again, first);
             assert_eq!(current_resume_token(&database)?.lsn, lsn);
             assert_eq!(database.subscription_state("sub")?, first);
+            Ok(())
+        }
+    }
+
+    /// System rows (`LogicalTarget::System`) need `System:Admin` on every principal surface:
+    /// changefeed polls, subscriptions and SQL.
+    mod system_rows {
+        use tokio::sync::mpsc;
+
+        use crate::{
+            cdc::{
+                ChangeEvent, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
+                LogicalTarget, ResumeToken, SubscriptionConfig, TransactionBoundary,
+                push_subscription_once, retain_events_visible_to,
+            },
+            db::{AdminCredentialRecord, Database, DbConfig, DbError, Profile, create_database},
+            extension::{LimitPolicy, MaskingPolicy, POLICIES_TABLE, PolicyConfig},
+            model::{FieldPath, Value, decode_value},
+            query::{ColumnDef, ColumnType, REL_INDEX_TABLE, RelIndexSpec, TableSchema},
+            security::{
+                AUDIT_TABLE, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry,
+                Resource, Role,
+            },
+        };
+
+        const ADMIN_AUTH: &str = "__admin_auth";
+        const AUTHZ_POLICY: &str = "__authz_policy";
+        const PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$marker-salt$marker-hash";
+        const SECRET_NAME: &str = "Ada-Secret-Name";
+
+        fn policy() -> AuthzPolicy {
+            AuthzPolicy::new([
+                Role::new("sysadmin")
+                    .grant(Resource::System, Permission::Admin)
+                    .grant(Resource::Database, Permission::Read)
+                    .grant(Resource::Database, Permission::Admin),
+                Role::new("system_admin").grant(Resource::System, Permission::Admin),
+                Role::new("db_admin").grant(Resource::Database, Permission::Admin),
+                Role::new("reader").grant(Resource::Database, Permission::Read),
+                Role::new("users_reader")
+                    .grant(Resource::Table("users".to_owned()), Permission::Read),
+            ])
+        }
+
+        fn root() -> Principal {
+            Principal::new("root").with_role("sysadmin")
+        }
+
+        fn alice() -> Principal {
+            Principal::new("alice").with_role("reader")
+        }
+
+        /// A database whose commit log holds an admin credential, the persisted RBAC state,
+        /// audit events, a masking policy and a `users` row whose masked `name` is indexed.
+        fn seeded_database() -> Result<Database, Box<dyn std::error::Error>> {
+            let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+            database.create_table(
+                "users",
+                Some(TableSchema::new(
+                    vec![
+                        ColumnDef::new("id", ColumnType::Int, false),
+                        ColumnDef::new("name", ColumnType::Str, false),
+                        ColumnDef::new("age", ColumnType::Int, false),
+                    ],
+                    0,
+                )),
+                vec![RelIndexSpec::new(1, 1)],
+            )?;
+            database.set_authz_policy(policy());
+            database.set_audit_enabled_as(&root(), true)?;
+            database.set_security_state_as(&root(), policy(), PrincipalRegistry::new())?;
+            database.set_admin_credential(&AdminCredentialRecord {
+                username: "admin".to_owned(),
+                password_hash: PASSWORD_HASH.to_owned(),
+                updated_at_millis: 1,
+            })?;
+            database.set_policy_config(&PolicyConfig {
+                validations: Vec::new(),
+                masking: vec![MaskingPolicy {
+                    resource: Resource::Table("users".to_owned()),
+                    paths: vec![FieldPath::new(["name"])],
+                    replacement: Value::Str("***".to_owned()),
+                }],
+                row_policies: Vec::new(),
+                limits: LimitPolicy::default(),
+            })?;
+            database.table("users")?.insert(vec![
+                Value::Int(1),
+                Value::Str(SECRET_NAME.to_owned()),
+                Value::Int(37),
+            ])?;
+            Ok(database)
+        }
+
+        fn all() -> ChangefeedFilter {
+            ChangefeedFilter::default()
+        }
+
+        fn system(table: &str) -> ChangefeedFilter {
+            ChangefeedFilter {
+                target: ChangefeedTarget::System(table.to_owned()),
+            }
+        }
+
+        fn include_system() -> ChangefeedOptions {
+            ChangefeedOptions {
+                include_system: true,
+            }
+        }
+
+        /// Polls with both `poll_changefeed_as` and `poll_changefeed_page_as`, checks that they
+        /// agree, and returns the events.
+        fn poll_as(
+            database: &Database,
+            principal: &Principal,
+            filter: &ChangefeedFilter,
+            options: &ChangefeedOptions,
+        ) -> Result<Vec<ChangeEvent>, DbError> {
+            let (events, _) = database.poll_changefeed_as(
+                principal,
+                &ResumeToken::default(),
+                filter,
+                options,
+                1_000,
+            )?;
+            let page = database.poll_changefeed_page_as(
+                principal,
+                &ResumeToken::default(),
+                filter,
+                options,
+                1_000,
+            )?;
+            assert_eq!(page.events, events);
+            Ok(events)
+        }
+
+        fn assert_denied_both_ways(
+            database: &Database,
+            principal: &Principal,
+            filter: &ChangefeedFilter,
+            options: &ChangefeedOptions,
+        ) {
+            let polled = database.poll_changefeed_as(
+                principal,
+                &ResumeToken::default(),
+                filter,
+                options,
+                1_000,
+            );
+            assert!(matches!(polled, Err(DbError::AuthzDenied(_))), "{polled:?}");
+            let paged = database.poll_changefeed_page_as(
+                principal,
+                &ResumeToken::default(),
+                filter,
+                options,
+                1_000,
+            );
+            assert!(matches!(paged, Err(DbError::AuthzDenied(_))), "{paged:?}");
+        }
+
+        fn system_tables(events: &[ChangeEvent]) -> Vec<&str> {
+            events
+                .iter()
+                .filter_map(|event| match &event.target {
+                    LogicalTarget::System(table) => Some(table.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Whether any event key or value contains `needle`.
+        fn carries(events: &[ChangeEvent], needle: &str) -> bool {
+            let needle = needle.as_bytes();
+            events.iter().any(|event| match &event.op {
+                ChangeOp::Upsert { key, value_after } => [key, value_after]
+                    .iter()
+                    .any(|bytes| bytes.windows(needle.len()).any(|window| window == needle)),
+                ChangeOp::Delete { key } => {
+                    key.windows(needle.len()).any(|window| window == needle)
+                }
+                ChangeOp::TxBegin | ChangeOp::TxCommit | ChangeOp::Ddl { .. } => false,
+            })
+        }
+
+        fn denied_poll_events(database: &Database, principal: &str) -> Result<usize, DbError> {
+            Ok(database
+                .audit_events()?
+                .iter()
+                .filter(|event| {
+                    event.action == "poll_changefeed"
+                        && event.outcome == AuditOutcome::Denied
+                        && event.resource == Resource::System
+                        && event.principal.as_deref() == Some(principal)
+                })
+                .count())
+        }
+
+        #[test]
+        fn include_system_requires_system_admin_and_denials_are_audited()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+
+            assert_denied_both_ways(&database, &alice(), &all(), &include_system());
+            assert_eq!(denied_poll_events(&database, "alice")?, 2);
+
+            // A table filter never matched system rows, but `include_system` is now refused with
+            // it too: the options are checked before the filter target is looked at.
+            let users_reader = Principal::new("bob").with_role("users_reader");
+            let users = ChangefeedFilter {
+                target: ChangefeedTarget::Table("users".to_owned()),
+            };
+            assert!(
+                poll_as(
+                    &database,
+                    &users_reader,
+                    &users,
+                    &ChangefeedOptions::default()
+                )
+                .is_ok()
+            );
+            assert_denied_both_ways(&database, &users_reader, &users, &include_system());
+            assert_eq!(denied_poll_events(&database, "bob")?, 2);
+            Ok(())
+        }
+
+        #[test]
+        fn system_admin_reads_credentials_rbac_and_audit_rows()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+
+            let events = poll_as(&database, &root(), &all(), &include_system())?;
+            let tables = system_tables(&events);
+            for table in [
+                ADMIN_AUTH,
+                AUTHZ_POLICY,
+                AUDIT_TABLE,
+                POLICIES_TABLE,
+                REL_INDEX_TABLE,
+            ] {
+                assert!(tables.contains(&table), "missing {table} in {tables:?}");
+            }
+            assert!(carries(&events, PASSWORD_HASH));
+            assert!(carries(&events, SECRET_NAME));
+
+            // `System:Admin` alone reads one system keyspace by name.
+            let system_admin = Principal::new("ops").with_role("system_admin");
+            let credentials = poll_as(
+                &database,
+                &system_admin,
+                &system(ADMIN_AUTH),
+                &include_system(),
+            )?;
+            assert!(carries(&credentials, PASSWORD_HASH));
+            assert!(
+                system_tables(&credentials)
+                    .iter()
+                    .all(|table| *table == ADMIN_AUTH)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn database_admin_grant_covers_system_rows() -> Result<(), Box<dyn std::error::Error>> {
+            // `Role::allows` lets a grant on `Resource::Database` satisfy the same permission
+            // on every resource, `Resource::System` included.
+            let database = seeded_database()?;
+            let db_admin = Principal::new("dba").with_role("db_admin");
+
+            let events = poll_as(&database, &db_admin, &system(ADMIN_AUTH), &include_system())?;
+
+            assert!(system_tables(&events).contains(&ADMIN_AUTH));
+            assert!(carries(&events, PASSWORD_HASH));
+            Ok(())
+        }
+
+        #[test]
+        fn polls_without_system_rows_are_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+
+            let events = poll_as(&database, &alice(), &all(), &ChangefeedOptions::default())?;
+            assert!(system_tables(&events).is_empty(), "{events:?}");
+            let masked = events
+                .iter()
+                .find_map(|event| match (&event.target, &event.op) {
+                    (LogicalTarget::Table(table), ChangeOp::Upsert { value_after, .. })
+                        if table == "users" =>
+                    {
+                        Some(value_after)
+                    }
+                    _ => None,
+                })
+                .ok_or("missing users upsert")?;
+            assert_eq!(
+                decode_value(masked)?,
+                Value::Array(vec![
+                    Value::Int(1),
+                    Value::Str("***".to_owned()),
+                    Value::Int(37)
+                ])
+            );
+            // Neither the credential nor the masked value reaches the reader, not even through
+            // the `rel_indexes` key that indexes the masked column.
+            assert!(!carries(&events, PASSWORD_HASH));
+            assert!(!carries(&events, SECRET_NAME));
+            assert_eq!(denied_poll_events(&database, "alice")?, 0);
+
+            // A table-only reader keeps its table feed and still cannot use the `All` filter.
+            let users_reader = Principal::new("bob").with_role("users_reader");
+            let users = ChangefeedFilter {
+                target: ChangefeedTarget::Table("users".to_owned()),
+            };
+            let table_events = poll_as(
+                &database,
+                &users_reader,
+                &users,
+                &ChangefeedOptions::default(),
+            )?;
+            assert!(!table_events.is_empty(), "expected a non-empty value");
+            assert!(!carries(&table_events, SECRET_NAME));
+            assert_denied_both_ways(
+                &database,
+                &users_reader,
+                &all(),
+                &ChangefeedOptions::default(),
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn system_targets_still_require_system_admin() -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+
+            for table in [ADMIN_AUTH, AUTHZ_POLICY, AUDIT_TABLE, REL_INDEX_TABLE] {
+                assert_denied_both_ways(&database, &alice(), &system(table), &include_system());
+                assert_denied_both_ways(
+                    &database,
+                    &alice(),
+                    &system(table),
+                    &ChangefeedOptions::default(),
+                );
+            }
+            assert_eq!(denied_poll_events(&database, "alice")?, 16);
+            Ok(())
+        }
+
+        #[test]
+        fn system_rows_are_dropped_for_principals_without_system_admin() {
+            let event = |target: LogicalTarget| ChangeEvent {
+                lsn: 1,
+                tx_id: 1,
+                at: std::time::SystemTime::UNIX_EPOCH,
+                hlc: None,
+                target,
+                op: ChangeOp::Upsert {
+                    key: b"admin".to_vec(),
+                    value_after: PASSWORD_HASH.as_bytes().to_vec(),
+                },
+                transaction_boundary: TransactionBoundary::Data,
+            };
+            let events = vec![
+                event(LogicalTarget::Table("users".to_owned())),
+                event(LogicalTarget::System(ADMIN_AUTH.to_owned())),
+                event(LogicalTarget::System(REL_INDEX_TABLE.to_owned())),
+            ];
+            let authz = policy();
+
+            for principal in [
+                alice(),
+                Principal::new("bob").with_role("users_reader"),
+                Principal::new("nobody"),
+            ] {
+                let visible = retain_events_visible_to(&authz, &principal, events.clone());
+                assert_eq!(visible, events[..1], "{principal:?}");
+            }
+            for principal in [
+                root(),
+                Principal::new("ops").with_role("system_admin"),
+                Principal::new("dba").with_role("db_admin"),
+            ] {
+                let visible = retain_events_visible_to(&authz, &principal, events.clone());
+                assert_eq!(visible, events, "{principal:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn subscriptions_never_deliver_system_rows() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let database = seeded_database()?;
+            let config = SubscriptionConfig::new("feed", ResumeToken::default());
+            database.create_subscription_as(&alice(), config)?;
+            let mut system_feed = SubscriptionConfig::new("system-feed", ResumeToken::default());
+            system_feed.filter = system(ADMIN_AUTH);
+            assert!(
+                database
+                    .create_subscription_as(&alice(), system_feed)
+                    .is_err()
+            );
+
+            let (sender, mut receiver) = mpsc::channel(4_096);
+            push_subscription_once(&database, database.catalog(), "feed", &sender).await?;
+            drop(sender);
+            let mut delivered = Vec::new();
+            while let Some(event) = receiver.recv().await {
+                delivered.push(event);
+            }
+
+            assert!(
+                delivered
+                    .iter()
+                    .any(|event| matches!(event.target, LogicalTarget::Table(_)))
+            );
+            assert!(system_tables(&delivered).is_empty(), "{delivered:?}");
+            assert!(!carries(&delivered, PASSWORD_HASH));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn sql_cannot_read_system_keyspaces() -> Result<(), Box<dyn std::error::Error>> {
+            // `query_as` serves PostgreSQL wire, the Control Plane `/sql` and the SDKs. Only
+            // catalog objects are SQL tables, so a system keyspace name is not one.
+            let database = seeded_database()?;
+
+            for table in [
+                ADMIN_AUTH,
+                AUTHZ_POLICY,
+                AUDIT_TABLE,
+                POLICIES_TABLE,
+                REL_INDEX_TABLE,
+            ] {
+                for principal in [alice(), root()] {
+                    let result = database
+                        .query_as(&principal, &format!("SELECT * FROM {table}"))
+                        .await;
+                    let Err(error) = result else {
+                        panic!("{table} answered SQL for {principal:?}: {result:?}");
+                    };
+                    assert!(!error.to_string().contains(PASSWORD_HASH), "{error}");
+                }
+            }
             Ok(())
         }
     }
