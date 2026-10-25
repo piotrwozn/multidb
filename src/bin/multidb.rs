@@ -5247,6 +5247,7 @@ fn usage() -> CliError {
          multidb maintenance gc --db <path> --profile <profile> [--dry-run] [--batch-size <n>] [--max-batches <n>] [--history-retain-lsns <n>] [--commit-log-retain-lsns <n>]\n\
          <profile> on --profile and MULTIDB_PROFILE: a storage profile (InMemory, Transactional, Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product slug or alias from multidb profile list (snake or kebab case), or auto to read an existing database (not accepted by restore)\n\
          --override takes a knob path from multidb profile knobs; repeat it or separate assignments with commas\n\
+         cdc poll --include-system also prints system rows: admin password hashes, the RBAC policy and principals, the audit log and raw index keys; the CLI reads the database file as a trusted local operator, without RBAC\n\
          config plan|apply|drift --spec provision the database at --db, else at the spec storage_path relative to the spec file; exit 0 ready, applied or in sync, 1 runtime error, locked database or partial apply, 2 invalid, blocked, flags or confirmation missing, 3 drift, 4 plan changed"
             .to_owned(),
     )
@@ -6135,6 +6136,71 @@ mod tests {
         ])?;
         assert_eq!(reject.exit_code, 0);
         assert!(reject.message.contains("\"status\": \"rejected\""));
+        Ok(())
+    }
+
+    #[test]
+    fn cdc_poll_include_system_prints_system_rows_for_the_local_operator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("cdc.redb");
+        let database = create_database(DbConfig::on_disk(Profile::Balanced, &db_path))?;
+        database.set_admin_credential(&multidb::db::AdminCredentialRecord {
+            username: "admin".to_owned(),
+            password_hash: "$argon2id$v=19$marker".to_owned(),
+            updated_at_millis: 1,
+        })?;
+        drop(database);
+        let poll = |extra: &[&str]| -> Result<Value, Box<dyn std::error::Error>> {
+            let mut args = vec![
+                "cdc".to_owned(),
+                "poll".to_owned(),
+                "--db".to_owned(),
+                db_path.display().to_string(),
+                "--profile".to_owned(),
+                "balanced".to_owned(),
+            ];
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let outcome = run(args)?;
+            assert_eq!(outcome.exit_code, 0);
+            Ok(serde_json::from_str(&outcome.message)?)
+        };
+        let credential_values = |output: &Value| -> Vec<String> {
+            output["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|event| event["target"]["System"] == "__admin_auth")
+                .filter_map(|event| event["op"]["Upsert"]["value_after"].as_array())
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .filter_map(|byte| char::from_u32(u32::try_from(byte).ok()?))
+                        .collect()
+                })
+                .collect()
+        };
+
+        // The CLI opens the file as a trusted local operator, so it keeps printing system rows,
+        // credential hashes included, when asked for them.
+        let trusted = poll(&["--include-system"])?;
+        assert!(
+            credential_values(&trusted)
+                .iter()
+                .any(|value| value.contains("$argon2id$v=19$marker")),
+            "{trusted}"
+        );
+        let plain = poll(&[])?;
+        assert!(credential_values(&plain).is_empty(), "{plain}");
+        assert!(
+            plain["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|event| event["target"].get("System").is_none()),
+            "{plain}"
+        );
         Ok(())
     }
 
