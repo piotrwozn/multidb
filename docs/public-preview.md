@@ -299,7 +299,9 @@ Consistency status:
   path or a path below it, and a row policy whose path no column reads hides
   every row. A masked column takes the type of its replacement. `EXPLAIN` of a
   table with such policies, `INSERT ... RETURNING` into one, and `match()` /
-  `within_radius()` searches over a collection with them are refused.
+  `within_radius()` searches over a collection with them are refused. A policy
+  covers only the resource it names: a table's `*_history` table or a
+  materialized view over it needs policies of its own.
 
 ## Migration Guide
 
