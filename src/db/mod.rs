@@ -2916,6 +2916,11 @@ impl Database {
     }
 
     /// Reads committed changes after a resume token.
+    ///
+    /// This trusted API checks no permission. With `options.include_system`, the events carry
+    /// system rows too: admin password hashes, the RBAC policy and principal registry, the audit
+    /// log, policy definitions and raw index keys. [`Database::poll_changefeed_as`] reads for a
+    /// principal.
     /// # Errors
     /// Fails when the database uses AP replication, the token is invalid, or CDC metadata cannot
     /// be read.
@@ -2938,6 +2943,10 @@ impl Database {
     }
 
     /// Reads one page of committed changes after a resume token.
+    ///
+    /// Like [`Database::poll_changefeed`], this trusted API checks no permission and returns
+    /// system rows with `options.include_system`; [`Database::poll_changefeed_page_as`] reads
+    /// for a principal.
     /// # Errors
     /// Fails when the database uses AP replication, the token is invalid, or CDC metadata cannot
     /// be read.
@@ -2960,6 +2969,12 @@ impl Database {
     }
 
     /// Polls committed change events after checking RBAC and applying policies.
+    ///
+    /// The principal needs `Read` on the filter target, and `System:Admin` when
+    /// `options.include_system` is set or the target is `ChangefeedTarget::System`: system rows
+    /// carry credential hashes, the RBAC state, the audit log and raw index keys. A denied
+    /// `System:Admin` check is audited as `poll_changefeed`. System rows are never returned to a
+    /// principal without `System:Admin`.
     /// # Errors
     /// Fails when authorization, changefeed reads, or policy masking fail.
     pub fn poll_changefeed_as(
@@ -2970,20 +2985,14 @@ impl Database {
         options: &ChangefeedOptions,
         max: usize,
     ) -> Result<(Vec<ChangeEvent>, ResumeToken), DbError> {
-        cdc::authorize_filter_access(&self.authz, principal, filter)?;
+        self.authorize_changefeed_poll(principal, filter, options)?;
         let (events, next) = self.poll_changefeed(token, filter, options, max)?;
-        let policy = self.policy_config()?;
-        let events = events
-            .into_iter()
-            .map(|event| self.apply_changefeed_policy(principal, &policy, event))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        Ok((events, next))
+        Ok((self.changefeed_events_visible_to(principal, events)?, next))
     }
 
     /// Polls one page of committed change events after checking RBAC and applying policies.
+    ///
+    /// Checks the same permissions as [`Database::poll_changefeed_as`].
     /// # Errors
     /// Fails when authorization, changefeed reads, or policy masking fail.
     pub fn poll_changefeed_page_as(
@@ -2994,17 +3003,9 @@ impl Database {
         options: &ChangefeedOptions,
         max: usize,
     ) -> Result<ChangefeedPage, DbError> {
-        cdc::authorize_filter_access(&self.authz, principal, filter)?;
+        self.authorize_changefeed_poll(principal, filter, options)?;
         let mut page = self.poll_changefeed_page(token, filter, options, max)?;
-        let policy = self.policy_config()?;
-        page.events = page
-            .events
-            .into_iter()
-            .map(|event| self.apply_changefeed_policy(principal, &policy, event))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        page.events = self.changefeed_events_visible_to(principal, page.events)?;
         Ok(page)
     }
 
@@ -3908,6 +3909,40 @@ impl Database {
             columns: rows.columns,
             rows: filtered,
         }))
+    }
+
+    /// Checks RBAC for a changefeed poll: `System:Admin` first, audited, when the poll can return
+    /// system rows, then `Read` on the filter target.
+    fn authorize_changefeed_poll(
+        &self,
+        principal: &Principal,
+        filter: &ChangefeedFilter,
+        options: &ChangefeedOptions,
+    ) -> Result<(), DbError> {
+        if cdc::reads_system_rows(filter, options) {
+            self.authorize_or_audit(
+                principal,
+                &Resource::System,
+                Permission::Admin,
+                "poll_changefeed",
+            )?;
+        }
+        cdc::authorize_filter_access(&self.authz, principal, filter).map_err(DbError::from)
+    }
+
+    /// The polled events `principal` may see: system rows only with `System:Admin`, whatever
+    /// the poll's options, and user rows after row and masking policies.
+    fn changefeed_events_visible_to(
+        &self,
+        principal: &Principal,
+        events: Vec<ChangeEvent>,
+    ) -> Result<Vec<ChangeEvent>, DbError> {
+        let policy = self.policy_config()?;
+        let events = cdc::retain_events_visible_to(&self.authz, principal, events)
+            .into_iter()
+            .map(|event| self.apply_changefeed_policy(principal, &policy, event))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(events.into_iter().flatten().collect())
     }
 
     fn apply_changefeed_policy(

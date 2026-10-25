@@ -267,6 +267,31 @@ All notable public changes will be recorded here.
   The Control Plane returns HTTP 500 `internal_error` in both cases. Size the
   limits for the concurrent load or retry such failures. `multidb serve` sets
   no tenant.
+- Fixed system rows leaking through changefeeds. `Database::poll_changefeed_as`
+  and `Database::poll_changefeed_page_as` checked only the filter target, so a
+  principal with `Database:Read` could poll the `All` target with
+  `ChangefeedOptions { include_system: true }` and read every system write
+  still in the commit log, from LSN 0 up to what history GC has truncated:
+  the Control Plane admin credentials (`__admin_auth`, the Argon2id hash of
+  every password set, which can be cracked offline), the RBAC policy and
+  principal registry (`__authz_policy`), the audit log and its hash-chain
+  head, the masking and row-policy definitions (`__policies`), provisioning,
+  extension (including WASM modules), CDC, outbox and tuning metadata, and raw
+  index keys (`rel_indexes` and document indexes). Index keys and `INCLUDE`
+  columns carry indexed values in the clear, so they also bypassed masking and
+  row policies. A changefeed poll that can return system rows
+  (`include_system`, or a `ChangefeedTarget::System` target as before) now
+  needs `System:Admin`, whatever the filter target, and a denied poll is
+  audited as `poll_changefeed`. System rows are also dropped from the events
+  returned to any principal without `System:Admin`. Only applications that
+  embed the crate and let callers choose the options were affected:
+  `multidb serve` has no changefeed endpoint on PostgreSQL wire or the Control
+  Plane, and SQL cannot name system keyspaces. Subscriptions, continuous
+  queries and outbox connectors never include system rows and are unchanged.
+  The trusted `Database::poll_changefeed`, `poll_changefeed_page` and
+  `multidb cdc poll --include-system` still return system rows to the local
+  operator, credential hashes included, so treat their output like the
+  database file.
 
 ### Added
 
@@ -857,6 +882,11 @@ All notable public changes will be recorded here.
 - `compat::execute_compat_sql` and `compat::compat_sql_requirements` take a
   new `&QueryExecutionConfig` argument, the SQL parser limits they apply
   (for example the database's `PerformanceConfig.query`).
+- `Database::poll_changefeed_as` and `Database::poll_changefeed_page_as` with
+  `ChangefeedOptions { include_system: true }` return `DbError::AuthzDenied`
+  unless the principal holds `System:Admin` (a grant on `Resource::System`, or
+  `Admin` on `Resource::Database`). Grant it to the principals that need
+  system rows, or read them through the trusted `Database::poll_changefeed`.
 
 ## 0.1.0-preview.1
 
