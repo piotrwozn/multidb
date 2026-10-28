@@ -47,7 +47,8 @@ use crate::{
     },
     extension::{ExtensionError, PolicyConfig},
     geo::GeoIndexConfig,
-    graph::GraphId,
+    graph::{GraphId, GraphNodeId},
+    graphrag::{GraphRagError, GraphRagRequest},
     model::{CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, Value as ModelValue},
     observability,
     provision::{
@@ -67,7 +68,7 @@ use crate::{
     },
     text::FullTextIndexConfig,
     timeseries::{DEFAULT_MAX_FUTURE_SKEW_MILLIS, TimePoint, TimeSeriesConfig, TimeSeriesError},
-    vector::{HnswParams, VectorCollectionConfig, VectorHit, VectorMetric},
+    vector::{HnswParams, VectorCollectionConfig, VectorError, VectorHit, VectorMetric},
 };
 
 const MAX_CONTROL_PLANE_BODY_BYTES: usize = 1024 * 1024;
@@ -346,6 +347,20 @@ const CONTROL_PLANE_OPERATIONS: &[ControlPlaneOperation] = &[
         operation_id: "searchVector",
         auth_required: true,
         stability: "stable",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/graphrag/query",
+        operation_id: "queryGraphRag",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/graphs/{name}/edges",
+        operation_id: "addGraphEdge",
+        auth_required: true,
+        stability: "preview",
     },
     ControlPlaneOperation {
         method: "GET",
@@ -1105,6 +1120,16 @@ pub struct CreateGraphRequest {
     pub graph_id: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphEdgeRequest {
+    pub source: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub props: JsonValue,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct VectorInsertRequest {
     pub metadata: JsonValue,
@@ -1563,6 +1588,8 @@ fn api_router() -> Router<AdminState> {
         )
         .route("/data/vectors/{name}/vectors", post(vector_insert_handler))
         .route("/data/vectors/{name}/search", post(vector_search_handler))
+        .route("/graphrag/query", post(graph_rag_query_handler))
+        .route("/data/graphs/{name}/edges", post(graph_edge_insert_handler))
         .route(
             "/data/time-series/{name}/points",
             get(time_series_range_handler).post(time_series_insert_handler),
@@ -2475,11 +2502,98 @@ async fn vector_search_handler(
         ) {
             return db_error(&DbError::from(error));
         }
-        match database.vector_collection(&name).and_then(|vectors| {
+        let resource = Resource::VectorCollection(name.clone());
+        let result = (|| {
+            let policy = database.policy_config()?;
+            let vectors = database.vector_collection(&name)?;
             let hits = vectors.knn(&request.vector, request.k)?;
-            vector_hits_with_metadata(&vectors, hits)
-        }) {
+            vector_hits_with_metadata(&vectors, hits, &principal, &resource, &policy)
+        })();
+        match result {
             Ok(hits) => api_ok(StatusCode::OK, VectorSearchResponse { hits }),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
+}
+
+async fn graph_rag_query_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<GraphRagRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    if let Err(error) = request.validate() {
+        return invalid_json_value(error.to_string());
+    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || match database.graph_rag_as(&principal, &request) {
+        Ok(result) => api_ok(StatusCode::OK, result),
+        Err(error) => graph_rag_error(&error),
+    })
+    .await
+}
+
+fn graph_rag_error(error: &DbError) -> Response {
+    if matches!(error, DbError::Config(ConfigError::Unsupported(_))) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "graphrag_unsupported",
+            error.to_string(),
+        );
+    }
+    db_error(error)
+}
+
+async fn graph_edge_insert_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<GraphEdgeRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    for (field, value, max_bytes) in [
+        ("graph", name.as_str(), 256),
+        ("source", request.source.as_str(), 256),
+        ("target", request.target.as_str(), 256),
+        ("label", request.label.as_str(), 128),
+    ] {
+        if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control)
+        {
+            return invalid_json_value(format!(
+                "{field} must contain 1 to {max_bytes} bytes and no control characters"
+            ));
+        }
+    }
+    let props = match json_to_model_value(request.props) {
+        Ok(value) => value,
+        Err(message) => return invalid_json_value(message),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        match database.add_graph_edge_as(
+            &principal,
+            &name,
+            GraphNodeId::from_str_id(&request.source),
+            &request.label,
+            GraphNodeId::from_str_id(&request.target),
+            &props,
+        ) {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "written": true })),
             Err(error) => db_error(&error),
         }
     })
@@ -3420,6 +3534,8 @@ async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
                 "full_text_builder",
                 "geo_builder",
                 "graph_builder",
+                "graph_edges_preview",
+                "graphrag_preview",
                 "security_rbac",
                 "audit_log",
             ],
@@ -3581,18 +3697,25 @@ fn model_value_to_json(value: &ModelValue) -> JsonValue {
 fn vector_hits_with_metadata(
     vectors: &crate::vector::VectorCollection<'_, dyn crate::repl::Replication + '_>,
     hits: Vec<VectorHit>,
+    principal: &Principal,
+    resource: &Resource,
+    policy: &PolicyConfig,
 ) -> Result<Vec<VectorHitSummary>, DbError> {
-    hits.into_iter()
-        .map(|hit| {
-            Ok(VectorHitSummary {
-                id: document_id_to_hex(hit.id),
-                distance: hit.distance,
-                metadata: vectors
-                    .get_metadata(hit.id)?
-                    .map(|metadata| model_value_to_json(&metadata)),
-            })
-        })
-        .collect()
+    let mut visible = Vec::new();
+    for hit in hits {
+        let Some(metadata) = vectors.get_metadata(hit.id)? else {
+            continue;
+        };
+        if !policy.row_visible(principal, resource, &metadata) {
+            continue;
+        }
+        visible.push(VectorHitSummary {
+            id: document_id_to_hex(hit.id),
+            distance: hit.distance,
+            metadata: Some(model_value_to_json(&policy.mask_value(resource, &metadata))),
+        });
+    }
+    Ok(visible)
 }
 
 fn security_state(database: &Database) -> SecurityStateResponse {
@@ -4306,8 +4429,31 @@ fn invalid_json_value(message: impl Into<String>) -> Response {
 /// time-series config or point is `400 invalid_value`, and everything else is
 /// `500 internal_error`.
 fn db_error(error: &DbError) -> Response {
-    if matches!(error, DbError::AuthzDenied(_)) {
+    if matches!(
+        error,
+        DbError::AuthzDenied(_) | DbError::GraphRag(GraphRagError::Policy(_))
+    ) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(error, DbError::MissingCatalogObject(_)) {
+        return api_error(StatusCode::NOT_FOUND, "not_found", error.to_string());
+    }
+    if matches!(
+        error,
+        DbError::CatalogKindMismatch { .. }
+            | DbError::InvalidCatalogName(_)
+            | DbError::Graph(crate::graph::GraphError::InvalidInput(_))
+            | DbError::GraphRag(
+                GraphRagError::InvalidRequest(_)
+                    | GraphRagError::Graph(crate::graph::GraphError::InvalidInput(_))
+            )
+    ) || match error {
+        DbError::Vector(error) | DbError::GraphRag(GraphRagError::Vector(error)) => {
+            invalid_vector_input(error)
+        }
+        _ => false,
+    } {
+        return invalid_json_value(error.to_string());
     }
     if matches!(error, DbError::Query(QueryError::Busy(_))) {
         let mut response = api_error(StatusCode::SERVICE_UNAVAILABLE, "busy", error.to_string());
@@ -4330,6 +4476,18 @@ fn db_error(error: &DbError) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
         error.to_string(),
+    )
+}
+
+fn invalid_vector_input(error: &VectorError) -> bool {
+    matches!(
+        error,
+        VectorError::InvalidDimension { .. }
+            | VectorError::EmptyDimension
+            | VectorError::NonFiniteValue
+            | VectorError::ZeroVector
+            | VectorError::InvalidHnswParams(_)
+            | VectorError::InvalidIndexConfig(_)
     )
 }
 
@@ -6948,6 +7106,423 @@ mod tests {
             )?)
             .await?;
         assert_eq!(delete_doc.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    struct GraphRagFixture {
+        app: axum::Router,
+        database: Arc<RwLock<crate::db::Database>>,
+        seed: String,
+        neighbor: String,
+    }
+
+    fn graph_rag_request() -> Value {
+        serde_json::json!({
+            "vector_collection": "knowledge", "graph": "links",
+            "query_vector": [1.0, 0.0], "seed_k": 1
+        })
+    }
+
+    async fn graph_rag_post_ok(
+        app: &axum::Router,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let (status, response) = post_as(app, path, body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["ok"], true);
+        Ok(response["data"].clone())
+    }
+
+    /// Builds the whole ingestion path over HTTP, including the graph edge joining the
+    /// canonical document IDs returned by vector insertion.
+    async fn graph_rag_fixture() -> Result<GraphRagFixture, Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router_with_api_prefix(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        graph_rag_post_ok(
+            &app,
+            "/api/builder/vector",
+            &serde_json::json!({
+                "name": "knowledge", "dim": 2, "metric": "Cosine"
+            }),
+        )
+        .await?;
+        graph_rag_post_ok(
+            &app,
+            "/api/builder/graph",
+            &serde_json::json!({
+                "name": "links", "graph_id": 101
+            }),
+        )
+        .await?;
+        let mut ids = Vec::new();
+        for (text, source, visible, vector) in [
+            ("seed fact", "seed.txt", true, [1.0, 0.0]),
+            ("neighbor fact", "neighbor.txt", false, [0.0, 1.0]),
+        ] {
+            let response = graph_rag_post_ok(
+                &app,
+                "/api/data/vectors/knowledge/vectors",
+                &serde_json::json!({
+                    "metadata": { "text": text, "source": source, "visible": visible },
+                    "vector": vector
+                }),
+            )
+            .await?;
+            ids.push(
+                response["id"]
+                    .as_str()
+                    .ok_or("missing document ID")?
+                    .to_owned(),
+            );
+        }
+        let seed = ids.remove(0);
+        let neighbor = ids.remove(0);
+        graph_rag_post_ok(
+            &app,
+            "/api/data/graphs/links/edges",
+            &serde_json::json!({
+                "source": seed, "label": "related", "target": neighbor
+            }),
+        )
+        .await?;
+        Ok(GraphRagFixture {
+            app,
+            database,
+            seed,
+            neighbor,
+        })
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_ingestion_expands_vector_seed_into_neighbor_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        let data =
+            graph_rag_post_ok(&fixture.app, "/api/graphrag/query", &graph_rag_request()).await?;
+        assert!(
+            data["context"]
+                .as_str()
+                .is_some_and(|text| text.contains("seed fact") && text.contains("neighbor fact"))
+        );
+        assert_eq!(
+            data["sources"]
+                .as_array()
+                .ok_or("sources must be an array")?
+                .len(),
+            2
+        );
+        assert_eq!(data["sources"][0]["document_id"], fixture.seed);
+        assert_eq!(data["sources"][0]["seed_id"], fixture.seed);
+        assert_eq!(data["sources"][0]["depth"], 0);
+        assert_eq!(data["sources"][1]["document_id"], fixture.neighbor);
+        assert_eq!(data["sources"][1]["source"], "neighbor.txt");
+        assert_eq!(data["sources"][1]["depth"], 1);
+        assert_eq!(
+            data["relationships"],
+            serde_json::json!([{
+                "source": fixture.seed, "label": "related", "target": fixture.neighbor
+            }])
+        );
+        assert_eq!(data["truncated"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_requires_token_and_read_grants_on_both_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        let no_token = fixture
+            .app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/graphrag/query",
+                &graph_rag_request(),
+            )?)
+            .await?;
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(no_token).await?["error"]["code"],
+            "missing_admin_token"
+        );
+        for granted in [
+            None,
+            Some(Resource::Graph("links".to_owned())),
+            Some(Resource::VectorCollection("knowledge".to_owned())),
+        ] {
+            let mut role = Role::new("limited");
+            if let Some(resource) = granted {
+                role = role.grant(resource, Permission::Read);
+            }
+            {
+                let mut database = fixture.database.write().await;
+                database.set_authz_policy(AuthzPolicy::new([role]));
+                database.set_principal_registry(
+                    PrincipalRegistry::new()
+                        .with_principal("root", Principal::new("root").with_role("limited")),
+                );
+            }
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/graphrag/query",
+                &graph_rag_request(),
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["error"]["code"], "forbidden");
+        }
+        let (status, body) = post_as(
+            &fixture.app,
+            "/api/data/graphs/links/edges",
+            &serde_json::json!({
+                "source": fixture.seed, "label": "related", "target": fixture.neighbor
+            }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_applies_row_filtering_and_masking_before_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{FieldPath, Value as ModelValue},
+        };
+        let fixture = graph_rag_fixture().await?;
+        fixture
+            .database
+            .read()
+            .await
+            .set_policy_config(&PolicyConfig {
+                row_policies: vec![RowPolicy {
+                    resource: Resource::VectorCollection("knowledge".to_owned()),
+                    path: FieldPath::new(["visible"]),
+                    equals: ModelValue::Bool(true),
+                }],
+                masking: vec![MaskingPolicy {
+                    resource: Resource::VectorCollection("knowledge".to_owned()),
+                    paths: vec![FieldPath::new(["text"])],
+                    replacement: ModelValue::Str("[redacted]".to_owned()),
+                }],
+                ..PolicyConfig::default()
+            })?;
+        let data =
+            graph_rag_post_ok(&fixture.app, "/api/graphrag/query", &graph_rag_request()).await?;
+        assert_eq!(
+            data["sources"].as_array().ok_or("missing sources")?.len(),
+            1
+        );
+        assert_eq!(data["sources"][0]["document_id"], fixture.seed);
+        assert_eq!(data["sources"][0]["text"], "[redacted]");
+        let context = data["context"].as_str().ok_or("missing context")?;
+        assert!(context.contains("[redacted]"));
+        assert!(!context.contains("seed fact") && !context.contains("neighbor fact"));
+        assert_eq!(data["relationships"], serde_json::json!([]));
+        let search = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/vectors/knowledge/search",
+            &serde_json::json!({
+                "vector": [1.0, 0.0], "k": 2
+            }),
+        )
+        .await?;
+        let hits = search["hits"].as_array().ok_or("missing vector hits")?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], fixture.seed);
+        assert_eq!(hits[0]["metadata"]["text"], "[redacted]");
+        assert!(!search.to_string().contains("neighbor fact"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_rejects_bounds_invalid_vectors_and_unknown_objects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        for (field, value) in [
+            ("seed_k", serde_json::json!(0)),
+            ("seed_k", serde_json::json!(65)),
+            ("max_depth", serde_json::json!(9)),
+            ("max_nodes", serde_json::json!(0)),
+            ("max_nodes", serde_json::json!(1025)),
+            ("max_edges", serde_json::json!(10001)),
+            ("max_context_bytes", serde_json::json!(0)),
+            ("max_context_bytes", serde_json::json!(1_048_577)),
+            ("query_vector", serde_json::json!([])),
+            ("query_vector", serde_json::json!([1.0])),
+            ("query_vector", serde_json::json!([0.0, 0.0])),
+            ("labels", serde_json::json!([])),
+            ("labels", serde_json::json!(["bad\nlabel"])),
+            ("text_field", serde_json::json!([])),
+            ("source_field", serde_json::json!([""])),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let mut request = graph_rag_request();
+            request[field] = value;
+            let (status, response) =
+                post_as(&fixture.app, "/api/graphrag/query", &request, "root").await?;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{field}: {request}: {response}"
+            );
+            assert_eq!(response["ok"], false);
+        }
+        for field in ["vector_collection", "graph"] {
+            let mut request = graph_rag_request();
+            request[field] = serde_json::json!("missing");
+            let (status, response) =
+                post_as(&fixture.app, "/api/graphrag/query", &request, "root").await?;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+            assert_eq!(response["error"]["code"], "not_found");
+        }
+        for edge in [
+            serde_json::json!({"source":"", "label":"related", "target":"b"}),
+            serde_json::json!({"source":"a", "label":"bad\nlabel", "target":"b"}),
+            serde_json::json!({"source":"a", "label":"related", "target":"b".repeat(257)}),
+        ] {
+            let (status, response) =
+                post_as(&fixture.app, "/api/data/graphs/links/edges", &edge, "root").await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_and_vector_search_fail_closed_on_corrupt_policies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        crate::repl::propose_system(
+            &*fixture.database.read().await,
+            crate::repl::Op::Put {
+                table: crate::extension::POLICIES_TABLE.to_owned(),
+                key: b"policy".to_vec(),
+                value: b"invalid policy bytes".to_vec(),
+            },
+        )?;
+        for (path, request) in [
+            ("/api/graphrag/query", graph_rag_request()),
+            (
+                "/api/data/vectors/knowledge/search",
+                serde_json::json!({"vector":[1.0,0.0],"k":2}),
+            ),
+        ] {
+            let (status, response) = post_as(&fixture.app, path, &request, "root").await?;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{path}: {response}"
+            );
+            assert!(response["data"].is_null());
+            assert!(!response.to_string().contains("seed fact"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_malformed_json_and_graph_edge_validation_use_error_envelopes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router_with_api_prefix(test_state()?);
+        for path in ["/api/graphrag/query", "/api/data/graphs/links/edges"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .header("x-multidb-principal", "root")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{"))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], "invalid_json");
+        }
+        let (status, body) = post_as(
+            &app,
+            "/api/data/graphs/missing/edges",
+            &serde_json::json!({
+                "source":"a", "label":"related", "target":"b", "props": {"weight":1}
+            }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_unsupported_backend_has_a_specific_preview_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response =
+            super::graph_rag_error(&DbError::Config(crate::db::ConfigError::Unsupported(
+                "GraphRAG requires bounded storage scans".to_owned(),
+            )));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "graphrag_unsupported");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_preview_manifest_and_openapi_document_exact_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        let response = fixture
+            .app
+            .oneshot(authed_request(Method::GET, "/api/studio", None::<&()>)?)
+            .await?;
+        let manifest = json_body(response).await?;
+        let capabilities = manifest["data"]["capabilities"]
+            .as_array()
+            .ok_or("missing capabilities")?;
+        assert!(capabilities.iter().any(|value| value == "graphrag_preview"));
+        let operations = manifest["data"]["operations"]
+            .as_array()
+            .ok_or("missing operations")?;
+        for id in ["queryGraphRag", "addGraphEdge"] {
+            assert!(operations.iter().any(|op| op["operation_id"] == id
+                && op["auth_required"] == true
+                && op["stability"] == "preview"));
+        }
+        let api: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        for (path, schema) in [
+            ("/graphrag/query", "GraphRagRequest"),
+            ("/data/graphs/{name}/edges", "GraphEdgeRequest"),
+        ] {
+            let operation = resolve_openapi_operation(&api, &api["paths"][path]["post"])?;
+            assert_eq!(operation["x-multidb-stability"], "preview");
+            let request = resolve_openapi_operation(&api, &operation["requestBody"])?;
+            assert_eq!(
+                request["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+            for status in ["400", "401", "403", "404", "503"] {
+                assert!(!operation["responses"][status].is_null(), "{path} {status}");
+            }
+        }
+        let properties = &api["components"]["schemas"]["GraphRagRequest"]["properties"];
+        assert_eq!(properties["seed_k"]["maximum"], 64);
+        assert_eq!(properties["max_context_bytes"]["maximum"], 1_048_576);
+        assert_eq!(
+            properties["text_field"]["default"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            properties["source_field"]["default"],
+            serde_json::json!(["source"])
+        );
         Ok(())
     }
 

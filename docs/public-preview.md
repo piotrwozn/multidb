@@ -104,6 +104,15 @@ To smoke a release binary directly:
 .\scripts\preview-smoke.ps1 -Bin .\target\release\multidb.exe
 ```
 
+## GraphRAG
+
+Retrieve cited context from vector seeds and graph-linked passages through
+`POST /api/graphrag/query` or the Rust API and SDKs. Create passage vectors,
+connect their returned document ids with `POST /api/data/graphs/{name}/edges`,
+then query with bounded nodes, edges, depth and context bytes. GraphRAG applies
+metadata policies before traversal and supports native bounded-scan backends;
+AP and sharded handles are outside this preview. See [graphrag.md](graphrag.md).
+
 ## Profiles
 
 `multidb profile list` shows the six product profiles with their variants.

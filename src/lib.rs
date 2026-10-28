@@ -17,6 +17,7 @@ pub mod federation;
 mod fileio;
 pub mod geo;
 pub mod graph;
+pub mod graphrag;
 pub mod hardening;
 pub mod internal_transport;
 pub mod keyenc;

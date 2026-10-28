@@ -21,6 +21,7 @@ which claims are deliberately out of scope.
 | --- | --- | --- |
 | CLI templates/config | Stable preview; built-in templates emit spec v2 with the physical parameters provisioning needs, and `init --template <t> --apply` (Preview, see the provisioning row) builds every template; `secure-saas` requires an explicit `MULTIDB_ENCRYPTION_KEY_PATH` | `scripts/preview-smoke.ps1`, template smoke (including `init --apply`, `config drift` and a re-apply per template), template plan and provisioning tests, config tests |
 | Control Plane API v1 | Stable preview | OpenAPI v1, operation registry, SDK contract tests |
+| GraphRAG retrieval | Preview: bounded vector-seed and directed graph expansion with policy-filtered, cited context; Rust API, POST `/graphrag/query` and four SDKs; native bounded scans required, AP/sharded refused; applications supply embeddings | GraphRAG core/DB/HTTP tests, bounded graph scans, SDK transport tests, `cargo run --example graphrag`; `docs/graphrag.md` |
 | Studio | Stable for documented admin workflows | Vitest, Playwright operator flow, Docker smoke |
 | Docker image | Stable for single-node production-shaped runtime | Docker smoke, GHCR release image, signed digest |
 | Helm chart | Supported runtime parity artifact | Helm values/templates match Docker env contract |

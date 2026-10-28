@@ -997,6 +997,10 @@ impl<S: StorageEngine> CpRaft<S> {
 }
 
 impl<S: StorageEngine> Replication for CpRaft<S> {
+    fn supports_bounded_scans(&self) -> bool {
+        true
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }

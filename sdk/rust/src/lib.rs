@@ -17,6 +17,12 @@ pub const MIN_MULTIDB_VERSION: &str = "0.1.0";
 
 pub type JsonValue = Value;
 
+mod graphrag;
+pub use graphrag::{
+    GraphEdgeRequest, GraphEdgeResponse, GraphRagRelationship, GraphRagRequest, GraphRagResult,
+    GraphRagSource,
+};
+
 #[derive(Clone)]
 pub struct ControlPlaneClient {
     base_url: String,

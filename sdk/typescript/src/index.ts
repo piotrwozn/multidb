@@ -2,6 +2,62 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export type JsonObject = { [key: string]: JsonValue };
 
+/** Bounded vector-seeded graph retrieval. The server assembles context locally, without an LLM. */
+export type GraphRagRequest = {
+  vector_collection: string;
+  graph: string;
+  query_vector: number[];
+  /** Default: 8. */
+  seed_k?: number;
+  /** Default: 2. */
+  max_depth?: number;
+  /** Default: 64. */
+  max_nodes?: number;
+  /** Default: 256. */
+  max_edges?: number;
+  /** Default: 16384 UTF-8 bytes. */
+  max_context_bytes?: number;
+  /** Default: ["related"]. */
+  labels?: string[];
+  /** Metadata path. Default: ["text"]. */
+  text_field?: string[];
+  /** Metadata path. Default: ["source"]. */
+  source_field?: string[];
+};
+
+export type GraphRagSource = {
+  document_id: string;
+  text: string;
+  source: string | null;
+  seed_distance: number;
+  depth: number;
+  seed_id: string;
+};
+
+export type GraphRagRelationship = {
+  source: string;
+  label: string;
+  target: string;
+};
+
+export type GraphRagResult = {
+  context: string;
+  sources: GraphRagSource[];
+  relationships: GraphRagRelationship[];
+  truncated: boolean;
+};
+
+/** GraphRAG node names are the lowercase 32-character hex ids returned by insertVector. */
+export type GraphEdgeRequest = {
+  source: string;
+  label: string;
+  target: string;
+  props?: JsonValue;
+};
+
+export type GraphEdgeWriteResult = { written: true };
+export type VectorInsertResult = { id: string };
+
 export type ApiErrorBody = {
   code: string;
   message: string;
@@ -1060,8 +1116,19 @@ export class ControlPlaneClient {
     return this.request<JsonObject>("/builder/graph", { method: "POST", body: request });
   }
 
-  insertVector(collection: string, metadata: JsonValue, vector: number[]): Promise<JsonObject> {
-    return this.request<JsonObject>(`/data/vectors/${encodeURIComponent(collection)}/vectors`, {
+  addGraphEdge(graph: string, request: GraphEdgeRequest): Promise<GraphEdgeWriteResult> {
+    return this.request<GraphEdgeWriteResult>(`/data/graphs/${encodeURIComponent(graph)}/edges`, {
+      method: "POST",
+      body: request,
+    });
+  }
+
+  graphRagQuery(request: GraphRagRequest): Promise<GraphRagResult> {
+    return this.request<GraphRagResult>("/graphrag/query", { method: "POST", body: request });
+  }
+
+  insertVector(collection: string, metadata: JsonValue, vector: number[]): Promise<VectorInsertResult> {
+    return this.request<VectorInsertResult>(`/data/vectors/${encodeURIComponent(collection)}/vectors`, {
       method: "POST",
       body: { metadata, vector },
     });

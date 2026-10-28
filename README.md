@@ -79,8 +79,9 @@ Built-in templates emit version 2 specs with the physical parameters
 provisioning needs (document index paths, the vector dimension, time-series
 chunks and table columns), so `init --template <t> --apply` writes the files
 and creates the database in one step; `config drift` exits 0 while it matches
-the spec. `secure-saas` asks for encryption at rest, which is provisioned
-through the Rust API only, so its `init --apply` writes the files and exits 2.
+the spec. `secure-saas` requires encryption at rest: select an existing key
+file with `MULTIDB_ENCRYPTION_KEY_PATH` before `init --apply`; without a key the
+command writes the spec files and exits 2.
 
 Profiles have typed knobs. Inspect them, or write a version 2 spec with a
 custom profile that extends a built-in one:
@@ -119,6 +120,21 @@ Checked-in examples are under `examples/`, with SDK examples under
 `examples/sdk/`; `examples/provisioning` is a full version 2 spec with
 full-text and geo indexes, a versioned table, a columnar table, roles and
 principals.
+
+## GraphRAG retrieval
+
+Use vector search to find seed passages, follow their graph relationships and
+return context with numbered citations and source provenance. The preview API is
+`POST /api/graphrag/query`; TypeScript, Python, Go and Rust SDKs expose the same
+operation. Metadata policies apply before text extraction and graph traversal.
+
+```sh
+cargo run --locked --example graphrag
+```
+
+See [the GraphRAG guide](docs/graphrag.md) for ingestion, API requests, resource
+budgets and authorization. Applications supply their embeddings and use the
+returned context to answer questions.
 
 ## Repository Gates
 
@@ -164,11 +180,9 @@ Release-sensitive gate:
   spec mode and `POST /provision/apply`) is a preview for embedded and
   single-node CP databases: it
   creates and adopts objects, roles and the profile, but never drops or alters
-  an object, switches a profile or storage class, or re-encrypts; encryption
-  at rest is provisioned through the Rust API only, so a spec with
-  `encryption.at_rest: true`, such as the `secure-saas` template, is blocked
-  on the CLI and the Control Plane and refused by `multidb serve` in spec
-  mode (`MULTIDB_SPEC_PATH`, see `docs/docker.md`). Values fixed at creation,
+  an object, switches a profile or storage class, or re-encrypts. CLI and serve
+  support encryption with `MULTIDB_ENCRYPTION_KEY_PATH`; Control Plane requests
+  use the database's existing encryption configuration (see `docs/docker.md`). Values fixed at creation,
   such as a vector `dim` or table columns, are edited in the spec before the
   first apply.
 - Studio v1 focuses on validation, catalog, advice, security views, audit and

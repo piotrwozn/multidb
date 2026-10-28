@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Literal, Mapping, MutableMapping, Optional, Tuple, TypedDict
 
 JsonValue = Any
 JsonObject = MutableMapping[str, JsonValue]
@@ -16,6 +16,67 @@ Transport = Callable[[str, str, Mapping[str, str], Optional[bytes]], Tuple[int, 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/api"
 CONTROL_PLANE_API_VERSION = 1
 MIN_MULTIDB_VERSION = "0.1.0"
+
+
+class _GraphRagOptions(TypedDict, total=False):
+    seed_k: int  # Server default: 8.
+    max_depth: int  # Server default: 2.
+    max_nodes: int  # Server default: 64.
+    max_edges: int  # Server default: 256.
+    max_context_bytes: int  # Server default: 16384 UTF-8 bytes.
+    labels: list[str]  # Server default: ["related"].
+    text_field: list[str]  # Metadata path; default: ["text"].
+    source_field: list[str]  # Metadata path; default: ["source"].
+
+
+class GraphRagRequest(_GraphRagOptions):
+    """Bounded vector-seeded graph retrieval; optional defaults are supplied by the server."""
+
+    vector_collection: str
+    graph: str
+    query_vector: list[float]
+
+
+class GraphRagSource(TypedDict):
+    document_id: str
+    text: str
+    source: Optional[str]
+    seed_distance: float
+    depth: int
+    seed_id: str
+
+
+class GraphRagRelationship(TypedDict):
+    source: str
+    label: str
+    target: str
+
+
+class GraphRagResult(TypedDict):
+    context: str
+    sources: list[GraphRagSource]
+    relationships: list[GraphRagRelationship]
+    truncated: bool
+
+
+class _GraphEdgeOptions(TypedDict, total=False):
+    props: JsonValue
+
+
+class GraphEdgeRequest(_GraphEdgeOptions):
+    """GraphRAG nodes use lowercase 32-character hex ids returned by insert_vector."""
+
+    source: str
+    label: str
+    target: str
+
+
+class GraphEdgeWriteResult(TypedDict):
+    written: Literal[True]
+
+
+class VectorInsertResult(TypedDict):
+    id: str
 
 
 class ControlPlaneError(Exception):
@@ -152,7 +213,14 @@ class ControlPlaneClient:
     def create_graph(self, request: JsonObject) -> JsonObject:
         return self._request("POST", "/builder/graph", request)
 
-    def insert_vector(self, collection: str, metadata: JsonValue, vector: list[float]) -> JsonObject:
+    def add_graph_edge(self, graph: str, request: GraphEdgeRequest) -> GraphEdgeWriteResult:
+        return self._request("POST", f"/data/graphs/{_quote(graph)}/edges", request)
+
+    def graph_rag_query(self, request: GraphRagRequest) -> GraphRagResult:
+        """Returns retrieved context and provenance, assembled locally without an LLM."""
+        return self._request("POST", "/graphrag/query", request)
+
+    def insert_vector(self, collection: str, metadata: JsonValue, vector: list[float]) -> VectorInsertResult:
         return self._request(
             "POST",
             f"/data/vectors/{_quote(collection)}/vectors",
@@ -327,6 +395,13 @@ def _quote(value: str) -> str:
 __all__ = [
     "ControlPlaneClient",
     "ControlPlaneError",
+    "GraphRagRequest",
+    "GraphRagSource",
+    "GraphRagRelationship",
+    "GraphRagResult",
+    "GraphEdgeRequest",
+    "GraphEdgeWriteResult",
+    "VectorInsertResult",
     "CONTROL_PLANE_API_VERSION",
     "DEFAULT_BASE_URL",
     "MIN_MULTIDB_VERSION",

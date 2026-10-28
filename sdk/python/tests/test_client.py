@@ -7,6 +7,8 @@ from multidb_client import (
     MIN_MULTIDB_VERSION,
     ControlPlaneClient,
     ControlPlaneError,
+    GraphEdgeRequest,
+    GraphRagRequest,
 )
 
 
@@ -97,6 +99,67 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 422)
         self.assertEqual(raised.exception.code, "provision_blocked")
         self.assertEqual(raised.exception.body["data"], plan)
+
+    def test_graph_rag_and_edges_preserve_payload_results_auth_and_encoded_paths(self) -> None:
+        calls = []
+        source, target = "01" * 16, "02" * 16
+        result = {
+            "context": "A retrieved passage",
+            "sources": [{"document_id": source, "text": "A retrieved passage", "source": None,
+                         "seed_distance": 0.25, "depth": 0, "seed_id": source}],
+            "relationships": [{"source": source, "label": "related", "target": target}],
+            "truncated": False,
+        }
+
+        def transport(method, url, headers, body):
+            calls.append((method, url, headers, json.loads(body.decode())))
+            data = result if url.endswith("/graphrag/query") else {"written": True}
+            return 200, {}, json.dumps({"ok": True, "data": data}).encode()
+
+        client = ControlPlaneClient(base_url="http://unit.test/api/", token="session-token",
+                                    principal="reader", transport=transport)
+        minimal = GraphRagRequest(vector_collection="chunks", graph="knowledge", query_vector=[1.0, 0.0, 0.0])
+        self.assertEqual(client.graph_rag_query(minimal), result)
+        bounded = GraphRagRequest(**minimal, seed_k=1, max_depth=2, max_nodes=4, max_edges=8,
+                                  max_context_bytes=1024, labels=["related", "cites"],
+                                  text_field=["content", "text"], source_field=["provenance", "url"])
+        self.assertEqual(client.graph_rag_query(bounded), result)
+        edge = GraphEdgeRequest(source=source, label="related", target=target,
+                                props={"confidence": 0.9, "tags": ["demo"], "note": None})
+        self.assertEqual(client.add_graph_edge("knowledge /?", edge), {"written": True})
+        bare_edge = GraphEdgeRequest(source=source, label="cites", target=target)
+        self.assertEqual(client.add_graph_edge("knowledge", bare_edge), {"written": True})
+        self.assertEqual([(method, url, body) for method, url, _, body in calls], [
+            ("POST", "http://unit.test/api/graphrag/query", minimal),
+            ("POST", "http://unit.test/api/graphrag/query", bounded),
+            ("POST", "http://unit.test/api/data/graphs/knowledge%20%2F%3F/edges", edge),
+            ("POST", "http://unit.test/api/data/graphs/knowledge/edges", bare_edge),
+        ])
+        for _, _, headers, _ in calls:
+            self.assertEqual(headers["Authorization"], "Bearer session-token")
+            self.assertEqual(headers["x-multidb-principal"], "reader")
+            self.assertEqual(headers["Content-Type"], "application/json")
+            self.assertEqual(headers["Accept"], "application/json")
+
+    def test_graph_rag_and_edges_preserve_server_errors(self) -> None:
+        for status, code in [(400, "invalid_value"), (403, "forbidden"), (404, "not_found")]:
+            payload = {"ok": False, "error": {"code": code, "message": "request refused"},
+                       "data": {"reason": "fixture"}}
+
+            def transport(method, url, headers, body):
+                return status, {}, json.dumps(payload).encode()
+
+            client = ControlPlaneClient(transport=transport)
+            for operation in [
+                lambda: client.graph_rag_query({"vector_collection": "chunks", "graph": "knowledge", "query_vector": [1.0]}),
+                lambda: client.add_graph_edge("knowledge", {"source": "01" * 16, "label": "related", "target": "02" * 16}),
+            ]:
+                with self.subTest(status=status, operation=operation), self.assertRaises(ControlPlaneError) as raised:
+                    operation()
+                self.assertEqual(raised.exception.status, status)
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(str(raised.exception), "request refused")
+                self.assertEqual(raised.exception.body, payload)
 
 
 if __name__ == "__main__":

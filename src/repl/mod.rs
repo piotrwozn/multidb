@@ -134,6 +134,12 @@ impl ReplError {
 }
 
 pub trait Replication: Send + Sync {
+    /// Whether range callbacks stop storage iteration without first materializing
+    /// the entire range. Bounded traversals must refuse the fallback scanner.
+    fn supports_bounded_scans(&self) -> bool {
+        false
+    }
+
     /// Whether committed writes are recorded in an ordered commit log.
     /// Backends without this capability must reject replay-based features.
     fn supports_commit_log(&self) -> bool {
@@ -645,6 +651,10 @@ fn clone_storage_error(error: &StorageError) -> StorageError {
 }
 
 impl<S: StorageEngine> Replication for SingleNode<S> {
+    fn supports_bounded_scans(&self) -> bool {
+        true
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }

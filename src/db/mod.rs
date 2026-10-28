@@ -100,6 +100,7 @@ use crate::vector::{
 };
 
 mod changefeed_policy;
+mod graphrag;
 mod history;
 mod lifecycle;
 mod profile_binding;
@@ -525,6 +526,9 @@ pub enum DbError {
 
     #[error("graph: {0}")]
     Graph(#[from] GraphError),
+
+    #[error("GraphRAG: {0}")]
+    GraphRag(#[from] crate::graphrag::GraphRagError),
 
     #[error("geo: {0}")]
     Geo(#[from] GeoError),
@@ -982,6 +986,10 @@ impl HealingBackend for DatabaseHealingBackend {
 }
 
 impl Replication for DatabaseRepl {
+    fn supports_bounded_scans(&self) -> bool {
+        self.replication_ref().supports_bounded_scans()
+    }
+
     fn supports_commit_log(&self) -> bool {
         self.replication_ref().supports_commit_log()
     }
@@ -5933,6 +5941,10 @@ impl WritePipeline {
 }
 
 impl Replication for WritePipeline {
+    fn supports_bounded_scans(&self) -> bool {
+        self.backend.supports_bounded_scans()
+    }
+
     fn supports_commit_log(&self) -> bool {
         self.backend.supports_commit_log()
     }
@@ -6235,6 +6247,10 @@ impl Drop for Database {
 }
 
 impl Replication for Database {
+    fn supports_bounded_scans(&self) -> bool {
+        self.repl.supports_bounded_scans()
+    }
+
     fn supports_commit_log(&self) -> bool {
         self.repl.supports_commit_log()
     }

@@ -4,6 +4,15 @@ All notable public changes will be recorded here.
 
 ## Unreleased
 
+- Added preview GraphRAG retrieval: bounded vector seeds, graph expansion,
+  deduplicated cited context and source provenance through the Rust API,
+  `POST /graphrag/query`, and TypeScript/Python/Go/Rust SDKs. Added a graph-edge
+  write endpoint and a runnable local example. Principal retrieval requires both
+  vector and graph Read, applies metadata policies before traversal, and refuses
+  unsupported graph policies/backends. Vector search responses now also filter
+  and mask metadata, closing an alternate read path around GraphRAG policies.
+
+
 - Control Plane table/document pages now apply row and masking policies before
   pagination. Pgwire Describe authorizes a metadata-only plan, including untyped
   parameters, rather than falling back to unguarded schema lookup.

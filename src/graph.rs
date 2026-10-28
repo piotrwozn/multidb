@@ -30,6 +30,26 @@ pub struct GraphEdge {
     pub props: Value,
 }
 
+/// One bounded outgoing-edge scan in storage-key order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundedNeighbors {
+    pub neighbors: Vec<GraphEdge>,
+    /// All storage records examined, including malformed keys, before filtering/deduplication.
+    pub scanned_count: usize,
+    /// The scan reached its budget and may have omitted edges. This is conservative:
+    /// exactly `max_edges` records, and a zero budget, also report truncation.
+    pub truncated: bool,
+}
+
+/// A bounded projection of outgoing destinations without decoding edge properties.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedNeighborIds {
+    pub neighbors: Vec<GraphNodeId>,
+    pub scanned_count: usize,
+    /// Conservative when the scan exactly fills its budget, including zero.
+    pub truncated: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraversalOptions {
     pub max_depth: usize,
@@ -181,6 +201,120 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         Ok(edges)
     }
 
+    /// Reads at most `max_edges` outgoing edge records for one label.
+    ///
+    /// The backend scan stops at the budget, before applying any caller-side visibility
+    /// filters or deduplication. A full budget conservatively reports truncation, without
+    /// reading an extra record. A zero budget performs no storage reads.
+    /// # Errors
+    /// Fails when the label is empty, bounded scans are unsupported, storage cannot be
+    /// scanned, or properties cannot decode.
+    pub fn neighbors_bounded(
+        &self,
+        src: &GraphNodeId,
+        label: &str,
+        max_edges: usize,
+    ) -> Result<BoundedNeighbors, GraphError> {
+        validate_label(label)?;
+        let mut result = BoundedNeighbors {
+            neighbors: Vec::new(),
+            scanned_count: 0,
+            truncated: max_edges == 0,
+        };
+        if max_edges == 0 {
+            return Ok(result);
+        }
+        if !self.repl.supports_bounded_scans() {
+            return Err(ReplError::Unsupported(
+                "bounded graph scans are not supported by this replication backend".to_owned(),
+            )
+            .into());
+        }
+        let prefix = out_prefix(self.graph_id, src, label);
+        let end = keyenc::range_end(&prefix);
+        self.repl.scan_range_batches(
+            GRAPH_OUT_EDGES_TABLE,
+            &prefix,
+            &end,
+            ReadConsistency::Strong,
+            1,
+            &|| false,
+            &mut |batch| {
+                for (key, value) in batch
+                    .iter()
+                    .take(max_edges.saturating_sub(result.scanned_count))
+                {
+                    result.scanned_count += 1;
+                    let Some(dst) = trailing_node(key) else {
+                        continue;
+                    };
+                    result.neighbors.push(GraphEdge {
+                        src: src.clone(),
+                        label: label.to_owned(),
+                        dst,
+                        props: decode_value(value)?,
+                    });
+                }
+                result.truncated = result.scanned_count == max_edges;
+                Ok(result.scanned_count < max_edges)
+            },
+        )?;
+        Ok(result)
+    }
+
+    /// Reads at most `max_edges` outgoing destinations without retaining edge properties.
+    ///
+    /// Every storage record counts against the budget, including malformed keys. Properties
+    /// are neither decoded nor returned, so graph-assisted retrieval holds only node ids.
+    /// # Errors
+    /// Fails when the label is empty, bounded scans are unsupported, or storage fails.
+    pub fn neighbor_ids_bounded(
+        &self,
+        src: &GraphNodeId,
+        label: &str,
+        max_edges: usize,
+    ) -> Result<BoundedNeighborIds, GraphError> {
+        validate_label(label)?;
+        let mut result = BoundedNeighborIds {
+            neighbors: Vec::new(),
+            scanned_count: 0,
+            truncated: max_edges == 0,
+        };
+        if max_edges == 0 {
+            return Ok(result);
+        }
+        if !self.repl.supports_bounded_scans() {
+            return Err(ReplError::Unsupported(
+                "bounded graph scans are not supported by this replication backend".to_owned(),
+            )
+            .into());
+        }
+        let prefix = out_prefix(self.graph_id, src, label);
+        let end = keyenc::range_end(&prefix);
+        self.repl.scan_range_batches(
+            GRAPH_OUT_EDGES_TABLE,
+            &prefix,
+            &end,
+            ReadConsistency::Strong,
+            1,
+            &|| false,
+            &mut |batch| {
+                for (key, _) in batch
+                    .iter()
+                    .take(max_edges.saturating_sub(result.scanned_count))
+                {
+                    result.scanned_count += 1;
+                    if let Some(dst) = trailing_node(key) {
+                        result.neighbors.push(dst);
+                    }
+                }
+                result.truncated = result.scanned_count == max_edges;
+                Ok(result.scanned_count < max_edges)
+            },
+        )?;
+        Ok(result)
+    }
+
     /// Traverses up to `max_depth` hops with deduplication.
     /// # Errors
     /// Fails when traversal limits are exceeded or storage fails.
@@ -307,15 +441,276 @@ fn skip_len_bytes(key: &[u8], cursor: &mut usize) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::{
         db::{DbConfig, Profile, create_database},
         model::Value,
-        repl::Replication,
+        repl::{Op, ReadConsistency, ReplError, Replication},
+        storage::Bytes,
+        txn::WriteAuthorization,
     };
 
     use super::{Graph, GraphId, GraphNodeId, TraversalOptions};
+
+    /// Rejects unbounded range reads and counts records actually delivered by the
+    /// real storage-backed batched scanner, including records the caller cannot use.
+    struct ScanOnlyRepl {
+        inner: Arc<dyn Replication>,
+        scanned: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl Replication for ScanOnlyRepl {
+        fn supports_bounded_scans(&self) -> bool {
+            true
+        }
+
+        fn propose(&self, op: Op) -> Result<(), ReplError> {
+            self.inner.propose(op)
+        }
+
+        fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+            self.inner.propose_batch(ops)
+        }
+
+        fn propose_authorized_batch(
+            &self,
+            ops: Vec<Op>,
+            authorization: WriteAuthorization,
+        ) -> Result<(), ReplError> {
+            self.inner.propose_authorized_batch(ops, authorization)
+        }
+
+        fn read(
+            &self,
+            table: &str,
+            key: &[u8],
+            consistency: ReadConsistency,
+        ) -> Result<Option<Bytes>, ReplError> {
+            self.inner.read(table, key, consistency)
+        }
+
+        fn range(
+            &self,
+            _table: &str,
+            _start: &[u8],
+            _end: &[u8],
+            _consistency: ReadConsistency,
+        ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+            Err(ReplError::Unsupported("unbounded graph scan".to_owned()))
+        }
+
+        #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+        fn scan_range_batches(
+            &self,
+            table: &str,
+            start: &[u8],
+            end: &[u8],
+            consistency: ReadConsistency,
+            batch_rows: usize,
+            cancelled: &dyn Fn() -> bool,
+            on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+        ) -> Result<(), ReplError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.scan_range_batches(
+                table,
+                start,
+                end,
+                consistency,
+                batch_rows,
+                cancelled,
+                &mut |batch| {
+                    self.scanned.fetch_add(batch.len(), Ordering::SeqCst);
+                    on_batch(batch)
+                },
+            )
+        }
+    }
+
+    /// Deliberately inherits the legacy eager scan default and capability=false.
+    struct UnboundedRepl {
+        inner: Arc<dyn Replication>,
+        range_calls: AtomicUsize,
+    }
+
+    impl Replication for UnboundedRepl {
+        fn propose(&self, op: Op) -> Result<(), ReplError> {
+            self.inner.propose(op)
+        }
+
+        fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+            self.inner.propose_batch(ops)
+        }
+
+        fn propose_authorized_batch(
+            &self,
+            ops: Vec<Op>,
+            authorization: WriteAuthorization,
+        ) -> Result<(), ReplError> {
+            self.inner.propose_authorized_batch(ops, authorization)
+        }
+
+        fn read(
+            &self,
+            table: &str,
+            key: &[u8],
+            consistency: ReadConsistency,
+        ) -> Result<Option<Bytes>, ReplError> {
+            self.inner.read(table, key, consistency)
+        }
+
+        fn range(
+            &self,
+            table: &str,
+            start: &[u8],
+            end: &[u8],
+            consistency: ReadConsistency,
+        ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+            self.range_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.range(table, start, end, consistency)
+        }
+    }
+
+    #[test]
+    fn bounded_neighbors_refuse_eager_backend_before_reading_any_edges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl = UnboundedRepl {
+            inner: Arc::new(database),
+            range_calls: AtomicUsize::new(0),
+        };
+        let graph = Graph::new(&repl, GraphId::new(1));
+        let node = GraphNodeId::from_str_id("root");
+        graph.add_edge(
+            node.clone(),
+            "knows",
+            GraphNodeId::from_str_id("a"),
+            &Value::Null,
+        )?;
+        assert!(matches!(
+            graph.neighbors_bounded(&node, "knows", 1),
+            Err(super::GraphError::Repl(ReplError::Unsupported(_)))
+        ));
+        assert_eq!(repl.range_calls.load(Ordering::SeqCst), 0);
+        // No scan is needed for zero budget, even on an eager backend.
+        assert_eq!(graph.neighbors_bounded(&node, "knows", 0)?.scanned_count, 0);
+        assert_eq!(repl.range_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_neighbors_stop_storage_scan_at_the_examined_edge_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl = ScanOnlyRepl {
+            inner: Arc::new(database),
+            scanned: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        };
+        let graph = Graph::new(&repl, GraphId::new(1));
+        let node = GraphNodeId::from_str_id("root");
+        for id in (0..100).rev() {
+            graph.add_edge(
+                node.clone(),
+                "knows",
+                GraphNodeId::from_str_id(&format!("n{id:03}")),
+                &Value::Int(id),
+            )?;
+        }
+        graph.add_edge(
+            node.clone(),
+            "other",
+            GraphNodeId::from_str_id("ignored"),
+            &Value::Null,
+        )?;
+        let result = graph.neighbors_bounded(&node, "knows", 7)?;
+        assert_eq!(result.scanned_count, 7);
+        assert!(result.truncated);
+        assert_eq!(repl.scanned.load(Ordering::SeqCst), 7);
+        assert_eq!(
+            result
+                .neighbors
+                .iter()
+                .map(|e| e.dst.clone())
+                .collect::<Vec<_>>(),
+            (0..7)
+                .map(|id| GraphNodeId::from_str_id(&format!("n{id:03}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(graph.neighbors_bounded(&node, "knows", 7)?, result);
+        let all = graph.neighbors_bounded(&node, "knows", 101)?;
+        assert_eq!(all.scanned_count, 100);
+        assert!(!all.truncated);
+        assert_eq!(all.neighbors.len(), 100);
+        let calls = repl.calls.load(Ordering::SeqCst);
+        let zero = graph.neighbors_bounded(&node, "knows", 0)?;
+        assert_eq!(zero.scanned_count, 0);
+        assert_eq!(zero.neighbors, Vec::new());
+        assert!(zero.truncated);
+        assert_eq!(repl.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            graph.neighbors_bounded(&node, "missing", 7)?.neighbors,
+            Vec::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_edge_keys_still_consume_the_bounded_scan_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let node = GraphNodeId::from_str_id("root");
+        let id = GraphId::new(1);
+        let mut malformed = super::out_prefix(id, &node, "knows");
+        malformed.push(0);
+        database.propose(Op::Put {
+            table: super::GRAPH_OUT_EDGES_TABLE.to_owned(),
+            key: malformed,
+            value: crate::model::encode_value(&Value::Null)?,
+        })?;
+        let graph = Graph::new(&database, id);
+        graph.add_edge(
+            node.clone(),
+            "knows",
+            GraphNodeId::from_str_id("visible"),
+            &Value::Null,
+        )?;
+        let result = graph.neighbors_bounded(&node, "knows", 1)?;
+        assert_eq!(result.scanned_count, 1);
+        assert!(result.truncated);
+        assert_eq!(result.neighbors, Vec::new());
+        assert!(graph.neighbors_bounded(&node, "", 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_neighbor_ids_do_not_decode_or_retain_edge_properties()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let id = GraphId::new(1);
+        let source = GraphNodeId::from_str_id("root");
+        let target = GraphNodeId::from_str_id("target");
+        database.propose(Op::Put {
+            table: super::GRAPH_OUT_EDGES_TABLE.to_owned(),
+            key: super::out_key(id, &source, "related", &target),
+            value: b"not encoded edge properties".to_vec(),
+        })?;
+        let graph = Graph::new(&database, id);
+        let result = graph.neighbor_ids_bounded(&source, "related", 2)?;
+        assert_eq!(result.neighbors, vec![target]);
+        assert_eq!(result.scanned_count, 1);
+        assert!(!result.truncated);
+        assert!(graph.neighbors_bounded(&source, "related", 2).is_err());
+        assert_eq!(
+            graph.neighbor_ids_bounded(&source, "related", 0)?.neighbors,
+            Vec::new()
+        );
+        Ok(())
+    }
 
     #[test]
     fn graph_edges_are_mirrored_and_traversed() -> Result<(), Box<dyn std::error::Error>> {
