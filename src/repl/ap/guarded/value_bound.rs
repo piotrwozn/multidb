@@ -2,13 +2,16 @@
 
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
-use crate::{repl::VersionedBytes, storage::StorageError};
+use crate::{
+    repl::VersionedBytes,
+    storage::{ReadBudget, StorageError},
+};
 
 /// Workspace of the slice decoder, distinct from the owned sibling allocations.
 /// Unescaped strings are borrowed; numeric byte-array length does not determine
 /// scratch capacity. Also cover `IgnoredAny`'s container stack and optional
 /// `serde_json` number-parser features without depending on feature unification.
-pub(super) fn working_bytes(bytes: &[u8]) -> usize {
+pub(super) fn working_bytes(bytes: &[u8], budget: &dyn ReadBudget) -> Result<usize, StorageError> {
     let mut start = None;
     let mut escaped = false;
     let mut has_escape = false;
@@ -19,6 +22,9 @@ pub(super) fn working_bytes(bytes: &[u8]) -> usize {
     let mut number = 0_usize;
     let mut longest_number = 0_usize;
     for (index, &byte) in bytes.iter().enumerate() {
+        if index.is_multiple_of(4096) {
+            budget.check()?;
+        }
         if let Some(begin) = start {
             if escaped {
                 escaped = false;
@@ -63,12 +69,13 @@ pub(super) fn working_bytes(bytes: &[u8]) -> usize {
     // also be quoted into serde's error: at most six output bytes per input
     // byte, with capacity slack and overlapping formatting buffers. Reserve
     // that workspace before parsing too; it is constant for normal field names.
-    longest_escaped
+    budget.check()?;
+    Ok(longest_escaped
         .saturating_mul(2)
         .saturating_add(longest_string.saturating_mul(24))
         .saturating_add(max_depth.saturating_mul(2))
         .saturating_add(longest_number.saturating_mul(2))
-        .saturating_add(512)
+        .saturating_add(512))
 }
 
 pub(super) fn versions_bound(bytes: &[u8], limit: usize) -> Result<usize, StorageError> {

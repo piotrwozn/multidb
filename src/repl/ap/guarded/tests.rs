@@ -245,6 +245,8 @@ fn numeric_sibling_arrays_fit_16k_with_prior_results_still_reserved() -> TestRes
 
 #[test]
 fn json_workspace_tracks_tokens_and_ignored_nesting_not_byte_array_length() -> TestResult {
+    let read_budget = budget()?;
+    let working = |bytes: &[u8]| super::value_bound::working_bytes(bytes, &read_budget);
     let raw = |count| {
         format!(
             "[{{\"value\":[{}0],\"clock\":{{\"1\":1}},\"origin\":1}}]",
@@ -253,31 +255,60 @@ fn json_workspace_tracks_tokens_and_ignored_nesting_not_byte_array_length() -> T
     };
     let short = raw(8);
     let long = raw(65_536);
-    assert_eq!(
-        super::value_bound::working_bytes(short.as_bytes()),
-        super::value_bound::working_bytes(long.as_bytes())
-    );
-    assert!(super::value_bound::working_bytes(long.as_bytes()) < 1024);
+    assert_eq!(working(short.as_bytes())?, working(long.as_bytes())?);
+    assert!(working(long.as_bytes())? < 1024);
     let escaped = br#"[{"valu\u0065":[1],"cl\u006fck":{"1":1},"or\u0069gin":1}]"#;
     assert!(super::value_bound::versions_bound(escaped, 8192)? > 1024);
-    assert!(
-        super::value_bound::working_bytes(escaped)
-            > super::value_bound::working_bytes(short.as_bytes())
-    );
+    assert!(working(escaped)? > working(short.as_bytes())?);
     let nested = format!(
         "[{{\"ignored\":{}null{}}}]",
         "[".repeat(4096),
         "]".repeat(4096)
     );
-    assert!(super::value_bound::working_bytes(nested.as_bytes()) > 8192);
+    assert!(working(nested.as_bytes())? > 8192);
     let malformed = format!("[{{\"value\":\"{}\"}}]", "\u{7f}".repeat(4096));
     // serde formats unexpected typed strings into errors, even without escapes.
-    assert!(super::value_bound::working_bytes(malformed.as_bytes()) > 24 * 4096);
+    assert!(working(malformed.as_bytes())? > 24 * 4096);
     assert!(matches!(
         super::value_bound::versions_bound(malformed.as_bytes(), 8192),
         Err(StorageError::Corruption(_))
     ));
     Ok(())
+}
+
+#[test]
+fn json_workspace_checks_cancellation_before_scanning_the_second_chunk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CancelOnSecondCheck(AtomicUsize);
+    impl ReadBudget for CancelOnSecondCheck {
+        fn check(&self) -> Result<(), StorageError> {
+            if self.0.fetch_add(1, Ordering::Relaxed) >= 1 {
+                Err(StorageError::Cancelled("test cancellation".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn reserve(
+            &self,
+            _: usize,
+        ) -> Result<Box<dyn crate::storage::ReadReservation>, StorageError> {
+            panic!("workspace preflight must not allocate owned input");
+        }
+
+        fn remaining_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    let source = [b'0'; 16 * 1024];
+    let budget = CancelOnSecondCheck(AtomicUsize::new(0));
+    assert!(matches!(
+        super::value_bound::working_bytes(&source, &budget),
+        Err(StorageError::Cancelled(_))
+    ));
+    assert_eq!(budget.0.load(Ordering::Relaxed), 2);
 }
 
 #[test]
