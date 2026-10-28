@@ -73,7 +73,7 @@ class ServiceLifecycle(unittest.TestCase):
             ports = [call.args[0][1] for call in constructor.return_value.__enter__.return_value.bind.call_args_list]
             self.assertEqual(ports, [15432, 15433, 15434, 17474, 18080, 18081, 27018])
             constructor.return_value.__enter__.return_value.bind.side_effect = OSError("port already in use")
-            with self.assertRaisesRegex(OSError, "already in use"):
+            with self.assertRaisesRegex(RuntimeError, "benchmark port 15433 is unavailable"):
                 competition.require_unused_ports(["kv"])
 
     def test_transient_startup_and_recovery_wait_is_outside_measurements(self):

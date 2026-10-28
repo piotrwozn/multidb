@@ -90,7 +90,15 @@ def require_unused_ports(domains, analytical=False):
     # particular, an old listener must not be mistaken for our new process.
     with contextlib.ExitStack() as stack:
         for port in sorted(ports):
-            stack.enter_context(socket.socket()).bind(("127.0.0.1", port))
+            probe = stack.enter_context(socket.socket())
+            # A previous, cleanly closed campaign can leave TCP TIME_WAIT
+            # connections. Match the server's restart semantics while still
+            # refusing a socket held by an active listener.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError as error:
+                raise RuntimeError(f"benchmark port {port} is unavailable") from error
 
 
 def competitor_probe(engine):
@@ -298,6 +306,7 @@ def main():
     provenance = verify_harness(args.harness)
     plan = dict(host=host_metadata(), binary=str(args.binary), binary_sha256=sha256(args.binary),
                 revision=args.revision, rows=args.rows, repeats=args.repeats, ops=args.ops, domains=args.domains,
+                runner_files_sha256={path.name: sha256(path) for path in sorted(Path(__file__).parent.glob("*.py"))},
                 analytical=args.analytical,
                 server_cpus=server_cpus, client_cpus=client_cpus, docker_images=IMAGES,
                 comparator_versions={"duckdb": "1.4.3", "deeplake": "4.7.4", "redis_client": "6.4.0"},

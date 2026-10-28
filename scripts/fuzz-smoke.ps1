@@ -22,10 +22,10 @@ if ($rustcVersion -notmatch "nightly") {
     $cargoFuzzArgs = @("+nightly", "fuzz", "run")
 }
 
-$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+$fuzzHostIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
-if ($isWindows) {
+if ($fuzzHostIsWindows) {
     $asanRuntime = Get-ChildItem `
         -Path "C:\Program Files\Microsoft Visual Studio", "C:\Program Files (x86)\Microsoft Visual Studio" `
         -Filter "clang_rt.asan_dynamic-x86_64.dll" `
