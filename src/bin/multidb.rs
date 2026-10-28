@@ -126,6 +126,7 @@ struct ServeConfig {
     pg_user: String,
     pg_password: String,
     pg_tls: ServePgTls,
+    pg_limits: ServePgLimits,
     studio_dir: PathBuf,
     query_governor: ServeQueryGovernor,
     history_retain_lsns: Option<u64>,
@@ -164,6 +165,15 @@ enum ProfileSelection {
 struct ServeQueryGovernor {
     max_concurrent_queries: Option<usize>,
     queue_timeout_ms: Option<u64>,
+}
+
+/// Optional process-local pgwire limits; unset values retain `NetworkConfig` defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ServePgLimits {
+    handshake_timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    max_frame_bytes: Option<usize>,
 }
 
 /// Upper bound for `MULTIDB_MAX_CONCURRENT_QUERIES`.
@@ -3357,7 +3367,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         4096,
         ScramCredential::from_password(&config.pg_password, 4096)?,
     );
-    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries);
+    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries, config.pg_limits);
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -4821,10 +4831,55 @@ fn flatten_serve_task(
 
 /// Runs at most as many `PostgreSQL` wire statements as the query governor admits,
 /// so a burst waits for a free statement slot instead of failing the governor queue timeout.
-fn serve_pg_config(tls: TlsMode, auth: AuthConfig, max_concurrent_queries: usize) -> NetworkConfig {
-    let config = NetworkConfig::new(tls, auth);
+fn serve_pg_config(
+    tls: TlsMode,
+    auth: AuthConfig,
+    max_concurrent_queries: usize,
+    limits: ServePgLimits,
+) -> NetworkConfig {
+    let mut config = NetworkConfig::new(tls, auth);
+    if let Some(timeout) = limits.handshake_timeout_ms {
+        config = config.with_handshake_timeout_ms(timeout);
+    }
+    if let Some(timeout) = limits.idle_timeout_ms {
+        config = config.with_idle_timeout_ms(timeout);
+    }
+    if let Some(timeout) = limits.request_timeout_ms {
+        config = config.with_connection_timeout_ms(timeout);
+    }
+    if let Some(bytes) = limits.max_frame_bytes {
+        config = config.with_max_frame_bytes(bytes);
+    }
     let max_blocking_tasks = config.max_blocking_tasks.min(max_concurrent_queries.max(1));
     config.with_max_blocking_tasks(max_blocking_tasks)
+}
+
+fn serve_pg_limits_from_sources<F>(get_env: &F) -> Result<ServePgLimits, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(ServePgLimits {
+        handshake_timeout_ms: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_HANDSHAKE_TIMEOUT_MS",
+            u64::MAX,
+        )?,
+        idle_timeout_ms: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_IDLE_TIMEOUT_MS",
+            u64::MAX,
+        )?,
+        request_timeout_ms: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_REQUEST_TIMEOUT_MS",
+            u64::MAX,
+        )?,
+        max_frame_bytes: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_MAX_FRAME_BYTES",
+            usize::MAX,
+        )?,
+    })
 }
 
 fn serve_config_from_env() -> Result<ServeConfig, CliError> {
@@ -4874,6 +4929,7 @@ where
         "/usr/share/multidb/studio",
     ));
     let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
+    let pg_limits = serve_pg_limits_from_sources(&get_env)?;
     let spec = serve_spec_from_sources(&get_env)?;
     let query_governor = ServeQueryGovernor {
         max_concurrent_queries: bounded_positive_from_sources(
@@ -4904,6 +4960,7 @@ where
         pg_user,
         pg_password,
         pg_tls,
+        pg_limits,
         studio_dir,
         spec,
         query_governor,
@@ -5497,7 +5554,7 @@ mod tests {
     #[cfg(unix)]
     use super::write_through_temp_file;
     use super::{
-        CliError, ProfileSelection, ServePgTls, ServeQueryGovernor, ServeSpecConfig,
+        CliError, ProfileSelection, ServePgLimits, ServePgTls, ServeQueryGovernor, ServeSpecConfig,
         apply_query_governor, cli_db_config, format_metadata_probe, parse_profile_selection, run,
         serve_config_from_sources, serve_database, serve_pg_config, values,
     };
@@ -5758,11 +5815,26 @@ mod tests {
         let default_tasks =
             NetworkConfig::new(TlsMode::DisabledForTests, auth.clone()).max_blocking_tasks;
 
-        let small = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 4);
+        let small = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth.clone(),
+            4,
+            ServePgLimits::default(),
+        );
         assert_eq!(small.max_blocking_tasks, 4);
-        let zero = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 0);
+        let zero = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth.clone(),
+            0,
+            ServePgLimits::default(),
+        );
         assert_eq!(zero.max_blocking_tasks, 1);
-        let large = serve_pg_config(TlsMode::DisabledForTests, auth, default_tasks + 64);
+        let large = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth,
+            default_tasks + 64,
+            ServePgLimits::default(),
+        );
         assert_eq!(large.max_blocking_tasks, default_tasks);
         Ok(())
     }
@@ -5775,6 +5847,86 @@ mod tests {
         ]);
         env.extend(env_map(extra));
         env
+    }
+
+    #[test]
+    fn serve_pg_limits_preserve_defaults_when_unset_or_blank()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for overrides in [
+            Vec::new(),
+            vec![
+                ("MULTIDB_PG_HANDSHAKE_TIMEOUT_MS", ""),
+                ("MULTIDB_PG_IDLE_TIMEOUT_MS", " "),
+                ("MULTIDB_PG_REQUEST_TIMEOUT_MS", "\t"),
+                ("MULTIDB_PG_MAX_FRAME_BYTES", ""),
+            ],
+        ] {
+            let env = local_dev_env(&overrides);
+            let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+            assert_eq!(config.pg_limits, ServePgLimits::default());
+            let auth = AuthConfig::single_user(
+                "postgres".to_owned(),
+                4096,
+                ScramCredential::from_password("pg-secret", 4096)?,
+            );
+            let network = serve_pg_config(TlsMode::DisabledForTests, auth, 4, config.pg_limits);
+            assert_eq!(network.handshake_timeout_ms, 10_000);
+            assert_eq!(network.idle_timeout_ms, 60_000);
+            assert_eq!(network.connection_timeout_ms, 300_000);
+            assert_eq!(network.max_frame_bytes, 16 * 1024 * 1024);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_limits_parse_and_reach_network_config() -> Result<(), Box<dyn std::error::Error>> {
+        let env = local_dev_env(&[
+            ("MULTIDB_PG_HANDSHAKE_TIMEOUT_MS", "12000"),
+            ("MULTIDB_PG_IDLE_TIMEOUT_MS", " 90000 "),
+            ("MULTIDB_PG_REQUEST_TIMEOUT_MS", "310000"),
+            ("MULTIDB_PG_MAX_FRAME_BYTES", "32768"),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(
+            config.pg_limits,
+            ServePgLimits {
+                handshake_timeout_ms: Some(12_000),
+                idle_timeout_ms: Some(90_000),
+                request_timeout_ms: Some(310_000),
+                max_frame_bytes: Some(32_768),
+            }
+        );
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let network = serve_pg_config(TlsMode::DisabledForTests, auth, 4, config.pg_limits);
+        assert_eq!(network.handshake_timeout_ms, 12_000);
+        assert_eq!(network.idle_timeout_ms, 90_000);
+        assert_eq!(network.connection_timeout_ms, 310_000);
+        assert_eq!(network.max_frame_bytes, 32_768);
+        assert_eq!(network.max_blocking_tasks, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_limits_reject_zero_overflow_and_invalid_numbers() {
+        for name in [
+            "MULTIDB_PG_HANDSHAKE_TIMEOUT_MS",
+            "MULTIDB_PG_IDLE_TIMEOUT_MS",
+            "MULTIDB_PG_REQUEST_TIMEOUT_MS",
+            "MULTIDB_PG_MAX_FRAME_BYTES",
+        ] {
+            for value in ["0", "-1", "many", "1.5", "18446744073709551616"] {
+                let env = local_dev_env(&[(name, value)]);
+                let error = serve_config_from_sources(|name| env.get(name).cloned());
+                assert!(
+                    matches!(error, Err(CliError::Usage(ref message)) if message.contains(name)),
+                    "{name}={value}: unexpected result {error:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5869,6 +6021,7 @@ mod tests {
             TlsMode::DisabledForTests,
             auth,
             database.performance_config().query.max_concurrent_queries,
+            ServePgLimits::default(),
         );
         assert_eq!(pg_config.max_blocking_tasks, 3);
         Ok(())

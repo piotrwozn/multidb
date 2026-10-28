@@ -64,8 +64,12 @@ use crate::{
     temporal::{self, TemporalRetention},
 };
 
+mod batch_cache;
+mod explain_fallback;
 mod optimizer;
 mod parser;
+mod row_scan;
+mod write_batch;
 
 pub use optimizer::{
     AccessPath, AnalyzeMode, AnalyzeReport, AnalyzeTarget, Bucket, CachedPlan,
@@ -329,15 +333,12 @@ pub trait SqlReadGuard: Send {
 enum PreparedStatement {
     Select(PreparedSelect),
     Analyze(AnalyzeTarget),
-    Explain {
-        sql: String,
-        simple: Box<SimpleSelectPlan>,
-        options: ExplainOptions,
-    },
+    Explain(explain_fallback::PreparedExplain),
     Insert(Box<sqlparser::ast::Insert>),
 }
 
 enum PreparedSelect {
+    RowRange(Box<row_scan::RowRangePlan>),
     Simple {
         sql: String,
         plan: Box<SimpleSelectPlan>,
@@ -361,6 +362,7 @@ pub struct RelTable {
     layout: TableLayout,
 }
 
+#[derive(Clone)]
 pub struct SqlEngine {
     repl: Arc<dyn Replication>,
     tables: BTreeMap<String, RelTable>,
@@ -371,6 +373,7 @@ pub struct SqlEngine {
     layout: TableLayout,
     cost_model: CostModel,
     plan_cache: Arc<Mutex<PlanCache>>,
+    batch_cache: Arc<batch_cache::BatchCache>,
     performance: PerformanceConfig,
     snapshot_lsn: Option<u64>,
 }
@@ -381,6 +384,7 @@ struct StorageTableProvider {
     arrow_schema: SchemaRef,
     performance: PerformanceConfig,
     snapshot_lsn: Option<u64>,
+    batch_cache: Arc<batch_cache::BatchCache>,
 }
 
 #[derive(Clone)]
@@ -743,11 +747,10 @@ impl RelTable {
         let old_bytes = self
             .repl
             .read(REL_ROWS_TABLE, &row_key, ReadConsistency::Strong)?;
-        let mut ops = Vec::new();
-        if let Some(old) = old_bytes.as_deref().map(decode_row).transpose()?.flatten() {
-            self.append_index_delete_ops(&mut ops, &old, &row_key)?;
-        }
-        ops.extend(self.put_ops(row, &row_key)?);
+        let ops = match old_bytes.as_deref().map(decode_row).transpose()?.flatten() {
+            Some(old) => self.update_ops_for_key(&old, row, &row_key)?,
+            None => self.put_ops(row, &row_key)?,
+        };
         let condition = WriteCondition::ValueEquals {
             table: REL_ROWS_TABLE.to_owned(),
             key: row_key,
@@ -773,14 +776,10 @@ impl RelTable {
         }
 
         let row_key = self.row_key(&row)?;
-        let mut ops = Vec::new();
-
-        if let Some(old) = self.get_by_row_key(&row_key)? {
-            self.append_index_delete_ops(&mut ops, &old, &row_key)?;
+        match self.get_by_row_key(&row_key)? {
+            Some(old) => self.update_ops_for_key(&old, row, &row_key),
+            None => self.put_ops(row, &row_key),
         }
-
-        ops.extend(self.put_ops(row, &row_key)?);
-        Ok(ops)
     }
 
     /// Deletes a row by primary key.
@@ -867,6 +866,18 @@ impl RelTable {
         }
 
         self.put_ops(row, row_key)
+    }
+
+    pub(crate) fn update_ops_for_key(
+        &self,
+        old: &Row,
+        row: Row,
+        row_key: &[u8],
+    ) -> Result<Vec<Op>, QueryError> {
+        if self.layout == TableLayout::Columnar {
+            return self.columnar_update_ops(row);
+        }
+        write_batch::update_ops_for_key(self, old, row, row_key)
     }
 
     pub(crate) fn index_delete_ops_for_key(
@@ -1006,18 +1017,21 @@ impl RelTable {
     ) -> Result<(RelQueryResult, AccessPath), QueryError> {
         validate_column(self.schema.as_ref(), column)?;
         let column_name = column_name(self.schema.as_ref(), column);
-        let path = cost_model.choose_eq_path(EqPathRequest {
-            layout: self.layout,
-            indexes: &self.indexes,
-            column,
-            column_name: &column_name,
-            value,
-            stats,
-            projected_columns: self
-                .schema
-                .as_ref()
-                .map_or(1, |schema| schema.columns.len()),
-        });
+        let path = cost_model.choose_eq_path_with_schema(
+            EqPathRequest {
+                layout: self.layout,
+                indexes: &self.indexes,
+                column,
+                column_name: &column_name,
+                value,
+                stats,
+                projected_columns: self
+                    .schema
+                    .as_ref()
+                    .map_or(1, |schema| schema.columns.len()),
+            },
+            self.schema.as_ref(),
+        );
 
         let result = self.query_eq_with_access_path(column, value, &path)?;
 
@@ -1076,12 +1090,25 @@ impl RelTable {
             .repl
             .range(REL_INDEX_TABLE, &prefix, &end, ReadConsistency::Strong)?;
 
+        let row_keys: Vec<Bytes> = entries
+            .into_iter()
+            .filter_map(|(key, _)| row_key_from_index_key(&key).map(<[u8]>::to_vec))
+            .collect();
+        let examined_rows = row_keys.len();
         let mut rows = Vec::new();
-        let mut examined_rows = 0;
-        for (key, _) in entries {
-            if let Some(row_key) = row_key_from_index_key(&key) {
-                examined_rows += 1;
-                if let Some(row) = self.get_by_row_key(row_key)?
+        for keys in row_keys.chunks(256) {
+            let values = self
+                .repl
+                .read_many(REL_ROWS_TABLE, keys, ReadConsistency::Strong)?;
+            if values.len() != keys.len() {
+                return Err(QueryError::Storage(StorageError::Corruption(format!(
+                    "index row fetch returned {} values for {} keys",
+                    values.len(),
+                    keys.len(),
+                ))));
+            }
+            for bytes in values.into_iter().flatten() {
+                if let Some(row) = decode_row(&bytes)?
                     && predicate_matches(&row, filter)?
                 {
                     rows.push(row);
@@ -1238,13 +1265,23 @@ impl RelTable {
 
     fn put_ops(&self, row: Row, row_key: &[u8]) -> Result<Vec<Op>, QueryError> {
         let mut ops = Vec::new();
-        self.append_index_put_ops(&mut ops, &row, row_key)?;
+        self.append_put_ops(&mut ops, row, row_key)?;
+        Ok(ops)
+    }
+
+    fn append_put_ops(
+        &self,
+        ops: &mut Vec<Op>,
+        row: Row,
+        row_key: &[u8],
+    ) -> Result<(), QueryError> {
+        self.append_index_put_ops(ops, &row, row_key)?;
         ops.push(Op::Put {
             table: REL_ROWS_TABLE.to_owned(),
             key: row_key.to_vec(),
             value: encode_value(&Value::Array(row))?,
         });
-        Ok(ops)
+        Ok(())
     }
 
     fn get_by_row_key(&self, row_key: &[u8]) -> Result<Option<Row>, QueryError> {
@@ -1944,6 +1981,7 @@ impl SqlEngine {
             layout,
             cost_model: CostModel::new(profile),
             plan_cache,
+            batch_cache: Arc::new(batch_cache::BatchCache::new(&performance)),
             performance,
             snapshot_lsn: None,
         }
@@ -2121,10 +2159,17 @@ impl SqlEngine {
     /// # Errors
     /// Fails when SQL is unsupported or execution fails under `ANALYZE`.
     pub fn explain(&self, sql: &str, options: ExplainOptions) -> Result<ExplainReport, QueryError> {
-        let simple = self
-            .simple_select_plan(sql)?
-            .ok_or_else(explain_unsupported)?;
-        self.explain_simple(sql, &simple, options)
+        if self.snapshot_lsn.is_none()
+            && let Some(plan) = row_scan::plan(self, sql)?
+        {
+            return self.explain_range(sql, &plan, options);
+        }
+        if self.snapshot_lsn.is_none()
+            && let Some(simple) = self.simple_select_plan(sql)?
+        {
+            return self.explain_simple(sql, &simple, options);
+        }
+        self.explain_fallback_sync(sql, options)
     }
 
     fn explain_simple(
@@ -2155,7 +2200,9 @@ impl SqlEngine {
                 &plan.access_path,
             )?;
             (
-                Some(usize_to_u64(result.rows.len())),
+                Some(usize_to_u64(
+                    result.rows.len().min(simple.limit.unwrap_or(usize::MAX)),
+                )),
                 Some(optimizer::elapsed_ms(started)),
             )
         } else {
@@ -2288,27 +2335,13 @@ impl SqlEngine {
                 format!("SELECT {projection} FROM {name}")
             }
             Statement::Explain { statement, .. } => {
-                let simple = self
-                    .simple_select_plan(&statement.to_string())?
-                    .ok_or_else(explain_unsupported)?;
-                if policies.contains_key(&simple.table) {
-                    return Err(QueryError::Unsupported(format!(
-                        "EXPLAIN over {} is unsupported while it has row or masking policies",
-                        simple.table
-                    )));
-                }
+                let (_, reads) = self
+                    .prepare_explain(&statement.to_string(), ExplainOptions::default(), &policies)
+                    .await?;
                 guard
-                    .authorize_reads(&BTreeSet::from([SqlReadTarget::Catalog(simple.table)]))
+                    .authorize_reads(&reads)
                     .map_err(QueryError::AuthzDenied)?;
-                return Ok(Some(Arc::new(Schema::new(vec![
-                    Field::new("operator", DataType::Utf8, false),
-                    Field::new("access_path", DataType::Utf8, false),
-                    Field::new("est_rows", DataType::Int64, false),
-                    Field::new("actual_rows", DataType::Int64, true),
-                    Field::new("cost", DataType::Float64, false),
-                    Field::new("actual_ms", DataType::Float64, true),
-                    Field::new("details", DataType::Utf8, false),
-                ]))));
+                return Ok(Some(explain_fallback::schema()));
             }
             // These commands have no normal row description on the wire. Their
             // write/admin checks are the Database caller's responsibility.
@@ -2350,26 +2383,10 @@ impl SqlEngine {
             Statement::Explain {
                 analyze, statement, ..
             } => {
-                let sql = statement.to_string();
-                let simple = self
-                    .simple_select_plan(&sql)?
-                    .ok_or_else(explain_unsupported)?;
-                // EXPLAIN reports the stored rows the plan touches, before any policy.
-                if policies.contains_key(&simple.table) {
-                    return Err(QueryError::Unsupported(format!(
-                        "EXPLAIN over {} is unsupported while it has row or masking policies",
-                        simple.table
-                    )));
-                }
-                let reads = BTreeSet::from([SqlReadTarget::Catalog(simple.table.clone())]);
-                Ok((
-                    PreparedStatement::Explain {
-                        sql,
-                        simple: Box::new(simple),
-                        options: ExplainOptions { analyze },
-                    },
-                    Some(reads),
-                ))
+                let (prepared, reads) = self
+                    .prepare_explain(&statement.to_string(), ExplainOptions { analyze }, policies)
+                    .await?;
+                Ok((PreparedStatement::Explain(prepared), Some(reads)))
             }
             Statement::Insert(insert) => {
                 // RETURNING hands back stored rows, the existing row of an
@@ -2396,6 +2413,9 @@ impl SqlEngine {
 
     async fn run_statement(&self, statement: PreparedStatement) -> Result<SqlOutput, QueryError> {
         match statement {
+            PreparedStatement::Select(PreparedSelect::RowRange(plan)) => {
+                row_scan::execute(self, &plan)
+            }
             PreparedStatement::Select(PreparedSelect::Simple { sql, plan }) => {
                 self.run_simple_select(&sql, &plan)
             }
@@ -2407,11 +2427,9 @@ impl SqlEngine {
             PreparedStatement::Analyze(target) => Ok(self
                 .analyze(target, AnalyzeMode::default())?
                 .to_sql_output()),
-            PreparedStatement::Explain {
-                sql,
-                simple,
-                options,
-            } => Ok(self.explain_simple(&sql, &simple, options)?.to_sql_output()),
+            PreparedStatement::Explain(prepared) => {
+                Ok(self.run_explain(prepared).await?.to_sql_output())
+            }
             PreparedStatement::Insert(insert) => self.execute_insert(&insert),
         }
     }
@@ -2421,6 +2439,15 @@ impl SqlEngine {
         sql: &str,
         policies: &BTreeMap<String, SqlRelationPolicy>,
     ) -> Result<(PreparedSelect, BTreeSet<SqlReadTarget>), QueryError> {
+        // Policy-protected relations always retain their provider barrier. This fast
+        // plan has a complete literal-PK grammar and reports its catalog read to the guard.
+        if self.snapshot_lsn.is_none()
+            && let Some(plan) = row_scan::plan(self, sql)?
+            && !policies.contains_key(&plan.table)
+        {
+            let reads = BTreeSet::from([SqlReadTarget::Catalog(plan.table.clone())]);
+            return Ok((PreparedSelect::RowRange(Box::new(plan)), reads));
+        }
         // The simple path reads stored rows directly, so a relation with policies
         // is always planned through `DataFusion`, where they are applied.
         if self.snapshot_lsn.is_none()
@@ -2470,6 +2497,7 @@ impl SqlEngine {
                     table.clone(),
                     self.performance.clone(),
                     self.snapshot_lsn,
+                    Arc::clone(&self.batch_cache),
                 )),
             ));
         }
@@ -2770,13 +2798,16 @@ impl SqlEngine {
             });
         }
 
-        let access_path = self.cost_model.choose_filter_path(FilterPathRequest {
-            layout: table.layout,
-            indexes: table.indexes(),
-            filter,
-            stats,
-            projection,
-        });
+        let access_path = self.cost_model.choose_filter_path_with_schema(
+            FilterPathRequest {
+                layout: table.layout,
+                indexes: table.indexes(),
+                filter,
+                stats,
+                projection,
+            },
+            table.schema.as_ref(),
+        );
         self.plan_cache
             .lock()
             .map_err(|_| {
@@ -2812,12 +2843,18 @@ impl SqlEngine {
 }
 
 impl StorageTableProvider {
-    fn new(table: RelTable, performance: PerformanceConfig, snapshot_lsn: Option<u64>) -> Self {
+    fn new(
+        table: RelTable,
+        performance: PerformanceConfig,
+        snapshot_lsn: Option<u64>,
+        batch_cache: Arc<batch_cache::BatchCache>,
+    ) -> Self {
         Self {
             arrow_schema: schema_to_arrow(table.schema.as_ref()),
             table,
             performance,
             snapshot_lsn,
+            batch_cache,
         }
     }
 }
@@ -3073,10 +3110,16 @@ impl TableProvider for StorageTableProvider {
         if self.table.layout == TableLayout::Columnar {
             return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
         }
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if self.snapshot_lsn.is_none() && row_scan::supports_filter(&self.table, filter) {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -3092,10 +3135,34 @@ impl TableProvider for StorageTableProvider {
         let projection_for_scan = projection.clone();
         let batch_rows = self.performance.query.batch_rows;
         let snapshot_lsn = self.snapshot_lsn;
+        let row_filters = filters.to_vec();
+        let batch_cache = Arc::clone(&self.batch_cache);
 
         let batches = tokio::task::spawn_blocking(move || {
             if let Some(snapshot_lsn) = snapshot_lsn {
                 table.scan_record_batches_as_of_lsn(&schema, limit, batch_rows, snapshot_lsn)
+            } else if table.layout == TableLayout::Row {
+                let scan = || {
+                    row_scan::batches(
+                        &table,
+                        &schema,
+                        projection_for_scan.as_deref(),
+                        &row_filters,
+                        limit,
+                        batch_rows,
+                    )
+                };
+                if row_filters.is_empty() && limit.is_none() {
+                    batch_cache.batches(
+                        &table,
+                        &schema,
+                        projection_for_scan.as_deref(),
+                        batch_rows,
+                        scan,
+                    )
+                } else {
+                    scan()
+                }
             } else {
                 table.scan_record_batches(
                     &schema,
@@ -3109,13 +3176,15 @@ impl TableProvider for StorageTableProvider {
         .map_err(|error| DataFusionError::Execution(error.to_string()))?
         .map_err(query_to_datafusion)?;
 
-        if self.table.layout == TableLayout::Columnar {
+        if self.table.layout == TableLayout::Columnar || snapshot_lsn.is_none() {
             let schema = projection.as_deref().map_or_else(
                 || self.arrow_schema.clone(),
                 |projection| project_schema(&self.arrow_schema, projection),
             );
             let partitions = if batches.is_empty() {
                 vec![Vec::new()]
+            } else if self.table.layout == TableLayout::Row {
+                vec![batches]
             } else {
                 split_into_partitions(
                     batches,
@@ -3124,7 +3193,12 @@ impl TableProvider for StorageTableProvider {
             };
             observability::record_parallel_scan(self.table.name(), partitions.len());
             let mem = MemTable::try_new(schema, partitions)?;
-            return mem.scan(state, None, &[], limit).await;
+            let safe_limit = if self.table.layout == TableLayout::Row && !filters.is_empty() {
+                None
+            } else {
+                limit
+            };
+            return mem.scan(state, None, &[], safe_limit).await;
         }
 
         let mem = MemTable::try_new(self.arrow_schema.clone(), vec![batches])?;
@@ -4657,6 +4731,9 @@ fn try_apply_row_insert(
     rows: &[Row],
     insert: &sqlparser::ast::Insert,
 ) -> Result<InsertAttempt, QueryError> {
+    if insert.on.is_none() {
+        return write_batch::try_plain_insert(table, rows);
+    }
     let mut initial = BTreeMap::<Bytes, Option<(Option<Bytes>, Row)>>::new();
     let mut staged = BTreeMap::<Bytes, Row>::new();
     let mut conditions = BTreeMap::<Bytes, WriteCondition>::new();
@@ -4688,7 +4765,7 @@ fn try_apply_row_insert(
         match existing_row {
             None => {
                 ensure_insert_condition(&mut conditions, &initial, &row_key);
-                ops.extend(table.put_ops_for_key(row.clone(), &row_key)?);
+                table.append_put_ops(&mut ops, row.clone(), &row_key)?;
                 staged.insert(row_key, row.clone());
                 affected.push(row.clone());
             }
@@ -4711,8 +4788,11 @@ fn try_apply_row_insert(
                             &update.assignments,
                         )?;
                         ensure_insert_condition(&mut conditions, &initial, &row_key);
-                        ops.extend(table.index_delete_ops_for_key(&existing_row, &row_key)?);
-                        ops.extend(table.put_ops_for_key(updated.clone(), &row_key)?);
+                        ops.extend(table.update_ops_for_key(
+                            &existing_row,
+                            updated.clone(),
+                            &row_key,
+                        )?);
                         staged.insert(row_key, updated.clone());
                         affected.push(updated);
                     }
@@ -4721,23 +4801,7 @@ fn try_apply_row_insert(
         }
     }
 
-    if !ops.is_empty() {
-        let batch = ConditionalBatch::new(conditions.into_values().collect(), ops);
-        match table.repl.propose_conditional_batch(batch) {
-            Ok(()) => {}
-            Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
-                return Ok(InsertAttempt::Conflict);
-            }
-            Err(ReplError::Unsupported(error)) => {
-                return Err(QueryError::Unsupported(format!(
-                    "atomic INSERT requires conditional batch support: {error}"
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Ok(InsertAttempt::Committed(affected))
+    write_batch::commit_insert(table, conditions.into_values().collect(), ops, affected)
 }
 
 fn ensure_insert_condition(
@@ -5060,10 +5124,6 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, QueryError> {
     }
 }
 
-fn explain_unsupported() -> QueryError {
-    QueryError::Unsupported("EXPLAIN supports simple SELECT in this preview".to_owned())
-}
-
 /// Collects every relation a `DataFusion` plan scans, including scans inside
 /// subqueries. Scans are mapped back to catalog names by provider identity, so
 /// a name is reported exactly as it was registered, whatever spelling the SQL
@@ -5309,5 +5369,7 @@ fn query_to_datafusion(error: QueryError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
+#[cfg(test)]
+mod index_read_tests;
 #[cfg(test)]
 mod tests;

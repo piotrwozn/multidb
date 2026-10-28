@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -19,7 +19,7 @@ use super::{
 use crate::{
     db::{DbConfig, Profile, create_database, open_database},
     model::{CollectionId, FieldPath},
-    repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication},
+    repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition},
     security::{AuthzError, Permission, Resource},
     storage::Bytes,
     txn::WriteAuthorization,
@@ -509,6 +509,7 @@ struct ScriptedRepl {
     writes: Mutex<VecDeque<Vec<Op>>>,
     conflicts: AtomicUsize,
     conditional_writes: bool,
+    interleave_at_commit: AtomicBool,
 }
 
 impl ScriptedRepl {
@@ -522,6 +523,7 @@ impl ScriptedRepl {
             writes: Mutex::new(VecDeque::new()),
             conflicts: AtomicUsize::new(0),
             conditional_writes,
+            interleave_at_commit: AtomicBool::new(false),
         }))
     }
 
@@ -584,6 +586,14 @@ impl Replication for ScriptedRepl {
                 "conditional batches are not supported".to_owned(),
             ));
         }
+        if self.interleave_at_commit.load(Ordering::SeqCst)
+            && batch.conditions.iter().any(|condition| match condition {
+                WriteCondition::KeyMissing { table, .. }
+                | WriteCondition::ValueEquals { table, .. } => table == self.interleave_after,
+            })
+        {
+            self.interleave(self.interleave_after)?;
+        }
         let result = self.inner.propose_conditional_batch(batch);
         if matches!(result, Err(ReplError::Conflict)) {
             self.conflicts.fetch_add(1, Ordering::SeqCst);
@@ -598,7 +608,9 @@ impl Replication for ScriptedRepl {
         consistency: ReadConsistency,
     ) -> Result<Option<Bytes>, ReplError> {
         let value = self.inner.read(table, key, consistency)?;
-        self.interleave(table)?;
+        if !self.interleave_at_commit.load(Ordering::SeqCst) {
+            self.interleave(table)?;
+        }
         Ok(value)
     }
 
@@ -610,7 +622,9 @@ impl Replication for ScriptedRepl {
         consistency: ReadConsistency,
     ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
         let rows = self.inner.range(table, start, end, consistency)?;
-        self.interleave(table)?;
+        if !self.interleave_at_commit.load(Ordering::SeqCst) {
+            self.interleave(table)?;
+        }
         Ok(rows)
     }
 }
@@ -948,6 +962,7 @@ async fn multi_row_insert_is_atomic_when_late_row_duplicates_primary_key()
 async fn row_insert_that_loses_a_race_maps_its_conflict_by_on_conflict_clause()
 -> Result<(), Box<dyn std::error::Error>> {
     let repl = ScriptedRepl::new(REL_ROWS_TABLE, true)?;
+    repl.interleave_at_commit.store(true, Ordering::SeqCst);
     let mut engine = SqlEngine::new(repl.clone());
     engine.create_table("users", Some(user_schema()), Vec::new())?;
     let table = RelTable::open(repl.clone(), "users", Vec::new())?;
@@ -960,8 +975,9 @@ async fn row_insert_that_loses_a_race_maps_its_conflict_by_on_conflict_clause()
         ]
     };
 
-    // Another writer inserts the key after the INSERT read it as missing: a
-    // plain INSERT reports the duplicate key instead of retrying.
+    // Another writer inserts the key immediately before the atomic commit: a
+    // plain INSERT reports the duplicate key instead of retrying, without a
+    // speculative read of that key.
     repl.queue(table.insert_ops(user(1, "Ada", 36))?)?;
     let result = engine
         .execute("INSERT INTO users (id, name, age, active) VALUES (1, 'Mine', 1, true)")
@@ -1870,12 +1886,16 @@ async fn read_guard_denies_before_any_statement_runs() -> Result<(), Box<dyn std
         )
         .await
     {
-        Err(QueryError::Unsupported(message)) => {
-            assert_eq!(message, "EXPLAIN supports simple SELECT in this preview");
-        }
-        other => panic!("non-simple EXPLAIN should be unsupported, got {other:?}"),
+        Err(QueryError::AuthzDenied(_)) => {}
+        other => panic!("non-simple EXPLAIN must authorize subquery reads, got {other:?}"),
     }
-    assert!(guard.seen.is_empty());
+    assert_eq!(
+        guard.seen,
+        BTreeSet::from([
+            SqlReadTarget::Catalog("public_t".to_owned()),
+            SqlReadTarget::Catalog("secrets".to_owned()),
+        ])
+    );
     Ok(())
 }
 

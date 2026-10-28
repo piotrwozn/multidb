@@ -4,6 +4,29 @@ All notable public changes will be recorded here.
 
 ## Unreleased
 
+- SQL primary-key equality and ordered Int64 ranges now use bounded row-store
+  access, including ASC/DESC, OFFSET and LIMIT, with execution deadlines and
+  retained-result memory limits. Row scans build projected Arrow batches rather
+  than retaining every payload column. A shared, bounded raw-batch cache uses
+  atomically committed table versions; authorization and policies remain fresh.
+- Reuse immutable SQL catalog templates and retain the plan cache between queries.
+  Fix column-name, primary-key, histogram and MCV cardinality estimates. EXPLAIN
+  supports real range paths and metadata-only DataFusion logical plans; unknown
+  estimates/costs are NULL and ANALYZE counts rows after LIMIT.
+- Native indexed row fetches read up to 256 keys in one storage snapshot. Plain
+  INSERT avoids redundant pre-reads while retaining atomic uniqueness checks;
+  upserts and transactional updates avoid rewriting unchanged index entries.
+- Concurrent audit requests share durable batches without an added single-caller
+  wait window. Every event retains its integrity sequence and is acknowledged
+  after database and configured anchor persistence; events can share a commit LSN.
+- Pgwire reuses its Tokio runtime, applies separate handshake, idle and request
+  deadlines instead of a total session lifetime, and checks frontend frame sizes
+  before decoding. Successful logins release their authentication reservation
+  without spending the failed-login budget. CLI timeout/frame overrides are
+  documented in `docs/docker.md`.
+- Added a reproducible local before/after SQL benchmark runner with binary/source
+  provenance, raw latency verification and all nine supplied workloads. See
+  `docs/performance-local-benchmarks.md`.
 - Updated the zstd implementation to the fixed 0.14.3 / zstd-safe 8.2 codec
   stack, including Arrow/Parquet callers through a small local compatibility
   re-export; the vulnerable registry codec versions are no longer resolved.

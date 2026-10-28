@@ -715,6 +715,7 @@ fn default_keyspaces() -> BTreeSet<String> {
         PLANNER_META_TABLE,
         txn::TXN_META_TABLE,
         txn::TXN_VERSIONS_TABLE,
+        txn::TABLE_DATA_VERSION_TABLE,
         txn::COMMIT_LOG_TABLE,
         txn::KEYSPACE_REGISTRY_TABLE,
         "__raft_log",

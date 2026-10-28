@@ -60,6 +60,7 @@ parquet = "58.3.0"
 bytes = "1"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1.89"
 hnsw_rs = "0.3.4"
 pgwire = { version = "0.36.3", default-features = false, features = ["server-api-ring"] }

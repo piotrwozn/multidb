@@ -998,6 +998,8 @@ async fn system_versioned_history_fails_closed_below_gc_horizon() -> TestResult 
             retention: TemporalRetention::default(),
         },
     );
+    // Match the invalidation performed by catalog loading/mutation APIs.
+    database.invalidate_plan_cache();
     let legacy = database.query("SELECT * FROM legacy_history").await;
     assert!(
         legacy

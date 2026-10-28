@@ -78,8 +78,8 @@ use crate::runtime_advisor::{
     RuntimeAdvisorError,
 };
 use crate::security::{
-    AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditEvent, AuditHead, AuditOutcome, AuditSink, AuthzError,
-    AuthzPolicy, FileAuditSink, Permission, Principal, PrincipalRegistry, Resource, Role,
+    AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditEvent, AuditHead, AuditOutcome, AuthzError, AuthzPolicy,
+    Permission, Principal, PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{
     AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, ReencryptionReport, StorageEngine,
@@ -99,6 +99,7 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod audit_batch;
 mod changefeed_policy;
 mod graphrag;
 mod history;
@@ -107,6 +108,7 @@ mod profile_binding;
 mod provisioning;
 mod review_fixes;
 mod runtime;
+mod sql_cache;
 mod tensor;
 
 pub(crate) use profile_binding::{
@@ -690,9 +692,11 @@ pub struct Database {
     audit_enabled: bool,
     audit_config: AuditConfig,
     audit_lock: Arc<Mutex<()>>,
+    audit_batch: Arc<audit_batch::AuditBatchCoordinator>,
     history_pins: Arc<Mutex<txn::ActiveSnapshotRegistry>>,
     encryption: Option<EncryptionConfig>,
     plan_cache: Arc<Mutex<PlanCache>>,
+    sql_catalog_cache: sql_cache::SqlCatalogCache,
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
@@ -1007,6 +1011,33 @@ impl HealingBackend for DatabaseHealingBackend {
 }
 
 impl Replication for DatabaseRepl {
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        tracing::trace!(
+            table,
+            key_count = keys.len(),
+            ?consistency,
+            "replication batch read"
+        );
+        let result = self.replication_ref().read_many(table, keys, consistency);
+        observability::record_replication_operation(
+            "read_many",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(error) = &result {
+            observability::record_replication_error(error.metric_kind());
+        }
+        result
+    }
+
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.replication_ref().table_data_version(table)
+    }
+
     fn supports_bounded_scans(&self) -> bool {
         self.replication_ref().supports_bounded_scans()
     }
@@ -1277,6 +1308,7 @@ impl Database {
             self.query_governor_overrides.queue_timeout_ms = true;
         }
         self.query_permits = query_permits_for(&self.performance);
+        self.invalidate_plan_cache();
         Ok(())
     }
 
@@ -2787,6 +2819,7 @@ impl Database {
         )?;
         self.performance_cache = PerformanceCache::new(&self.performance.cache);
         self.query_permits = query_permits_for(&self.performance);
+        self.invalidate_plan_cache();
         tuning::write_tuning_log(self.replication_ref(), &entry)?;
         Ok(entry)
     }
@@ -2829,6 +2862,7 @@ impl Database {
             tuning::rollback_decision_in_config(&mut self.performance, &applied, reason)?;
         self.performance_cache = PerformanceCache::new(&self.performance.cache);
         self.query_permits = query_permits_for(&self.performance);
+        self.invalidate_plan_cache();
         tuning::write_tuning_log(self.replication_ref(), &rollback)?;
         observability::record_tuning_rollback(&rollback.decision.id);
         Ok(rollback)
@@ -3737,7 +3771,7 @@ impl Database {
         let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
         let _history_pin = self.pin_history_lsn(lsn)?;
-        let engine = self.sql_engine()?.with_snapshot_lsn(lsn);
+        let engine = self.sql_engine()?.as_ref().clone().with_snapshot_lsn(lsn);
         Ok(engine.execute_with_read_guard(sql, guard).await?)
     }
 
@@ -4131,10 +4165,21 @@ impl Database {
     /// # Errors
     /// Fails when an audit row is missing integrity metadata, has been changed, or the chain is broken.
     pub fn verify_audit_chain(&self) -> Result<(), DbError> {
+        let _audit_guard = self
+            .audit_lock
+            .lock()
+            .map_err(|_| DbError::AuditIntegrity("audit lock poisoned".to_owned()))?;
         let key = self.audit_key()?;
+        let mut events = self.audit_events()?;
+        events.sort_by_key(|event| {
+            event
+                .integrity
+                .as_ref()
+                .map_or(0, |integrity| integrity.sequence)
+        });
         let mut previous_hash = None;
         let mut expected_sequence = 0_u64;
-        for event in self.audit_events()? {
+        for event in events {
             expected_sequence = expected_sequence
                 .checked_add(1)
                 .ok_or_else(|| DbError::AuditIntegrity("audit sequence overflow".to_owned()))?;
@@ -4324,9 +4369,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4357,9 +4404,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4390,9 +4439,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4422,9 +4473,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4464,6 +4517,7 @@ impl Database {
             backend: self.repl.replication_handle(),
             tenant: self.tenant.clone(),
             wasm_runtime: Arc::clone(&self.wasm_runtime),
+            sql_schema_epoch: Arc::clone(&self.sql_catalog_cache.schema_epoch),
         }
     }
 
@@ -4500,7 +4554,7 @@ impl Database {
             .clone())
     }
 
-    fn sql_engine(&self) -> Result<SqlEngine, DbError> {
+    fn build_sql_engine(&self) -> Result<SqlEngine, DbError> {
         let mut engine = SqlEngine::with_layout_profile_cache_and_performance(
             self.replication_handle(),
             self.layout(),
@@ -4585,6 +4639,7 @@ impl Database {
     }
 
     fn invalidate_plan_cache(&self) {
+        self.sql_catalog_cache.invalidate();
         if let Ok(mut cache) = self.plan_cache.lock() {
             cache.invalidate_all();
         }
@@ -4680,55 +4735,8 @@ impl Database {
         if !self.audit_enabled {
             return Ok(());
         }
-
-        let _audit_guard = self
-            .audit_lock
-            .lock()
-            .map_err(|_| DbError::AuditIntegrity("audit lock poisoned".to_owned()))?;
-        let key = self.audit_key()?;
-        let head = self.audit_head()?;
-        let sequence = head
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| DbError::AuditIntegrity("audit sequence overflow".to_owned()))?;
-        let event = event
-            .clone()
-            .with_integrity(head.hash.clone(), sequence, &key)
-            .map_err(DbError::AuditIntegrity)?;
-        let new_head = AuditHead {
-            sequence,
-            hash: event
-                .integrity
-                .as_ref()
-                .map(|integrity| integrity.hash.clone()),
-        };
-        let value =
-            serde_json::to_vec(&event).map_err(|error| DbError::Serde(error.to_string()))?;
-        let head_value =
-            serde_json::to_vec(&new_head).map_err(|error| DbError::Serde(error.to_string()))?;
-        let result = propose_system_batch(
-            &self.repl,
-            vec![
-                Op::Put {
-                    table: AUDIT_TABLE.to_owned(),
-                    key: event.key(),
-                    value,
-                },
-                Op::Put {
-                    table: AUDIT_HEAD_TABLE.to_owned(),
-                    key: b"head".to_vec(),
-                    value: head_value,
-                },
-            ],
-        );
-        observability::record_audit_write(if result.is_ok() { "ok" } else { "error" });
-        result?;
-        if let Some(anchor_path) = &self.audit_config.anchor_path {
-            FileAuditSink::new(anchor_path)
-                .append(&event)
-                .map_err(DbError::AuditIntegrity)?;
-        }
-        Ok(())
+        self.audit_batch
+            .record(event, |events| self.persist_audit_batch(events))
     }
 
     fn audit_head(&self) -> Result<AuditHead, DbError> {
@@ -4786,6 +4794,7 @@ impl Database {
             runtime.reconcile_storage_bytes(self.estimate_tenant_storage_bytes());
             runtime
         });
+        self.invalidate_plan_cache();
     }
 
     fn estimate_tenant_storage_bytes(&self) -> u64 {
@@ -5211,11 +5220,12 @@ impl MultiModelTxn<'_> {
 
         let row_key = table.row_key_for_row(&row)?;
 
-        if let Some(old) = self.get_row_by_key(&row_key)? {
-            self.queue_ops(table.index_delete_ops_for_key(&old, &row_key)?);
-        }
-
-        self.queue_ops(table.put_ops_for_key(row, &row_key)?);
+        let ops = if let Some(old) = self.get_row_by_key(&row_key)? {
+            table.update_ops_for_key(&old, row, &row_key)?
+        } else {
+            table.put_ops_for_key(row, &row_key)?
+        };
+        self.queue_ops(ops);
         Ok(())
     }
 
@@ -5471,6 +5481,7 @@ struct WritePipeline {
     backend: Arc<dyn Replication>,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
+    sql_schema_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Maps rejections raised before the commit into the caller's error type.
@@ -5664,6 +5675,7 @@ impl WritePipeline {
             )),
             None => None,
         };
+        let schema_changed = sql_cache::schema_changed(&ops);
         if let Err(error) = commit(ConditionalBatch::new(conditions, ops)) {
             if let Some((tenant, reservation, _)) = &reservation {
                 tenant.release(reservation);
@@ -5672,6 +5684,10 @@ impl WritePipeline {
         }
 
         // The write is durable from here on: nothing below may return an error.
+        if schema_changed {
+            self.sql_schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         if let Some((tenant, reservation, committed)) = &reservation {
             tenant.commit_successful_ops(committed, reservation);
         }
@@ -5999,6 +6015,24 @@ impl WritePipeline {
 }
 
 impl Replication for WritePipeline {
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.read_many(table, keys, consistency)
+    }
+
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.backend.table_data_version(table)
+    }
+
     fn supports_bounded_scans(&self) -> bool {
         self.backend.supports_bounded_scans()
     }
@@ -6022,7 +6056,13 @@ impl Replication for WritePipeline {
         ops: Vec<Op>,
         authorization: txn::WriteAuthorization,
     ) -> Result<(), ReplError> {
-        self.backend.propose_authorized_batch(ops, authorization)
+        let schema_changed = sql_cache::schema_changed(&ops);
+        self.backend.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(())
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
@@ -6318,6 +6358,24 @@ impl Drop for Database {
 }
 
 impl Replication for Database {
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.repl.read_many(table, keys, consistency)
+    }
+
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.repl.table_data_version(table)
+    }
+
     fn supports_bounded_scans(&self) -> bool {
         self.repl.supports_bounded_scans()
     }
@@ -6342,7 +6400,12 @@ impl Replication for Database {
         ops: Vec<Op>,
         authorization: txn::WriteAuthorization,
     ) -> Result<(), ReplError> {
-        self.repl.propose_authorized_batch(ops, authorization)
+        let schema_changed = sql_cache::schema_changed(&ops);
+        self.repl.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_catalog_cache.invalidate();
+        }
+        Ok(())
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
@@ -8891,6 +8954,9 @@ fn write_json<T: serde::Serialize>(
     txn.put(META_TABLE, key, &bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod read_many_tests;
 
 #[cfg(test)]
 mod tests;

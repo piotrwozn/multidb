@@ -67,6 +67,8 @@ impl Database {
             let _pin = self.pin_history_lsn(lsn)?;
             return Ok(self
                 .sql_engine()?
+                .as_ref()
+                .clone()
                 .with_snapshot_lsn(lsn)
                 .describe_with_read_guard(&rewritten, &mut guard)
                 .await?);

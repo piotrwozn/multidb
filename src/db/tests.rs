@@ -5327,8 +5327,8 @@ fn concurrent_on_conflict_inserts_do_not_report_duplicate_keys()
     Ok(())
 }
 
-/// Commits a queued write right after the next relational row read, as a statement
-/// that commits between another statement's read and its commit would.
+/// Commits a queued write after the next relational row read, or immediately
+/// before its conditional commit when the statement needs no speculative read.
 struct RowReadRace {
     database: Arc<Database>,
     queued: Mutex<Option<Vec<Op>>>,
@@ -5356,6 +5356,14 @@ impl RowReadRace {
             .lock()
             .map_err(|_| ReplError::Transport("race queue poisoned".to_owned()))
     }
+
+    fn commit_queued(&self) -> Result<(), ReplError> {
+        let queued = self.queued_ops()?.take();
+        if let Some(ops) = queued {
+            self.database.propose_batch(ops)?;
+        }
+        Ok(())
+    }
 }
 
 impl Replication for RowReadRace {
@@ -5376,6 +5384,7 @@ impl Replication for RowReadRace {
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        self.commit_queued()?;
         self.database.propose_conditional_batch(batch)
     }
 
@@ -5387,10 +5396,7 @@ impl Replication for RowReadRace {
     ) -> Result<Option<Bytes>, ReplError> {
         let value = self.database.read(table, key, consistency)?;
         if table == REL_ROWS_TABLE {
-            let queued = self.queued_ops()?.take();
-            if let Some(ops) = queued {
-                self.database.propose_batch(ops)?;
-            }
+            self.commit_queued()?;
         }
         Ok(value)
     }

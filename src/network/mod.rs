@@ -13,7 +13,8 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use futures::{Sink, stream};
 use pgwire::{
     api::{
-        ClientInfo, ClientPortalStore, METADATA_USER, PgWireServerHandlers, Type,
+        ClientInfo, ClientPortalStore, METADATA_USER, PgWireConnectionState, PgWireServerHandlers,
+        Type,
         auth::{
             AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
             sasl::{
@@ -32,7 +33,6 @@ use pgwire::{
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage},
-    tokio::process_socket,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{
@@ -51,6 +51,8 @@ use crate::{
     query::{Row, SqlOutput, SqlRows},
 };
 
+mod session;
+
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
 const DEFAULT_BLOCKING_TASKS: usize = 32;
 const DEFAULT_MAX_CONNECTIONS: usize = 512;
@@ -60,6 +62,8 @@ const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_AUTH_FAILURE_LIMIT: usize = 10;
 const DEFAULT_AUTH_FAILURE_WINDOW_MS: u64 = 60_000;
+const MAX_AUTH_RATE_KEYS: usize = 65_536;
+const MAX_AUTH_USERNAME_BYTES: usize = 256;
 
 #[derive(Clone)]
 pub struct NetworkConfig {
@@ -67,9 +71,15 @@ pub struct NetworkConfig {
     pub auth: AuthConfig,
     pub max_blocking_tasks: usize,
     pub max_connections: usize,
+    /// Maximum processing time for one protocol request (including response writes).
+    /// This used to cap the entire session; active sessions now have no total lifetime cap.
+    /// The database query execution/queue budgets are enforced independently.
     pub connection_timeout_ms: u64,
+    /// Total TLS/startup/SCRAM deadline, shared across all handshake messages.
     pub handshake_timeout_ms: u64,
+    /// Deadline for receiving one next frame, never time spent executing a query.
     pub idle_timeout_ms: u64,
+    /// Maximum declared frontend frame length; upstream type-specific limits also apply.
     pub max_frame_bytes: usize,
     pub auth_failure_limit: usize,
     pub auth_failure_window_ms: u64,
@@ -150,6 +160,7 @@ struct DbStartupHandler {
     startup_error: Option<String>,
     tls_required: bool,
     auth_limiter: AuthRateLimiter,
+    pending_auth: StdMutex<Option<AuthAttempt>>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +184,45 @@ struct AuthRateKey {
 #[derive(Clone, Copy, Debug)]
 struct AuthRateEntry {
     window_start: Instant,
-    attempts: usize,
+    failures: usize,
+    in_flight: usize,
+}
+
+struct AuthAttempt {
+    limiter: AuthRateLimiter,
+    key: AuthRateKey,
+    completed: bool,
+}
+
+impl AuthAttempt {
+    fn succeed(mut self) {
+        self.complete(false);
+    }
+
+    fn complete(&mut self, failed: bool) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Ok(mut state) = self.limiter.state.lock()
+            && let Some(entry) = state.get_mut(&self.key)
+        {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            if failed {
+                entry.failures = entry.failures.saturating_add(1);
+            }
+            if entry.in_flight == 0 && entry.failures == 0 {
+                state.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl Drop for AuthAttempt {
+    fn drop(&mut self) {
+        // Failed or abandoned SCRAM exchanges consume the reserved failure budget.
+        self.complete(true);
+    }
 }
 
 /// Database handle shared between `PostgreSQL` wire and other in-process servers.
@@ -218,6 +267,8 @@ impl NetworkConfig {
         self
     }
 
+    /// Sets the per-protocol-request processing ceiling, not the session lifetime.
+    /// Handshake and idle limits have their own settings; the database owns query budgets.
     #[must_use]
     pub const fn with_connection_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.connection_timeout_ms = timeout_ms;
@@ -400,7 +451,16 @@ impl AuthRateLimiter {
         }
     }
 
-    fn record_attempt(&self, ip: std::net::IpAddr, user: &str) -> Result<(), NetworkError> {
+    fn reserve_attempt(
+        &self,
+        ip: std::net::IpAddr,
+        user: &str,
+    ) -> Result<AuthAttempt, NetworkError> {
+        if user.len() > MAX_AUTH_USERNAME_BYTES {
+            return Err(NetworkError::Auth(
+                "authentication username is too long".to_owned(),
+            ));
+        }
         let key = AuthRateKey {
             ip,
             user: user.to_owned(),
@@ -410,21 +470,37 @@ impl AuthRateLimiter {
             .state
             .lock()
             .map_err(|_| NetworkError::Runtime("auth rate limiter lock poisoned".to_owned()))?;
-        let entry = state.entry(key).or_insert(AuthRateEntry {
+        if !state.contains_key(&key) && state.len() >= MAX_AUTH_RATE_KEYS {
+            state.retain(|_, entry| {
+                entry.in_flight > 0 || now.duration_since(entry.window_start) < self.window
+            });
+            if state.len() >= MAX_AUTH_RATE_KEYS {
+                return Err(NetworkError::Auth(
+                    "authentication rate limit exceeded".to_owned(),
+                ));
+            }
+        }
+        let entry = state.entry(key.clone()).or_insert(AuthRateEntry {
             window_start: now,
-            attempts: 0,
+            failures: 0,
+            in_flight: 0,
         });
         if now.duration_since(entry.window_start) >= self.window {
             entry.window_start = now;
-            entry.attempts = 0;
+            entry.failures = 0;
         }
-        entry.attempts = entry.attempts.saturating_add(1);
-        if entry.attempts > self.limit {
+        // Reserve before verification so concurrent bad proofs cannot outrun the limit.
+        if entry.failures.saturating_add(entry.in_flight) >= self.limit {
             return Err(NetworkError::Auth(
                 "authentication rate limit exceeded".to_owned(),
             ));
         }
-        Ok(())
+        entry.in_flight += 1;
+        Ok(AuthAttempt {
+            limiter: self.clone(),
+            key,
+            completed: false,
+        })
     }
 }
 
@@ -519,8 +595,7 @@ impl PgServer {
             TlsMode::DisabledForTests => None,
         };
         let max_connections = config.max_connections.max(1);
-        let connection_timeout_ms = config.connection_timeout_ms.max(1);
-        let connection_timeout = Duration::from_millis(connection_timeout_ms);
+        let session_limits = session::SessionLimits::from_config(&config);
         let connection_permits = Arc::new(Semaphore::new(max_connections));
         let blocking_tasks = u32::try_from(config.max_blocking_tasks.max(1))
             .map_err(|_| NetworkError::Runtime("max_blocking_tasks exceeds u32".to_owned()))?;
@@ -553,22 +628,8 @@ impl PgServer {
                     };
                     connections.spawn(async move {
                         let _permit = permit;
-                        match tokio::time::timeout(
-                            connection_timeout,
-                            process_socket(socket, tls_acceptor, factory),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                tracing::warn!(error = %error, "pgwire connection failed");
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    timeout_ms = connection_timeout_ms,
-                                    "pgwire connection timed out"
-                                );
-                            }
+                        if let Err(error) = session::process_socket(socket, tls_acceptor, factory, session_limits).await {
+                            tracing::warn!(%error, "pgwire connection failed");
                         }
                     });
                 }
@@ -597,12 +658,9 @@ impl BlockingDbExecutor {
             .await
             .map_err(|error| network_to_pg(NetworkError::Runtime(error.to_string())))?;
         let database = self.database.clone();
+        let runtime = tokio::runtime::Handle::current();
         spawn_blocking(move || {
             let _permit = permit;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| network_to_pg(NetworkError::Runtime(error.to_string())))?;
             let describe = |database: &crate::db::Database| {
                 let principal = database.principal_for_user(&user);
                 runtime
@@ -636,13 +694,10 @@ impl BlockingDbExecutor {
             .map_err(|error| NetworkError::Runtime(error.to_string()))?;
         let database = self.database.clone();
         let user_for_query = user.clone();
+        let runtime = tokio::runtime::Handle::current();
 
         let result = spawn_blocking(move || {
             let _permit = permit;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| NetworkError::Runtime(error.to_string()))?;
             if enforce_rbac {
                 match database {
                     DatabaseHandle::Direct(database) => {
@@ -749,6 +804,7 @@ impl DbStartupHandler {
             startup_error,
             tls_required,
             auth_limiter,
+            pending_auth: StdMutex::new(None),
         }
     }
 }
@@ -782,16 +838,43 @@ impl StartupHandler for DbStartupHandler {
                 .parameters
                 .get("user")
                 .map_or("unknown", String::as_str);
-            self.auth_limiter
-                .record_attempt(client.socket_addr().ip(), user)
+            let attempt = self
+                .auth_limiter
+                .reserve_attempt(client.socket_addr().ip(), user)
                 .map_err(|error| pg_error("FATAL", "28000", error.to_string()))?;
+            let mut pending = self
+                .pending_auth
+                .lock()
+                .map_err(|_| pg_error("FATAL", "08006", "authentication state lock poisoned"))?;
+            if pending.is_some() {
+                return Err(pg_error(
+                    "FATAL",
+                    "08P01",
+                    "authentication is already in progress",
+                ));
+            }
+            *pending = Some(attempt);
         }
 
         let Some(inner) = &self.inner else {
             return Err(pg_error("FATAL", "08006", "startup handler is unavailable"));
         };
 
-        inner.on_startup(client, message).await
+        let result = inner.on_startup(client, message).await;
+        if result.is_err() || matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            let attempt = self
+                .pending_auth
+                .lock()
+                .map_err(|_| pg_error("FATAL", "08006", "authentication state lock poisoned"))?
+                .take();
+            // On error, dropping the attempt records the failed exchange.
+            if let Some(attempt) = attempt
+                && result.is_ok()
+            {
+                attempt.succeed();
+            }
+        }
+        result
     }
 }
 
@@ -1349,18 +1432,273 @@ mod tests {
     }
 
     #[test]
-    fn auth_rate_limiter_rejects_repeated_attempts() -> Result<(), Box<dyn std::error::Error>> {
+    fn auth_rate_limiter_rejects_failed_exchanges() -> Result<(), Box<dyn std::error::Error>> {
         let limiter = super::AuthRateLimiter::new(2, 60_000);
         let ip = "127.0.0.1".parse()?;
 
-        assert!(limiter.record_attempt(ip, "alice").is_ok());
-        assert!(limiter.record_attempt(ip, "alice").is_ok());
+        drop(limiter.reserve_attempt(ip, "alice")?);
+        drop(limiter.reserve_attempt(ip, "alice")?);
         assert!(matches!(
-            limiter.record_attempt(ip, "alice"),
+            limiter.reserve_attempt(ip, "alice"),
             Err(NetworkError::Auth(_))
         ));
-        assert!(limiter.record_attempt(ip, "bob").is_ok());
+        limiter.reserve_attempt(ip, "bob")?.succeed();
         Ok(())
+    }
+
+    #[test]
+    fn successful_authentication_releases_its_reservation_without_spending_failure_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = super::AuthRateLimiter::new(2, 60_000);
+        let ip = "127.0.0.1".parse()?;
+        for _ in 0..20 {
+            limiter.reserve_attempt(ip, "alice")?.succeed();
+        }
+        assert_eq!(
+            limiter.state.lock().map_err(|_| "limiter poisoned")?.len(),
+            0
+        );
+        let first = limiter.reserve_attempt(ip, "alice")?;
+        let second = limiter.reserve_attempt(ip, "alice")?;
+        assert!(limiter.reserve_attempt(ip, "alice").is_err());
+        first.succeed();
+        let third = limiter.reserve_attempt(ip, "alice")?;
+        drop(second);
+        drop(third);
+        assert!(limiter.reserve_attempt(ip, "alice").is_err());
+        assert!(limiter.reserve_attempt(ip, &"u".repeat(257)).is_err());
+        Ok(())
+    }
+
+    async fn plain_client(
+        addr: std::net::SocketAddr,
+        password: &str,
+    ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let (client, connection) = tokio_postgres::Config::new()
+            .host("127.0.0.1")
+            .port(addr.port())
+            .user("alice")
+            .password(password)
+            .dbname("multidb")
+            .ssl_mode(SslMode::Disable)
+            .connect(tokio_postgres::NoTls)
+            .await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    async fn start_session_test_server(
+        config: NetworkConfig,
+    ) -> Result<TestServer, Box<dyn std::error::Error>> {
+        let database = Arc::new(shared_users_database()?);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown, receive) = oneshot::channel();
+        let handle = tokio::spawn(PgServer::serve_until_shutdown(
+            listener,
+            database,
+            config,
+            async {
+                let _ = receive.await;
+            },
+        ));
+        Ok(TestServer {
+            addr,
+            shutdown,
+            handle,
+        })
+    }
+
+    #[tokio::test]
+    async fn active_session_outlives_request_ceiling_but_idle_session_expires()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_connection_timeout_ms(250)
+            .with_handshake_timeout_ms(2_000)
+            .with_idle_timeout_ms(150);
+        let server = start_session_test_server(config).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        // Six individually short requests span more than the former total-session ceiling.
+        for _ in 0..6 {
+            assert_eq!(
+                client.simple_query("select name from users").await?.len(),
+                3
+            );
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(client.simple_query("select name from users").await.is_err());
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_budget_is_suspended_while_a_request_waits_for_database_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (stop, receive) = oneshot::channel();
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_connection_timeout_ms(2_000)
+            .with_handshake_timeout_ms(2_000)
+            .with_idle_timeout_ms(50);
+        let task = tokio::spawn(PgServer::serve_shared_until_shutdown(
+            listener,
+            Arc::clone(&database),
+            config,
+            async {
+                let _ = receive.await;
+            },
+        ));
+        let client = Arc::new(plain_client(addr, "secret").await?);
+        let writer = database.write().await;
+        let query = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.simple_query("select name from users").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(writer);
+        assert_eq!(query.await??.len(), 3);
+        assert_eq!(
+            client.simple_query("select name from users").await?.len(),
+            3
+        );
+        let _ = stop.send(());
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_processing_ceiling_closes_a_blocked_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (stop, receive) = oneshot::channel();
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_connection_timeout_ms(100)
+            .with_handshake_timeout_ms(2_000)
+            .with_idle_timeout_ms(2_000);
+        let task = tokio::spawn(PgServer::serve_shared_until_shutdown(
+            listener,
+            Arc::clone(&database),
+            config,
+            async {
+                let _ = receive.await;
+            },
+        ));
+        let client = plain_client(addr, "secret").await?;
+        let writer = database.write().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.simple_query("select name from users"),
+        )
+        .await?;
+        assert!(result.is_err());
+        // Timed-out socket work may already be running in spawn_blocking. Release
+        // its database lock before graceful shutdown drains the executor permits.
+        drop(writer);
+        let _ = stop.send(());
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_and_frontend_frame_cap_apply_to_real_sockets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncReadExt;
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_handshake_timeout_ms(100)
+            .with_max_frame_bytes(1024);
+        let server = start_session_test_server(config).await?;
+        let mut stalled = tokio::net::TcpStream::connect(server.addr).await?;
+        let mut byte = [0_u8];
+        let read = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte)).await??;
+        assert_eq!(read, 0);
+        let client = plain_client(server.addr, "secret").await?;
+        client.simple_query("select name from users").await?;
+        assert!(
+            client
+                .simple_query(&format!("SELECT '{}'", "x".repeat(2048)))
+                .await
+                .is_err()
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_pgwire_logins_do_not_trigger_failed_authentication_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_auth_failure_limit(2, 60_000);
+        let server = start_session_test_server(config).await?;
+        for _ in 0..12 {
+            plain_client(server.addr, "secret")
+                .await?
+                .simple_query("select name from users")
+                .await?;
+        }
+        assert!(plain_client(server.addr, "wrong").await.is_err());
+        // A valid login still fits the one remaining failure slot, and does not spend it.
+        plain_client(server.addr, "secret")
+            .await?
+            .simple_query("select name from users")
+            .await?;
+        assert!(plain_client(server.addr, "wrong").await.is_err());
+        let error = plain_client(server.addr, "secret")
+            .await
+            .err()
+            .ok_or("failed auth throttle was bypassed")?;
+        server.shutdown().await?;
+        let database_error = error
+            .as_db_error()
+            .ok_or_else(|| format!("expected a pgwire authentication rejection, got {error:?}"))?;
+        assert_eq!(database_error.code().code(), "28000");
+        assert!(
+            database_error
+                .message()
+                .contains("authentication rate limit exceeded"),
+            "unexpected authentication rejection: {database_error:?}"
+        );
+        Ok(())
+    }
+
+    async fn executor_uses_the_existing_runtime() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let executor = super::BlockingDbExecutor::new(super::DatabaseHandle::Shared(database), 2);
+        assert!(
+            executor
+                .describe_sql_as_user("alice".to_owned(), "select name from users".to_owned())
+                .await?
+                .is_some()
+        );
+        let output = executor
+            .execute_sql_as_user(
+                "alice".to_owned(),
+                "select name from users".to_owned(),
+                true,
+            )
+            .await?;
+        assert!(
+            matches!(output, crate::query::SqlOutput::Rows(rows) if rows.rows == vec![vec![Value::Str("Ada".to_owned())]])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_and_describe_work_on_an_existing_current_thread_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        executor_uses_the_existing_runtime().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_and_describe_work_on_an_existing_multi_thread_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        executor_uses_the_existing_runtime().await
     }
 
     #[tokio::test]
