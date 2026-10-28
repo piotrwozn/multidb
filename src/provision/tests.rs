@@ -59,6 +59,8 @@ use crate::vector::{VectorCollectionConfig, VectorMetric};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type Error = Box<dyn std::error::Error>;
 
+mod tensor_tests;
+
 fn spec(profile: &str, collections: &JsonValue) -> Result<DatabaseSpec, Error> {
     let mut spec =
         DatabaseSpec::from_db_config("app", &DbConfig::on_disk(Profile::Balanced, "app.redb"));

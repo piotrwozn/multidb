@@ -342,6 +342,12 @@
         "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } }
       }
     },
+    "/builder/tensor-dataset": { "post": { "$ref": "#/components/pathItems/createTensorDataset" } },
+    "/data/tensor-datasets/{name}": { "get": { "$ref": "#/components/pathItems/getTensorDataset" } },
+    "/data/tensor-datasets/{name}/append": { "post": { "$ref": "#/components/pathItems/appendTensors" } },
+    "/data/tensor-datasets/{name}/read": { "post": { "$ref": "#/components/pathItems/readTensors" } },
+    "/data/tensor-datasets/{name}/search": { "post": { "$ref": "#/components/pathItems/searchTensors" } },
+    "/data/tensor-datasets/{name}/compute": { "post": { "$ref": "#/components/pathItems/computeTensors" } },
     "/builder/table": { "post": { "$ref": "#/components/pathItems/createTable" } },
     "/builder/collection": { "post": { "$ref": "#/components/pathItems/createCollection" } },
     "/builder/vector": { "post": { "$ref": "#/components/pathItems/createVector" } },
@@ -398,6 +404,862 @@
       }
     },
     "schemas": {
+      "ProfileVariantSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "storage_profile",
+          "canonical"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "storage_profile": {
+            "type": "string"
+          },
+          "canonical": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ProfileSummary": {
+        "type": "object",
+        "required": [
+          "slug",
+          "aliases",
+          "status",
+          "description",
+          "default_domain",
+          "compatible_roles"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "default_domain": {
+            "type": "string"
+          },
+          "compatible_roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requires_gpu": {
+            "type": "boolean",
+            "description": "True when opening the canonical storage profile requires a supported native GPU adapter. Optional for compatibility with earlier API v1 servers."
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileVariantSummary"
+            }
+          },
+          "knobs": {
+            "$ref": "#/components/schemas/JsonObject"
+          }
+        }
+      },
+      "ProfilesEnvelope": {
+        "type": "object",
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileSummary"
+            }
+          }
+        }
+      },
+      "TensorDType": {
+        "type": "string",
+        "enum": [
+          "u8",
+          "i64",
+          "f32",
+          "f64",
+          "bool",
+          "utf8"
+        ]
+      },
+      "TensorData": {
+        "description": "Exactly one dtype-tagged array. Numeric values must be finite. These typed tensor values are stored in binary chunks, not as arbitrary JSON document blobs.",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "u8"
+            ],
+            "properties": {
+              "u8": {
+                "type": "array",
+                "maxItems": 4000000,
+                "items": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "i64"
+            ],
+            "properties": {
+              "i64": {
+                "type": "array",
+                "maxItems": 4000000,
+                "items": {
+                  "type": "integer",
+                  "minimum": -9223372036854775808,
+                  "maximum": 9223372036854775807,
+                  "format": "int64"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "f32"
+            ],
+            "properties": {
+              "f32": {
+                "type": "array",
+                "maxItems": 4000000,
+                "items": {
+                  "type": "number",
+                  "format": "float",
+                  "minimum": -3.4028234663852886e+38,
+                  "maximum": 3.4028234663852886e+38
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "f64"
+            ],
+            "properties": {
+              "f64": {
+                "type": "array",
+                "maxItems": 4000000,
+                "items": {
+                  "type": "number",
+                  "format": "double"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "bool"
+            ],
+            "properties": {
+              "bool": {
+                "type": "array",
+                "maxItems": 4000000,
+                "items": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "utf8"
+            ],
+            "properties": {
+              "utf8": {
+                "type": "array",
+                "maxItems": 4000000,
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "Tensor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "shape",
+          "data"
+        ],
+        "properties": {
+          "shape": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4000000
+            },
+            "description": "Per-sample shape; [] is a scalar. Product must match data length and not exceed 4,000,000 elements."
+          },
+          "data": {
+            "$ref": "#/components/schemas/TensorData"
+          }
+        }
+      },
+      "TensorColumn": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "dtype",
+          "shape"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "description": "At most 128 UTF-8 bytes, without control characters."
+          },
+          "dtype": {
+            "$ref": "#/components/schemas/TensorDType"
+          },
+          "shape": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4000000
+            },
+            "description": "Per-sample schema; null is a ragged dimension. For example [null,null,3] allows differently sized RGB images."
+          }
+        }
+      },
+      "TensorDatasetConfig": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "tensors"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "description": "At most 128 UTF-8 bytes, without control characters."
+          },
+          "tensors": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/TensorColumn"
+            }
+          },
+          "chunk_samples": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1024,
+            "default": 64
+          },
+          "max_chunk_bytes": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 16777216,
+            "default": 4194304
+          }
+        }
+      },
+      "TensorBatch": {
+        "type": "object",
+        "minProperties": 1,
+        "maxProperties": 64,
+        "propertyNames": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+          "description": "At most 128 UTF-8 bytes, without control characters."
+        },
+        "additionalProperties": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/components/schemas/Tensor"
+          }
+        },
+        "description": "A sample array for every dataset column. All columns must contain the same number of samples; dtype and shape must match the schema. Append is atomic; decoded tensor batches are also capped at 64 MiB."
+      },
+      "TensorReadValues": {
+        "type": "object",
+        "maxProperties": 64,
+        "propertyNames": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+          "description": "At most 128 UTF-8 bytes, without control characters."
+        },
+        "additionalProperties": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/components/schemas/Tensor"
+          }
+        }
+      },
+      "TensorAppendRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tensors"
+        ],
+        "properties": {
+          "tensors": {
+            "$ref": "#/components/schemas/TensorBatch"
+          }
+        }
+      },
+      "TensorReadRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64",
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1024,
+            "default": 100
+          },
+          "columns": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "minItems": 1,
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+              "description": "At most 128 UTF-8 bytes, without control characters."
+            }
+          },
+          "revision": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "format": "uint64"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "description": "Reads a bounded sample range from the current immutable append snapshot or an explicit retained revision. Maximum decoded result: 64 MiB."
+      },
+      "TensorSearchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tensor",
+          "query"
+        ],
+        "properties": {
+          "tensor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "description": "At most 128 UTF-8 bytes, without control characters."
+          },
+          "query": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4000000,
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 10
+          },
+          "metric": {
+            "type": "string",
+            "enum": [
+              "Cosine",
+              "L2"
+            ],
+            "default": "Cosine"
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64",
+            "default": 0
+          },
+          "max_samples": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "default": 10000
+          },
+          "revision": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "format": "uint64"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "description": "Exact bounded distance search over a fixed rank-one numeric tensor column. Query values must be finite and dimension-matched. Tensor-profile execution requires the real GPU backend; other profiles expose the CPU reference device explicitly."
+      },
+      "TensorComputeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tensor",
+          "operation"
+        ],
+        "properties": {
+          "tensor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "description": "At most 128 UTF-8 bytes, without control characters."
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "sum",
+              "mean",
+              "l2_norm"
+            ]
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64",
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1024,
+            "default": 100
+          },
+          "revision": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "format": "uint64"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "description": "Bounded per-sample reduction. The execution field identifies the actual device and backend. No automatic ML inference or training is performed."
+      },
+      "TensorExecution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "device",
+          "adapter",
+          "backend"
+        ],
+        "properties": {
+          "device": {
+            "type": "string",
+            "enum": [
+              "cpu",
+              "gpu"
+            ]
+          },
+          "adapter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backend": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "TensorDatasetInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "config",
+          "samples",
+          "revision"
+        ],
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/TensorDatasetConfig"
+          },
+          "samples": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          }
+        }
+      },
+      "TensorAppendResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "start",
+          "end",
+          "revision"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          }
+        }
+      },
+      "TensorReadBatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "start",
+          "end",
+          "total_samples",
+          "revision",
+          "tensors"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "total_samples": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "tensors": {
+            "$ref": "#/components/schemas/TensorReadValues"
+          }
+        }
+      },
+      "TensorSearchHit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "distance"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "distance": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "TensorSearchResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hits",
+          "scanned_samples",
+          "next_start",
+          "total_samples",
+          "revision",
+          "skipped_samples",
+          "execution"
+        ],
+        "properties": {
+          "hits": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/TensorSearchHit"
+            }
+          },
+          "scanned_samples": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "next_start": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "format": "uint64"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total_samples": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "skipped_samples": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/TensorExecution"
+          }
+        }
+      },
+      "TensorComputeResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "start",
+          "end",
+          "revision",
+          "values",
+          "execution"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "format": "uint64"
+          },
+          "values": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "execution": {
+            "$ref": "#/components/schemas/TensorExecution"
+          }
+        }
+      },
+      "TensorDatasetInfoEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/TensorDatasetInfo"
+          }
+        }
+      },
+      "TensorAppendResultEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/TensorAppendResult"
+          }
+        }
+      },
+      "TensorReadBatchEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/TensorReadBatch"
+          }
+        }
+      },
+      "TensorSearchResultEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/TensorSearchResult"
+          }
+        }
+      },
+      "TensorComputeResultEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "data"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/TensorComputeResult"
+          }
+        }
+      },
       "GraphRagRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -933,6 +1795,61 @@
       "LimitQuery": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
     },
     "requestBodies": {
+      "TensorDatasetConfig": {
+        "required": true,
+        "description": "The shared HTTP request body limit is 1 MiB, including JSON encoding. Binary chunk storage limits do not enlarge this HTTP cap.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorDatasetConfig"
+            }
+          }
+        }
+      },
+      "TensorAppendRequest": {
+        "required": true,
+        "description": "The shared HTTP request body limit is 1 MiB, including JSON encoding. Binary chunk storage limits do not enlarge this HTTP cap.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorAppendRequest"
+            }
+          }
+        }
+      },
+      "TensorReadRequest": {
+        "required": true,
+        "description": "The shared HTTP request body limit is 1 MiB, including JSON encoding. Binary chunk storage limits do not enlarge this HTTP cap.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorReadRequest"
+            }
+          }
+        }
+      },
+      "TensorSearchRequest": {
+        "required": true,
+        "description": "The shared HTTP request body limit is 1 MiB, including JSON encoding. Binary chunk storage limits do not enlarge this HTTP cap.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorSearchRequest"
+            }
+          }
+        }
+      },
+      "TensorComputeRequest": {
+        "required": true,
+        "description": "The shared HTTP request body limit is 1 MiB, including JSON encoding. Binary chunk storage limits do not enlarge this HTTP cap.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorComputeRequest"
+            }
+          }
+        }
+      },
       "GraphRagRequest": {
         "required": true,
         "content": {
@@ -979,6 +1896,66 @@
       }
     },
     "responses": {
+      "ProfilesEnvelope": {
+        "description": "Built-in profiles, storage variants and GPU requirements.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProfilesEnvelope"
+            }
+          }
+        }
+      },
+      "TensorDatasetInfoEnvelope": {
+        "description": "Typed tensor dataset result envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorDatasetInfoEnvelope"
+            }
+          }
+        }
+      },
+      "TensorAppendResultEnvelope": {
+        "description": "Typed tensor dataset result envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorAppendResultEnvelope"
+            }
+          }
+        }
+      },
+      "TensorReadBatchEnvelope": {
+        "description": "Typed tensor dataset result envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorReadBatchEnvelope"
+            }
+          }
+        }
+      },
+      "TensorSearchResultEnvelope": {
+        "description": "Typed tensor dataset result envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorSearchResultEnvelope"
+            }
+          }
+        }
+      },
+      "TensorComputeResultEnvelope": {
+        "description": "Typed tensor dataset result envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TensorComputeResultEnvelope"
+            }
+          }
+        }
+      },
       "GraphRagEnvelope": {
         "description": "Policy-aware GraphRAG retrieval result",
         "content": {
@@ -1097,6 +2074,399 @@
       }
     },
     "pathItems": {
+      "createTensorDataset": {
+        "operationId": "createTensorDataset",
+        "tags": [
+          "Tensor datasets"
+        ],
+        "summary": "Create a typed tensor dataset.",
+        "description": "Preview. Requires Collection(name):Admin. Native single-node storage only. The Tensor profile requires a real GPU at startup; unsupported non-tensor builders are rejected on that profile. Tensor contents use dtype-tagged arrays, not arbitrary JSON documents. The shared HTTP body limit is 1 MiB.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "x-multidb-stability": "preview",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/TensorDatasetConfig"
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TensorDatasetInfoEnvelope"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "422": {
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "503": {
+            "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "getTensorDataset": {
+        "operationId": "getTensorDataset",
+        "tags": [
+          "Tensor datasets"
+        ],
+        "summary": "Read tensor dataset metadata and revision.",
+        "description": "Preview. Requires Collection(name):Read. Bounded immutable metadata lookup, without scanning sample chunks. Tensor contents use dtype-tagged arrays, not arbitrary JSON documents. The shared HTTP body limit is 1 MiB.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "x-multidb-stability": "preview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamePath"
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615,
+              "format": "uint64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TensorDatasetInfoEnvelope"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "422": {
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "503": {
+            "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "appendTensors": {
+        "operationId": "appendTensors",
+        "tags": [
+          "Tensor datasets"
+        ],
+        "summary": "Atomically append a typed tensor batch.",
+        "description": "Preview. Requires Collection(name):Write. All configured columns must be present with equal sample counts. The append creates a new immutable revision. Tensor contents use dtype-tagged arrays, not arbitrary JSON documents. The shared HTTP body limit is 1 MiB.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "x-multidb-stability": "preview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamePath"
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/TensorAppendRequest"
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TensorAppendResultEnvelope"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "422": {
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "503": {
+            "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "readTensors": {
+        "operationId": "readTensors",
+        "tags": [
+          "Tensor datasets"
+        ],
+        "summary": "Read a projected tensor sample range.",
+        "description": "Preview. Requires Collection(name):Read. Supports fixed and ragged shapes and immutable revision selection. Row/masking policies are unsupported and fail closed. Tensor contents use dtype-tagged arrays, not arbitrary JSON documents. The shared HTTP body limit is 1 MiB.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "x-multidb-stability": "preview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamePath"
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/TensorReadRequest"
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TensorReadBatchEnvelope"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "422": {
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "503": {
+            "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "searchTensors": {
+        "operationId": "searchTensors",
+        "tags": [
+          "Tensor datasets"
+        ],
+        "summary": "Search a bounded tensor embedding range.",
+        "description": "Preview. Requires Collection(name):Read. Returns exact distances and execution provenance. Tensor-profile requests run on the real GPU backend with no silent CPU fallback. This is retrieval, not automatic model inference. Tensor contents use dtype-tagged arrays, not arbitrary JSON documents. The shared HTTP body limit is 1 MiB.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "x-multidb-stability": "preview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamePath"
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/TensorSearchRequest"
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TensorSearchResultEnvelope"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "422": {
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "503": {
+            "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "computeTensors": {
+        "operationId": "computeTensors",
+        "tags": [
+          "Tensor datasets"
+        ],
+        "summary": "Compute bounded tensor reductions.",
+        "description": "Preview. Requires Collection(name):Read. sum, mean and l2_norm operate per sample. The execution object identifies the actual GPU adapter/backend, or an explicit CPU reference execution on other profiles. GPU unavailability returns 503 tensor_gpu_unavailable; there is no silent fallback. Tensor contents use dtype-tagged arrays, not arbitrary JSON documents. The shared HTTP body limit is 1 MiB.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "x-multidb-stability": "preview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NamePath"
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/TensorComputeRequest"
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/TensorComputeResultEnvelope"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "422": {
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorEnvelope"
+          },
+          "503": {
+            "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
       "queryGraphRag": {
         "operationId": "queryGraphRag",
         "tags": [
@@ -1219,13 +2589,13 @@
       "getCatalog": { "operationId": "getCatalog", "tags": ["Catalog"], "summary": "Return catalog objects.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "insertVector": { "operationId": "insertVector", "tags": ["Data"], "summary": "Insert a vector.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "parameters": [{ "$ref": "#/components/parameters/NamePath" }], "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "searchVector": { "operationId": "searchVector", "tags": ["Data"], "summary": "Search vectors.", "description": "Requires Read on the named vector collection. Applies row filters to stored metadata and then masks returned metadata; hidden or missing documents are omitted, so the result can contain fewer than k hits. Unreadable policy metadata fails closed.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "parameters": [{ "$ref": "#/components/parameters/NamePath" }], "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createTable": { "operationId": "createTable", "tags": ["Builder"], "summary": "Create a table.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createCollection": { "operationId": "createCollection", "tags": ["Builder"], "summary": "Create a document collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createVector": { "operationId": "createVector", "tags": ["Builder"], "summary": "Create a vector collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createTimeSeries": { "operationId": "createTimeSeries", "tags": ["Builder"], "summary": "Create a time-series collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createFullText": { "operationId": "createFullText", "tags": ["Builder"], "summary": "Create a full-text index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createGeoIndex": { "operationId": "createGeoIndex", "tags": ["Builder"], "summary": "Create a geo index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
-      "createGraph": { "operationId": "createGraph", "tags": ["Builder"], "summary": "Create a graph.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "createTable": { "operationId": "createTable", "tags": ["Builder"], "summary": "Create a table.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
+      "createCollection": { "operationId": "createCollection", "tags": ["Builder"], "summary": "Create a document collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
+      "createVector": { "operationId": "createVector", "tags": ["Builder"], "summary": "Create a vector collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
+      "createTimeSeries": { "operationId": "createTimeSeries", "tags": ["Builder"], "summary": "Create a time-series collection.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
+      "createFullText": { "operationId": "createFullText", "tags": ["Builder"], "summary": "Create a full-text index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
+      "createGeoIndex": { "operationId": "createGeoIndex", "tags": ["Builder"], "summary": "Create a geo index.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
+      "createGraph": { "operationId": "createGraph", "tags": ["Builder"], "summary": "Create a graph.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "description": "unsupported: the dedicated Tensor profile rejects other data-model builders.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } } },
       "getAudit": { "operationId": "getAudit", "tags": ["Admin"], "summary": "Read audit events.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getConfig": { "operationId": "getConfig", "tags": ["Admin"], "summary": "Return current DatabaseSpec.", "description": "Legacy: a version 1 spec built from the database configuration only (no collections). GET /config/live describes the served database as a spec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "validateConfig": { "operationId": "validateConfig", "tags": ["Admin"], "summary": "Validate a DatabaseSpec.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "requestBody": { "$ref": "#/components/requestBodies/JsonObject" }, "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" }, "422": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
@@ -1236,7 +2606,7 @@
       "planProvision": { "operationId": "planProvision", "tags": ["Provisioning"], "summary": "Plan a spec against the served database.", "description": "A dry run on the control_plane surface; nothing is written. Ready, noop and needs_flags plans are 200; a blocked plan or an invalid spec is 422 with the plan in data (codes invalid_spec, provision_blocked, audit_required, rbac_self_lockout); an unsupported spec version is 422 invalid_spec_version; a storage error or an unreadable provision record is 500. Requires System:Admin.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "requestBody": { "$ref": "#/components/requestBodies/ProvisionRequest" }, "responses": { "200": { "$ref": "#/components/responses/ProvisionPlanEnvelope" }, "400": { "$ref": "#/components/responses/ErrorEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "500": { "$ref": "#/components/responses/ErrorEnvelope" } } },
       "applyProvision": { "operationId": "applyProvision", "tags": ["Provisioning"], "summary": "Apply a spec to the served database.", "description": "Recomputes the plan and applies it as the calling principal (System:Admin and Database:Admin) when confirm is its current prov_ id; there is no client plan. 409 plan_changed when the id is no longer current, or object_conflict when a create met an existing object; 422 confirmation_required, flags_required, provision_blocked, invalid_spec, audit_required or rbac_self_lockout, with the plan or report in data; 500 provision_partially_applied with the report. Retunes and the storage format upgrade take effect at the next restart (session_pending_restart).", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "requestBody": { "$ref": "#/components/requestBodies/ProvisionApplyRequest" }, "responses": { "200": { "$ref": "#/components/responses/ProvisionApplyReportEnvelope" }, "400": { "$ref": "#/components/responses/ErrorEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "409": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "500": { "$ref": "#/components/responses/ProvisionErrorEnvelope" } } },
       "checkProvisionDrift": { "operationId": "checkProvisionDrift", "tags": ["Provisioning"], "summary": "Report how the served database differs from a spec.", "description": "The drift of the control_plane plan of the spec; 422 invalid_spec with the validation report in data for an invalid spec; a storage error or an unreadable provision record is 500. Requires System:Admin.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "preview", "requestBody": { "$ref": "#/components/requestBodies/ProvisionRequest" }, "responses": { "200": { "$ref": "#/components/responses/DriftReportEnvelope" }, "400": { "$ref": "#/components/responses/ErrorEnvelope" }, "403": { "$ref": "#/components/responses/ErrorEnvelope" }, "422": { "$ref": "#/components/responses/ProvisionErrorEnvelope" }, "500": { "$ref": "#/components/responses/ErrorEnvelope" } } },
-      "getProfiles": { "operationId": "getProfiles", "tags": ["Admin"], "summary": "List built-in profiles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
+      "getProfiles": { "operationId": "getProfiles", "tags": ["Admin"], "summary": "List built-in profiles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/ProfilesEnvelope" } } },
       "getRoles": { "operationId": "getRoles", "tags": ["Admin"], "summary": "List collection roles.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getDomains": { "operationId": "getDomains", "tags": ["Admin"], "summary": "List consistency domains.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },
       "getExtensions": { "operationId": "getExtensions", "tags": ["Admin"], "summary": "List extension manifests.", "security": [{ "BearerAuth": [] }], "x-multidb-stability": "stable", "responses": { "200": { "$ref": "#/components/responses/JsonObjectEnvelope" } } },

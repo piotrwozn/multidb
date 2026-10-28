@@ -214,6 +214,7 @@ pub enum ProvisionStepKind {
     RecordMetadata,
     RecordAppliedSpec,
     Noop,
+    CreateTensorDataset,
 }
 
 /// How risky a step is, and what it needs to run.
@@ -2146,6 +2147,7 @@ fn rollback_text(planned: &ProvisionStep) -> String {
             "delete the new database file; nothing else refers to it".to_owned()
         }
         ProvisionStepKind::CreateCollection
+        | ProvisionStepKind::CreateTensorDataset
         | ProvisionStepKind::CreateVectorCollection
         | ProvisionStepKind::CreateTable
         | ProvisionStepKind::CreateTimeSeries
@@ -2196,6 +2198,7 @@ fn identity_digest(spec: &DatabaseSpec) -> String {
 const fn create_kind(kind: &DesiredKind) -> ProvisionStepKind {
     match kind {
         DesiredKind::Document { .. } => ProvisionStepKind::CreateCollection,
+        DesiredKind::TensorDataset { .. } => ProvisionStepKind::CreateTensorDataset,
         DesiredKind::Table { .. } => ProvisionStepKind::CreateTable,
         DesiredKind::Vector { .. } => ProvisionStepKind::CreateVectorCollection,
         DesiredKind::TimeSeries { .. } => ProvisionStepKind::CreateTimeSeries,
@@ -2221,6 +2224,7 @@ fn object_order(index: usize, object: &DesiredObject) -> (Phase, (u8, u8, usize)
             (u8::from(collection_id.is_none()), 1, index),
         ),
         DesiredKind::Table { .. } => (Phase::Containers, (1, 2, index)),
+        DesiredKind::TensorDataset { .. } => (Phase::Containers, (1, 5, index)),
         DesiredKind::TimeSeries { .. } => (Phase::Containers, (1, 3, index)),
         DesiredKind::Graph { graph_id } => {
             (Phase::Containers, (u8::from(graph_id.is_none()), 4, index))
@@ -2253,6 +2257,7 @@ fn describe(object: &DesiredObject) -> String {
     let name = &object.name;
     match &object.kind {
         DesiredKind::Document { .. } => format!("document collection {name}"),
+        DesiredKind::TensorDataset { .. } => format!("typed tensor dataset {name}"),
         DesiredKind::Table { layout, .. } => format!(
             "{} table {name}",
             match layout {
@@ -2589,7 +2594,10 @@ fn differing_fields(
 ) -> Vec<&'static str> {
     let mut fields = Vec::new();
     let same_kind = match &object.kind {
-        DesiredKind::Document { .. } | DesiredKind::Table { .. } | DesiredKind::Vector { .. } => {
+        DesiredKind::Document { .. }
+        | DesiredKind::Table { .. }
+        | DesiredKind::Vector { .. }
+        | DesiredKind::TensorDataset { .. } => {
             record_differences(object, physical, entry, live, allocated_id, &mut fields)
         }
         _ => other_differences(object, entry, live, allocated_id, &mut fields),
@@ -2616,6 +2624,10 @@ fn record_differences(
         }
     };
     match (&object.kind, entry) {
+        (
+            DesiredKind::TensorDataset { config: expected },
+            CatalogEntry::TensorDataset { config: actual },
+        ) => tensor_differences(expected, actual, fields),
         (
             DesiredKind::Document {
                 collection_id,
@@ -2703,6 +2715,29 @@ fn record_differences(
         }
         _ => false,
     }
+}
+
+fn tensor_differences(
+    expected: &crate::tensor::TensorDatasetConfig,
+    actual: &crate::tensor::TensorDatasetConfig,
+    fields: &mut Vec<&'static str>,
+) -> bool {
+    fields.extend(
+        [
+            ("tensors", expected.tensors != actual.tensors),
+            (
+                "tensor_chunk_samples",
+                expected.chunk_samples != actual.chunk_samples,
+            ),
+            (
+                "tensor_max_chunk_bytes",
+                expected.max_chunk_bytes != actual.max_chunk_bytes,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, different)| different.then_some(name)),
+    );
+    true
 }
 
 /// Time series, graphs, full-text and geo indexes and history tables; `false` when the live
@@ -2919,7 +2954,9 @@ pub(super) fn desired_role(role: &crate::config_spec::RoleSpec, desired: &[Desir
 pub(crate) fn object_resource(name: &str, kind: &DesiredKind) -> Resource {
     let name = name.to_owned();
     match kind {
-        DesiredKind::Document { .. } => Resource::Collection(name),
+        DesiredKind::Document { .. } | DesiredKind::TensorDataset { .. } => {
+            Resource::Collection(name)
+        }
         DesiredKind::Table { .. } | DesiredKind::History { .. } => Resource::Table(name),
         DesiredKind::Vector { .. } => Resource::VectorCollection(name),
         DesiredKind::TimeSeries { .. } => Resource::TimeSeries(name),

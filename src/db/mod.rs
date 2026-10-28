@@ -107,6 +107,7 @@ mod profile_binding;
 mod provisioning;
 mod review_fixes;
 mod runtime;
+mod tensor;
 
 pub(crate) use profile_binding::{
     MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
@@ -183,11 +184,12 @@ pub enum Profile {
     HighDurability,
     #[default]
     Balanced,
+    Tensor,
 }
 
 impl Profile {
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 9] {
         [
             Self::InMemory,
             Self::Transactional,
@@ -197,6 +199,7 @@ impl Profile {
             Self::TimeSeries,
             Self::HighDurability,
             Self::Balanced,
+            Self::Tensor,
         ]
     }
 
@@ -208,6 +211,12 @@ impl Profile {
     #[must_use]
     pub const fn is_on_disk(self) -> bool {
         !self.is_in_memory()
+    }
+
+    /// Whether opening this profile requires a physical GPU compute adapter.
+    #[must_use]
+    pub const fn requires_gpu(self) -> bool {
+        matches!(self, Self::Tensor)
     }
 }
 
@@ -502,6 +511,9 @@ pub enum CatalogEntry {
         schema: TableSchema,
         retention: TemporalRetention,
     },
+    TensorDataset {
+        config: crate::tensor::TensorDatasetConfig,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -529,6 +541,9 @@ pub enum DbError {
 
     #[error("GraphRAG: {0}")]
     GraphRag(#[from] crate::graphrag::GraphRagError),
+
+    #[error("tensor: {0}")]
+    Tensor(#[from] crate::tensor::TensorError),
 
     #[error("geo: {0}")]
     Geo(#[from] GeoError),
@@ -613,6 +628,12 @@ impl DbError {
         matches!(
             self,
             Self::Storage(StorageError::Conflict)
+                | Self::Tensor(
+                    crate::tensor::TensorError::Storage(StorageError::Conflict)
+                        | crate::tensor::TensorError::Repl(
+                            ReplError::Conflict | ReplError::Storage(StorageError::Conflict)
+                        )
+                )
                 | Self::Repl(ReplError::Conflict | ReplError::Storage(StorageError::Conflict))
                 | Self::Query(
                     QueryError::Storage(StorageError::Conflict)
@@ -2020,6 +2041,7 @@ impl Database {
         source: ForeignSource,
         options: ForeignTableOptions,
     ) -> Result<(), DbError> {
+        self.ensure_non_tensor_model_allowed("create_foreign_table")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         validate_foreign_source(&source)?;
@@ -2094,6 +2116,7 @@ impl Database {
         fields: Vec<DocField>,
         indexes: Vec<IndexSpec>,
     ) -> Result<DocumentCollection<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_collection")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         self.ensure_collection_id_available(collection_id)?;
@@ -2144,6 +2167,7 @@ impl Database {
         name: impl Into<String>,
         config: VectorCollectionConfig,
     ) -> Result<VectorCollection<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_vector_collection")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         self.ensure_collection_id_available(config.collection_id)?;
@@ -2202,6 +2226,7 @@ impl Database {
         &mut self,
         config: FullTextIndexConfig,
     ) -> Result<FullTextIndex<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_full_text_index")?;
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
         let TextSource::Collection { collection_id, .. } = &config.source;
@@ -2232,6 +2257,7 @@ impl Database {
         &mut self,
         config: TimeSeriesConfig,
     ) -> Result<TimeSeriesCollection<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_time_series")?;
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
         {
@@ -2262,6 +2288,7 @@ impl Database {
         name: impl Into<String>,
         graph_id: GraphId,
     ) -> Result<Graph<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_graph")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         self.ensure_graph_id_available(graph_id)?;
@@ -2302,6 +2329,7 @@ impl Database {
         &mut self,
         config: GeoIndexConfig,
     ) -> Result<GeoIndex<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_geo_index")?;
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
         self.ensure_document_collection(config.collection_id)?;
@@ -3219,6 +3247,7 @@ impl Database {
         &self,
         spec: &MaterializedViewSpec,
     ) -> Result<MaterializedViewRows, DbError> {
+        self.ensure_non_tensor_model_allowed("create_materialized_view")?;
         Ok(cdc::create_materialized_view(self, spec)?)
     }
 
@@ -3229,6 +3258,7 @@ impl Database {
         &mut self,
         spec: &MaterializedViewSpec,
     ) -> Result<MaterializedViewRows, DbError> {
+        self.ensure_non_tensor_model_allowed("create_materialized_view_object")?;
         self.ensure_name_available(&spec.name)?;
         let source_schema = self
             .table(&spec.source_table)?
@@ -4429,6 +4459,8 @@ impl Database {
 
     fn write_pipeline(&self) -> WritePipeline {
         WritePipeline {
+            tensor_only: self.profile().requires_gpu(),
+            typed_tensor_write: false,
             backend: self.repl.replication_handle(),
             tenant: self.tenant.clone(),
             wasm_runtime: Arc::clone(&self.wasm_runtime),
@@ -4519,7 +4551,8 @@ impl Database {
                 | CatalogEntry::FullTextIndex { .. }
                 | CatalogEntry::TimeSeries { .. }
                 | CatalogEntry::Graph { .. }
-                | CatalogEntry::GeoIndex { .. } => {}
+                | CatalogEntry::GeoIndex { .. }
+                | CatalogEntry::TensorDataset { .. } => {}
             }
         }
 
@@ -4571,7 +4604,8 @@ impl Database {
                 | CatalogEntry::FullTextIndex { .. }
                 | CatalogEntry::TimeSeries { .. }
                 | CatalogEntry::Graph { .. }
-                | CatalogEntry::GeoIndex { .. } => None,
+                | CatalogEntry::GeoIndex { .. }
+                | CatalogEntry::TensorDataset { .. } => None,
             })
             .collect()
     }
@@ -4597,7 +4631,8 @@ impl Database {
                 | CatalogEntry::FullTextIndex { .. }
                 | CatalogEntry::TimeSeries { .. }
                 | CatalogEntry::Graph { .. }
-                | CatalogEntry::GeoIndex { .. } => None,
+                | CatalogEntry::GeoIndex { .. }
+                | CatalogEntry::TensorDataset { .. } => None,
             })
             .collect::<BTreeMap<_, _>>();
         PgCatalogSnapshot::from_catalog(&self.catalog, &schemas)
@@ -4759,6 +4794,10 @@ impl Database {
             REL_ROWS_TABLE,
             REL_COLUMNAR_SEGMENTS_TABLE,
             DOCUMENT_TABLE,
+            crate::tensor::TENSOR_CHUNKS_TABLE,
+            crate::tensor::TENSOR_META_TABLE,
+            crate::tensor::TENSOR_SAMPLE_INDEX_TABLE,
+            crate::tensor::TENSOR_REVISIONS_TABLE,
             AUDIT_TABLE,
             AUDIT_HEAD_TABLE,
             ADMIN_AUTH_TABLE,
@@ -4783,6 +4822,16 @@ impl Database {
             })
         })
         .sum()
+    }
+
+    fn ensure_non_tensor_model_allowed(&self, operation: &str) -> Result<(), DbError> {
+        if self.profile().requires_gpu() {
+            return Err(ConfigError::Unsupported(format!(
+                "{operation} is unavailable in the Tensor profile; create a typed tensor dataset"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     fn ensure_name_available(&self, name: &str) -> Result<(), DbError> {
@@ -5417,6 +5466,8 @@ fn validate_serializable_reads(
 /// bypass every stage.
 #[derive(Clone)]
 struct WritePipeline {
+    tensor_only: bool,
+    typed_tensor_write: bool,
     backend: Arc<dyn Replication>,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
@@ -5577,6 +5628,13 @@ impl WritePipeline {
         commit: impl FnOnce(ConditionalBatch) -> Result<(), E>,
     ) -> Result<(), E> {
         let ConditionalBatch { conditions, ops } = batch;
+        if self.tensor_only && !self.typed_tensor_write && !ops.is_empty() {
+            return Err(ReplError::Unsupported(
+                "the Tensor profile accepts user writes only from validated typed tensor appends"
+                    .to_owned(),
+            )
+            .into());
+        }
         let triggers = self.resolved_triggers(&ops).map_err(E::trigger)?;
         let (ops, invocations) = if triggers.is_empty() {
             (ops, Vec::new())
@@ -5973,6 +6031,19 @@ impl Replication for WritePipeline {
         })
     }
 
+    fn propose_tensor_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: crate::tensor::TensorWriteAuthorization,
+    ) -> Result<(), ReplError> {
+        authorization.validate(&batch)?;
+        let mut pipeline = self.clone();
+        pipeline.typed_tensor_write = true;
+        pipeline.execute(batch, None, |batch| {
+            self.backend.propose_conditional_batch(batch)
+        })
+    }
+
     fn read(
         &self,
         table: &str,
@@ -6278,6 +6349,15 @@ impl Replication for Database {
         self.write_pipeline().execute(batch, None, |batch| {
             self.repl.propose_conditional_batch(batch)
         })
+    }
+
+    fn propose_tensor_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: crate::tensor::TensorWriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.write_pipeline()
+            .propose_tensor_batch(batch, authorization)
     }
 
     fn read(
@@ -6713,6 +6793,11 @@ pub fn create_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
 ) -> Result<Database, ConfigError> {
+    if config.profile.requires_gpu() {
+        return Err(ConfigError::Unsupported(
+            "Tensor GPU databases do not support sharding".to_owned(),
+        ));
+    }
     validate(&config)?;
     let repl = Arc::new(build_sharded_replication(sharding, true)?);
 
@@ -6741,6 +6826,11 @@ pub fn open_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
 ) -> Result<Database, ConfigError> {
+    if config.profile.requires_gpu() {
+        return Err(ConfigError::Unsupported(
+            "Tensor GPU databases do not support sharding".to_owned(),
+        ));
+    }
     validate(&config)?;
     let repl = Arc::new(build_sharded_replication(sharding, false)?);
     let read = read_metadata_from_repl(repl.as_ref())?;
@@ -6794,11 +6884,20 @@ pub fn open_sharded_database_with_ops(
     Ok(database)
 }
 
+fn ensure_tensor_gpu_ready(config: &DbConfig) -> Result<(), ConfigError> {
+    if config.profile.requires_gpu() {
+        crate::tensor_gpu::TensorGpuEngine::shared()
+            .map_err(|error| ConfigError::Unsupported(error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Maps a profile to the concrete storage engine used in this phase.
 /// # Errors
 /// Fails when the config is invalid or the selected storage cannot open.
 pub fn engine_for(config: &DbConfig) -> Result<AnyEngine, ConfigError> {
     validate(config)?;
+    ensure_tensor_gpu_ready(config)?;
 
     if config.profile.is_in_memory() {
         return Ok(AnyEngine::memory());
@@ -6823,6 +6922,7 @@ pub fn engine_for_operational(
     ops: &OperationalConfig,
 ) -> Result<AnyEngine, ConfigError> {
     validate_operational(config, ops)?;
+    ensure_tensor_gpu_ready(config)?;
     let compression = ops
         .performance
         .as_ref()
@@ -7111,6 +7211,11 @@ fn force_wasm_runtime_init_failure(enabled: bool) {
 /// # Errors
 /// Fails when the selected profile contradicts the provided path.
 pub fn validate(config: &DbConfig) -> Result<(), ConfigError> {
+    if config.profile.requires_gpu() && config.replication != ReplicationKind::Cp {
+        return Err(ConfigError::Unsupported(
+            "the Tensor GPU profile requires native single-node CP storage".to_owned(),
+        ));
+    }
     if config.profile.is_in_memory() && config.path.is_some() {
         return Err(ConfigError::VolatileWithPath {
             profile: config.profile,
@@ -7247,6 +7352,12 @@ pub fn profile_validation_report(
             capabilities.insert("durable-storage");
             capabilities.insert("redb-commit");
             capabilities.insert("compression-lz4");
+        }
+        Profile::Tensor => {
+            capabilities.insert("tensor-datasets");
+            capabilities.insert("typed-tensor-chunks");
+            capabilities.insert("gpu-compute-required");
+            capabilities.insert("dataset-revisions");
         }
         Profile::Balanced => {
             capabilities.insert("row-layout");
@@ -8063,7 +8174,9 @@ fn resource_for_catalog_name(catalog: &BTreeMap<String, CatalogEntry>, name: &st
     }
 
     match catalog.get(name) {
-        Some(CatalogEntry::Collection { .. }) => Resource::Collection(name.to_owned()),
+        Some(CatalogEntry::Collection { .. } | CatalogEntry::TensorDataset { .. }) => {
+            Resource::Collection(name.to_owned())
+        }
         Some(CatalogEntry::Vector { .. }) => Resource::VectorCollection(name.to_owned()),
         Some(CatalogEntry::FullTextIndex { .. }) => Resource::FullTextIndex(name.to_owned()),
         Some(CatalogEntry::TimeSeries { .. }) => Resource::TimeSeries(name.to_owned()),
@@ -8285,7 +8398,7 @@ fn ensure_ap_supported(config: &DbConfig, cluster: &ApClusterConfig) -> Result<(
 #[must_use]
 pub const fn layout_for(profile: Profile) -> TableLayout {
     match profile {
-        Profile::Analytical => TableLayout::Columnar,
+        Profile::Analytical | Profile::Tensor => TableLayout::Columnar,
         Profile::InMemory
         | Profile::Transactional
         | Profile::Document
@@ -8299,7 +8412,7 @@ pub const fn layout_for(profile: Profile) -> TableLayout {
 const fn cost_profile_for(profile: Profile) -> CostProfile {
     match profile {
         Profile::InMemory => CostProfile::InMemory,
-        Profile::Analytical => CostProfile::Analytical,
+        Profile::Analytical | Profile::Tensor => CostProfile::Analytical,
         Profile::Transactional | Profile::HighDurability => CostProfile::Transactional,
         Profile::Document | Profile::Vector | Profile::TimeSeries | Profile::Balanced => {
             CostProfile::Balanced
@@ -8764,6 +8877,7 @@ fn kind_mismatch(name: &str, expected: &'static str, entry: &CatalogEntry) -> Db
             CatalogEntry::ForeignTable { .. } => "foreign table",
             CatalogEntry::MaterializedView { .. } => "materialized view",
             CatalogEntry::TemporalTable { .. } => "temporal table",
+            CatalogEntry::TensorDataset { .. } => "tensor dataset",
         },
     }
 }

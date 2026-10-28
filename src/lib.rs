@@ -36,6 +36,8 @@ pub mod security;
 pub mod storage;
 pub mod templates;
 pub mod temporal;
+pub mod tensor;
+pub mod tensor_gpu;
 pub mod text;
 pub mod timeseries;
 pub mod tuning;

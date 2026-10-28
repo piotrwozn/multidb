@@ -17,7 +17,7 @@ use axum::{
     Extension, Json, Router,
     extract::{
         ConnectInfo, DefaultBodyLimit, OriginalUri, Path as AxumPath, Query as AxumQuery, State,
-        rejection::JsonRejection,
+        rejection::{JsonRejection, QueryRejection},
     },
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -65,6 +65,10 @@ use crate::{
     security::{
         AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource,
         Role,
+    },
+    tensor::{
+        TensorBatch, TensorComputeRequest, TensorDatasetConfig, TensorError, TensorReadRequest,
+        TensorSearchRequest,
     },
     text::FullTextIndexConfig,
     timeseries::{DEFAULT_MAX_FUTURE_SKEW_MILLIS, TimePoint, TimeSeriesConfig, TimeSeriesError},
@@ -375,6 +379,48 @@ const CONTROL_PLANE_OPERATIONS: &[ControlPlaneOperation] = &[
         operation_id: "insertTimeSeriesPoint",
         auth_required: true,
         stability: "stable",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/builder/tensor-dataset",
+        operation_id: "createTensorDataset",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "GET",
+        path: "/data/tensor-datasets/{name}",
+        operation_id: "getTensorDataset",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/append",
+        operation_id: "appendTensors",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/read",
+        operation_id: "readTensors",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/search",
+        operation_id: "searchTensors",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/compute",
+        operation_id: "computeTensors",
+        auth_required: true,
+        stability: "preview",
     },
     ControlPlaneOperation {
         method: "POST",
@@ -1154,6 +1200,18 @@ pub struct VectorHitSummary {
     pub metadata: Option<JsonValue>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TensorAppendRequest {
+    pub tensors: TensorBatch,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TensorInfoQuery {
+    revision: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TimeSeriesPointRequest {
     pub series: String,
@@ -1593,6 +1651,30 @@ fn api_router() -> Router<AdminState> {
         .route(
             "/data/time-series/{name}/points",
             get(time_series_range_handler).post(time_series_insert_handler),
+        )
+        .route(
+            "/builder/tensor-dataset",
+            post(create_tensor_dataset_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}",
+            get(tensor_dataset_info_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/append",
+            post(tensor_append_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/read",
+            post(tensor_read_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/search",
+            post(tensor_search_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/compute",
+            post(tensor_compute_handler),
         )
         .route("/builder/table", post(create_table_handler))
         .route("/builder/collection", post(create_collection_handler))
@@ -2517,6 +2599,179 @@ async fn vector_search_handler(
     .await
 }
 
+async fn create_tensor_dataset_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<TensorDatasetConfig>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(config) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let result = database
+            .create_tensor_dataset_as(&principal, config)
+            .and_then(|dataset| Ok(dataset.info(None)?));
+        match result {
+            Ok(info) => api_ok(StatusCode::OK, info),
+            Err(error) => tensor_error(&error),
+        }
+    })
+    .await
+}
+
+async fn tensor_dataset_info_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    query: Result<AxumQuery<TensorInfoQuery>, QueryRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let AxumQuery(query) = match query {
+        Ok(query) => query,
+        Err(error) => return invalid_json_value(error.to_string()),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.tensor_dataset_info_as(&principal, &name, query.revision) {
+            Ok(info) => api_ok(StatusCode::OK, info),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_append_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorAppendRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.append_tensors_as(&principal, &name, &request.tensors) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_read_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorReadRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.read_tensors_as(&principal, &name, &request) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_search_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorSearchRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.search_tensors_as(&principal, &name, &request) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_compute_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorComputeRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.compute_tensors_as(&principal, &name, &request) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+fn tensor_error(error: &DbError) -> Response {
+    match error {
+        DbError::Config(ConfigError::Unsupported(_)) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tensor_unsupported",
+            error.to_string(),
+        ),
+        DbError::Tensor(TensorError::Config(_) | TensorError::InvalidValue(_)) => {
+            invalid_json_value(error.to_string())
+        }
+        DbError::Tensor(TensorError::MissingDataset(_) | TensorError::MissingRevision(_)) => {
+            api_error(StatusCode::NOT_FOUND, "not_found", error.to_string())
+        }
+        DbError::Tensor(TensorError::GpuUnsupported(_)) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tensor_gpu_unsupported",
+            error.to_string(),
+        ),
+        DbError::Tensor(TensorError::GpuUnavailable(_)) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tensor_gpu_unavailable",
+            error.to_string(),
+        ),
+        _ => db_error(error),
+    }
+}
+
 async fn graph_rag_query_handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -3351,6 +3606,8 @@ async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -
                 "aliases": profile.aliases,
                 "status": profile.status,
                 "description": profile.description,
+                "requires_gpu": resolve_named_profile(profile.slug, &ProfileKnobOverrides::default())
+                    .resolved().is_some_and(|resolved| resolved.storage_profile.requires_gpu()),
                 "default_domain": consistency_domain_definition(profile.default_domain)
                     .map_or("unknown", |domain| domain.slug),
                 "compatible_roles": profile
@@ -3536,6 +3793,8 @@ async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
                 "graph_builder",
                 "graph_edges_preview",
                 "graphrag_preview",
+                "tensor_datasets_preview",
+                "tensor_gpu_compute_preview",
                 "security_rbac",
                 "audit_log",
             ],
@@ -3578,6 +3837,13 @@ fn catalog_response(database: &Database) -> Result<CatalogResponse, DbError> {
                 let collection = database.collection(name)?;
                 (None, Some(collection.scan()?.len()))
             }
+            CatalogEntry::TensorDataset { .. } => {
+                let info = database.tensor_dataset(name)?.info(None)?;
+                (
+                    None,
+                    Some(usize::try_from(info.samples).unwrap_or(usize::MAX)),
+                )
+            }
             _ => (None, None),
         };
         objects.push(CatalogObjectSummary {
@@ -3603,6 +3869,7 @@ fn catalog_kind(entry: &CatalogEntry) -> &'static str {
         CatalogEntry::ForeignTable { .. } => "foreign_table",
         CatalogEntry::MaterializedView { .. } => "materialized_view",
         CatalogEntry::TemporalTable { .. } => "temporal_table",
+        CatalogEntry::TensorDataset { .. } => "tensor_dataset",
     }
 }
 
@@ -4434,6 +4701,16 @@ fn db_error(error: &DbError) -> Response {
         DbError::AuthzDenied(_) | DbError::GraphRag(GraphRagError::Policy(_))
     ) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(error, DbError::Extension(ExtensionError::PolicyDenied(_))) {
+        return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(error, DbError::Config(ConfigError::Unsupported(_))) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported",
+            error.to_string(),
+        );
     }
     if matches!(error, DbError::MissingCatalogObject(_)) {
         return api_error(StatusCode::NOT_FOUND, "not_found", error.to_string());
@@ -6319,7 +6596,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await?;
         let profiles = body["data"].as_array().ok_or("profiles is not an array")?;
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), 7);
         for profile in profiles {
             let variants = profile["variants"]
                 .as_array()
@@ -6367,6 +6644,15 @@ mod tests {
         assert_eq!(high_durability["canonical"], false);
         // The listed knobs are the canonical variant's: transactional commits immediately.
         assert_eq!(secure["knobs"]["durability"]["commit"], "immediate");
+        let tensor = find("tensor_dataset")?;
+        assert_eq!(tensor["requires_gpu"], true);
+        assert_eq!(game["requires_gpu"], false);
+        assert_eq!(
+            tensor["variants"],
+            serde_json::json!([
+                { "name":"tensor", "storage_profile":"Tensor", "canonical":true }
+            ])
+        );
         Ok(())
     }
 
@@ -7106,6 +7392,410 @@ mod tests {
             )?)
             .await?;
         assert_eq!(delete_doc.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    struct TensorFixture {
+        app: axum::Router,
+        database: Arc<RwLock<crate::db::Database>>,
+        batch: Value,
+        revision: u64,
+    }
+
+    fn tensor_dataset_config() -> Value {
+        serde_json::json!({"name":"training","chunk_samples":2,"tensors":[
+            {"name":"image","dtype":"u8","shape":[null,null,3]},
+            {"name":"caption","dtype":"utf8","shape":[]},
+            {"name":"embedding","dtype":"f32","shape":[3]}
+        ]})
+    }
+
+    fn tensor_dataset_batch() -> Value {
+        serde_json::json!({"tensors":{
+            "image":[{"shape":[1,1,3],"data":{"u8":[255,0,0]}},
+                     {"shape":[1,2,3],"data":{"u8":[0,255,0,0,0,255]}}],
+            "caption":[{"shape":[],"data":{"utf8":["red pixel"]}},
+                       {"shape":[],"data":{"utf8":["green and blue pixels"]}}],
+            "embedding":[{"shape":[3],"data":{"f32":[1.0,0.0,0.0]}},
+                         {"shape":[3],"data":{"f32":[0.0,1.0,0.0]}}]
+        }})
+    }
+
+    async fn tensor_fixture() -> Result<TensorFixture, Box<dyn std::error::Error>> {
+        // A normal embedded profile exercises the explicitly labelled CPU reference path;
+        // the Tensor profile's real GPU requirement is tested by GPU/startup tests.
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router_with_api_prefix(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        let info = graph_rag_post_ok(
+            &app,
+            "/api/builder/tensor-dataset",
+            &tensor_dataset_config(),
+        )
+        .await?;
+        assert_eq!(info["samples"], 0);
+        assert_eq!(
+            info["config"]["tensors"][0]["shape"],
+            serde_json::json!([null, null, 3])
+        );
+        let batch = tensor_dataset_batch();
+        let appended =
+            graph_rag_post_ok(&app, "/api/data/tensor-datasets/training/append", &batch).await?;
+        assert_eq!(appended["start"], 0);
+        assert_eq!(appended["end"], 2);
+        let revision = appended["revision"].as_u64().ok_or("missing revision")?;
+        Ok(TensorFixture {
+            app,
+            database,
+            batch,
+            revision,
+        })
+    }
+
+    #[tokio::test]
+    async fn tensor_http_preserves_ragged_samples_projection_and_append_revisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let appended = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/append",
+            &fixture.batch,
+        )
+        .await?;
+        assert_eq!(appended["start"], 2);
+        assert_eq!(appended["end"], 4);
+        assert!(
+            appended["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > fixture.revision)
+        );
+        let read = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/read",
+            &serde_json::json!({
+                "start":0,"limit":100,"columns":["image","caption"],"revision":fixture.revision
+            }),
+        )
+        .await?;
+        assert_eq!(read["start"], 0);
+        assert_eq!(read["end"], 2);
+        assert_eq!(read["total_samples"], 2);
+        assert_eq!(read["revision"], fixture.revision);
+        assert_eq!(read["tensors"]["image"], fixture.batch["tensors"]["image"]);
+        assert_eq!(
+            read["tensors"]["caption"],
+            fixture.batch["tensors"]["caption"]
+        );
+        assert!(read["tensors"].get("embedding").is_none());
+        let (status, body) = get_as(
+            &fixture.app,
+            &format!(
+                "/api/data/tensor-datasets/training?revision={}",
+                fixture.revision
+            ),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["samples"], 2);
+        let (status, body) =
+            get_as(&fixture.app, "/api/data/tensor-datasets/training", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["samples"], 4);
+        let (status, catalog) = get_as(&fixture.app, "/api/catalog", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        assert!(
+            catalog["data"]["objects"]
+                .as_array()
+                .is_some_and(
+                    |objects| objects.iter().any(|entry| entry["name"] == "training"
+                        && entry["kind"] == "tensor_dataset"
+                        && entry["row_count"] == 4)
+                )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_search_reports_actual_reference_execution_and_compute_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let result = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/search",
+            &serde_json::json!({
+                "tensor":"embedding","query":[1.0,0.0,0.0],"k":1,"max_samples":1
+            }),
+        )
+        .await?;
+        assert_eq!(result["hits"][0]["index"], 0);
+        assert_eq!(result["hits"][0]["distance"], 0.0);
+        assert_eq!(result["scanned_samples"], 1);
+        assert_eq!(result["next_start"], 1);
+        assert_eq!(result["execution"]["device"], "cpu");
+        assert!(result["execution"].get("adapter").is_some());
+        assert!(result["execution"].get("backend").is_some());
+        let computed=graph_rag_post_ok(&fixture.app,"/api/data/tensor-datasets/training/compute",&serde_json::json!({
+            "tensor":"embedding","operation":"sum","start":0,"limit":2,"revision":fixture.revision
+        })).await?;
+        assert_eq!(computed["values"], serde_json::json!([1.0, 1.0]));
+        assert_eq!(computed["execution"]["device"], "cpu");
+        assert_eq!(computed["revision"], fixture.revision);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_invalid_appends_are_atomic_and_json_blobs_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let mut wrong_shape = fixture.batch.clone();
+        wrong_shape["tensors"]["image"][0]["shape"] = serde_json::json!([2, 2, 3]);
+        let mut wrong_dtype = fixture.batch.clone();
+        wrong_dtype["tensors"]["image"][0]["data"] = serde_json::json!({"f32":[1.0,2.0,3.0]});
+        let mut unequal = fixture.batch.clone();
+        unequal["tensors"]["caption"]
+            .as_array_mut()
+            .ok_or("captions not array")?
+            .pop();
+        let mut json_blob = fixture.batch.clone();
+        json_blob["tensors"]["caption"][0]["data"] = serde_json::json!({"json":{"untyped":"blob"}});
+        for request in [wrong_shape, wrong_dtype, unequal, json_blob] {
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/data/tensor-datasets/training/append",
+                &request,
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["ok"], false);
+        }
+        let (_, info) = get_as(&fixture.app, "/api/data/tensor-datasets/training", "root").await?;
+        assert_eq!(info["data"]["samples"], 2);
+        assert_eq!(info["data"]["revision"], fixture.revision);
+        for (path, request) in [
+            ("read", serde_json::json!({"limit":0})),
+            (
+                "search",
+                serde_json::json!({"tensor":"embedding","query":[1.0],"k":0}),
+            ),
+            (
+                "compute",
+                serde_json::json!({"tensor":"embedding","operation":"unknown"}),
+            ),
+            ("read", serde_json::json!({"columns":[]})),
+        ] {
+            let (status, body) = post_as(
+                &fixture.app,
+                &format!("/api/data/tensor-datasets/training/{path}"),
+                &request,
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let (status, body) = post_as(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/read",
+            &serde_json::json!({"revision":999_999}),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_read_and_write_grants_are_checked_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let missing = fixture
+            .app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/data/tensor-datasets/training/read",
+                &serde_json::json!({}),
+            )?)
+            .await?;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        for permission in [Permission::Read, Permission::Write] {
+            {
+                let mut database = fixture.database.write().await;
+                database.set_authz_policy(AuthzPolicy::new([Role::new("limited")
+                    .grant(Resource::Collection("training".to_owned()), permission)]));
+                database.set_principal_registry(
+                    PrincipalRegistry::new()
+                        .with_principal("root", Principal::new("root").with_role("limited")),
+                );
+            }
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/data/tensor-datasets/training/read",
+                &serde_json::json!({}),
+                "root",
+            )
+            .await?;
+            assert_eq!(
+                status,
+                if permission == Permission::Read {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{body}"
+            );
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/data/tensor-datasets/training/append",
+                &fixture.batch,
+                "root",
+            )
+            .await?;
+            assert_eq!(
+                status,
+                if permission == Permission::Write {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{body}"
+            );
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/builder/tensor-dataset",
+                &tensor_dataset_config(),
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_row_and_masking_policies_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{FieldPath, Value as ModelValue},
+        };
+        let fixture = tensor_fixture().await?;
+        for policy in [
+            PolicyConfig {
+                row_policies: vec![RowPolicy {
+                    resource: Resource::Collection("training".to_owned()),
+                    path: FieldPath::new(["visible"]),
+                    equals: ModelValue::Bool(true),
+                }],
+                ..PolicyConfig::default()
+            },
+            PolicyConfig {
+                masking: vec![MaskingPolicy {
+                    resource: Resource::Collection("training".to_owned()),
+                    paths: vec![FieldPath::new(["caption"])],
+                    replacement: ModelValue::Str("masked".to_owned()),
+                }],
+                ..PolicyConfig::default()
+            },
+        ] {
+            fixture.database.read().await.set_policy_config(&policy)?;
+            for (path, request) in [
+                ("read", serde_json::json!({})),
+                (
+                    "search",
+                    serde_json::json!({"tensor":"embedding","query":[1.0,0.0,0.0]}),
+                ),
+                (
+                    "compute",
+                    serde_json::json!({"tensor":"embedding","operation":"sum"}),
+                ),
+            ] {
+                let (status, body) = post_as(
+                    &fixture.app,
+                    &format!("/api/data/tensor-datasets/training/{path}"),
+                    &request,
+                    "root",
+                )
+                .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert!(body["data"].is_null());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_errors_and_openapi_expose_device_and_body_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tensor::TensorError;
+        for (error, status, code) in [
+            (
+                DbError::Tensor(TensorError::GpuUnavailable("no adapter".to_owned())),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tensor_gpu_unavailable",
+            ),
+            (
+                DbError::Tensor(TensorError::GpuUnsupported("unsupported tensor".to_owned())),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tensor_gpu_unsupported",
+            ),
+            (
+                DbError::Config(crate::db::ConfigError::Unsupported(
+                    "native backend required".to_owned(),
+                )),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tensor_unsupported",
+            ),
+        ] {
+            let response = super::tensor_error(&error);
+            assert_eq!(response.status(), status);
+            assert_eq!(json_body(response).await?["error"]["code"], code);
+        }
+        let fixture = tensor_fixture().await?;
+        let oversized = fixture
+            .app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/data/tensor-datasets/training/append")
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .header("x-multidb-principal", "root")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        " ".repeat(super::MAX_CONTROL_PLANE_BODY_BYTES + 1),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(oversized).await?["error"]["code"], "invalid_json");
+        let api: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        for operation in [
+            "createTensorDataset",
+            "getTensorDataset",
+            "appendTensors",
+            "readTensors",
+            "searchTensors",
+            "computeTensors",
+        ] {
+            assert_eq!(
+                api["components"]["pathItems"][operation]["x-multidb-stability"],
+                "preview"
+            );
+        }
+        assert_eq!(
+            api["components"]["schemas"]["TensorData"]["oneOf"]
+                .as_array()
+                .ok_or("missing dtype variants")?
+                .len(),
+            6
+        );
+        assert!(
+            api["components"]["requestBodies"]["TensorAppendRequest"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("1 MiB"))
+        );
         Ok(())
     }
 

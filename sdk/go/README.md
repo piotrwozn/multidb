@@ -109,3 +109,80 @@ Run the deterministic HTTP fixture tests without a server:
 cd sdk/go
 go test ./...
 ```
+
+## Typed tensors on a GPU server
+
+Connect to a server opened with the `tensor_dataset` profile and an actual native
+GPU. That profile refuses to open without a supported GPU; the SDK does not run
+local kernels or substitute CPU execution. Typed datasets can also be stored under
+other profiles for reference CPU operations, but that is a different execution mode.
+This API does not claim DeepLake compatibility.
+
+Using the authenticated client and timeout context from above:
+
+```go
+func tensorExample(ctx context.Context, client *multidb.Client) error {
+    dimension := uint64(2)
+    config := multidb.TensorDatasetConfig{
+        Name: "training",
+        Tensors: []multidb.TensorColumn{
+            {Name: "text", DType: multidb.TensorUTF8DType, Shape: []*uint64{}},
+            {Name: "image", DType: multidb.TensorU8DType, Shape: []*uint64{nil}},
+            {Name: "embedding", DType: multidb.TensorF32DType, Shape: []*uint64{&dimension}},
+        },
+    }
+    // Create once; use TensorDatasetInfo to inspect an existing dataset.
+    if _, err := client.CreateTensorDataset(ctx, config); err != nil {
+        return err
+    }
+    appended, err := client.AppendTensors(ctx, "training", multidb.TensorBatch{
+        "text": {{Shape: []uint64{}, Data: multidb.TensorData{UTF8: []string{"a caption"}}}},
+        "image": {{Shape: []uint64{3}, Data: multidb.TensorData{U8: multidb.TensorU8{0, 128, 255}}}},
+        "embedding": {{Shape: []uint64{2}, Data: multidb.TensorData{F32: []float32{1, 0}}}},
+    })
+    if err != nil {
+        return err
+    }
+    limit := 1
+    columns := []string{"text", "embedding"}
+    snapshot, err := client.ReadTensors(ctx, "training", multidb.TensorReadRequest{
+        Limit: &limit, Columns: &columns, Revision: &appended.Revision,
+    })
+    if err != nil {
+        return err
+    }
+    found, err := client.SearchTensors(ctx, "training", multidb.TensorSearchRequest{
+        Tensor: "embedding", Query: []float64{1, 0}, K: &limit, Metric: multidb.TensorMetricL2,
+    })
+    if err != nil {
+        return err
+    }
+    reduced, err := client.ComputeTensors(ctx, "training", multidb.TensorComputeRequest{
+        Tensor: "embedding", Operation: multidb.TensorGpuL2Norm, Limit: &limit,
+    })
+    if err != nil {
+        return err
+    }
+    if found.Execution.Device != multidb.TensorDeviceGPU || reduced.Execution.Device != multidb.TensorDeviceGPU {
+        return fmt.Errorf("this example requires a Tensor GPU server")
+    }
+    fmt.Printf("revision=%d hits=%v reduction=%v execution=%+v\n",
+        snapshot.Revision, found.Hits, reduced.Values, reduced.Execution)
+    return nil
+}
+```
+
+Each column has the same number of samples in an append. The schema's empty shape
+means a scalar; a nil dimension means ragged. Concrete sample shapes always contain
+numbers. Set exactly one non-nil `TensorData` field (`U8`, `I64`, `F32`, `F64`,
+`Bool`, `UTF8`). `TensorU8` sends numeric JSON arrays rather than Go's default base64
+byte encoding. Payloads are typed at the API boundary and stored by the server as
+native binary chunks.
+
+Omitted chunk settings use 64 samples and 4194304 bytes. Read defaults are start 0
+and limit 100; search defaults are k 10, cosine metric and at most 10000 scanned
+samples. Pointers preserve explicit zero start/revision, while nil revision selects
+the current dataset. `TensorDatasetInfo(ctx, name, &zero)` reads the initial empty
+revision when `zero := uint64(0)`. `Execution` reports actual server device/adapter/
+backend metadata. GPU failures retain the server's `APIError`, including HTTP 503
+`tensor_gpu_unavailable`; the client does not retry with a CPU request.

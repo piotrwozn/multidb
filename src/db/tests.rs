@@ -2684,8 +2684,14 @@ fn engine_for_maps_profiles() -> Result<(), Box<dyn std::error::Error>> {
     {
         let temp_dir = tempfile::tempdir()?;
         let path = temp_dir.path().join(format!("{profile:?}.redb"));
-        let engine = engine_for(&DbConfig::on_disk(profile, path))?;
-        assert_eq!(engine.kind(), EngineKind::Redb);
+        match engine_for(&DbConfig::on_disk(profile, &path)) {
+            Ok(engine) => assert_eq!(engine.kind(), EngineKind::Redb),
+            Err(ConfigError::Unsupported(message)) if profile.requires_gpu() => {
+                assert!(message.contains("GPU"));
+                assert!(!path.exists(), "GPU refusal must precede file creation");
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 
     Ok(())
@@ -2800,9 +2806,10 @@ fn sharded_database_supports_document_and_vector_models() -> Result<(), Box<dyn 
 #[test]
 fn profiles_select_expected_table_layouts() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(layout_for(Profile::Analytical), TableLayout::Columnar);
+    assert_eq!(layout_for(Profile::Tensor), TableLayout::Columnar);
     for profile in Profile::all()
         .into_iter()
-        .filter(|profile| *profile != Profile::Analytical)
+        .filter(|profile| !matches!(profile, Profile::Analytical | Profile::Tensor))
     {
         assert_eq!(layout_for(profile), TableLayout::Row);
     }

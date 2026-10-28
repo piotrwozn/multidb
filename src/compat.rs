@@ -56,6 +56,7 @@ pub enum CatalogObjectKind {
     ForeignTable,
     MaterializedView,
     TemporalTable,
+    TensorDataset,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -149,6 +150,7 @@ impl PgCatalogSnapshot {
                         (CatalogObjectKind::MaterializedView, None)
                     }
                     CatalogEntry::TemporalTable { .. } => (CatalogObjectKind::TemporalTable, None),
+                    CatalogEntry::TensorDataset { .. } => (CatalogObjectKind::TensorDataset, None),
                 };
                 CatalogObject {
                     name: name.clone(),
@@ -557,7 +559,8 @@ fn relkind(kind: CatalogObjectKind) -> &'static str {
         | CatalogObjectKind::Graph
         | CatalogObjectKind::GeoIndex
         | CatalogObjectKind::MaterializedView
-        | CatalogObjectKind::TemporalTable => "v",
+        | CatalogObjectKind::TemporalTable
+        | CatalogObjectKind::TensorDataset => "v",
     }
 }
 

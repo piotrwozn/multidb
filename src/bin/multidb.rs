@@ -2534,6 +2534,7 @@ fn run_profile_list(args: &[String]) -> Result<CliRun, CliError> {
                         .iter()
                         .map(|role| role_slug(*role))
                         .collect::<Vec<_>>(),
+                    "requires_gpu": named_profile(profile.slug).is_some_and(|resolved| resolved.storage_profile.requires_gpu()),
                     "variants": product_variants(profile.slug)
                         .map(|variant| {
                             json!({
@@ -2710,6 +2711,7 @@ fn resolution_run(resolution: &ProfileResolution, output: &str) -> Result<CliRun
             ProfileResolution::Resolved { profile, issues } => json!({
                 "resolution": "resolved",
                 "profile": profile,
+                "requires_gpu": profile.storage_profile.requires_gpu(),
                 "rows": knob_rows_json(&profile.knobs, Some(&profile.provenance))?,
                 "issues": issues,
             }),
@@ -4004,9 +4006,10 @@ fn format_resolution(resolution: &ProfileResolution) -> Result<String, CliError>
                     storage_summary(&profile.knobs)
                 ),
                 format!(
-                    "kind={} digest={}",
+                    "kind={} digest={} requires_gpu={}",
                     kind_label(profile.kind),
-                    profile.digest
+                    profile.digest,
+                    profile.storage_profile.requires_gpu()
                 ),
                 knob_table(&profile.knobs, Some(&profile.provenance))?,
             ]
@@ -4523,7 +4526,11 @@ fn guided_spec_for_domain(
     }
     let durable_storage = guided_profile_uses_durable_storage(profile.slug);
     DatabaseSpec {
-        version: multidb::config_spec::DATABASE_SPEC_VERSION,
+        version: if profile.slug == "tensor_dataset" {
+            DATABASE_SPEC_VERSION_V2
+        } else {
+            multidb::config_spec::DATABASE_SPEC_VERSION
+        },
         name: name.to_owned(),
         profile: profile.slug.to_owned(),
         deployment: DeploymentSpec {
@@ -5296,7 +5303,7 @@ fn parse_profile_selection(value: &str) -> Result<ProfileSelection, CliError> {
     }
     Err(CliError::Usage(format!(
         "unknown profile {value}{}; expected a storage profile (InMemory, Transactional, \
-         Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product profile \
+         Analytical, Document, Vector, TimeSeries, HighDurability, Balanced, Tensor), a product profile \
          slug or alias (run multidb profile list), or auto",
         did_you_mean(value)
     )))
@@ -5313,6 +5320,7 @@ fn storage_profile_name(value: &str) -> Option<Profile> {
         "TimeSeries" | "time-series" | "time_series" => Some(Profile::TimeSeries),
         "HighDurability" | "high-durability" => Some(Profile::HighDurability),
         "Balanced" | "balanced" => Some(Profile::Balanced),
+        "Tensor" | "tensor" => Some(Profile::Tensor),
         _ => None,
     }
 }
@@ -5499,15 +5507,16 @@ mod tests {
             restore_backup_with_config,
         },
         config_spec::{
-            CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, DeploymentMode,
-            GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, PolicyCompiler, ProfileResolution,
-            RESERVED_KNOBS, WriteAck, resolve_named_profile,
+            CollectionRole, CollectionRoleSpec, ConsistencyMode, DATABASE_SPEC_VERSION_V2,
+            DatabaseSpec, DeploymentMode, GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner,
+            PolicyCompiler, ProfileResolution, RESERVED_KNOBS, WriteAck, resolve_named_profile,
+            resolve_profile,
             spec_io::{MAX_SPEC_BYTES, SpecFormat, decode_spec_bytes},
         },
         db::{
             ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
             ReplicationKind, create_database, create_database_with_profile,
-            inspect_database_metadata, open_database,
+            inspect_database_metadata, open_database, open_database_with_ops,
         },
         network::{AuthConfig, NetworkConfig, ScramCredential, TlsMode},
         tuning::WorkloadSample,
@@ -6689,7 +6698,7 @@ mod tests {
             "--json".to_owned(),
         ])?;
         let profiles = serde_json::from_str::<serde_json::Value>(&profiles_json.message)?;
-        assert!(profiles.as_array().is_some_and(|items| items.len() == 6));
+        assert!(profiles.as_array().is_some_and(|items| items.len() == 7));
 
         let roles_json = run(vec![
             "role".to_owned(),
@@ -6955,11 +6964,14 @@ mod tests {
             ("high-durability", Profile::HighDurability),
             ("Balanced", Profile::Balanced),
             ("balanced", Profile::Balanced),
+            ("Tensor", Profile::Tensor),
+            ("tensor", Profile::Tensor),
         ];
         let aliases = [
             ("in_memory", Profile::InMemory),
             ("high_durability", Profile::HighDurability),
             ("High-Durability", Profile::HighDurability),
+            ("deeplake_like", Profile::Tensor),
         ];
         for (value, profile) in storage_names.into_iter().chain(aliases) {
             assert_eq!(
@@ -6976,6 +6988,7 @@ mod tests {
             ("secure_app", Profile::Transactional),
             ("production_cp", Profile::Transactional),
             ("analytics_columnar", Profile::Analytical),
+            ("tensor_dataset", Profile::Tensor),
         ];
         for (slug, profile) in products {
             for value in [slug.to_owned(), slug.replace('_', "-")] {
@@ -7450,12 +7463,95 @@ mod tests {
     }
 
     #[test]
+    fn tensor_profile_inspection_and_guided_init_work_without_a_gpu()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let shown = run(strings(&["profile", "show", "tensor", "--json"]))?;
+        assert_eq!(shown.exit_code, 0, "{}", shown.message);
+        let report = json_message(&shown)?;
+        assert_eq!(report["requires_gpu"], true);
+        assert_eq!(report["profile"]["product_profile"], "tensor_dataset");
+        assert_eq!(report["profile"]["variant"], "tensor");
+        assert_eq!(report["profile"]["storage_profile"], "Tensor");
+        assert_eq!(
+            report["profile"]["knobs"]["compression"]["algorithm"],
+            "lz4"
+        );
+        let listed = json_message(&run(strings(&["profile", "list", "--json"]))?)?;
+        let tensor = listed
+            .as_array()
+            .ok_or("profile list")?
+            .iter()
+            .find(|profile| profile["slug"] == "tensor_dataset")
+            .ok_or("tensor profile")?;
+        assert_eq!(tensor["requires_gpu"], true);
+        assert_eq!(
+            tensor["variants"],
+            json!([{
+                "name": "tensor", "storage_profile": "Tensor", "canonical": true,
+            }])
+        );
+        let dir = tempdir()?;
+        let path = dir.path().join("tensors.json");
+        let created = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "deeplake-like",
+            "--name",
+            "Dataset",
+            "--format",
+            "json",
+            "--out",
+            &path_arg(&path),
+            "--json",
+        ]))?;
+        assert_eq!(created.exit_code, 0, "{}", created.message);
+        let spec: DatabaseSpec = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(spec.version, DATABASE_SPEC_VERSION_V2);
+        assert_eq!(spec.profile, "tensor_dataset");
+        assert_eq!(
+            resolve_profile(&spec)
+                .resolved()
+                .ok_or("resolved tensor")?
+                .storage_profile,
+            Profile::Tensor
+        );
+        assert!(spec.collections.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_profile_open_is_gpu_gated_and_auto_preserves_its_storage_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("tensors.redb");
+        match create_database(DbConfig::on_disk(Profile::Tensor, &path)) {
+            Err(error) => {
+                assert!(error.to_string().contains("GPU"), "{error}");
+                assert!(
+                    !path.exists(),
+                    "an unavailable GPU must refuse before creating the database"
+                );
+            }
+            Ok(db) => {
+                assert_eq!(db.profile(), Profile::Tensor);
+                drop(db);
+                let auto = cli_db_config(ProfileSelection::Auto, path.clone())?;
+                assert_eq!(auto.profile, Profile::Tensor);
+                let db = open_database_with_ops(auto, &OperationalConfig::new())?;
+                assert_eq!(db.profile(), Profile::Tensor);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn profile_list_json_adds_variants_and_knobs() -> Result<(), Box<dyn std::error::Error>> {
         let outcome = run(strings(&["profile", "list", "--json"]))?;
         let report = json_message(&outcome)?;
         let profiles = report.as_array().ok_or("profile list is not an array")?;
 
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), 7);
         for profile in profiles {
             let variants = profile["variants"].as_array().ok_or("missing variants")?;
             assert_eq!(

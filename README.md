@@ -95,6 +95,11 @@ multidb profile explain --spec .\orders.yaml
 
 See `docs/profiles.md` for the knob reference and the profile commands.
 
+The `tensor_dataset` profile stores user data in typed tensor chunks and requires
+a hardware GPU for search and batch reductions. It includes append-only dataset
+revisions, projected reads, API endpoints and all four SDKs. See
+[tensor datasets](docs/tensor-datasets.md) for supported operations and GPU setup.
+
 Build a database from a spec (preview). `config plan --spec` is a dry run that
 prints every step, the flags it needs and how each guarantee is enforced;
 `config apply` recomputes the plan and applies it with the `prov_` id it

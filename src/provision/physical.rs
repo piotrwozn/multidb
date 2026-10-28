@@ -43,6 +43,9 @@ pub struct DesiredObject {
 /// example vector quantization keeps its runtime default.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DesiredKind {
+    TensorDataset {
+        config: crate::tensor::TensorDatasetConfig,
+    },
     /// `create_collection` (pinned id) or `create_collection_auto_id`.
     Document {
         collection_id: Option<CollectionId>,
@@ -104,6 +107,7 @@ impl DesiredKind {
             Self::FullText { .. } => "full_text",
             Self::Geo { .. } => "geo",
             Self::History { .. } => "history",
+            Self::TensorDataset { .. } => "tensor_dataset",
         }
     }
 }
@@ -114,6 +118,7 @@ impl DesiredObject {
     #[must_use]
     pub fn params_json(&self) -> JsonValue {
         match &self.kind {
+            DesiredKind::TensorDataset { config } => tensor_json(config),
             DesiredKind::Document {
                 collection_id,
                 fields,
@@ -168,6 +173,7 @@ impl DesiredKind {
             Self::FullText { .. } => ObjectKind::FullText,
             Self::Geo { .. } => ObjectKind::Geo,
             Self::History { .. } => ObjectKind::History,
+            Self::TensorDataset { .. } => ObjectKind::TensorDataset,
         }
     }
 }
@@ -185,6 +191,7 @@ pub(crate) const fn entry_kind(entry: &CatalogEntry) -> ObjectKind {
         CatalogEntry::ForeignTable { .. } => ObjectKind::ForeignTable,
         CatalogEntry::MaterializedView { .. } => ObjectKind::MaterializedView,
         CatalogEntry::TemporalTable { .. } => ObjectKind::History,
+        CatalogEntry::TensorDataset { .. } => ObjectKind::TensorDataset,
     }
 }
 
@@ -199,6 +206,7 @@ pub(crate) fn live_params_json(
     schemas: &BTreeMap<String, TableSchema>,
 ) -> JsonValue {
     match entry {
+        CatalogEntry::TensorDataset { config } => tensor_json(config),
         CatalogEntry::Collection {
             collection_id,
             fields,
@@ -280,6 +288,15 @@ fn document_json(
             .iter()
             .map(|index| json!({ "path": path_text(&index.path), "id": index.id.as_u32() }))
             .collect::<Vec<_>>(),
+    })
+}
+
+fn tensor_json(config: &crate::tensor::TensorDatasetConfig) -> JsonValue {
+    json!({
+        "kind": "tensor_dataset",
+        "tensors": config.tensors,
+        "tensor_chunk_samples": config.chunk_samples,
+        "tensor_max_chunk_bytes": config.max_chunk_bytes,
     })
 }
 
@@ -425,6 +442,7 @@ fn desired_object(planned: PlannedObject) -> Result<DesiredObject, ValidationIss
         kind,
     } = planned;
     let kind = match kind {
+        PlannedKind::TensorDataset { config } => DesiredKind::TensorDataset { config },
         PlannedKind::Document {
             collection_id,
             fields,
@@ -808,15 +826,21 @@ mod tests {
                 json!(["graph"]),
                 json!({ "kind": "graph", "graph_id": null }),
             ),
+            PhysicalKind::TensorDataset => (
+                json!({"kind":"tensor_dataset","tensors":[{"name":"embedding","dtype":"f32","shape":[3]}]}),
+                json!(["columnar"]),
+                json!({"kind":"tensor_dataset","tensors":[{"name":"embedding","dtype":"f32","shape":[3]}],"tensor_chunk_samples":64,"tensor_max_chunk_bytes":4_194_304}),
+            ),
         }
     }
 
-    const ALL_KINDS: [PhysicalKind; 5] = [
+    const ALL_KINDS: [PhysicalKind; 6] = [
         PhysicalKind::Document,
         PhysicalKind::Table,
         PhysicalKind::Vector,
         PhysicalKind::TimeSeries,
         PhysicalKind::Graph,
+        PhysicalKind::TensorDataset,
     ];
 
     #[test]
@@ -827,7 +851,7 @@ mod tests {
             for kind in allowed_kinds(role) {
                 let (physical, indexes, expected) = golden(*kind);
                 let mut physical = physical;
-                if role == CollectionRole::Analytics {
+                if role == CollectionRole::Analytics && *kind == PhysicalKind::Table {
                     // Analytics tables are columnar unless the spec says otherwise.
                     physical["layout"] = json!("row");
                 }
@@ -850,7 +874,7 @@ mod tests {
                 covered += 1;
             }
         }
-        assert_eq!(covered, 14);
+        assert_eq!(covered, 16);
         Ok(())
     }
 

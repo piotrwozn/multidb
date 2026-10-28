@@ -4,6 +4,11 @@ Public preview means MultiDB has an installable, repeatable starter path with
 clear support boundaries. It is not a claim that every planned distributed
 feature is production-ready.
 
+The preview `tensor_dataset` profile adds typed tensor storage and hardware GPU
+search/reductions. Its device requirements, API and current operation limits are
+documented in [tensor-datasets.md](tensor-datasets.md). Creating or opening that
+profile without a supported GPU fails before opening its writable storage engine.
+
 ## Install And Verify
 
 Download the release binary for your platform, `SHA256SUMS`,

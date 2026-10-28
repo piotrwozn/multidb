@@ -4,6 +4,16 @@ All notable public changes will be recorded here.
 
 ## Unreleased
 
+- Updated the zstd implementation to the fixed 0.14.3 / zstd-safe 8.2 codec
+  stack, including Arrow/Parquet callers through a small local compatibility
+  re-export; the vulnerable registry codec versions are no longer resolved.
+- Added the preview `tensor_dataset` / `tensor` profile: durable binary typed
+  tensor chunks, aligned and ragged samples, atomic append revisions and projected
+  reads. GPU search and batch reductions dispatch WGSL kernels through wgpu;
+  the profile requires a hardware adapter and refuses CPU fallback. Added six
+  authenticated API operations, four SDKs, spec-v2 provisioning and a runnable
+  example. Other native profiles can use tensor datasets with explicit CPU
+  reference execution. See `docs/tensor-datasets.md` for limits and device support.
 - Added preview GraphRAG retrieval: bounded vector seeds, graph expansion,
   deduplicated cited context and source provenance through the Rust API,
   `POST /graphrag/query`, and TypeScript/Python/Go/Rust SDKs. Added a graph-edge

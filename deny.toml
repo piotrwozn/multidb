@@ -72,11 +72,24 @@ skip = [
     # DataFusion and OpenRaft intentionally use adjacent itertools releases.
     { crate = "itertools@0.14.0", reason = "DataFusion 54 pins itertools 0.14 while OpenRaft 0.10 alpha uses 0.15" },
 
+    # Native wgpu 26 backends and their proc macros straddle existing dependency generations.
+    { crate = "ordered-float@2.10.1", reason = "Parquet 58 thrift support requires ordered-float 2 while wgpu-hal 26 requires ordered-float 5" },
+    { crate = "rustc-hash@1.1.0", reason = "naga/wgpu-core 26 use rustc-hash 1 while Wasmtime 36 and regalloc2 require rustc-hash 2" },
+    { crate = "syn@3.0.9", reason = "wgpu's bytemuck_derive and Metal foreign-types-macros use syn 3 while the existing proc-macro stack uses syn 2" },
+    # Arrow/Parquet's old dependency constraint is bridged by a reviewed first-party re-export.
+    { crate = "zstd@0.13.4", reason = "local compat/zstd is only a re-export facade with no codec implementation; Arrow/Parquet 58 calls execute the same patched registry zstd 0.14.3 used directly by MultiDB" },
+
     # Some transitive crates still depend on thiserror 1 while the project and current crates use thiserror 2.
     { crate = "thiserror@1.0.69", reason = "older transitive crates have not migrated to thiserror 2" },
     { crate = "thiserror-impl@1.0.69", reason = "proc-macro pair for thiserror 1" },
 
     # Windows target crates come from hnsw_rs/mmap-rs, ring/rustls, Wasmtime, and the current Tokio/tooling stack.
+    { crate = "windows@0.58.0", reason = "wgpu-hal 26 DX12 and gpu-allocator 0.27 require windows 0.58 while hnsw_rs/mmap-rs still uses windows 0.48" },
+    { crate = "windows-core@0.58.0", reason = "wgpu's windows 0.58 target support coexists with iana-time-zone's windows-core 0.62" },
+    { crate = "windows-implement@0.58.0", reason = "proc-macro support paired with wgpu's windows-core 0.58; iana-time-zone uses windows-implement 0.60" },
+    { crate = "windows-interface@0.58.0", reason = "proc-macro support paired with wgpu's windows-core 0.58; iana-time-zone uses windows-interface 0.59" },
+    { crate = "windows-result@0.2.0", reason = "result support paired with wgpu's windows-core 0.58; iana-time-zone uses windows-result 0.4" },
+    { crate = "windows-strings@0.1.0", reason = "string support paired with wgpu's windows-core 0.58; iana-time-zone uses windows-strings 0.5" },
     { crate = "windows-sys@0.52.0", reason = "ring/rustls transitive target support still uses windows-sys 0.52" },
     { crate = "windows-sys@0.60.2", reason = "Wasmtime 36 uses windows-sys 0.60 while Tokio/tooling uses 0.61" },
     { crate = "windows-targets@0.48.5", reason = "hnsw_rs/mmap-rs still depends on windows 0.48" },

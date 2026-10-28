@@ -34,15 +34,17 @@ gain new Advice and Warnings.
 
 ## Model
 
-- **Product profile.** One of the six built-in profiles listed by
+- **Product profile.** One of the seven built-in profiles listed by
   `multidb profile list` (`game_local_balanced`, `desktop_app_embedded`,
-  `ai_agent_memory`, `secure_app`, `production_cp`, `analytics_columnar`). It
+  `ai_agent_memory`, `secure_app`, `production_cp`, `analytics_columnar`,
+  `tensor_dataset`). It
   carries the support status, the default consistency domain and the
   compatible collection roles.
 - **Variant.** Every alias of a product profile is a variant pinned 1:1 to a
   storage `Profile`. A product slug selects its canonical variant; an alias
   selects the variant of the same name. `production_cp` has no alias, so its
-  only variant is named after itself.
+  only variant is named after itself. The `deeplake_like` alias is a synonym
+  for the `tensor` variant of `tensor_dataset`.
 - **Preset.** The knob values of one variant: the variant columns below plus
   the values every preset shares and the product's domain, roles and floors.
 - **Custom profile.** A spec version 2 block,
@@ -67,12 +69,16 @@ lowercase and map `-` to `_`, so `High-Durability` means `high_durability`.
 | production_cp | production_cp* | Transactional | durable | row | immediate | 2 | on / 2048 | 1 GiB | backup |
 | analytical | analytics_columnar* | Analytical | durable | columnar | immediate | 0 | on / 4096 | 2 GiB | - |
 | time_series | analytics_columnar | TimeSeries | durable | row | immediate | 2 | on / 2048 | 1 GiB | - |
+| tensor | tensor_dataset* | Tensor | durable | columnar tensor chunks | immediate | 0 | on / 4096 | 2 GiB | - |
 
 Values every preset shares:
 
-- compression `none`, `min_bytes` 256, `zstd_level` 3. Compression is a
+- compression `none`, `min_bytes` 256, `zstd_level` 3 for the existing nine
+  variants. The new `tensor` variant uses `lz4` / 256 / 3. Compression is a
   forward-only on-disk format change (value framing and `schema_version` 2),
-  so no preset turns it on;
+  so existing presets stay unchanged; creation through the resolved tensor preset
+  starts framed. The bare legacy `create_database(DbConfig)` constructor does not
+  apply named-profile compression knobs;
 - query `max_concurrent_queries: auto` (four permits per available thread,
   today's value) and `target_partitions: auto` (the storage profile default);
   the other query limits are the runtime defaults: 1 MiB SQL, 32 statements,
@@ -85,10 +91,40 @@ Values every preset shares:
 - `consistency.default_domain` and `compatible_roles` from the product profile.
 
 A test pins the presets to the runtime: for every storage `Profile`, resolving
-its alias gives `PerformanceConfig::for_profile` with only the compression
-replaced by `none` / 256 / 3, the same table layout as `layout_for`,
+its alias gives `PerformanceConfig::for_profile` with compression replaced by
+`none` / 256 / 3 for the older variants or `lz4` / 256 / 3 for Tensor,
+the same storage layout as `layout_for`,
 two-phase commit exactly for HighDurability and a volatile medium exactly for
-InMemory. Each variant's knob digest is pinned as well.
+InMemory. The existing nine variants' knob digests remain pinned unchanged.
+
+### GPU tensor datasets
+
+`tensor_dataset` is an experimental profile for durable tensor datasets with
+GPU search and reductions. Its storage class is `Profile::Tensor`, its
+canonical variant is `tensor`, and its aliases are `tensor` and
+`deeplake_like` (also accepted in kebab case by named-profile commands).
+`deeplake_like` describes the workload inspiration; it does not promise
+DeepLake file-format or API compatibility.
+
+Opening or creating this profile requires a physical GPU compute adapter.
+The default `tensor-gpu` Cargo feature enables the GPU backend; builds without
+that feature cannot open the profile. A machine without a supported adapter
+gets an unavailable-GPU error before a new database file is created. There is
+no CPU fallback or CPU emulation. Static commands such as `profile list`,
+`profile show tensor` and guided config generation work without a GPU.
+The list/show JSON reports `requires_gpu: true`. `--profile auto` preserves
+the Tensor storage class of an existing database and still requires its GPU
+backend to open it.
+
+The preset uses durable, columnar tensor chunks, LZ4 value framing, immediate
+commits, a cache of 4096 entries and a 2 GiB query memory budget. Columnar
+here describes tensor storage; it does not turn relational SQL tables into
+tensor datasets. The compatible spec roles are `analytics` and
+`vector_memory`; the physical tensor-dataset kind identifies the model.
+Tensor specs require version 2. `init --guided --profile tensor` emits that
+version, while all existing profiles keep their prior generated format and
+persisted knob digests. Custom profiles extending Tensor must retain durable
+columnar storage, immediate commits and a zero group-commit window.
 
 ## Capability matrix
 
@@ -99,7 +135,7 @@ The storage `Profile` is derived from `storage.medium`, `storage.layout` and
 | --- | --- | --- | --- |
 | volatile | row | immediate | InMemory (requires group commit 0 ms) |
 | durable | row | two_phase | HighDurability (requires group commit 0 ms) |
-| durable | columnar | immediate | Analytical |
+| durable | columnar | immediate | Tensor for the tensor_dataset product; Analytical for other products |
 | durable | row | immediate | the variant's own class when it is Transactional, Document, Vector, TimeSeries or Balanced; otherwise the product's durable row class |
 
 The durable row class of each product: game_local_balanced Balanced,
@@ -110,6 +146,9 @@ Every other combination is refused with `PROFILE_KNOB_COMBINATION_UNSUPPORTED`:
 volatile with columnar layout, volatile with two-phase commit, volatile with a
 group commit window above 0, two-phase commit with columnar layout, and
 two-phase commit with a group commit window above 0.
+The tensor_dataset product also refuses row or volatile storage, two-phase
+commits and nonzero group-commit windows, so overrides cannot silently change
+it into another storage class.
 
 ## Knob reference
 
@@ -122,7 +161,7 @@ profile.
 | path | type and bounds | timing | runtime sink | enforcement | after creation |
 | --- | --- | --- | --- | --- | --- |
 | `storage.medium` | durable \| volatile | creation | `__meta.profile` -> `engine_for` (memory or redb engine) | enforced | unsupported |
-| `storage.layout` | row \| columnar | creation | `__meta.layout` / `layout_for` (default layout for new tables) | enforced | unsupported |
+| `storage.layout` | row \| columnar | creation | `__meta.layout` / `layout_for` (relational table layout, or tensor chunk layout for Tensor) | enforced | unsupported |
 | `durability.commit` | immediate \| two_phase | creation | redb two-phase commit (storage profile HighDurability) | enforced | unsupported |
 | `durability.group_commit_window_ms` | 0..=50 | every open | `IoConfig.group_commit_window_ms` -> `SingleNode::with_group_commit_window` | enforced | retune |
 | `compression.algorithm` | none \| lz4 \| zstd | creation | `CompressionConfig.algorithm` -> `CompressedEngine` value framing | enforced | format upgrade (none to lz4/zstd); lz4/zstd switch is a retune |
@@ -692,7 +731,7 @@ first (see [CLI](#cli)).
 
 | command | output | exit code |
 | --- | --- | --- |
-| `profile list [--json]` | the six product profiles; JSON adds `variants` (`name`, `storage_profile`, `canonical`) and the canonical variant's `knobs`, text adds `variants=` | 0 |
+| `profile list [--json]` | the seven product profiles; JSON adds `requires_gpu`, `variants` (`name`, `storage_profile`, `canonical`) and the canonical variant's `knobs`, text adds `variants=` | 0 |
 | `profile show <profile> [--override path=value]... [--json]` | the resolved profile: a header naming the product, variant, status and storage profile, the digest, and one row per knob with its value, source (`preset`, `variant`, `override`), timing, enforcement and sink | 0, or 2 when the profile is invalid |
 | `profile show --db <path> [--json]` | the profile manifest of the database, or `legacy database: storage profile X, no manifest`, and a warning per unmet floor; JSON prints the `inspect_database_metadata` result; it never writes the file | 0, or 1 when nothing, an uninitialized file, or a locked, unrecovered or unreadable database is found |
 | `profile explain --spec <file> [--json]` | `resolve_profile` for a spec read through `spec_io`; JSON has `resolution` (`resolved`, `unresolved`, `invalid`), `profile`, `rows` and `issues` | 0 for resolved and version 1 unresolved profiles, 2 when invalid (including `FIELD_REQUIRES_SPEC_V2` for a version 1 spec that sets `custom_profile`) or when the spec cannot be read (`SPEC_TOO_LARGE`, `UNSUPPORTED_VERSION`, ...) |
@@ -798,7 +837,7 @@ exact profile.
 
 ## Control Plane and Studio
 
-`GET /profiles` lists the six product profiles. Each entry carries
+`GET /profiles` lists the seven product profiles. Each entry carries
 `variants` (`name`, `storage_profile`, `canonical`; exactly one variant is
 canonical) and `knobs`, the fully resolved `ProfileKnobs` of the canonical
 variant. Its knob sections use the same leaf names and value forms as

@@ -70,6 +70,7 @@ pub enum PhysicalKind {
     Vector,
     TimeSeries,
     Graph,
+    TensorDataset,
 }
 
 /// The value type of a document field or table column.
@@ -89,7 +90,8 @@ pub enum ColumnTypeSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalObjectSpec {
-    /// Every kind; defaults to the first of [`allowed_kinds`] for the role.
+    /// Every kind; defaults to the first of [`allowed_kinds`] for the role,
+    /// except the Tensor storage profile, which requires a tensor dataset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<PhysicalKind>,
     /// Document and vector: a pinned collection id. Unpinned ids are allocated at apply time.
@@ -165,6 +167,15 @@ pub struct PhysicalObjectSpec {
     /// Graph: a pinned graph id. Unpinned ids are allocated at apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_id: Option<u32>,
+    /// Tensor dataset: immutable typed tensor columns and fixed/ragged shapes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tensors: Vec<crate::tensor::TensorColumn>,
+    /// Tensor dataset: samples per chunk (1..=1024, default 64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor_chunk_samples: Option<usize>,
+    /// Tensor dataset: encoded chunk byte bound (1024..=16777216, default 4194304).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor_max_chunk_bytes: Option<usize>,
 }
 
 impl PhysicalObjectSpec {
@@ -339,9 +350,9 @@ pub const fn allowed_kinds(role: CollectionRole) -> &'static [PhysicalKind] {
         | CollectionRole::EventLog
         | CollectionRole::Cache
         | CollectionRole::Audit => &[PhysicalKind::Document, PhysicalKind::Table],
-        CollectionRole::VectorMemory => &[PhysicalKind::Vector],
+        CollectionRole::VectorMemory => &[PhysicalKind::Vector, PhysicalKind::TensorDataset],
         CollectionRole::Graph => &[PhysicalKind::Graph],
-        CollectionRole::Analytics => &[PhysicalKind::Table],
+        CollectionRole::Analytics => &[PhysicalKind::Table, PhysicalKind::TensorDataset],
         CollectionRole::TimeSeries => &[PhysicalKind::TimeSeries],
     }
 }
@@ -439,6 +450,9 @@ pub(crate) struct PlannedObject {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedKind {
+    TensorDataset {
+        config: crate::tensor::TensorDatasetConfig,
+    },
     Document {
         collection_id: Option<u32>,
         fields: Vec<PlannedField>,
@@ -660,37 +674,59 @@ impl Planner<'_> {
             CheckMode::V2 | CheckMode::Provisioning => collection.physical.as_ref(),
         };
         let default = PhysicalObjectSpec::default();
+        let tensor_profile = self.mode != CheckMode::V1
+            && self
+                .resolved
+                .is_some_and(|resolved| resolved.storage_profile == crate::db::Profile::Tensor);
         let context = CollectionContext {
             index,
             collection,
             physical: declared.unwrap_or(&default),
-            checked: declared.is_some() || self.mode == CheckMode::Provisioning,
+            checked: declared.is_some() || self.mode == CheckMode::Provisioning || tensor_profile,
         };
         let allowed = allowed_kinds(collection.role);
-        let mut kind = allowed[0];
-        if let Some(requested) = context.physical.kind {
-            if allowed.contains(&requested) {
+        let mut kind = if tensor_profile {
+            PhysicalKind::TensorDataset
+        } else {
+            allowed[0]
+        };
+        if let Some(requested) = context
+            .physical
+            .kind
+            .or(tensor_profile.then_some(PhysicalKind::TensorDataset))
+        {
+            if allowed.contains(&requested)
+                && (!tensor_profile || requested == PhysicalKind::TensorDataset)
+            {
                 kind = requested;
             } else {
                 self.push(
                     Class::Physical,
                     context.checked,
-                    "PHYSICAL_KIND_INCOMPATIBLE_WITH_ROLE",
+                    if tensor_profile && requested != PhysicalKind::TensorDataset {
+                        "PHYSICAL_KIND_INCOMPATIBLE_WITH_PROFILE"
+                    } else {
+                        "PHYSICAL_KIND_INCOMPATIBLE_WITH_ROLE"
+                    },
                     context.path("kind"),
-                    format!(
+                    if tensor_profile && requested != PhysicalKind::TensorDataset {
+                        format!("the Tensor profile requires native tensor datasets; collection {} cannot use kind {}", collection.name, kind_slug(requested))
+                    } else { format!(
                         "collection {} has role {}, which cannot be a {} object",
                         collection.name,
                         role_slug(collection.role),
                         kind_slug(requested)
-                    ),
-                    format!(
+                    ) },
+                    if tensor_profile {
+                        "Use an analytics or vector_memory role with physical.kind: tensor_dataset and typed tensors.".to_owned()
+                    } else { format!(
                         "Use one of: {}.",
                         allowed
                             .iter()
                             .map(|kind| kind_slug(*kind))
                             .collect::<Vec<_>>()
                             .join(", ")
-                    ),
+                    ) },
                 );
                 // Kind-specific checks would only repeat the mismatch; the default kind keeps
                 // the collection name in the catalog plan.
@@ -711,14 +747,15 @@ impl Planner<'_> {
             PhysicalKind::Vector => self.vector(&context),
             PhysicalKind::TimeSeries => self.time_series(&context),
             PhysicalKind::Graph => self.graph(&context),
+            PhysicalKind::TensorDataset => self.tensor_dataset(&context),
         }
     }
 
     /// `PHYSICAL_FIELD_NOT_APPLICABLE` for every field set on a kind it does not apply to.
     fn check_applicable_fields(&mut self, context: &CollectionContext<'_>, kind: PhysicalKind) {
-        use PhysicalKind::{Document, Graph, Table, TimeSeries, Vector};
+        use PhysicalKind::{Document, Graph, Table, TensorDataset, TimeSeries, Vector};
         let physical = context.physical;
-        let fields: [(&str, bool, &[PhysicalKind]); 18] = [
+        let fields: [(&str, bool, &[PhysicalKind]); 21] = [
             (
                 "collection_id",
                 physical.collection_id.is_some(),
@@ -765,6 +802,17 @@ impl Planner<'_> {
                 &[TimeSeries],
             ),
             ("graph_id", physical.graph_id.is_some(), &[Graph]),
+            ("tensors", !physical.tensors.is_empty(), &[TensorDataset]),
+            (
+                "tensor_chunk_samples",
+                physical.tensor_chunk_samples.is_some(),
+                &[TensorDataset],
+            ),
+            (
+                "tensor_max_chunk_bytes",
+                physical.tensor_max_chunk_bytes.is_some(),
+                &[TensorDataset],
+            ),
         ];
         for (field, set, kinds) in fields {
             if set && !kinds.contains(&kind) {
@@ -1673,6 +1721,48 @@ impl Planner<'_> {
         );
     }
 
+    fn tensor_dataset(&mut self, context: &CollectionContext<'_>) {
+        let mut config = crate::tensor::TensorDatasetConfig::new(
+            &context.collection.name,
+            context.physical.tensors.clone(),
+        );
+        config.chunk_samples = context.physical.tensor_chunk_samples.unwrap_or(64);
+        config.max_chunk_bytes = context
+            .physical
+            .tensor_max_chunk_bytes
+            .unwrap_or(4 * 1024 * 1024);
+        if config.tensors.is_empty() {
+            self.parameter_required(
+                context,
+                "tensors",
+                format!(
+                    "tensor dataset {} requires at least one typed tensor column",
+                    context.collection.name
+                ),
+            );
+        } else if let Err(error) = config.validate() {
+            self.push(
+                Class::Physical, context.checked, "TENSOR_PARAMS_INVALID", context.path("tensors"),
+                error.to_string(), "Use unique typed columns, valid fixed or ragged shapes, and bounded chunk settings.",
+            );
+        }
+        for (position, kind) in context.collection.indexes.iter().enumerate() {
+            if !matches!(
+                kind,
+                CollectionIndexKind::Primary | CollectionIndexKind::Columnar
+            ) {
+                self.index_not_applicable(context, position, "PHYSICAL_FIELD_NOT_APPLICABLE",
+                    "tensor datasets support typed chunk storage; SQL, document, vector ANN and graph indexes do not apply");
+            }
+        }
+        self.objects.push(PlannedObject {
+            name: context.collection.name.clone(),
+            spec_collection: context.collection.name.clone(),
+            path: format!("collections[{}].name", context.index),
+            kind: PlannedKind::TensorDataset { config },
+        });
+    }
+
     fn graph(&mut self, context: &CollectionContext<'_>) {
         for (position, kind) in context.collection.indexes.iter().enumerate() {
             match kind {
@@ -1867,6 +1957,9 @@ fn default_container(kind: PhysicalKind) -> PlannedKind {
             max_future_skew_millis: DEFAULT_MAX_FUTURE_SKEW_MILLIS,
         },
         PhysicalKind::Graph => PlannedKind::Graph { graph_id: None },
+        PhysicalKind::TensorDataset => PlannedKind::TensorDataset {
+            config: crate::tensor::TensorDatasetConfig::new("", Vec::new()),
+        },
     }
 }
 
@@ -1902,6 +1995,7 @@ pub(crate) const fn kind_slug(kind: PhysicalKind) -> &'static str {
         PhysicalKind::Vector => "vector",
         PhysicalKind::TimeSeries => "time_series",
         PhysicalKind::Graph => "graph",
+        PhysicalKind::TensorDataset => "tensor_dataset",
     }
 }
 

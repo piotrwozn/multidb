@@ -179,6 +179,21 @@ pub trait Replication: Send + Sync {
         }
     }
 
+    /// Commits a validated typed tensor append through the ordinary user write path.
+    /// Only the tensor engine can issue this payload-bound capability. Wrappers that enforce
+    /// user policies must forward this method while retaining their normal checks.
+    /// # Errors
+    /// Fails for a mismatched capability or a rejected conditional write.
+    #[doc(hidden)]
+    fn propose_tensor_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: crate::tensor::TensorWriteAuthorization,
+    ) -> Result<(), ReplError> {
+        authorization.validate(&batch)?;
+        self.propose_conditional_batch(batch)
+    }
+
     /// Persists a prepared distributed transaction participant record.
     /// # Errors
     /// Fails when this backend cannot participate in distributed transactions.

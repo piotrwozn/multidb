@@ -723,7 +723,7 @@ impl RuntimeLimits {
                 max_batch_ops: 2_048,
                 max_concurrent_queries: 16,
             },
-            "analytics_columnar" => Self {
+            "analytics_columnar" | "tensor_dataset" => Self {
                 max_value_bytes: 2 * 1_024 * 1_024,
                 max_batch_ops: 4_096,
                 max_concurrent_queries: 16,
@@ -1184,7 +1184,11 @@ impl DatabaseSpec {
         };
 
         Self {
-            version: DATABASE_SPEC_VERSION,
+            version: if config.profile == Profile::Tensor {
+                DATABASE_SPEC_VERSION_V2
+            } else {
+                DATABASE_SPEC_VERSION
+            },
             name: name.into(),
             profile,
             deployment: DeploymentSpec {
@@ -2767,6 +2771,7 @@ const fn storage_engine(profile: Profile) -> &'static str {
         Profile::InMemory => "in-memory engine",
         Profile::HighDurability => "redb engine with two-phase commit",
         Profile::Analytical => "redb engine with columnar table layout",
+        Profile::Tensor => "redb engine with native tensor chunks and required GPU compute",
         Profile::Transactional
         | Profile::Document
         | Profile::Vector
@@ -3581,6 +3586,8 @@ const ANALYTICS_COLUMNAR_ROLES: &[CollectionRole] = &[
     CollectionRole::TimeSeries,
     CollectionRole::EventLog,
 ];
+const TENSOR_DATASET_ROLES: &[CollectionRole] =
+    &[CollectionRole::Analytics, CollectionRole::VectorMemory];
 
 const BUILT_IN_PROFILES: &[ProfileSpec] = &[
     ProfileSpec {
@@ -3630,6 +3637,14 @@ const BUILT_IN_PROFILES: &[ProfileSpec] = &[
         description: "Columnar analytics profile for event, time-series and aggregate workloads.",
         default_domain: ConsistencyMode::LocalSnapshot,
         compatible_roles: ANALYTICS_COLUMNAR_ROLES,
+    },
+    ProfileSpec {
+        slug: "tensor_dataset",
+        aliases: &["tensor", "deeplake_like"],
+        status: SupportStatus::Experimental,
+        description: "Durable tensor datasets with GPU search and reductions; a physical GPU is required, with no CPU fallback.",
+        default_domain: ConsistencyMode::LocalSnapshot,
+        compatible_roles: TENSOR_DATASET_ROLES,
     },
 ];
 
@@ -4449,6 +4464,7 @@ fn profile_slug(profile: Profile) -> &'static str {
         Profile::TimeSeries => "time_series",
         Profile::HighDurability => "high_durability",
         Profile::Balanced => "balanced",
+        Profile::Tensor => "tensor",
     }
 }
 
@@ -4512,6 +4528,9 @@ mod tests {
             &DbConfig::on_disk(Profile::Balanced, "catalog.redb"),
         );
         spec.profile = profile.to_owned();
+        if built_in_profile(profile).is_some_and(|product| product.slug == "tensor_dataset") {
+            spec.version = super::DATABASE_SPEC_VERSION_V2;
+        }
         spec.domains[0].mode = mode;
         spec
     }
@@ -4771,7 +4790,14 @@ mod tests {
             };
             let spec = DatabaseSpec::from_db_config(format!("{profile:?}"), &config);
 
-            assert_eq!(spec.version, DATABASE_SPEC_VERSION);
+            assert_eq!(
+                spec.version,
+                if profile == Profile::Tensor {
+                    super::DATABASE_SPEC_VERSION_V2
+                } else {
+                    DATABASE_SPEC_VERSION
+                }
+            );
             assert_eq!(spec.domains.len(), 1);
             assert_eq!(spec.defaults.consistency_domain, "primary");
             assert_eq!(spec.deployment.storage_path.is_some(), profile.is_on_disk());
@@ -4798,7 +4824,7 @@ mod tests {
 
     #[test]
     fn phase37_catalog_contains_profiles_roles_and_domains() {
-        assert_eq!(built_in_profiles().len(), 6);
+        assert_eq!(built_in_profiles().len(), 7);
         assert_eq!(collection_role_definitions().len(), 9);
         assert_eq!(consistency_domain_definitions().len(), 3);
 
@@ -4928,6 +4954,8 @@ mod tests {
             ("high_durability", "secure_app"),
             ("analytical", "analytics_columnar"),
             ("time_series", "analytics_columnar"),
+            ("tensor", "tensor_dataset"),
+            ("deeplake_like", "tensor_dataset"),
         ];
 
         for (alias, expected_slug) in aliases {
@@ -6054,7 +6082,7 @@ mod tests {
     fn runtime_limits_keep_their_catalog_values() -> Result<(), Box<dyn std::error::Error>> {
         let expected = |slug: &str| match slug {
             "production_cp" => (4 * 1_024 * 1_024, 2_048, 16),
-            "analytics_columnar" => (2 * 1_024 * 1_024, 4_096, 16),
+            "analytics_columnar" | "tensor_dataset" => (2 * 1_024 * 1_024, 4_096, 16),
             _ => (1_048_576, 1_024, 8),
         };
         for profile in built_in_profiles() {

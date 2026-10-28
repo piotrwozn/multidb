@@ -23,6 +23,14 @@ pub use graphrag::{
     GraphRagSource,
 };
 
+mod tensor;
+pub use tensor::{
+    Tensor, TensorAppendResult, TensorBatch, TensorColumn, TensorComputeRequest,
+    TensorComputeResult, TensorDType, TensorData, TensorDatasetConfig, TensorDatasetInfo,
+    TensorDevice, TensorExecution, TensorGpuOperation, TensorMetric, TensorReadBatch,
+    TensorReadRequest, TensorSearchHit, TensorSearchRequest, TensorSearchResult,
+};
+
 #[derive(Clone)]
 pub struct ControlPlaneClient {
     base_url: String,

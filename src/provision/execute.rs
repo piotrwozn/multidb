@@ -742,7 +742,7 @@ const fn error_kind(error: &DbError) -> &'static str {
 fn managed_resource(name: &str, kind: ObjectKind) -> Resource {
     let name = name.to_owned();
     match kind {
-        ObjectKind::Document => Resource::Collection(name),
+        ObjectKind::Document | ObjectKind::TensorDataset => Resource::Collection(name),
         ObjectKind::Vector => Resource::VectorCollection(name),
         ObjectKind::TimeSeries => Resource::TimeSeries(name),
         ObjectKind::Graph => Resource::Graph(name),
@@ -1102,6 +1102,7 @@ impl Run<'_> {
             ProvisionStepKind::EnableAudit => self.set_audit(true),
             ProvisionStepKind::DisableAudit => self.set_audit(false),
             ProvisionStepKind::CreateCollection
+            | ProvisionStepKind::CreateTensorDataset
             | ProvisionStepKind::CreateVectorCollection
             | ProvisionStepKind::CreateTable
             | ProvisionStepKind::CreateTimeSeries
@@ -1349,7 +1350,8 @@ impl Run<'_> {
         match &object.kind {
             DesiredKind::Document { .. }
             | DesiredKind::Vector { .. }
-            | DesiredKind::Graph { .. } => self.create_with_id(object, principal)?,
+            | DesiredKind::Graph { .. }
+            | DesiredKind::TensorDataset { .. } => self.create_container(object, principal)?,
             DesiredKind::Table {
                 layout,
                 schema,
@@ -1461,15 +1463,24 @@ impl Run<'_> {
         }
     }
 
-    /// Creates a document collection, vector collection or graph: with its pinned id, or with
-    /// the next free id (the `_auto_id` creates).
-    fn create_with_id(
+    /// Creates document, vector, graph or tensor containers, assigning collection
+    /// and graph ids from the spec or from the next free id.
+    fn create_container(
         &mut self,
         object: &DesiredObject,
         principal: Option<&Principal>,
     ) -> Result<(), DbError> {
         let name = object.name.as_str();
         match &object.kind {
+            DesiredKind::TensorDataset { config } => match principal {
+                Some(principal) => {
+                    self.db
+                        .create_tensor_dataset_as(principal, config.clone())?;
+                }
+                None => {
+                    self.db.create_tensor_dataset(config.clone())?;
+                }
+            },
             DesiredKind::Document {
                 collection_id,
                 fields,

@@ -191,3 +191,89 @@ test("GraphRAG and graph edge methods preserve server errors", async () => {
     }
   }
 });
+
+test("tensor methods preserve typed batches, revisions, execution and encoded dataset paths", async () => {
+  const calls = [];
+  const config = { name: "training /?", tensors: [
+    { name: "image", dtype: "u8", shape: [null, null, 3] },
+    { name: "caption", dtype: "utf8", shape: [] },
+    { name: "embedding", dtype: "f32", shape: [3] },
+  ] };
+  const tensors = {
+    image: [{ shape: [1, 1, 3], data: { u8: [255, 0, 0] } }],
+    caption: [{ shape: [], data: { utf8: ["red pixel"] } }],
+    embedding: [{ shape: [3], data: { f32: [1, 0, 0] } }],
+  };
+  const execution = { device: "gpu", adapter: "fixture-adapter", backend: "Vulkan" };
+  const info = { config: { ...config, chunk_samples: 64, max_chunk_bytes: 4194304 }, samples: 1, revision: 1 };
+  const searchResult = { hits: [{ index: 0, distance: 0 }], scanned_samples: 1, next_start: null,
+    total_samples: 1, revision: 1, skipped_samples: 0, execution };
+  const computeResult = { start: 0, end: 1, revision: 1, values: [1], execution };
+  const client = new ControlPlaneClient({ baseUrl: "http://unit.test/api/", token: "secret", principal: "trainer",
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      calls.push({ url, method: init.method, headers: init.headers,
+        body: init.body === undefined ? undefined : JSON.parse(init.body) });
+      const data = url.endsWith("/search") ? searchResult : url.endsWith("/compute") ? computeResult
+        : url.endsWith("/append") ? { start: 0, end: 1, revision: 1 }
+        : url.endsWith("/read") ? { start: 0, end: 1, total_samples: 1, revision: 1, tensors } : info;
+      return jsonResponse(200, { ok: true, data });
+    } });
+  assert.deepEqual(await client.createTensorDataset(config), info);
+  assert.deepEqual(await client.tensorDatasetInfo(config.name, 0), info);
+  await client.tensorDatasetInfo(config.name);
+  assert.deepEqual(await client.appendTensors(config.name, tensors), { start: 0, end: 1, revision: 1 });
+  const read = { start: 0, limit: 1, columns: ["image", "caption"], revision: 1 };
+  assert.deepEqual((await client.readTensors(config.name, read)).tensors, tensors);
+  await client.readTensors(config.name);
+  const search = { tensor: "embedding", query: [1, 0, 0], k: 1, metric: "Cosine", start: 0, max_samples: 100, revision: 1 };
+  assert.deepEqual(await client.searchTensors(config.name, search), searchResult);
+  const compute = { tensor: "embedding", operation: "sum", start: 0, limit: 1, revision: 1 };
+  assert.deepEqual(await client.computeTensors(config.name, compute), computeResult);
+  const base = "http://unit.test/api/data/tensor-datasets/training%20%2F%3F";
+  assert.deepEqual(calls.map(({ method, url, body }) => [method, url, body]), [
+    ["POST", "http://unit.test/api/builder/tensor-dataset", config],
+    ["GET", `${base}?revision=0`, undefined], ["GET", base, undefined],
+    ["POST", `${base}/append`, { tensors }], ["POST", `${base}/read`, read],
+    ["POST", `${base}/read`, {}], ["POST", `${base}/search`, search], ["POST", `${base}/compute`, compute],
+  ]);
+  for (const call of calls) {
+    assert.equal(call.headers.Authorization, "Bearer secret");
+    assert.equal(call.headers["x-multidb-principal"], "trainer");
+  }
+});
+
+test("tensor GPU and validation errors are preserved without client fallback", async () => {
+  for (const [status, code] of [[400, "invalid_value"], [403, "forbidden"], [404, "not_found"],
+    [422, "tensor_gpu_unsupported"], [503, "tensor_gpu_unavailable"]]) {
+    let calls = 0;
+    const client = new ControlPlaneClient({ fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse(status, { ok: false, error: { code, message: "request refused" } });
+    } });
+    await assert.rejects(() => client.computeTensors("training", { tensor: "embedding", operation: "mean" }),
+      (error) => error instanceof ControlPlaneError && error.status === status && error.code === code);
+    assert.equal(calls, 1);
+  }
+});
+
+test("tensor provisioning preserves the version 2 physical schema fields", async () => {
+  const calls = [];
+  const client = new ControlPlaneClient({ fetchImpl: async (input, init) => {
+    calls.push(JSON.parse(init.body));
+    return jsonResponse(200, { ok: true, data: { plan_id: "prov_tensor", outcome: "ready" } });
+  } });
+  const physical = {
+    kind: "tensor_dataset",
+    tensors: [{ name: "image", dtype: "u8", shape: [null, null, 3] },
+      { name: "embedding", dtype: "f32", shape: [3] }],
+    tensor_chunk_samples: 64,
+    tensor_max_chunk_bytes: 4194304,
+  };
+  const spec = { version: 2, name: "training", profile: "tensor_dataset", collections: [
+    { name: "training", role: "analytics", domain: "local", indexes: [], physical },
+  ] };
+  await client.provisionPlan(spec);
+  assert.deepEqual(calls, [{ spec }]);
+  assert.deepEqual(calls[0].spec.collections[0].physical, physical);
+});

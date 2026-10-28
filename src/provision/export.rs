@@ -385,6 +385,7 @@ fn container_collection(
     findings: &mut Findings,
 ) -> Option<CollectionRoleSpec> {
     match entry {
+        CatalogEntry::TensorDataset { config } => Some(tensor_collection(name, config)),
         CatalogEntry::Collection {
             collection_id,
             fields,
@@ -483,6 +484,24 @@ fn container_collection(
         | CatalogEntry::GeoIndex { .. }
         | CatalogEntry::TemporalTable { .. } => None,
     }
+}
+
+fn tensor_collection(
+    name: &str,
+    config: &crate::tensor::TensorDatasetConfig,
+) -> CollectionRoleSpec {
+    collection_spec(
+        name,
+        CollectionRole::Analytics,
+        vec![CollectionIndexKind::Columnar],
+        PhysicalObjectSpec {
+            kind: Some(PhysicalKind::TensorDataset),
+            tensors: config.tensors.clone(),
+            tensor_chunk_samples: Some(config.chunk_samples),
+            tensor_max_chunk_bytes: Some(config.max_chunk_bytes),
+            ..PhysicalObjectSpec::default()
+        },
+    )
 }
 
 /// Attaches a full-text index, geo index or history table to the collection it derives from.

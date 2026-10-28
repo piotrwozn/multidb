@@ -1185,3 +1185,51 @@ they are applied by provisioning, not by `config apply`.
   `ProvisioningPolicySpec`, `UnmanagedPolicy`, the pinned `DEFAULT_*`
   constants, the size limits and `allowed_kinds`, `full_text_index_name`,
   `geo_index_name` and `history_table_name`.
+
+## Native tensor datasets and GPU profiles
+
+Version 2 specs can provision typed tensor datasets. Add a collection with role
+`analytics` or `vector_memory` and `physical.kind: tensor_dataset`. This is native
+tensor storage, not a SQL table or a claim of compatibility with another database:
+
+```yaml
+# Fragment of a version 2 spec; keep its deployment, defaults and guarantees.
+profile: tensor_dataset
+collections:
+  - name: training
+    role: analytics
+    domain: primary
+    indexes: [columnar]
+    physical:
+      kind: tensor_dataset
+      tensors:
+        - { name: embedding, dtype: f32, shape: [768] }
+        - { name: tokens, dtype: i64, shape: [null] }
+        - { name: text, dtype: utf8, shape: [] }
+      tensor_chunk_samples: 64
+      tensor_max_chunk_bytes: 4194304
+```
+
+The `tensor_dataset` profile requires an actual GPU supported by the native
+backend. Opening or applying a new database fails before creating its file when
+that GPU is unavailable; the profile never silently switches to CPU execution.
+Dry-run planning and schema validation do not initialize a GPU. Under this
+profile, omitting `kind` infers `tensor_dataset`; other physical kinds are
+refused. Other supported profiles can explicitly store a native tensor dataset
+and use its reference CPU operations without claiming to be the GPU profile.
+
+Tensor dtypes are `u8`, `i64`, `f32`, `f64`, `bool` and `utf8`. Shape `[]` is a
+scalar; a `null` dimension varies per sample. Dataset schemas have at most 64
+unique tensor columns, at most 8 dimensions and at most 4,000,000 elements per
+tensor. Chunk limits are 1–1024 samples and 1024–16777216 encoded bytes. The
+physical chunk defaults are 64 samples and 4194304 bytes. SQL, document, vector
+ANN and graph indexes do not apply to this kind; `primary` and `columnar` are the
+accepted spec index labels.
+
+Planning compares tensor names, dtypes, shapes and chunk limits. Apply creates
+the dataset and its initial revision with the catalog entry. Existing matching
+datasets are adopted; schema or chunk changes are conflicts because no alter API
+is provided. Drift reports those differences and export preserves every tensor
+and chunk setting in a version 2 spec. Appending samples does not change the
+provisioning fingerprint. Full backup/restore preserves the binary chunks,
+sample indexes and append-revision snapshots.
