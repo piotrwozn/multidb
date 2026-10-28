@@ -191,11 +191,15 @@ def run_vectors(args, recorder, multidb, suffix, report):
             multidb.json("POST", "/builder/vector", {"name": name, "dim": DIMENSIONS, "metric": "L2", "hnsw": {"m": 16, "ef_construction": 128, "ef_search": EF_SEARCH}})
             qdrant.json("PUT", f"/collections/{name}", {
                 "vectors": {"size": DIMENSIONS, "distance": "Euclid", "on_disk": False},
-                "hnsw_config": {"m": 16, "ef_construct": 128, "full_scan_threshold": 1},
+                "hnsw_config": {"m": 16, "ef_construct": 128, "full_scan_threshold": 10},
                 "optimizers_config": {"default_segment_number": 1, "indexing_threshold": 1},
             })
             for index, vector in enumerate(vectors):
                 multidb.json("POST", f"/data/vectors/{name}/vectors", {"metadata": {"index": index, "tag": "keep" if index % 5 == 0 else "omit"}, "vector": vector.tolist()})
+            # Native fixture ingestion can exceed Qdrant's HTTP keepalive
+            # timeout. Start a fresh untimed connection; measured operations
+            # never retry a disconnected request.
+            qdrant.close()
             for start in range(0, size, 128):
                 points = [{"id": index + 1, "payload": {"index": index, "tag": "keep" if index % 5 == 0 else "omit"}, "vector": vectors[index].tolist()} for index in range(start, min(size, start + 128))]
                 qdrant.json("PUT", f"/collections/{name}/points?wait=true", {"points": points})
@@ -204,6 +208,7 @@ def run_vectors(args, recorder, multidb, suffix, report):
             metadata = dict(dataset_vectors=size, dimensions=DIMENSIONS, seed=SEED, metric="L2 Euclidean", k=K,
                             m=16, ef_construction=128, ef_search=EF_SEARCH, fixture_load_timed=False,
                             qdrant_version=version, qdrant_indexed_vectors=info["indexed_vectors_count"],
+                            qdrant_full_scan_threshold_kb=10,
                             protocol="authenticated loopback HTTP JSON", validation="NumPy float64 exact reference; per-query recall>=.8 and mean>=.95; exact returned distances",
                             caveat="different server audit, WAL and protocol implementations; end-to-end warm ANN comparison")
             for repeat in range(args.repeats):
@@ -289,6 +294,8 @@ def run_graphs(args, recorder, multidb, suffix, report):
             for edge in edges:
                 result = multidb.json("POST", f"/data/graphs/{name}/edges", edge)
                 require(result.get("written") is True, "MultiDB edge write was not acknowledged")
+            # Reconnect outside timing after the other backend's long load.
+            neo4j.close()
             for start in range(0, len(edges), 512):
                 neo4j_rows(neo4j, f"UNWIND $edges AS e MATCH (s:{label} {{id:e.source}}),(t:{label} {{id:e.target}}) CREATE (s)-[:RELATED {{fixture:true}}]->(t)", {"edges": edges[start:start + 512]})
             require(neo4j_rows(neo4j, f"MATCH (s:{label})-[:RELATED]->(t:{label}) RETURN count(*)") == [[len(edges)]], "Neo4j fixture edge count differs")
@@ -324,7 +331,8 @@ def run_graphs(args, recorder, multidb, suffix, report):
                         return {"written": True}
                     recorder.measure(engine, f"graph.durable_edge_update.n{size}", repeat, args.ops, write,
                                      lambda result, _: result.get("written") is True,
-                                     write_semantics="one durable transaction per existing edge update; separate from query timings", engine_order=list(engines), **metadata)
+                                     write_semantics="one durable transaction per existing edge update; separate from query timings", engine_order=list(engines),
+                                     **{**metadata, "validation": "successful write acknowledgement; Neo4j also requires exactly one affected relationship; MultiDB public HTTP has no edge-property readback, so stored write_seq values are not independently verified"})
 
 
 def run(args, recorder):

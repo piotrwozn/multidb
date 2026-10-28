@@ -35,6 +35,10 @@ processes and detects contamination during collection. Native server and client
 CPU affinity are disjoint. Competitor containers have a two-CPU quota and4GiB
 memory cap; the native server has affinity and the host/cgroup memory limit.
 Those memory limits are different and are recorded, not presented as identical.
+For the default sizes, budget about 12 GiB of free workspace disk after building;
+compiler caches, Docker's storage driver, AOF/journals and disposable fixtures
+all consume real space. The resource trace records output-filesystem free space.
+A comparator's disk-space failure invalidates the run.
 In-process DuckDB/Deep Lake use the client-side CPU affinity. Resource sampling
 coverage is recorded; do not treat one server PID as an entire process tree.
 
@@ -52,7 +56,7 @@ Redis database or overwrites an existing data fixture.
 | Analytical/DuckDB | Integer group count/sum, ordered range100, projected/full scans and filtered counts; source values and complete answers checked. DuckDB's in-process API includes a different transport/serialization cost from MultiDB HTTP. Schema/load is outside query timing. |
 | KV/Redis | Equal full logical records, point GET, full-record upsert and atomic100-record insert batches. Redis requires AOF appendfsync=always, authenticated RESP and no client retries. MultiDB uses HTTP SQL and only the storage primary key. Redis MULTI/EXEC does not provide SQL-style rollback after runtime command errors; errors invalidate sections. |
 | Vector/Qdrant |128D L2 HNSW top10 at1k/10k vectors, explicit index/search settings, actual index readiness, exact NumPy references, returned-distance validation and recall thresholds. Server-side filtering and extreme-float behavior are recorded separately; unsupported MultiDB options must be rejected, not silently ignored. |
-| Graph/Neo4j | Directed deterministic graph with four outgoing edges per node,1k/10k nodes; exact depth1/2 reachable-node sets, with duplicate/missing-node checks. Fixture creation is outside query latency. Timed durable edge updates are a separate workload. |
+| Graph/Neo4j | Directed deterministic graph with four outgoing edges per node,1k/10k nodes; exact depth1/2 reachable-node sets, with duplicate/missing-node checks. Fixture creation is outside query latency. Timed durable edge updates validate successful acknowledgements (and one affected Neo4j relationship); MultiDB's public HTTP API cannot read back edge properties, so stored `write_seq` values are not independently verified. |
 | Tensor/Deep Lake | Named text, U8 images and F32 embeddings; committed append batches, projected32-sample reads, immutable revisions and exact CPU L2 top10 checked against NumPy. All source values/shapes/dtypes are checked. This is explicitly CPU-reference mode. Deep Lake's local commit API is not asserted equivalent to redb Immediate fsync. |
 
 Operation latency stops before validation. Section throughput includes client
@@ -60,6 +64,9 @@ validation and recording, so it is not a pure server throughput limit. The
 legacy SQL workload uses warm data; each domain records its own warmup behavior.
 Repetitions can reuse/mutate a fixture, as described by the adapter; they are not
 all independent fresh database loads. Load may have only one repetition.
+HTTP connections are reopened outside timing after another engine's long
+fixture load, which can exceed the idle keepalive timeout. Measured requests
+are never silently retried.
 
 Inspect p50/p95/p99, errors, sample counts and the range across repetitions.
 Very small samples, especially aggregate/full-scan/load tails, do not support

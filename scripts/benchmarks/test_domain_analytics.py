@@ -49,6 +49,9 @@ class AdapterValidation(unittest.TestCase):
 
             def json(self, method, path, body):
                 if (method, path) == ("POST", "/builder/table"):
+                    for index in body["indexes"]:
+                        if index.get("expression") != {"Column": index["column"]}:
+                            raise AssertionError("builder index expression contract is missing")
                     self.connection.execute(f"CREATE TABLE {body['name']} (id BIGINT, category BIGINT, value BIGINT, payload VARCHAR)")
                     return {}
                 if (method, path) != ("POST", "/sql"):

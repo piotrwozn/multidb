@@ -227,7 +227,7 @@ request API with CPU calculations and labels its results accordingly.
 | Tensor elements | At most 4,000,000 per sample; each dimension is 0–4,000,000. |
 | Append | 1–1024 aligned samples per request. |
 | Physical chunks | 1–1024 samples; 1024–16777216 encoded bytes per column chunk. Defaults: 64 samples and 4194304 bytes. |
-| Decoded payload | 64 MiB tensor-allocation budget for an append/read, including vector/string capacities. A read's decoded chunk cache and returned tensors share this budget. Encoded frames, HTTP serialization and allocator bookkeeping are additional, so this is not a process RSS cap. |
+| Decoded payload | 64 MiB tensor-allocation budget for an append/read, including vector/string capacities. A read's decoded chunk cache and returned tensors share this budget. CPU search shares the budget between one decoded float chunk, logical query bytes, top-k capacity and 128 KiB of metadata working space; it borrows sample vectors instead of cloning tensors or converting complete vectors to `f64` buffers. Encoded frames, HTTP serialization and allocator bookkeeping are additional, so this is not a process RSS cap. |
 | Read/compute | 1–1024 samples; default 100. Read starts at 0 by default. |
 | Search | k 1–100, default 10; max_samples 1–100000, default 10000. |
 | GPU search | Fixed rank-one F32, dimension 1–16384. GPU dispatches are internally batched. |

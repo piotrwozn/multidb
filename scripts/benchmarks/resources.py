@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path, PurePosixPath
+import shutil
 import threading
 import time
 
@@ -92,7 +93,13 @@ class ResourceSampler:
                     require_idle()
                     with self.target_lock:
                         targets = dict(self.targets)
-                    stream.write(json.dumps({name: collect() for name, collect in targets.items()}) + "\n")
+                    samples = {name: collect() for name, collect in targets.items()}
+                    space = shutil.disk_usage(self.path.parent)
+                    samples["output_filesystem"] = {
+                        "scope": "output_filesystem", "time_monotonic": time.monotonic(),
+                        "free_bytes": space.free, "total_bytes": space.total,
+                    }
+                    stream.write(json.dumps(samples) + "\n")
                     stream.flush()
                     self.stop.wait(.5)
         except Exception as failure:

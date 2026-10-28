@@ -54,7 +54,9 @@ def prepare_multidb(http, name, size, *, indexes=True):
             {"name": column, "ty": "Str" if column == "payload" else "Int", "nullable": False}
             for column in ("id", "category", "value", "payload")
         ], "primary_key": 0},
-        "indexes": [{"id": 1, "column": 0}, {"id": 2, "column": 1}] if indexes else [],
+        "indexes": [{"id": column + 1, "column": column,
+                     "expression": {"Column": column}, "include": []}
+                    for column in (0, 1)] if indexes else [],
     })
     for start in range(0, size, 512):
         values = ",".join(

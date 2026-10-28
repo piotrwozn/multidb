@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use redb::{
     Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, TableDefinition,
@@ -39,6 +39,10 @@ pub struct RedbReadTxn {
 
 pub struct RedbWriteTxn {
     tx: redb::WriteTransaction,
+    // The writer owns an isolated snapshot and is the only way to create tables
+    // in it. Keep its catalog local instead of enumerating redb's catalog for
+    // every row/version/prepared-lock lookup.
+    tables: BTreeSet<String>,
 }
 
 impl RedbEngine {
@@ -145,7 +149,12 @@ impl StorageEngine for RedbEngine {
         if self.two_phase_commit {
             tx.set_two_phase_commit(true);
         }
-        Ok(RedbWriteTxn { tx })
+        let tables = tx
+            .list_tables()
+            .map_err(to_storage_err)?
+            .map(|handle| handle.name().to_owned())
+            .collect();
+        Ok(RedbWriteTxn { tx, tables })
     }
 }
 
@@ -198,7 +207,7 @@ impl ReadTransaction for RedbReadTxn {
 
 impl ReadTransaction for RedbWriteTxn {
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
-        if !self.table_exists(table)? {
+        if !self.table_exists(table) {
             return Ok(None);
         }
 
@@ -218,7 +227,7 @@ impl ReadTransaction for RedbWriteTxn {
         start: &[u8],
         end: &[u8],
     ) -> Result<RangeIter<'txn>, StorageError> {
-        if (!end.is_empty() && start >= end) || !self.table_exists(table)? {
+        if (!end.is_empty() && start >= end) || !self.table_exists(table) {
             return Ok(Box::new(std::iter::empty()));
         }
 
@@ -254,12 +263,17 @@ impl WriteTransaction for RedbWriteTxn {
             .tx
             .open_table(table_def(table)?)
             .map_err(to_storage_err)?;
+        // open_table may have created an empty table even if insert fails.
+        // Existing tables need neither another catalog walk nor a name clone.
+        if !self.tables.contains(table) {
+            self.tables.insert(table.to_owned());
+        }
         data.insert(key, value).map_err(to_storage_err)?;
         Ok(())
     }
 
     fn delete(&mut self, table: &str, key: &[u8]) -> Result<(), StorageError> {
-        if !self.table_exists(table)? {
+        if !self.table_exists(table) {
             return Ok(());
         }
 
@@ -289,9 +303,8 @@ impl RedbReadTxn {
 }
 
 impl RedbWriteTxn {
-    fn table_exists(&self, table: &str) -> Result<bool, StorageError> {
-        let tables = self.tx.list_tables().map_err(to_storage_err)?;
-        Ok(tables.into_iter().any(|handle| handle.name() == table))
+    fn table_exists(&self, table: &str) -> bool {
+        self.tables.contains(table)
     }
 }
 
@@ -307,4 +320,95 @@ fn table_def(table: &str) -> Result<RawTableDefinition<'_>, StorageError> {
 
 fn to_storage_err(error: impl std::fmt::Display) -> StorageError {
     StorageError::Backend(error.to_string())
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn absent_write_snapshot_reads_and_deletes_do_not_create_tables() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let engine = RedbEngine::open(directory.path().join("catalog.redb"))?;
+        let mut write = engine.begin_write()?;
+        assert_eq!(write.get("missing", b"key")?, None);
+        assert_eq!(write.range("missing", &[], &[])?.count(), 0);
+        write.delete("missing", b"key")?;
+        write.commit()?;
+        assert_eq!(engine.db.begin_read()?.list_tables()?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_table_creation_is_visible_to_get_range_and_delete() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let engine = RedbEngine::open(directory.path().join("catalog.redb"))?;
+        let mut write = engine.begin_write()?;
+        assert_eq!(write.get("items", b"a")?, None);
+        write.put("items", b"a", b"first")?;
+        write.put("items", b"b", b"second")?;
+        assert_eq!(write.get("items", b"a")?, Some(b"first".to_vec()));
+        assert_eq!(
+            write
+                .range("items", &[], &[])?
+                .collect::<Result<Vec<_>, _>>()?,
+            vec![
+                (b"a".to_vec(), b"first".to_vec()),
+                (b"b".to_vec(), b"second".to_vec())
+            ]
+        );
+        write.delete("items", b"a")?;
+        assert_eq!(write.get("items", b"a")?, None);
+        assert_eq!(
+            write
+                .range("items", &[], &[])?
+                .collect::<Result<Vec<_>, _>>()?,
+            vec![(b"b".to_vec(), b"second".to_vec())]
+        );
+        write.commit()?;
+        assert_eq!(
+            engine.begin_read()?.get("items", b"b")?,
+            Some(b"second".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_is_fresh_after_rollback_and_each_committed_transaction() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let engine = RedbEngine::open(directory.path().join("catalog.redb"))?;
+        let mut seed = engine.begin_write()?;
+        seed.put("existing", b"key", b"original")?;
+        seed.commit()?;
+        let old_read = engine.begin_read()?;
+
+        let mut aborted = engine.begin_write()?;
+        assert_eq!(aborted.get("existing", b"key")?, Some(b"original".to_vec()));
+        aborted.put("rolled_back", b"key", b"discarded")?;
+        aborted.delete("existing", b"key")?;
+        aborted.rollback();
+
+        let mut committed = engine.begin_write()?;
+        assert_eq!(committed.get("rolled_back", b"key")?, None);
+        assert_eq!(
+            committed.get("existing", b"key")?,
+            Some(b"original".to_vec())
+        );
+        committed.put("created", b"key", b"committed")?;
+        committed.commit()?;
+
+        let current = engine.begin_write()?;
+        assert_eq!(current.get("rolled_back", b"key")?, None);
+        assert_eq!(current.get("created", b"key")?, Some(b"committed".to_vec()));
+        assert_eq!(current.get("existing", b"key")?, Some(b"original".to_vec()));
+        current.rollback();
+        assert_eq!(old_read.get("created", b"key")?, None);
+        assert_eq!(
+            old_read.get("existing", b"key")?,
+            Some(b"original".to_vec())
+        );
+        Ok(())
+    }
 }
