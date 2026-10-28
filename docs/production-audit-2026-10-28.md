@@ -24,6 +24,7 @@ suite, recorded below.
 | SQL authorization and statistics | `ANALYZE` checks both administrative permission and source reads before executing any statement. Row or masking policies cannot expose raw statistics through unsupported analysis. Graph SQL helpers and materialized reads fail closed when their underlying relations are protected. | [analysis guards](../src/query/analyze_guard_tests.rs), [database authorization regressions](../src/db/review_fixes.rs), [SQL dispatch](../src/query/mod.rs) |
 | SQL grammar and cached plans | Optimized paths accept only the grammar they implement; qualifiers, aliases and wildcard modifiers cannot silently change meaning. Unicode string operations use DataFusion's string expressions. A cached plan rechecks a partial index's applicability for each new literal. Nested `VALUES` obey statement limits. | [simple grammar](../src/query/simple_grammar.rs), [parser](../src/query/parser.rs), [optimizer](../src/query/optimizer.rs), [partial-index regression](../src/query/audit_tests.rs), [row-scan regressions](../src/query/row_scan/tests.rs) |
 | Query resources | Native query paths share statement memory reservations for source, result and cache data, stop bounded scans early, and carry deadlines/cancellation through execution. Custom dispatchers also enforce SQL text limits. Legacy distributed or external backend materialization has separate qualification limits. | [statement budget](../src/query/budget.rs), [query execution](../src/query/mod.rs), [bounded row scans](../src/query/row_scan.rs), [custom-dispatch regressions](../src/db/review_fixes.rs) |
+| Native storage hot paths | A write transaction enumerates its physical table catalog once, updates its local catalog when a table is created, and never shares that cache across snapshots. This removes repeated catalog scans during batched row/index/version/lock checks while preserving every prepared-key isolation check. Absent reads do not create tables; staged changes, rollback and new-transaction visibility have direct regressions. | [redb transaction catalog and regressions](../src/storage/redb.rs), [prepared-key guards](../src/repl/dist_txn/locks.rs) |
 | Authentication and pgwire | Credential rotation uses a compare-and-set after password verification. Existing password sessions recheck the live credential fingerprint; an old delayed login cannot restore a revoked credential. Frame structure is checked before decoding, parameter substitution respects SQL tokens, and retained statements/portals/results have aggregate limits and release accounting on replacement or close. | [authentication rotation](../src/admin/auth_rotation_tests.rs), [frame checks](../src/network/frame.rs), [parameters](../src/network/parameters.rs), [session accounting](../src/network/session_state.rs), [sessions](../src/network/session.rs) |
 | Document/index atomicity | Conditional document mutations do not silently degrade to unconditional writes on unknown or unsupported backends. Plain multi-node AP document LWW remains an explicit, narrowly validated index-free operation. Indexed single-node AP mutations retain atomic source/index updates. | [model mutations](../src/model/mod.rs), [conditional mutation regressions](../src/model/conditional_tests.rs), [AP conditions](../src/repl/ap/conditional.rs), [database catalog guard](../src/db/review_fixes.rs) |
 | Full-text refresh | Refresh reconciles the current source document and conditionally updates source/index/configuration/frontier state. A conflicting writer prevents stale publication and frontier advancement. Searches suppress stale or deleted source documents until repair. Full repair's retry/partial-progress behavior remains explicit. | [full-text implementation](../src/text.rs), [interleaved refresh regressions](../src/text_refresh_race_tests.rs) |
@@ -31,7 +32,7 @@ suite, recorded below.
 | Temporal history and GC | History uses actual commit timestamps, closes an interval at its next version or deletion, and does not invent a deletion row. Commit metadata is cached by LSN during the request; missing metadata fails closed. A retained pre-GC anchor remains usable for an eligible point-in-time read but cannot masquerade as complete history. Retention filtering preserves complete histories independently of unrelated older GC activity. | [history implementation](../src/temporal.rs), [interval/GC/timestamp regressions](../src/temporal/tests.rs), [provisioning history-floor contract](../src/provision/tests.rs) |
 | Backup and file publication | Private files/directories use restrictive permissions. Restore validates paths, records, chain ancestry and bounded payloads before publishing a closed, synced staging database without clobbering a target. Existing empty paths and links are also targets. Backup payload and decompression limits are explicit; volatile restore is refused. A new full backup is required before continuing legacy chains without ancestry metadata. | [backup implementation](../src/backup.rs), [restore regressions](../src/backup/audit_tests.rs), [file publication](../src/fileio.rs), [backup/restore guide](backup-and-restore.md) |
 | Encryption and audit durability | Restore does not create a missing keyring. Envelope key publication/rotation uses exclusive publication, a stable sibling lock and stale-state checks; debug output redacts Vault tokens. Audit failure seals the handle, recovery verifies the signed prefix before appending, and checkpoint reuse requires trustworthy file-change evidence. Corrupted evidence is preserved for operator recovery. | [encrypted storage](../src/storage/encrypted.rs), [audit batching](../src/db/audit_batch.rs), [anchor verification](../src/db/audit_batch/anchor.rs), [audit recovery contract](audit-anchors.md) |
-| Tensor datasets and GPU execution | Persisted manifests, revisions and chunks are validated before use. Decoded chunks share a capacity-aware cache budget; operations account for outputs and carry deadlines through CPU/GPU batches and serial GPU submission. A timed-out submitted device is stopped and requires restart. Scaled L2 computation preserves small differences beside large equal coordinates; unsupported conversion/subnormal ranges are rejected. A strict GPU profile cannot be bypassed by explicitly requesting CPU search. | [tensor storage/API](../src/tensor.rs), [database tensor integration](../src/db/tensor.rs), [GPU execution](../src/tensor_gpu.rs), [GPU datasets](../src/tensor_gpu/dataset.rs), [kernel](../src/shaders/tensor_compute.wgsl), [documented limits](tensor-datasets.md) |
+| Tensor datasets and GPU execution | Persisted manifests, revisions and chunks are validated before use. Decoded chunks and outputs share a capacity-aware budget. CPU search pins its revision once, validates every index, decodes one selected float chunk at a time and borrows F32/F64 values without cloning tensor outputs or conversion buffers. Query/top-k/metadata memory remains budgeted; near-limit legal F32/F64 samples have regressions. Operations retain CPU/GPU deadlines and serialized GPU submission. A timed-out submitted device is stopped and requires restart. Scaled L2 preserves small differences beside large equal coordinates; unsupported conversion/subnormal ranges are rejected. A strict GPU profile cannot be bypassed by explicitly requesting CPU search. | [tensor storage/API and regressions](../src/tensor.rs), [database tensor integration](../src/db/tensor.rs), [GPU execution](../src/tensor_gpu.rs), [GPU datasets](../src/tensor_gpu/dataset.rs), [kernel](../src/shaders/tensor_compute.wgsl), [documented limits](tensor-datasets.md) |
 | Vectors, graph and GraphRAG | Distance accumulation uses stable wider arithmetic and rejects unrepresentable results. Dimensions and search parameters are capped; unsupported HTTP filters are rejected explicitly. Query authorization, governor checks and audit apply to retrieval. Graph expansion uses bounded neighbor scanning. Small indexes can use an exact candidate path only when the complete index fits the request budget; larger indexes retain approximate retrieval semantics. | [vector implementation](../src/vector/mod.rs), [database vector queries](../src/db/vector_search.rs), [graph traversal](../src/graph.rs), [GraphRAG contract](graphrag.md) |
 | Prepared transactions and AP writes | Prepared 2PC keys remain isolated from conflicting public reads/writes, ranges and cache tokens. Decisions are durable and immutable, completion is atomic/idempotent, and transaction identities survive restarts; absence of a decision does not imply abort. Single-node AP/RF1 conditional writes atomically update data/index/version/Merkle/clock state. Durable per-node AP clock reservations avoid reuse across concurrent publications and restarts. | [2PC](../src/repl/dist_txn.rs), [prepared locks](../src/repl/dist_txn/locks.rs), [2PC regressions](../src/repl/dist_txn/audit_tests.rs), [AP replication](../src/repl/ap.rs), [AP condition regressions](../src/repl/ap/conditional/tests.rs) |
 | Sharding and internal transport | A router's migration barrier covers route selection through backend access; migration copies the registered model keyspaces in bounded batches before changing ownership. Failure preserves the original owner. Scatter reads filter current ownership. Internal messages receive typed nonallocating structural checks with wire/decoded limits and no trailing bytes. | [shard router](../src/repl/shard.rs), [migration regressions](../src/repl/shard/migration_tests.rs), [internal transport](../src/internal_transport.rs), [frame budgets](../src/internal_transport/frame_budget.rs), [transport regressions](../src/internal_transport/frame_budget/tests.rs) |
@@ -57,7 +58,7 @@ an independent security review.
 | Studio dependencies | Compatible dependency updates to Vite 8.3.5 and Vitest 4.1.12 plus compatible transitive fixes; npm audit reported zero known advisories. No forced npm upgrade was used. |
 | Rust dependency policy | `cargo deny` advisories, bans, licenses and sources gates passed. `cargo audit --deny warnings` completed for 646 root dependencies and 47 Rust SDK dependencies. |
 | Supply-chain review metadata | `cargo vet --locked` succeeded with 644 exemptions. These exemptions are not 644 independent audits. |
-| Benchmark-tool regressions | 47 tests passed with the optional benchmark dependencies installed. A standard-library-only run passed with 3 optional-dependency skips. Fixture timing output from these tests is not competitor performance evidence. |
+| Benchmark-tool regressions | 52 tests passed with the optional benchmark dependencies installed, including strict multi-campaign report validation. Optional adapter tests are skipped in standard-library-only environments. Fixture timing output from these tests is not competitor performance evidence. |
 | Software GPU kernel validation | The explicitly invoked SwiftShader Vulkan kernel regression passed. This validates a software adapter, not physical GPU compatibility or throughput. |
 | Targeted storage lifecycle | Backup/restore 44, encrypted storage 22 and private file publication 3 targeted regressions passed before final integration. Final integrated Rust results supersede these subset counts. |
 
@@ -68,11 +69,58 @@ executing the fuzz targets.
 
 ## Final release evidence
 
-Final Rust integration, the default-feature release artifact, the corrected
-seven-engine campaign and the process-kill/restore drill are pending at the time
-this report is prepared. Populate this section with the exact source commit,
-artifact SHA-256, commands, counts, correctness results and evidence links after
-those runs finish. Do not infer completion from the source coverage table.
+The measured runtime release source is
+`12efdaa5d16c36a922c209236f7e02681197931d`. The immutable default-feature Linux
+release binary has SHA-256
+`8e29f953a517d3957100a4adb56f0b5bede9b9948d9cb3b06da7372cd6e48db2`.
+It includes the measured transaction-catalog and CPU tensor-search improvements.
+Subsequent report commits do not change that runtime source.
+
+| Final local gate | Result |
+| --- | --- |
+| Default secure Rust configuration | 1,265 library and 93 CLI release tests passed after the logical performance changes; four explicitly ignored tests. Subsequent Clippy cleanup extracts pure helpers and uses exact fixture conversions. |
+| All features | Full suite passed on the exact measured source in CI. This test configuration includes `insecure-transport`; official artifacts do not. |
+| No default features | Full suite passed on the exact measured source in CI; the explicitly ignored cluster tests remain separate qualification work. |
+| Documentation | Two compile-fail contract tests passed. |
+| Formatting and static analysis | `cargo fmt --all -- --check` and all-target/all-feature Clippy with `-D warnings` passed. |
+| Minimum Rust version | Rust 1.89 all-target/all-feature check passed, including on the exact measured source in CI. |
+| Release build | `cargo build --locked --release --bin multidb` passed with default features. |
+| Explicit software Vulkan test | One kernel validation passed with SwiftShader; physical GPU qualification remains open. |
+| Abrupt process death and full restore | All 20 SIGKILL cycles passed: 1,000 acknowledged single-row writes survived, 20 in-flight 100-row batches were each either absent or complete, and a verified full backup restored the complete observed logical state. |
+
+The three ignored cluster tests are reserved for `scripts/cluster-smoke.ps1`;
+their presence in the suite is not execution evidence. The fourth ignored test
+is the software Vulkan regression, which was invoked explicitly. None of these
+results certifies physical power-loss behavior or physical GPU hardware.
+
+[CI run 40757227491](https://github.com/piotrwozn/multidb/actions/runs/40757227491)
+completed successfully for the measured runtime source `12efdaa`: check, MSRV,
+supply-chain and required fuzz jobs all passed. The check job includes SDKs,
+Studio, desktop/mobile Chromium, Docker, examples and performance gates. The
+real fuzz smoke executed all nine targets, each completing 256 runs. These
+2,304 smoke iterations do not replace a sustained fuzz campaign. The evidence
+archive retains commit-specific job IDs, step conclusions and fuzz excerpts.
+
+The subsequent benchmark-tooling commit `97b763f` also passed all four jobs in
+[CI run 40760281822](https://github.com/piotrwozn/multidb/actions/runs/40760281822).
+It changes Python qualification/report tooling only; the runtime source remains
+identical to the measured artifact.
+
+The qualified comparison against all seven agreed competitors is complete:
+378 sections, 130 aggregate result cells and 156,030 successful timed requests,
+with zero recorded timed errors. Six isolated campaigns measured the identical
+runtime artifact, passed independent raw-data/correctness checks and exited
+cleanly. The [complete report](performance/2026-10-28-production-audit.md)
+includes exact versions, configuration, all result cells, resource-coverage
+limits and excluded failed attempts; its linked evidence archive retains the
+raw samples and provenance. It does not establish universal superiority.
+
+A separate matched 1,000-sample CPU tensor experiment reduced median exact-search
+latency from 21.4615 to 2.8554 ms (7.52×) after the catalog/streaming changes.
+That diagnostic is separate from the primary comparison and does not establish
+the same improvement at larger sizes or on a GPU. The 100k-row SQL batch workload
+improved from 94.71 to 102.24 requests/s against the PR #38 baseline; other SQL
+cells include small regressions, which remain visible in the report.
 
 The pre-audit SQL baseline is complete: 117,780 raw samples across 168 sections,
 with no setup/correctness failures, independently verified raw results, an

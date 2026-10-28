@@ -32,7 +32,7 @@ python scripts/benchmarks/competition.py \
 Review the printed resource/host plan, then run the same command without
 `--plan`. Run on an otherwise idle host; the runner refuses active compiler
 processes and detects contamination during collection. Native server and client
-CPU affinity are disjoint. Competitor containers have a two-CPU quota and4GiB
+CPU affinity are disjoint. Competitor containers have a two-CPU quota and 4 GiB
 memory cap; the native server has affinity and the host/cgroup memory limit.
 Those memory limits are different and are recorded, not presented as identical.
 For the default sizes, budget about 12 GiB of free workspace disk after building;
@@ -80,6 +80,24 @@ Generate a compact Markdown/JSON/CSV summary only from a completed campaign:
 python scripts/benchmarks/report_competition.py /absolute/results \
   --output-prefix /absolute/new-summary
 ```
+
+Domains can instead run as isolated campaigns using `--domains sql`,
+`--domains analytics`, `--domains kv`, `--domains graph`, `--domains tensor`
+and `--domains vector`. Use a fresh output directory for each, the identical
+immutable binary and matching host/workload settings. The qualified audit used
+this layout; it did not claim one uninterrupted server process. Combine those
+completed campaigns with full-suite coverage required:
+
+```sh
+python scripts/benchmarks/report_competition.py \
+  /absolute/results-sql /absolute/results-analytics /absolute/results-kv \
+  /absolute/results-graph /absolute/results-tensor /absolute/results-vector \
+  --require-full-suite --output-prefix /absolute/new-summary
+```
+
+The combiner checks artifact identity, compatible settings, duplicate domains,
+independent proofs and complete domain coverage; an incomplete or failed
+campaign does not become qualified by combining it with successful campaigns.
 
 The full evidence includes source/artifact hashes, dependency versions, image
 digests/configuration, resource samples, individual successful and failed

@@ -1,0 +1,175 @@
+{
+  "scope": "Diagnostics for the complete campaign, including fixture load, verification and measured operations; heterogeneous scopes cannot rank engine RAM. RSS peaks are sampled (0.5s), process high-water marks recorded separately; container charged memory includes page cache/kernel.",
+  "domains": {
+    "sql": {
+      "campaign": "multidb-audit-qualified2-sql",
+      "resource_ticks": 205,
+      "minimum_filesystem_free_bytes": 5063659520,
+      "targets": {
+        "benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 205,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 44593152,
+          "peak_process_high_water_bytes": 44593152
+        },
+        "multidb": {
+          "scope": "one_native_process_including_threads",
+          "samples": 205,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 659095552,
+          "peak_process_high_water_bytes": 659095552
+        },
+        "postgres": {
+          "scope": "container_cgroup_v2_including_descendants",
+          "samples": 200,
+          "aggregate_available_samples": 0,
+          "unavailable_reason": "ValueError: invalid container cgroup path"
+        },
+        "mongodb": {
+          "scope": "container_cgroup_v2_including_descendants",
+          "samples": 197,
+          "aggregate_available_samples": 0,
+          "unavailable_reason": "ValueError: invalid container cgroup path"
+        },
+        "sql_benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 189,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 185421824,
+          "peak_process_high_water_bytes": 185421824
+        }
+      }
+    },
+    "analytics": {
+      "campaign": "multidb-audit-qualified2-analytics",
+      "resource_ticks": 282,
+      "minimum_filesystem_free_bytes": 7225221120,
+      "targets": {
+        "benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 282,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 318377984,
+          "peak_process_high_water_bytes": 338169856
+        },
+        "multidb": {
+          "scope": "one_native_process_including_threads",
+          "samples": 282,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 601759744,
+          "peak_process_high_water_bytes": 674111488
+        },
+        "multidb_analytical": {
+          "scope": "one_native_process_including_threads",
+          "samples": 281,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 590561280,
+          "peak_process_high_water_bytes": 652038144
+        }
+      }
+    },
+    "kv": {
+      "campaign": "multidb-audit-qualified2-kv",
+      "resource_ticks": 36,
+      "minimum_filesystem_free_bytes": 6519980032,
+      "targets": {
+        "benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 36,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 46813184,
+          "peak_process_high_water_bytes": 46813184
+        },
+        "multidb": {
+          "scope": "one_native_process_including_threads",
+          "samples": 36,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 303431680,
+          "peak_process_high_water_bytes": 335077376
+        },
+        "redis": {
+          "scope": "container_cgroup_v2_including_descendants",
+          "samples": 35,
+          "aggregate_available_samples": 0,
+          "unavailable_reason": "ValueError: invalid container cgroup path"
+        }
+      }
+    },
+    "graph": {
+      "campaign": "multidb-audit-qualified2-graph",
+      "resource_ticks": 382,
+      "minimum_filesystem_free_bytes": 4674301952,
+      "targets": {
+        "benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 382,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 60424192,
+          "peak_process_high_water_bytes": 60424192
+        },
+        "multidb": {
+          "scope": "one_native_process_including_threads",
+          "samples": 382,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 179507200,
+          "peak_process_high_water_bytes": 179507200
+        },
+        "neo4j": {
+          "scope": "container_cgroup_v2_including_descendants",
+          "samples": 376,
+          "aggregate_available_samples": 0,
+          "unavailable_reason": "ValueError: invalid container cgroup path"
+        }
+      }
+    },
+    "tensor": {
+      "campaign": "multidb-audit-qualified2-tensor",
+      "resource_ticks": 585,
+      "minimum_filesystem_free_bytes": 5114028032,
+      "targets": {
+        "benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 585,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 279379968,
+          "peak_process_high_water_bytes": 279379968
+        },
+        "multidb": {
+          "scope": "one_native_process_including_threads",
+          "samples": 585,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 454352896,
+          "peak_process_high_water_bytes": 454352896
+        }
+      }
+    },
+    "vector": {
+      "campaign": "multidb-audit-vector-quality",
+      "resource_ticks": 122,
+      "minimum_filesystem_free_bytes": 7498326016,
+      "targets": {
+        "benchmark_client": {
+          "scope": "one_native_process_including_threads",
+          "samples": 122,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 65757184,
+          "peak_process_high_water_bytes": 96382976
+        },
+        "multidb": {
+          "scope": "one_native_process_including_threads",
+          "samples": 122,
+          "aggregate_available_samples": 0,
+          "peak_sampled_rss_bytes": 155992064,
+          "peak_process_high_water_bytes": 155992064
+        },
+        "qdrant": {
+          "scope": "container_cgroup_v2_including_descendants",
+          "samples": 119,
+          "aggregate_available_samples": 0,
+          "unavailable_reason": "ValueError: invalid container cgroup path"
+        }
+      }
+    }
+  }
+}
