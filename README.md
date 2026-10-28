@@ -17,6 +17,7 @@ testing and operational ownership.
 - Crate publishing: disabled with `publish = false`
 - Public preview guide: `docs/public-preview.md`
 - Supported surfaces and limits: `docs/support-matrix.md`
+- Measured SQL optimization results: [local before/after report](docs/performance/2026-10-28-sql-optimization.md)
 
 ## Quickstart With Docker
 

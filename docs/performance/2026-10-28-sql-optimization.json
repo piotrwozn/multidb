@@ -1,0 +1,1424 @@
+{
+  "artifact_directory": "/workspace/scratch/multidb-local-benchmark-20261028T152921Z",
+  "comparison": [
+    {
+      "after": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 2.4872299991329783,
+          "median": 2.2902335003891494,
+          "min": 2.1334739994927077
+        },
+        "p95_ms": {
+          "max": 3.1162350501290343,
+          "median": 3.0548519496733206,
+          "min": 2.202790200499294
+        },
+        "p99_ms": {
+          "max": 3.4264863308817444,
+          "median": 3.24662051985797,
+          "min": 2.220103769814159
+        },
+        "successful_records_per_second": {
+          "max": 4730865.254644065,
+          "median": 4202734.593291653,
+          "min": 3977136.6609211382
+        },
+        "successful_requests_per_second": {
+          "max": 473.0865254644065,
+          "median": 420.2734593291653,
+          "min": 397.71366609211384
+        }
+      },
+      "before": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 8.737145999475615,
+          "median": 8.660836499984725,
+          "min": 8.474031999867293
+        },
+        "p95_ms": {
+          "max": 10.305458449875005,
+          "median": 10.186105799857614,
+          "min": 9.800934999293528
+        },
+        "p99_ms": {
+          "max": 10.473500159660034,
+          "median": 10.431074090229231,
+          "min": 10.242834678683721
+        },
+        "successful_records_per_second": {
+          "max": 1145335.7104185799,
+          "median": 1133560.9969644952,
+          "min": 1126740.3772780097
+        },
+        "successful_requests_per_second": {
+          "max": 114.533571041858,
+          "median": 113.35609969644953,
+          "min": 112.67403772780096
+        }
+      },
+      "p50_speedup_before_over_after": 3.781639076763615,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 3.707550457845621,
+      "workload": "aggregate"
+    },
+    {
+      "after": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 1.361385999189224,
+          "median": 1.3261185004012077,
+          "min": 1.3225174998297007
+        },
+        "p95_ms": {
+          "max": 2.426716149511776,
+          "median": 1.5787303987053747,
+          "min": 1.4735645996552194
+        },
+        "p99_ms": {
+          "max": 2.5928347299850474,
+          "median": 1.797713810356072,
+          "min": 1.7161045891771216
+        },
+        "successful_records_per_second": {
+          "max": 72244.29309500108,
+          "median": 71270.73779812167,
+          "min": 65661.47657077215
+        },
+        "successful_requests_per_second": {
+          "max": 722.4429309500108,
+          "median": 712.7073779812167,
+          "min": 656.6147657077215
+        }
+      },
+      "before": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 1.6042705001382274,
+          "median": 1.4914060002411134,
+          "min": 1.3783419999526814
+        },
+        "p95_ms": {
+          "max": 1.9645011500870169,
+          "median": 1.8782533011290068,
+          "min": 1.8702515001677966
+        },
+        "p99_ms": {
+          "max": 2.4018320506547846,
+          "median": 2.3578343401459283,
+          "min": 2.036037039488295
+        },
+        "successful_records_per_second": {
+          "max": 68480.776302062,
+          "median": 63222.81618335885,
+          "min": 60742.387507219
+        },
+        "successful_requests_per_second": {
+          "max": 684.80776302062,
+          "median": 632.2281618335886,
+          "min": 607.4238750721901
+        }
+      },
+      "p50_speedup_before_over_after": 1.124640067829458,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.1272945765563847,
+      "workload": "category_read"
+    },
+    {
+      "after": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 10.614668500238622,
+          "median": 10.310989499885181,
+          "min": 8.443732500381884
+        },
+        "p95_ms": {
+          "max": 12.536141050986767,
+          "median": 10.980165600540204,
+          "min": 9.376009550032904
+        },
+        "p99_ms": {
+          "max": 40.232054230200475,
+          "median": 11.499974950129399,
+          "min": 9.737284920975071
+        },
+        "successful_records_per_second": {
+          "max": 11839.407249206448,
+          "median": 9683.054236467453,
+          "min": 8239.834738369103
+        },
+        "successful_requests_per_second": {
+          "max": 118.39407249206448,
+          "median": 96.83054236467454,
+          "min": 82.39834738369103
+        }
+      },
+      "before": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 11.227195000174106,
+          "median": 10.733565500231634,
+          "min": 8.89924350030924
+        },
+        "p95_ms": {
+          "max": 12.513086100079816,
+          "median": 11.543734149563534,
+          "min": 10.368356849903646
+        },
+        "p99_ms": {
+          "max": 13.034353909733909,
+          "median": 11.644684929251525,
+          "min": 10.659890760944108
+        },
+        "successful_records_per_second": {
+          "max": 11047.494929912327,
+          "median": 9229.5853163481,
+          "min": 8927.982474012455
+        },
+        "successful_requests_per_second": {
+          "max": 110.47494929912327,
+          "median": 92.29585316348101,
+          "min": 89.27982474012454
+        }
+      },
+      "p50_speedup_before_over_after": 1.0409830696026952,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.0491321012349424,
+      "workload": "insert_batch"
+    },
+    {
+      "after": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 1.8533595002736547,
+          "median": 1.7046360007952899,
+          "min": 1.5581810002913699
+        },
+        "p95_ms": {
+          "max": 2.319088349395315,
+          "median": 2.0008522999887646,
+          "min": 1.8215333996522534
+        },
+        "p99_ms": {
+          "max": 3.1087768895122276,
+          "median": 2.5955307693948257,
+          "min": 1.98896077065001
+        },
+        "successful_records_per_second": {
+          "max": 630.987791512262,
+          "median": 575.3100259913023,
+          "min": 532.2735251724778
+        },
+        "successful_requests_per_second": {
+          "max": 630.987791512262,
+          "median": 575.3100259913023,
+          "min": 532.2735251724778
+        }
+      },
+      "before": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 1.8806144998961827,
+          "median": 1.8464184995536925,
+          "min": 1.7666935000306694
+        },
+        "p95_ms": {
+          "max": 2.4240745504357624,
+          "median": 2.37810654916757,
+          "min": 2.348666749549011
+        },
+        "p99_ms": {
+          "max": 3.06847679094062,
+          "median": 3.013846490412106,
+          "min": 2.7842410802804793
+        },
+        "successful_records_per_second": {
+          "max": 556.1774103083822,
+          "median": 529.6805844580576,
+          "min": 516.3282874534882
+        },
+        "successful_requests_per_second": {
+          "max": 556.1774103083822,
+          "median": 529.6805844580576,
+          "min": 516.3282874534882
+        }
+      },
+      "p50_speedup_before_over_after": 1.0831746476621722,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.086145203113175,
+      "workload": "insert_single"
+    },
+    {
+      "after": {
+        "attempts": 100,
+        "p50_ms": {
+          "max": 9.77462100036064,
+          "median": 9.77462100036064,
+          "min": 9.77462100036064
+        },
+        "p95_ms": {
+          "max": 11.447021000913082,
+          "median": 11.447021000913082,
+          "min": 11.447021000913082
+        },
+        "p99_ms": {
+          "max": 12.804088678931295,
+          "median": 12.804088678931295,
+          "min": 12.804088678931295
+        },
+        "successful_records_per_second": {
+          "max": 10424.965905998624,
+          "median": 10424.965905998624,
+          "min": 10424.965905998624
+        },
+        "successful_requests_per_second": {
+          "max": 104.24965905998624,
+          "median": 104.24965905998624,
+          "min": 104.24965905998624
+        }
+      },
+      "before": {
+        "attempts": 100,
+        "p50_ms": {
+          "max": 10.0661284996022,
+          "median": 10.0661284996022,
+          "min": 10.0661284996022
+        },
+        "p95_ms": {
+          "max": 12.077506750301836,
+          "median": 12.077506750301836,
+          "min": 12.077506750301836
+        },
+        "p99_ms": {
+          "max": 12.757117919609302,
+          "median": 12.757117919609302,
+          "min": 12.757117919609302
+        },
+        "successful_records_per_second": {
+          "max": 9904.503481347361,
+          "median": 9904.503481347361,
+          "min": 9904.503481347361
+        },
+        "successful_requests_per_second": {
+          "max": 99.04503481347362,
+          "median": 99.04503481347362,
+          "min": 99.04503481347362
+        }
+      },
+      "p50_speedup_before_over_after": 1.029822895356332,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.0525480581264293,
+      "workload": "load_batch"
+    },
+    {
+      "after": {
+        "attempts": 1500,
+        "p50_ms": {
+          "max": 1.1385520001567784,
+          "median": 1.022167500195792,
+          "min": 0.9914219990605488
+        },
+        "p95_ms": {
+          "max": 1.7115597499469,
+          "median": 1.6020128004129217,
+          "min": 1.561501350442995
+        },
+        "p99_ms": {
+          "max": 4.82581097898218,
+          "median": 1.9370479198187227,
+          "min": 1.7572461996860511
+        },
+        "successful_records_per_second": {
+          "max": 899.7073669379733,
+          "median": 838.780572883109,
+          "min": 815.3972719294708
+        },
+        "successful_requests_per_second": {
+          "max": 899.7073669379733,
+          "median": 838.780572883109,
+          "min": 815.3972719294708
+        }
+      },
+      "before": {
+        "attempts": 1500,
+        "p50_ms": {
+          "max": 1.0966190002363874,
+          "median": 1.042567999320454,
+          "min": 1.0085769999932381
+        },
+        "p95_ms": {
+          "max": 2.388934899681771,
+          "median": 2.2411746005673194,
+          "min": 2.1982322493386164
+        },
+        "p99_ms": {
+          "max": 3.0249060194182666,
+          "median": 2.6398588697702503,
+          "min": 2.3494478993052326
+        },
+        "successful_records_per_second": {
+          "max": 809.2938345752816,
+          "median": 788.7314679734135,
+          "min": 739.7795424410322
+        },
+        "successful_requests_per_second": {
+          "max": 809.2938345752816,
+          "median": 788.7314679734135,
+          "min": 739.7795424410322
+        }
+      },
+      "p50_speedup_before_over_after": 1.0199580784174358,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.0634551896836233,
+      "workload": "mixed_c1"
+    },
+    {
+      "after": {
+        "attempts": 12000,
+        "p50_ms": {
+          "max": 3.073478499572957,
+          "median": 2.93495499954588,
+          "min": 2.7774299996963236
+        },
+        "p95_ms": {
+          "max": 7.293156050127436,
+          "median": 7.289310150190429,
+          "min": 6.70854490081183
+        },
+        "p99_ms": {
+          "max": 9.388466138952907,
+          "median": 8.923810041105744,
+          "min": 8.518043470376137
+        },
+        "successful_records_per_second": {
+          "max": 2309.2446467804825,
+          "median": 2248.022770822697,
+          "min": 2228.5338100599847
+        },
+        "successful_requests_per_second": {
+          "max": 2309.2446467804825,
+          "median": 2248.022770822697,
+          "min": 2228.5338100599847
+        }
+      },
+      "before": {
+        "attempts": 12000,
+        "p50_ms": {
+          "max": 7.9822479992799344,
+          "median": 7.862524999836751,
+          "min": 7.549880999249581
+        },
+        "p95_ms": {
+          "max": 12.573328148846484,
+          "median": 12.446508450011605,
+          "min": 11.881373751020874
+        },
+        "p99_ms": {
+          "max": 15.69214057992212,
+          "median": 15.54471041954456,
+          "min": 15.009496669881615
+        },
+        "successful_records_per_second": {
+          "max": 1038.67610879108,
+          "median": 987.4777926300775,
+          "min": 980.6850769191764
+        },
+        "successful_requests_per_second": {
+          "max": 1038.67610879108,
+          "median": 987.4777926300775,
+          "min": 980.6850769191764
+        }
+      },
+      "p50_speedup_before_over_after": 2.678925230899044,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 2.276529950952362,
+      "workload": "mixed_c8"
+    },
+    {
+      "after": {
+        "attempts": 3000,
+        "p50_ms": {
+          "max": 1.0483919995749602,
+          "median": 0.9330490001957514,
+          "min": 0.8954229997470975
+        },
+        "p95_ms": {
+          "max": 1.3426761491245998,
+          "median": 1.1331631501889206,
+          "min": 1.0785066499920504
+        },
+        "p99_ms": {
+          "max": 1.903373471468512,
+          "median": 1.3042219388626106,
+          "min": 1.2549595607924855
+        },
+        "successful_records_per_second": {
+          "max": 1090.1014133668154,
+          "median": 1059.2320698629735,
+          "min": 921.9464252791815
+        },
+        "successful_requests_per_second": {
+          "max": 1090.1014133668154,
+          "median": 1059.2320698629735,
+          "min": 921.9464252791815
+        }
+      },
+      "before": {
+        "attempts": 3000,
+        "p50_ms": {
+          "max": 1.1828885008071666,
+          "median": 1.1750015000870917,
+          "min": 1.1041755005862797
+        },
+        "p95_ms": {
+          "max": 1.432670598387631,
+          "median": 1.3809515506181924,
+          "min": 1.3788502504212372
+        },
+        "p99_ms": {
+          "max": 1.7682677499396957,
+          "median": 1.6540913897006242,
+          "min": 1.6532169094534763
+        },
+        "successful_records_per_second": {
+          "max": 880.7297854535598,
+          "median": 841.8881864546773,
+          "min": 836.4153678327885
+        },
+        "successful_requests_per_second": {
+          "max": 880.7297854535598,
+          "median": 841.8881864546773,
+          "min": 836.4153678327885
+        }
+      },
+      "p50_speedup_before_over_after": 1.2593138193605902,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.2581624102881943,
+      "workload": "point_read"
+    },
+    {
+      "after": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 1.2460289990485762,
+          "median": 1.2090874988643918,
+          "min": 1.1952419999943231
+        },
+        "p95_ms": {
+          "max": 2.003179698385793,
+          "median": 1.4189472507496248,
+          "min": 1.3608836000457813
+        },
+        "p99_ms": {
+          "max": 2.118456979496842,
+          "median": 1.79559510046602,
+          "min": 1.5053517899286843
+        },
+        "successful_records_per_second": {
+          "max": 78191.23652924466,
+          "median": 76563.55918608466,
+          "min": 73964.54791976568
+        },
+        "successful_requests_per_second": {
+          "max": 781.9123652924467,
+          "median": 765.6355918608467,
+          "min": 739.6454791976569
+        }
+      },
+      "before": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 8.844592000968987,
+          "median": 8.257010999841441,
+          "min": 8.203039999898465
+        },
+        "p95_ms": {
+          "max": 13.833296350276214,
+          "median": 9.647936600231333,
+          "min": 9.109863401499751
+        },
+        "p99_ms": {
+          "max": 14.991538160593336,
+          "median": 12.312684069129364,
+          "min": 9.56651736016284
+        },
+        "successful_records_per_second": {
+          "max": 11935.392313019476,
+          "median": 11475.270112431464,
+          "min": 10289.490080543508
+        },
+        "successful_requests_per_second": {
+          "max": 119.35392313019477,
+          "median": 114.75270112431465,
+          "min": 102.89490080543509
+        }
+      },
+      "p50_speedup_before_over_after": 6.829126103443012,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 6.672048538808801,
+      "workload": "range_read"
+    },
+    {
+      "after": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 1.5065190000314033,
+          "median": 1.3950464999652468,
+          "min": 1.3298789990585647
+        },
+        "p95_ms": {
+          "max": 2.1889405004913,
+          "median": 1.633394149121159,
+          "min": 1.5933136492094493
+        },
+        "p99_ms": {
+          "max": 3.554769769725679,
+          "median": 1.8803619806385525,
+          "min": 1.7934946692548686
+        },
+        "successful_records_per_second": {
+          "max": 732.5716086298571,
+          "median": 699.9411193217495,
+          "min": 622.032614148672
+        },
+        "successful_requests_per_second": {
+          "max": 732.5716086298571,
+          "median": 699.9411193217495,
+          "min": 622.032614148672
+        }
+      },
+      "before": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 1.8923474999610335,
+          "median": 1.7620975004319916,
+          "min": 1.7311260007772944
+        },
+        "p95_ms": {
+          "max": 2.7143753997734166,
+          "median": 2.096040399555932,
+          "min": 1.9860258510561835
+        },
+        "p99_ms": {
+          "max": 4.9051082883670425,
+          "median": 2.361184350338588,
+          "min": 2.124458060916364
+        },
+        "successful_records_per_second": {
+          "max": 568.4210157741358,
+          "median": 553.3325114512861,
+          "min": 493.01773169114585
+        },
+        "successful_requests_per_second": {
+          "max": 568.4210157741358,
+          "median": 553.3325114512861,
+          "min": 493.01773169114585
+        }
+      },
+      "p50_speedup_before_over_after": 1.263110226416029,
+      "rows": 10000,
+      "throughput_ratio_after_over_before": 1.2649557089749468,
+      "workload": "upsert"
+    },
+    {
+      "after": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 2.9828725000697887,
+          "median": 2.771040500192612,
+          "min": 2.706960499381239
+        },
+        "p95_ms": {
+          "max": 3.3036504002666334,
+          "median": 3.303508298722589,
+          "min": 3.0374686006325646
+        },
+        "p99_ms": {
+          "max": 3.5384242496365914,
+          "median": 3.5312818807142325,
+          "min": 3.11871056948803
+        },
+        "successful_records_per_second": {
+          "max": 36447562.066557996,
+          "median": 35304587.74168094,
+          "min": 32933606.442408334
+        },
+        "successful_requests_per_second": {
+          "max": 364.47562066558,
+          "median": 353.04587741680945,
+          "min": 329.33606442408336
+        }
+      },
+      "before": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 112.82754199964984,
+          "median": 110.6668720003654,
+          "min": 109.70711800018762
+        },
+        "p95_ms": {
+          "max": 121.17989755033705,
+          "median": 119.36626500018973,
+          "min": 118.90231329944072
+        },
+        "p99_ms": {
+          "max": 137.86991117101937,
+          "median": 124.52211474987052,
+          "min": 119.23935737970169
+        },
+        "successful_records_per_second": {
+          "max": 904614.8730539962,
+          "median": 890822.9110915079,
+          "min": 881268.0118680423
+        },
+        "successful_requests_per_second": {
+          "max": 9.046148730539963,
+          "median": 8.908229110915078,
+          "min": 8.812680118680422
+        }
+      },
+      "p50_speedup_before_over_after": 39.936937764956184,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 39.63143213102021,
+      "workload": "aggregate"
+    },
+    {
+      "after": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 4.226699498758535,
+          "median": 4.101628501302912,
+          "min": 3.968367000197759
+        },
+        "p95_ms": {
+          "max": 4.933587151390383,
+          "median": 4.508490049465763,
+          "min": 4.414933250245667
+        },
+        "p99_ms": {
+          "max": 5.361353479202087,
+          "median": 4.726356670325913,
+          "min": 4.547484750546576
+        },
+        "successful_records_per_second": {
+          "max": 232982.80650680093,
+          "median": 226432.13297341124,
+          "min": 218224.6406801666
+        },
+        "successful_requests_per_second": {
+          "max": 232.98280650680093,
+          "median": 226.43213297341126,
+          "min": 218.2246406801666
+        }
+      },
+      "before": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 4.7295320000557695,
+          "median": 4.585435000080906,
+          "min": 4.300558501199703
+        },
+        "p95_ms": {
+          "max": 5.730191301154264,
+          "median": 5.45778419900671,
+          "min": 4.639213101108908
+        },
+        "p99_ms": {
+          "max": 6.142140629581267,
+          "median": 6.014990199855676,
+          "min": 5.219980641486479
+        },
+        "successful_records_per_second": {
+          "max": 216294.78289930604,
+          "median": 200933.0058896841,
+          "min": 196595.20924866802
+        },
+        "successful_requests_per_second": {
+          "max": 216.29478289930603,
+          "median": 200.93300588968413,
+          "min": 196.59520924866803
+        }
+      },
+      "p50_speedup_before_over_after": 1.1179547339853695,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.126903626264998,
+      "workload": "category_read"
+    },
+    {
+      "after": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 10.893018500610196,
+          "median": 10.263309000038134,
+          "min": 9.24972349912423
+        },
+        "p95_ms": {
+          "max": 12.299058599546697,
+          "median": 11.031155749878963,
+          "min": 10.517842199442383
+        },
+        "p99_ms": {
+          "max": 12.676208999328082,
+          "median": 11.555862009900011,
+          "min": 11.338650349571253
+        },
+        "successful_records_per_second": {
+          "max": 10757.293527506528,
+          "median": 9704.151349283942,
+          "min": 9040.377435519767
+        },
+        "successful_requests_per_second": {
+          "max": 107.57293527506528,
+          "median": 97.04151349283941,
+          "min": 90.40377435519767
+        }
+      },
+      "before": {
+        "attempts": 90,
+        "p50_ms": {
+          "max": 12.265675499293138,
+          "median": 11.326367500259948,
+          "min": 9.72363949949795
+        },
+        "p95_ms": {
+          "max": 19.427370049834273,
+          "median": 12.291763900066144,
+          "min": 11.027609349002885
+        },
+        "p99_ms": {
+          "max": 44.98476846976703,
+          "median": 12.872830129290378,
+          "min": 12.004896569942504
+        },
+        "successful_records_per_second": {
+          "max": 10361.594754564108,
+          "median": 8791.157757436586,
+          "min": 7043.80461319685
+        },
+        "successful_requests_per_second": {
+          "max": 103.61594754564109,
+          "median": 87.91157757436585,
+          "min": 70.4380461319685
+        }
+      },
+      "p50_speedup_before_over_after": 1.103578534000863,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.1038536239524357,
+      "workload": "insert_batch"
+    },
+    {
+      "after": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 2.011326999308949,
+          "median": 1.8773599995256518,
+          "min": 1.8712860000960063
+        },
+        "p95_ms": {
+          "max": 2.4916322999160916,
+          "median": 2.2536450993356993,
+          "min": 2.175612400333194
+        },
+        "p99_ms": {
+          "max": 3.017337390265309,
+          "median": 2.7054798211429434,
+          "min": 2.418500001258505
+        },
+        "successful_records_per_second": {
+          "max": 526.0786083183477,
+          "median": 522.3165636587456,
+          "min": 485.61447015835
+        },
+        "successful_requests_per_second": {
+          "max": 526.0786083183477,
+          "median": 522.3165636587456,
+          "min": 485.61447015835
+        }
+      },
+      "before": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 2.2496580004371936,
+          "median": 2.0832190002693096,
+          "min": 2.065887500975805
+        },
+        "p95_ms": {
+          "max": 4.2617871012225805,
+          "median": 2.593345750028676,
+          "min": 2.517753700431058
+        },
+        "p99_ms": {
+          "max": 6.025414060241018,
+          "median": 3.1677887501245983,
+          "min": 3.0861009006730455
+        },
+        "successful_records_per_second": {
+          "max": 476.63683145199764,
+          "median": 469.1661540441484,
+          "min": 404.0463224353532
+        },
+        "successful_requests_per_second": {
+          "max": 476.63683145199764,
+          "median": 469.1661540441484,
+          "min": 404.0463224353532
+        }
+      },
+      "p50_speedup_before_over_after": 1.1096534499486894,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.1132869648768307,
+      "workload": "insert_single"
+    },
+    {
+      "after": {
+        "attempts": 1000,
+        "p50_ms": {
+          "max": 12.955076999787707,
+          "median": 12.955076999787707,
+          "min": 12.955076999787707
+        },
+        "p95_ms": {
+          "max": 15.220726899951842,
+          "median": 15.220726899951842,
+          "min": 15.220726899951842
+        },
+        "p99_ms": {
+          "max": 16.97535366882221,
+          "median": 16.97535366882221,
+          "min": 16.97535366882221
+        },
+        "successful_records_per_second": {
+          "max": 7727.570756635536,
+          "median": 7727.570756635536,
+          "min": 7727.570756635536
+        },
+        "successful_requests_per_second": {
+          "max": 77.27570756635535,
+          "median": 77.27570756635535,
+          "min": 77.27570756635535
+        }
+      },
+      "before": {
+        "attempts": 1000,
+        "p50_ms": {
+          "max": 13.736696500018297,
+          "median": 13.736696500018297,
+          "min": 13.736696500018297
+        },
+        "p95_ms": {
+          "max": 16.053425649988636,
+          "median": 16.053425649988636,
+          "min": 16.053425649988636
+        },
+        "p99_ms": {
+          "max": 18.402845729124238,
+          "median": 18.402845729124238,
+          "min": 18.402845729124238
+        },
+        "successful_records_per_second": {
+          "max": 7308.321932754184,
+          "median": 7308.321932754184,
+          "min": 7308.321932754184
+        },
+        "successful_requests_per_second": {
+          "max": 73.08321932754184,
+          "median": 73.08321932754184,
+          "min": 73.08321932754184
+        }
+      },
+      "p50_speedup_before_over_after": 1.0603330648087541,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.057365949083657,
+      "workload": "load_batch"
+    },
+    {
+      "after": {
+        "attempts": 1500,
+        "p50_ms": {
+          "max": 1.2146765002398752,
+          "median": 1.1523835000843974,
+          "min": 1.1114875005659997
+        },
+        "p95_ms": {
+          "max": 2.6571957499072583,
+          "median": 1.8752886000584108,
+          "min": 1.764576549976482
+        },
+        "p99_ms": {
+          "max": 4.9548428193338605,
+          "median": 2.2690376899117837,
+          "min": 1.9126935592430525
+        },
+        "successful_records_per_second": {
+          "max": 814.278526395033,
+          "median": 780.613613288582,
+          "min": 681.5041348010209
+        },
+        "successful_requests_per_second": {
+          "max": 814.278526395033,
+          "median": 780.613613288582,
+          "min": 681.5041348010209
+        }
+      },
+      "before": {
+        "attempts": 1500,
+        "p50_ms": {
+          "max": 1.2796640003216453,
+          "median": 1.2690329995166394,
+          "min": 1.2216324994369643
+        },
+        "p95_ms": {
+          "max": 2.6506029004849547,
+          "median": 2.6337397510360456,
+          "min": 2.4204128009841943
+        },
+        "p99_ms": {
+          "max": 4.080522369768005,
+          "median": 3.4519685505983935,
+          "min": 2.6780802189568926
+        },
+        "successful_records_per_second": {
+          "max": 685.4138729660812,
+          "median": 653.8133756673438,
+          "min": 644.1069844283791
+        },
+        "successful_requests_per_second": {
+          "max": 685.4138729660812,
+          "median": 653.8133756673438,
+          "min": 644.1069844283791
+        }
+      },
+      "p50_speedup_before_over_after": 1.1012245484456338,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.1939394976308244,
+      "workload": "mixed_c1"
+    },
+    {
+      "after": {
+        "attempts": 12000,
+        "p50_ms": {
+          "max": 3.4186975008196896,
+          "median": 3.3493844994154642,
+          "min": 3.0878364996169694
+        },
+        "p95_ms": {
+          "max": 8.091771000999868,
+          "median": 7.4124659003246025,
+          "min": 7.2803572007614985
+        },
+        "p99_ms": {
+          "max": 10.168646498914313,
+          "median": 9.655959870051438,
+          "min": 9.113405800399043
+        },
+        "successful_records_per_second": {
+          "max": 2177.395169335615,
+          "median": 2003.5525471056437,
+          "min": 1968.2689642443954
+        },
+        "successful_requests_per_second": {
+          "max": 2177.395169335615,
+          "median": 2003.5525471056437,
+          "min": 1968.2689642443954
+        }
+      },
+      "before": {
+        "attempts": 12000,
+        "p50_ms": {
+          "max": 8.840093999424425,
+          "median": 8.669073500641389,
+          "min": 8.557269499760878
+        },
+        "p95_ms": {
+          "max": 14.911245950315784,
+          "median": 14.094778149774355,
+          "min": 12.757227898873676
+        },
+        "p99_ms": {
+          "max": 19.35224037113585,
+          "median": 17.81770832001712,
+          "min": 15.86141252977538
+        },
+        "successful_records_per_second": {
+          "max": 922.4887095052084,
+          "median": 879.9798907347501,
+          "min": 861.189313529914
+        },
+        "successful_requests_per_second": {
+          "max": 922.4887095052084,
+          "median": 879.9798907347501,
+          "min": 861.189313529914
+        }
+      },
+      "p50_speedup_before_over_after": 2.588258679215336,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 2.276816286600314,
+      "workload": "mixed_c8"
+    },
+    {
+      "after": {
+        "attempts": 3000,
+        "p50_ms": {
+          "max": 1.0650370004441356,
+          "median": 1.0636645001795841,
+          "min": 1.0604705012156046
+        },
+        "p95_ms": {
+          "max": 1.3142186001459772,
+          "median": 1.2905125508950732,
+          "min": 1.2604856499820016
+        },
+        "p99_ms": {
+          "max": 1.991196950693847,
+          "median": 1.8761439089939804,
+          "min": 1.5158549012267026
+        },
+        "successful_records_per_second": {
+          "max": 921.034643530038,
+          "median": 916.9564666320673,
+          "min": 915.6453071325195
+        },
+        "successful_requests_per_second": {
+          "max": 921.034643530038,
+          "median": 916.9564666320673,
+          "min": 915.6453071325195
+        }
+      },
+      "before": {
+        "attempts": 3000,
+        "p50_ms": {
+          "max": 1.2938700001541292,
+          "median": 1.2533540011645528,
+          "min": 1.1774554996009101
+        },
+        "p95_ms": {
+          "max": 1.5977985001882187,
+          "median": 1.5052420995743887,
+          "min": 1.385145600852411
+        },
+        "p99_ms": {
+          "max": 2.4050027799785303,
+          "median": 1.8007806696004987,
+          "min": 1.7213797702243028
+        },
+        "successful_records_per_second": {
+          "max": 826.8694659496892,
+          "median": 790.1852612183862,
+          "min": 757.3133370304832
+        },
+        "successful_requests_per_second": {
+          "max": 826.8694659496892,
+          "median": 790.1852612183862,
+          "min": 757.3133370304832
+        }
+      },
+      "p50_speedup_before_over_after": 1.178335838935061,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.1604322576432426,
+      "workload": "point_read"
+    },
+    {
+      "after": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 1.363515500088397,
+          "median": 1.3314815005287528,
+          "min": 1.308397499997227
+        },
+        "p95_ms": {
+          "max": 1.6032666489081748,
+          "median": 1.5891174009993847,
+          "min": 1.4848174506369103
+        },
+        "p99_ms": {
+          "max": 2.4149205408502925,
+          "median": 1.807529599445849,
+          "min": 1.5657311298127756
+        },
+        "successful_records_per_second": {
+          "max": 73005.41646207341,
+          "median": 70541.1735423736,
+          "min": 69346.2910300106
+        },
+        "successful_requests_per_second": {
+          "max": 730.0541646207341,
+          "median": 705.4117354237359,
+          "min": 693.462910300106
+        }
+      },
+      "before": {
+        "attempts": 300,
+        "p50_ms": {
+          "max": 111.37689000042883,
+          "median": 110.38527250002517,
+          "min": 110.21297900060745
+        },
+        "p95_ms": {
+          "max": 119.67380990090533,
+          "median": 118.0269582992878,
+          "min": 117.80780330000198
+        },
+        "p99_ms": {
+          "max": 123.64475256008518,
+          "median": 120.51308687903656,
+          "min": 120.24302979905772
+        },
+        "successful_records_per_second": {
+          "max": 903.4410527978424,
+          "median": 901.3521829283762,
+          "min": 893.0509450387091
+        },
+        "successful_requests_per_second": {
+          "max": 9.034410527978425,
+          "median": 9.013521829283762,
+          "min": 8.930509450387092
+        }
+      },
+      "p50_speedup_before_over_after": 82.90409777093365,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 78.26149964289705,
+      "workload": "range_read"
+    },
+    {
+      "after": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 1.6981870003291988,
+          "median": 1.5956424995238194,
+          "min": 1.5515970007982105
+        },
+        "p95_ms": {
+          "max": 2.3800186500011478,
+          "median": 2.0993003008698,
+          "min": 1.771150599961402
+        },
+        "p99_ms": {
+          "max": 4.1396532588805695,
+          "median": 3.8735899492894514,
+          "min": 1.9543357199654554
+        },
+        "successful_records_per_second": {
+          "max": 637.6442327341136,
+          "median": 590.3639346296723,
+          "min": 555.4140010959976
+        },
+        "successful_requests_per_second": {
+          "max": 637.6442327341136,
+          "median": 590.3639346296723,
+          "min": 555.4140010959976
+        }
+      },
+      "before": {
+        "attempts": 900,
+        "p50_ms": {
+          "max": 2.070174000436964,
+          "median": 1.972402500541648,
+          "min": 1.9347914994796156
+        },
+        "p95_ms": {
+          "max": 2.857050099646586,
+          "median": 2.3766927495671553,
+          "min": 2.294642650394963
+        },
+        "p99_ms": {
+          "max": 4.698081119513515,
+          "median": 3.891578399543503,
+          "min": 3.041109829900961
+        },
+        "successful_records_per_second": {
+          "max": 502.2939774318263,
+          "median": 491.5830663975835,
+          "min": 453.3638441161251
+        },
+        "successful_requests_per_second": {
+          "max": 502.2939774318263,
+          "median": 491.5830663975835,
+          "min": 453.3638441161251
+        }
+      },
+      "p50_speedup_before_over_after": 1.2361180534676555,
+      "rows": 100000,
+      "throughput_ratio_after_over_before": 1.2009444079430445,
+      "workload": "upsert"
+    }
+  ],
+  "compiler": {
+    "build_command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--release",
+      "--bin",
+      "multidb"
+    ],
+    "build_environment": {
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_PROFILE_RELEASE_DEBUG": "0"
+    },
+    "cargo": "1.99.1",
+    "features": "default",
+    "msrv_check_separate": "1.89",
+    "rustc": "1.99.1"
+  },
+  "configuration": {
+    "audit": "profile default, no bypass",
+    "authentication": "SCRAM; benchmark principal mapped to admin",
+    "durability": "Immediate",
+    "profile": "transactional",
+    "protocol": "simple PostgreSQL query; autocommit; no prepared statements",
+    "row_or_masking_policies": false,
+    "transport": "loopback plaintext, local-dev"
+  },
+  "date": "2026-10-28",
+  "drivers": {
+    "dnspython": "2.9.0",
+    "psycopg": "3.3.6",
+    "psycopg-binary": "3.3.6",
+    "pymongo": "4.19.0",
+    "python": "3.12.14",
+    "typing-extensions": "4.16.0"
+  },
+  "harness": {
+    "arguments": {
+      "aggregate_ops": 30,
+      "batch_ops": 30,
+      "batch_size": 100,
+      "engines": [
+        "multidb"
+      ],
+      "mixed_ops": 500,
+      "only_load": false,
+      "read_ops": 1000,
+      "repeats": 3,
+      "rows": [
+        10000,
+        100000
+      ],
+      "run_id": "localbench",
+      "seed": 20261028,
+      "timeout": 15.0,
+      "workloads": [
+        "aggregate",
+        "point_read",
+        "mixed_c1",
+        "mixed_c8",
+        "range_read",
+        "category_read",
+        "insert_batch",
+        "insert_single",
+        "upsert"
+      ],
+      "write_ops": 300
+    },
+    "data_payload_bytes": 256,
+    "fixture_note": "Fresh database per phase; repeats reuse and mutate fixture in identical sequence; separate growing insert table",
+    "reviewed_sha256": {
+      "benchmark.py": "1288ed7c8dda92e3f8a9af8556401d3eee14b03560946e74ca860585c699b4f4",
+      "initialize-multidb.py": "309135a4ad97e66422e31fcd5e6492a26b5a75ead218b824f01a44793e784609",
+      "verify-results.py": "197827e4922b7f46f98ea864ef104557114dd714d6ecc646e8b54e258101d832"
+    }
+  },
+  "host": {
+    "cgroup": {
+      "cpu.max": "400000 100000",
+      "cpuset.cpus.effective": "0-4",
+      "memory.max": "17179869184"
+    },
+    "client_cpus": [
+      2,
+      3,
+      4
+    ],
+    "native_no_docker_limits": true,
+    "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+    "server_cpus": [
+      0,
+      1
+    ],
+    "server_memory_cap": null
+  },
+  "limits": [
+    "One before phase followed by one after phase; no reversed-order campaign",
+    "Three repetitions; small p99 samples for aggregate/batch",
+    "Per-request latency excludes validation; throughput includes Python loop/bookkeeping/validation",
+    "Data fit in memory; compressible synthetic payload",
+    "No cold-storage, crash, failover, distributed, policy-cost or production capacity claim"
+  ],
+  "observations": {
+    "all_18_nonload_cells_improved_median_p50_and_throughput": true,
+    "p99_increases": [
+      {
+        "after_ms": 1.8761439089939804,
+        "before_ms": 1.8007806696004987,
+        "change_percent": 4.185031562461239,
+        "rows": 100000,
+        "workload": "point_read"
+      },
+      {
+        "after_ms": 12.804088678931295,
+        "before_ms": 12.757117919609302,
+        "change_percent": 0.36819256212874407,
+        "rows": 10000,
+        "workload": "load_batch"
+      }
+    ],
+    "sampled_peak_rss_mib": {
+      "after": 625.04296875,
+      "before": 590.01171875,
+      "change_percent": 5.937382070006558
+    },
+    "sampling_interval_seconds": 1
+  },
+  "phases": {
+    "after": {
+      "artifact_directory": "/workspace/scratch/multidb-local-benchmark-20261028T152921Z/after",
+      "binary_sha256": "3b881025915d07dc147aef7086f1dd56b50d06dd01a2824c01f5cefe1bc3eb59",
+      "cargo_lock_sha256": "d81b8b57cc4785b5fec856db531042e13c1ba00be7bca4fe438ac1cd477bc11c",
+      "runner_sha256": "344717f0d17c484cce58f29d373c355ba6a3d142a036d7e3ff8333c42add056b",
+      "server_exit": {
+        "case_elapsed_seconds": 57.36611578799966,
+        "database_bytes": 1056968704,
+        "returncode": 0,
+        "sample_count": 57,
+        "shutdown": {
+          "forced_kill": false,
+          "was_running": true
+        }
+      },
+      "source_dirty": [],
+      "source_manifest_sha256": "49336d9f62f3d8b6ad69ab4a0680d0a537a8e7f1d524ebe3d270c155097cb587",
+      "source_revision": "6f98d85d3b604c947a46c722cdcacfa0c7b8340b",
+      "verification": {
+        "issues": [],
+        "passed": true,
+        "raw_samples": 39260,
+        "setup_or_correctness_failures": 0,
+        "summaries": 56
+      }
+    },
+    "before": {
+      "artifact_directory": "/workspace/scratch/multidb-local-benchmark-20261028T152921Z/before",
+      "binary_sha256": "713d72a02d9c4d7cf62fee4a58892ccfb13f97b1a1479afbcd720246c6ee310b",
+      "cargo_lock_sha256": "0c86463e3da8b9ce640bbd87bd906b914ccf6e9da332e21091fc252b24e5f1e1",
+      "runner_sha256": "abeb41d9df0317d81c3d9e67e29b6e78ffc9f543714f9d12d73032ff46bd5881",
+      "server_exit": {
+        "case_elapsed_seconds": 124.45580569000049,
+        "database_bytes": 1189089280,
+        "returncode": 0,
+        "sample_count": 124
+      },
+      "source_dirty": [],
+      "source_manifest_sha256": "ce06efd6aa4d609734a3cbc935c44fa274a27b9f4e58d736ef207e24a2c3803f",
+      "source_revision": "b2bde5f9feeb21d27859281e2c5d1744a1b60d5c",
+      "verification": {
+        "issues": [],
+        "passed": true,
+        "raw_samples": 39260,
+        "setup_or_correctness_failures": 0,
+        "summaries": 56
+      }
+    }
+  },
+  "schema_version": 1,
+  "scope": "Local native single-node warm-cache comparison; no new PostgreSQL/MongoDB run"
+}
