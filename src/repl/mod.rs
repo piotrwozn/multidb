@@ -134,6 +134,12 @@ impl ReplError {
 }
 
 pub trait Replication: Send + Sync {
+    /// Whether committed writes are recorded in an ordered commit log.
+    /// Backends without this capability must reject replay-based features.
+    fn supports_commit_log(&self) -> bool {
+        true
+    }
+
     /// Proposes one write operation.
     /// # Errors
     /// Fails when the replication backend or storage rejects the write.

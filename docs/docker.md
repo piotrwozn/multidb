@@ -49,7 +49,7 @@ Environment:
 | --- | --- | --- | --- |
 | `MULTIDB_RUNTIME_MODE` | no | `production` | Use `local-dev` only for local plaintext PG smoke. |
 | `MULTIDB_DB_PATH` | no | `/var/lib/multidb/multidb.redb` | Must live on the mounted volume. |
-| `MULTIDB_PROFILE` | no | `transactional` | Storage profile name, product slug, alias, or `auto` (probe the existing database; required for manifest databases built with a non-default profile). `auto` fails when the database does not exist yet, so the first start of a fresh volume needs an explicit profile. A database left by a stopped or killed container gets redb's crash recovery before `auto` reads it, as with a named profile. |
+| `MULTIDB_PROFILE` | no | `transactional` | Storage profile name, product slug, alias, or `auto` (probe the existing database; required for manifest databases built with a non-default profile). `auto` fails when the database does not exist yet, so the first start of a fresh volume needs an explicit profile. After an unclean shutdown, redb crash recovery runs before `auto` reads the database, as with a named profile. With encryption, the configured key is also used to inspect metadata. |
 | `MULTIDB_BIND` | no | `0.0.0.0:8080` | HTTP API and Studio bind. |
 | `MULTIDB_PG_BIND` | no | `0.0.0.0:5432` | PostgreSQL wire bind. |
 | `MULTIDB_STUDIO_DIR` | no | `/usr/share/multidb/studio` | Built Studio asset directory. |
@@ -70,6 +70,8 @@ Environment:
 | `MULTIDB_REPLICATION` | no | unset | Read in spec mode only (`cp` or `ap`), where it must agree with the spec; ignored otherwise. |
 | `MULTIDB_MAX_CONCURRENT_QUERIES` | no | 4 x available CPUs | Statements the query governor runs at once, `1` to `4096`. PostgreSQL wire admits at most this many statements, and never more than 32, at a time. |
 | `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` | no | `100` | How long a statement waits for a free governor slot before it fails as busy, `1` to `60000`. |
+| `MULTIDB_HISTORY_RETAIN_LSNS` | no | unset | Opt in to online MVCC history GC, retaining this positive number of recent LSNs (plus active snapshots and temporal retention). One bounded batch runs every 10 seconds. Never truncates the commit log. |
+| `MULTIDB_ENCRYPTION_KEY_PATH` | no | unset | Path to an existing 32-byte encryption key file (raw bytes or 64 hexadecimal characters). Used by `serve` and CLI database/provisioning commands; mount it read-only. |
 
 `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` must be
 whole numbers in their range; any other non-empty value stops `multidb serve`
@@ -114,8 +116,8 @@ start (see [provisioning.md](provisioning.md#serve)). Without
 3. Before anything is opened, `serve` refuses an explicit `MULTIDB_PROFILE`
    that selects another storage profile than the spec profile (`auto` never
    conflicts), an explicit `MULTIDB_REPLICATION` other than the spec
-   `defaults.replication`, `guarantees.encryption.at_rest: true` (serve cannot
-   open encrypted databases in this build) and a volatile profile. The image
+   `defaults.replication`, `guarantees.encryption.at_rest: true` without
+   `MULTIDB_ENCRYPTION_KEY_PATH`, and a volatile profile. The image
    sets `MULTIDB_PROFILE=transactional`, so unsetting the variable falls back
    to that default: in spec mode set it to an empty value
    (`MULTIDB_PROFILE=""`, which is not explicit) or make it agree, since the
@@ -160,6 +162,57 @@ mode (see the RBAC note above).
 
 Known limit in this build: audit is chained with the development key
 (`enforced_with_development_key`); `serve` has no audit key setting.
+
+## Encryption At Rest
+
+Set `MULTIDB_ENCRYPTION_KEY_PATH` to a mounted key file to create or open
+an encrypted database. The file must already exist and contain 32 raw bytes
+or a 64-character hexadecimal key. The variable carries only its path; key
+bytes are never accepted as an environment variable or written into a spec.
+The same selector works with `config plan`, `config apply`, `config drift`,
+`config status`, `init --apply`, `profile show --db`, backup source reads,
+and the other CLI database commands. `--profile auto` decrypts the existing
+metadata with that key.
+
+For example, with an existing key file mounted at
+`/run/secrets/multidb-encryption.key`:
+
+```text
+MULTIDB_ENCRYPTION_KEY_PATH=/run/secrets/multidb-encryption.key
+MULTIDB_SPEC_PATH=/etc/multidb/multidb.yaml
+MULTIDB_SPEC_APPLY=create
+```
+
+A spec that asks for encryption at rest, including `secure-saas`, can be
+provisioned with this key configured. Without it the plan or startup is
+refused. Keep the same key available across restarts: changing the contents
+of this file does not re-encrypt existing data. This selector uses the
+file-key storage mode; envelope rotation remains a Rust API operation.
+
+## Background Maintenance And Shutdown
+
+Both `multidb serve` and `multidb admin serve` sweep time-series retention
+without waiting for another series write. Each second they scan at most
+128 chunk or latest-point records, resuming the scan on the next tick.
+Expired chunks and their latest-point entries are removed conditionally,
+so a concurrent update is preserved for a later sweep. Retention still
+uses server time and whole chunks; cleanup of a large collection takes
+multiple batches.
+
+Workload-profiler samples flush every 10 seconds even when no new statement
+arrives. `serve` also runs one bounded online MVCC GC batch every 10 seconds
+when `MULTIDB_HISTORY_RETAIN_LSNS` is explicitly set to a positive integer.
+An unset value leaves history untouched. This task does not shrink the redb
+file or truncate the commit log, so it preserves incremental-backup chains.
+Commit-log truncation remains an offline `maintenance gc` operation and
+requires a fresh full backup afterwards.
+
+On SIGTERM (including `docker stop`) or Ctrl+C, both servers stop accepting
+requests, stop maintenance, wait for active storage work, flush buffered
+profiler samples and close the database. PostgreSQL sockets are closed;
+already-running statements finish before the final flush. The process may
+therefore wait for a long statement to finish. SIGKILL or a container stop
+timeout bypasses this shutdown path and can lose unflushed advisory samples.
 
 ## Helm Chart Variables
 
@@ -251,8 +304,9 @@ Control Plane login limits:
   itself. `INSERT ... ON CONFLICT` and inserts into columnar
   tables (the `analytical` profile) retry internally when another statement
   commits first, and fail with SQLSTATE 40001 if 64 retries also conflict;
-  retry those. A columnar insert rewrites the whole table, so inserts into one
-  columnar table effectively run one at a time. Control Plane single-row,
+  retry those. A plain columnar insert appends to the last segment while checking primary-key
+  uniqueness against existing rows. Concurrent appenders can still conflict on
+  the tail; updates can rewrite the table. Control Plane single-row,
   single-document and time-series point writes also retry conflicts
   internally. The Control Plane returns a conflict that outlasts the retries
   as HTTP 409 with error code `conflict`. Retry single-statement requests; a
@@ -270,7 +324,8 @@ Control Plane login limits:
   that DataFusion executes, and cannot interrupt a storage scan in progress.
   Single-table `SELECT`s with an equality filter and writes have no time
   limit.
-- `/catalog` row counts still scan every table and collection.
+- `/catalog` exact counts scan row-layout keys and document collections;
+  columnar table counts use segment metadata when available.
 
 ## Smoke Test
 

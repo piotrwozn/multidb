@@ -45,6 +45,7 @@ use crate::{
         AdminCredentialRecord, CatalogEntry, ConfigError, ConfigPlanSource, Database, DbError,
         PersistedProfileManifest, Profile, ReplicationKind, bootstrap_admin_identity,
     },
+    extension::{ExtensionError, PolicyConfig},
     geo::GeoIndexConfig,
     graph::GraphId,
     model::{CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, Value as ModelValue},
@@ -56,8 +57,8 @@ use crate::{
         StartupMode, StepOutcome,
     },
     query::{
-        DocField, QueryError, RelIndexExpression, RelIndexSpec, Row, SqlOutput, TableLayout,
-        TableSchema,
+        DocField, QueryError, RelIndexExpression, RelIndexSpec, RelTable, Row, SqlOutput,
+        TableLayout, TableSchema,
     },
     runtime_advisor::{RuntimeAdviceDecisionRequest, RuntimeAdvicePlanRequest},
     security::{
@@ -2077,7 +2078,8 @@ async fn table_rows_handler(
         }
         let page = data_page(&query);
         match database.table(&name).and_then(|table| {
-            let mut rows = table.scan_page(page.offset, page.limit.saturating_add(1))?;
+            let policy = database.policy_config()?;
+            let mut rows = policy_table_page(&table, &policy, &principal, &name, page)?;
             let has_more = rows.len() > page.limit;
             if has_more {
                 rows.truncate(page.limit);
@@ -2185,7 +2187,25 @@ async fn documents_handler(
         }
         let page = data_page(&query);
         match database.collection(&name).and_then(|collection| {
-            let mut documents = collection.scan_page(page.offset, page.limit.saturating_add(1))?;
+            let policy = database.policy_config()?;
+            let resource = Resource::Collection(name.clone());
+            let has_row_policy = policy.row_policies.iter().any(|p| p.resource == resource);
+            // Offset and the lookahead count visible documents, so a hidden document
+            // cannot create an empty page or leak its presence through has_more.
+            let mut documents = if has_row_policy {
+                collection
+                    .scan()?
+                    .into_iter()
+                    .filter(|(_, document)| policy.row_visible(&principal, &resource, document))
+                    .skip(page.offset)
+                    .take(page.limit.saturating_add(1))
+                    .collect::<Vec<_>>()
+            } else {
+                collection.scan_page(page.offset, page.limit.saturating_add(1))?
+            };
+            for (_, document) in &mut documents {
+                *document = policy.mask_value(&resource, document);
+            }
             let has_more = documents.len() > page.limit;
             if has_more {
                 documents.truncate(page.limit);
@@ -3436,7 +3456,7 @@ fn catalog_response(database: &Database) -> Result<CatalogResponse, DbError> {
         let (schema, row_count) = match entry {
             CatalogEntry::Table { .. } => {
                 let table = database.table(name)?;
-                (table.schema().cloned(), Some(table.scan()?.len()))
+                (table.schema().cloned(), Some(table.row_count()?))
             }
             CatalogEntry::Collection { .. } => {
                 let collection = database.collection(name)?;
@@ -3614,6 +3634,94 @@ fn data_page(query: &DataPageQuery) -> DataPage {
         limit,
         capped: requested != limit,
     }
+}
+
+/// Reads one page after row policies, with the same column-name matching and
+/// scalar replacements as principal-scoped SQL. The extra visible row is the
+/// caller's lookahead for `has_more`.
+fn policy_table_page(
+    table: &RelTable,
+    policy: &PolicyConfig,
+    principal: &Principal,
+    name: &str,
+    page: DataPage,
+) -> Result<Vec<Row>, DbError> {
+    let resource = Resource::Table(name.to_owned());
+    let has_row_policy = policy.row_policies.iter().any(|p| p.resource == resource);
+    let masks = policy
+        .masking
+        .iter()
+        .filter(|p| p.resource == resource)
+        .collect::<Vec<_>>();
+    if !has_row_policy && masks.is_empty() {
+        return Ok(table.scan_page(page.offset, page.limit.saturating_add(1))?);
+    }
+    // Positional rows without a schema cannot be matched to policy paths.
+    // Refuse the request rather than returning the original values.
+    let schema = table.schema().ok_or_else(|| {
+        ExtensionError::PolicyDenied(format!(
+            "reading table {name} with row or masking policies requires schema"
+        ))
+    })?;
+    let replacements = schema
+        .columns
+        .iter()
+        .map(|column| {
+            let column_path = [column.name.clone()];
+            masks
+                .iter()
+                .rev()
+                .find(|mask| {
+                    mask.paths
+                        .iter()
+                        .any(|path| column_path.starts_with(path.segments()))
+                })
+                .map(|mask| mask.replacement.clone())
+        })
+        .collect::<Vec<_>>();
+    if replacements.iter().flatten().any(|value| {
+        matches!(
+            value,
+            ModelValue::Array(_)
+                | ModelValue::Object(_)
+                | ModelValue::Vector(_)
+                | ModelValue::GeoPoint { .. }
+        )
+    }) {
+        return Err(ExtensionError::PolicyDenied(format!(
+            "table {name} has a masking policy whose replacement is not a scalar"
+        ))
+        .into());
+    }
+    let mut rows = if has_row_policy {
+        table
+            .scan()?
+            .into_iter()
+            .filter(|row| {
+                let object = ModelValue::Object(
+                    schema
+                        .columns
+                        .iter()
+                        .zip(row)
+                        .map(|(column, value)| (column.name.clone(), value.clone()))
+                        .collect(),
+                );
+                policy.row_visible(principal, &resource, &object)
+            })
+            .skip(page.offset)
+            .take(page.limit.saturating_add(1))
+            .collect::<Vec<_>>()
+    } else {
+        table.scan_page(page.offset, page.limit.saturating_add(1))?
+    };
+    for row in &mut rows {
+        for (value, replacement) in row.iter_mut().zip(&replacements) {
+            if let Some(replacement) = replacement {
+                *value = replacement.clone();
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn role_summary(role: &Role) -> RoleSummary {
@@ -4430,6 +4538,7 @@ mod tests {
     use serde::Serialize;
     use serde_json::Value;
     use std::{
+        collections::BTreeMap,
         convert::Infallible,
         fs,
         net::{IpAddr, SocketAddr},
@@ -8398,6 +8507,267 @@ mod tests {
             message.contains("lacks Read on Table(\"orders\")"),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_table_pages_filter_before_pagination_and_mask_stored_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{FieldPath, Value as ModelValue},
+            query::{ColumnDef, ColumnType, TableSchema},
+        };
+
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let table = database.create_table(
+            "people",
+            Some(TableSchema::new(
+                vec![
+                    ColumnDef::new("id", ColumnType::Int, false),
+                    ColumnDef::new("owner", ColumnType::Str, false),
+                    ColumnDef::new("secret", ColumnType::Str, false),
+                ],
+                0,
+            )),
+            Vec::new(),
+        )?;
+        for (id, owner) in [
+            (0, "bob"),
+            (1, "alice"),
+            (2, "bob"),
+            (3, "alice"),
+            (4, "bob"),
+        ] {
+            table.insert(vec![
+                ModelValue::Int(id),
+                ModelValue::Str(owner.to_owned()),
+                ModelValue::Str(format!("secret-{id}")),
+            ])?;
+        }
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("reader").grant(Resource::Table("people".to_owned()), Permission::Read)
+        ]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("alice", Principal::new("alice").with_role("reader")),
+        );
+        database.set_policy_config(&PolicyConfig {
+            row_policies: vec![RowPolicy {
+                resource: Resource::Table("people".to_owned()),
+                path: FieldPath::new(["owner"]),
+                equals: ModelValue::Str("public".to_owned()),
+            }],
+            masking: vec![MaskingPolicy {
+                resource: Resource::Table("people".to_owned()),
+                paths: vec![FieldPath::new(["secret"])],
+                replacement: ModelValue::Str("***".to_owned()),
+            }],
+            ..PolicyConfig::default()
+        })?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for (offset, expected, more) in [
+            (0, serde_json::json!([[1, "alice", "***"]]), true),
+            (1, serde_json::json!([[3, "alice", "***"]]), false),
+            (2, serde_json::json!([]), false),
+        ] {
+            let (status, body) = get_as(
+                &app,
+                &format!("/data/tables/people/rows?offset={offset}&limit=1"),
+                "alice",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let page = &body["data"];
+            assert_eq!(page["rows"], expected);
+            assert_eq!(page["has_more"], more);
+            assert_eq!(page["returned"], usize::from(offset < 2));
+            assert_eq!(
+                page["next_offset"],
+                if more {
+                    serde_json::json!(offset + 1)
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(!body.to_string().contains("secret-"));
+        }
+        let (status, _) = get_as(&app, "/data/tables/people/rows", "nobody").await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_document_pages_use_stored_document_policies_and_mask_nested_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{CollectionId, FieldPath, Value as ModelValue},
+        };
+
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let collection = database.create_collection(
+            "profiles",
+            CollectionId::new(7),
+            vec![crate::query::DocField::document_id("id")],
+            Vec::new(),
+        )?;
+        for owner in [
+            Some(ModelValue::Str("bob".to_owned())),
+            Some(ModelValue::Str("alice".to_owned())),
+            Some(ModelValue::Null),
+            None,
+            Some(ModelValue::Int(3)),
+        ] {
+            let mut document = BTreeMap::from([(
+                "profile".to_owned(),
+                ModelValue::Object(BTreeMap::from([(
+                    "city".to_owned(),
+                    ModelValue::Str("private-city".to_owned()),
+                )])),
+            )]);
+            if let Some(owner) = owner {
+                document.insert("owner".to_owned(), owner);
+            }
+            collection.insert(&ModelValue::Object(document))?;
+        }
+        let resource = Resource::Collection("profiles".to_owned());
+        let policy = PolicyConfig {
+            row_policies: vec![RowPolicy {
+                resource: resource.clone(),
+                path: FieldPath::new(["owner"]),
+                equals: ModelValue::Null,
+            }],
+            masking: vec![MaskingPolicy {
+                resource: resource.clone(),
+                paths: vec![FieldPath::new(["profile", "city"])],
+                replacement: ModelValue::Str("***".to_owned()),
+            }],
+            ..PolicyConfig::default()
+        };
+        let principal = Principal::new("alice").with_role("reader");
+        let expected = collection
+            .scan()?
+            .into_iter()
+            .filter(|(_, document)| policy.row_visible(&principal, &resource, document))
+            .map(|(id, document)| {
+                serde_json::json!({
+                    "id": super::document_id_to_hex(id),
+                    "document": super::model_value_to_json(&policy.mask_value(&resource, &document)),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 2);
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("reader").grant(resource, Permission::Read)
+        ]));
+        database
+            .set_principal_registry(PrincipalRegistry::new().with_principal("alice", principal));
+        database.set_policy_config(&policy)?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for offset in 0..=2 {
+            let (status, body) = get_as(
+                &app,
+                &format!("/data/collections/profiles/documents?offset={offset}&limit=1"),
+                "alice",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["data"]["documents"],
+                serde_json::json!(expected.iter().skip(offset).take(1).collect::<Vec<_>>())
+            );
+            assert_eq!(body["data"]["has_more"], offset == 0);
+            assert_eq!(
+                body["data"]["next_offset"],
+                if offset == 0 {
+                    serde_json::json!(1)
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(!body.to_string().contains("private-city"));
+        }
+        let (status, _) = get_as(&app, "/data/collections/profiles/documents", "nobody").await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_table_pages_refuse_policies_they_cannot_apply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig},
+            model::{FieldPath, Value as ModelValue},
+            query::{ColumnDef, ColumnType, TableSchema},
+        };
+
+        let mut database = admin_database()?;
+        database
+            .create_table("schemaless", None, Vec::new())?
+            .insert(vec![ModelValue::Str("private-value".to_owned())])?;
+        database
+            .create_table(
+                "typed",
+                Some(TableSchema::new(
+                    vec![ColumnDef::new("secret", ColumnType::Str, false)],
+                    0,
+                )),
+                Vec::new(),
+            )?
+            .insert(vec![ModelValue::Str("private-value".to_owned())])?;
+        database.set_policy_config(&PolicyConfig {
+            masking: vec![
+                MaskingPolicy {
+                    resource: Resource::Table("schemaless".to_owned()),
+                    paths: vec![FieldPath::new(["secret"])],
+                    replacement: ModelValue::Str("***".to_owned()),
+                },
+                MaskingPolicy {
+                    resource: Resource::Table("typed".to_owned()),
+                    paths: vec![FieldPath::new(["secret"])],
+                    replacement: ModelValue::Array(vec![ModelValue::Null]),
+                },
+            ],
+            ..PolicyConfig::default()
+        })?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for name in ["schemaless", "typed"] {
+            let (status, body) = get_as(&app, &format!("/data/tables/{name}/rows"), "root").await?;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert!(!body.to_string().contains("private-value"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_pages_fail_closed_when_policy_metadata_is_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = admin_database()?;
+        database.create_table("people", None, Vec::new())?;
+        database.create_collection(
+            "profiles",
+            crate::model::CollectionId::new(7),
+            vec![crate::query::DocField::document_id("id")],
+            Vec::new(),
+        )?;
+        crate::repl::propose_system(
+            &database,
+            crate::repl::Op::Put {
+                table: crate::extension::POLICIES_TABLE.to_owned(),
+                key: b"policy".to_vec(),
+                value: b"invalid policy bytes".to_vec(),
+            },
+        )?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for path in [
+            "/data/tables/people/rows",
+            "/data/collections/profiles/documents",
+        ] {
+            let (status, body) = get_as(&app, path, "root").await?;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert!(body["data"].is_null(), "{body}");
+        }
         Ok(())
     }
 

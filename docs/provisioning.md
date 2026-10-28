@@ -327,11 +327,15 @@ dry run: it never creates a file and never writes a database.
   `Unsupported`, so no CP cluster handle reaches provisioning.
 - **Surfaces.** `ProvisionEnvironment.surface` is `rust_api`, `cli`, `serve`
   or `control_plane`. `ProvisionEnvironment.encryption` is accepted on the
-  Rust API only, as a `LocalEnvelope` config; with an open database it must
-  equal the config the database was opened with. `ProvisionEnvironment.audit`
-  must equal the audit config of an open handle (`open_database_with_ops` does
-  not apply `OperationalConfig.security.audit`, so a different one would be
-  silently ignored). `ProvisionEnvironment.principal`, the principal that will
+  Rust API, CLI and serve surfaces, as a `LocalEnvelope` or file-key config;
+  with an open database it must equal the config the database was opened
+  with. CLI and `serve` select the file key with
+  `MULTIDB_ENCRYPTION_KEY_PATH`. The Control Plane accepts no new encryption
+  config and uses the already-open database. `ProvisionEnvironment.audit`
+  must equal the audit config of an open handle. The `open_*_with_ops` APIs
+  apply `OperationalConfig.security.audit` to the runtime handle while
+  preserving persisted roles, principals and the audit-enabled flag.
+  `ProvisionEnvironment.principal`, the principal that will
   apply the plan, is checked for `RBAC_SELF_LOCKOUT`.
 - **Options.** `ProvisionOptions` (`allow_weakening` and `allow_destructive`
   path sets, `allow_format_upgrade`, `unmanaged`) are per run and never stored
@@ -498,9 +502,9 @@ the change (`set_authz_policy_as`, `set_principal_registry_as`,
 | --- | --- |
 | `write_ack`, `conflict_resolution: none`, `strict_cross_domain_transactions`, `local_snapshot` and `strong_cp` domains | `trivially_satisfied`: one replica, redb `Durability::Immediate`, one replication mode |
 | `backup.enabled`, `backup.pitr` | `operator_managed` with the `multidb backup`, `verify` and `restore` runbook and the Warning `GUARANTEE_OPERATOR_MANAGED`, when requested; there is no scheduler |
-| `encryption.at_rest` | `enforced` on the Rust API with a `LocalEnvelope` config for a new database, or for an open database that is encrypted; otherwise `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): provisioning cannot encrypt or decrypt an existing database (`Database::reencrypt_existing_values` only rewrites the values of an encrypted database under its current key). So is a `ProvisionEnvironment.encryption` for a new database whose spec says `at_rest: false`, refused before anything is created |
+| `encryption.at_rest` | `enforced` for a new database with an explicit `ProvisionEnvironment.encryption` config on the Rust API, CLI or serve surface, or for an open database that is encrypted. CLI and `serve` obtain a file-key config from `MULTIDB_ENCRYPTION_KEY_PATH`; without a key config the guarantee is `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): provisioning cannot encrypt or decrypt an existing database (`Database::reencrypt_existing_values` only rewrites the values of an encrypted database under its current key). A new encrypted database whose spec says `at_rest: false` is also refused before anything is created |
 | `sensitive_data` | follows `encryption.at_rest`; the development audit key warns but never blocks it |
-| `audit.enabled` | `enforced` with a configured audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one, which is always the case on the CLI and `serve`. A plan with steps against an existing database whose newest audit event does not verify under the handle's key (a chain written with a configured key, planned through a handle that falls back to the development key, or the reverse) is `PROVISION_AUDIT_KEY_MISMATCH` (blocks), since the events the apply appends would break `verify_audit_chain`; a noop is not blocked, since it writes nothing. The check reads the whole audit log |
+| `audit.enabled` | `enforced` with a configured runtime audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one. The CLI and `multidb serve` currently have no audit-key selector and use the development key; embedders can pass `OperationalConfig.security.audit` when opening the database or `ProvisionEnvironment.audit` to `open_from_spec`. A plan with steps against an existing database whose newest audit event does not verify under the handle's key is `PROVISION_AUDIT_KEY_MISMATCH` (blocks), since the events the apply appends would break `verify_audit_chain`; a noop is not blocked, since it writes nothing. The check reads the whole audit log |
 | `cache` TTL and eviction, `event_log` append-only | `not_enforced`, the Warning `ROLE_CONSTRAINT_NOT_ENFORCED` |
 
 A guarantee the spec does not ask for is `not_requested`.
@@ -725,11 +729,12 @@ in-memory database (Rust API only).
    provisioning plan id is `ConfirmationRequired`.
 2. The database is created with `create_database_with_profile`: audit on,
    `ProvisionEnvironment.audit` as its audit key and anchor, and
-   `ProvisionEnvironment.encryption` (a `LocalEnvelope` config, Rust API only)
-   as its encryption. The new file holds no tables yet, so its keyring is
-   created at the configured path, or opened when one already exists there
-   (with the configured KEK). `create_*_with_ops` is never used on an
-   existing database, since it would overwrite its security state.
+   `ProvisionEnvironment.encryption` as its encryption. A `LocalEnvelope`
+   config creates its keyring at the configured path for the new database,
+   or opens an existing keyring with the configured KEK. A file-key config
+   requires an existing operator-provided key file; it never generates or
+   replaces a missing key. Existing targets use the open path and retain
+   their persisted security state.
 3. The plan is recomputed against the new database. Its steps must equal the
    confirmed ones minus `create_database` (kinds, paths, objects, safety
    classes and flags), otherwise the apply stops with a `plan_changed` report
@@ -750,6 +755,23 @@ open handle to see what remains.
 The CLI provisions as the local operator `local:cli` on the `cli` surface. It
 relies on filesystem trust, like `backup` and `restore`, and on redb's
 exclusive file lock: a database another process holds open is refused.
+
+For a spec with `guarantees.encryption.at_rest: true`, set
+`MULTIDB_ENCRYPTION_KEY_PATH` to an existing key file before planning or
+applying it. This selector is also used to probe and reopen encrypted
+databases for provisioning commands. The key file must contain 32 raw bytes
+or 64 hexadecimal characters (surrounding whitespace is allowed for hex).
+Provisioning does not generate this file. A missing, unreadable, malformed
+or incorrect key fails creation or opening rather than falling back to
+plaintext. Without a key config, the secure spec is blocked with
+`GUARANTEE_NOT_ENFORCEABLE`. The key path is runtime configuration and is not
+stored as a secret in the spec. For example, in PowerShell, using a key the
+operator has already provisioned:
+
+```powershell
+$env:MULTIDB_ENCRYPTION_KEY_PATH = "C:\multidb-keys\app.key"
+multidb config plan --spec .\multidb.yaml --db .\app.redb
+```
 
 | command | what it does |
 | --- | --- |
@@ -778,7 +800,8 @@ profile with neither is `PROVISION_STORAGE_PATH_REQUIRED`, and a volatile
 profile is `PROVISION_VOLATILE_ON_SURFACE`: the CLI builds durable databases
 only. The target is probed first: a missing or empty file is planned as
 absent and nothing is created by a dry run. An existing database is opened
-with `open_database_with_ops`, which loads its persisted RBAC state; only
+with `open_database_with_ops` and the selected encryption config, which loads
+its persisted RBAC state; only
 single-node CP databases are provisioned, so an AP database is refused with
 `PROVISION_REPLICATION_UNSUPPORTED` before it is opened.
 
@@ -824,8 +847,8 @@ converted version 1 spec says what to add before `config apply --spec`.
 - **A database that was not closed cleanly** (for example after `serve` was
   killed) first gets redb's crash recovery, which every opener runs; it is
   the only change a dry run can make to a file. A file that still cannot be
-  read, or a storage format the CLI cannot open (a legacy framed database
-  needs the Rust API), is reported with its reason (exit 1).
+  read, or a storage format the CLI cannot open, is reported with its reason
+  (exit 1).
 - **A partial apply** (exit 1) leaves the steps before the failed one
   applied and a `failed` record; `config plan` shows the remaining steps and
   `config status` the record and history.
@@ -852,14 +875,17 @@ container contract (variables, Helm values) is in
      the Helm chart does in spec mode) rather than unset it;
    - an explicit `MULTIDB_REPLICATION` (`cp` or `ap`, read in spec mode only)
      other than the spec `defaults.replication`;
-   - `guarantees.encryption.at_rest: true`: encryption at rest is provisioned
-     through the Rust API only;
+   - `guarantees.encryption.at_rest: true` without
+     `MULTIDB_ENCRYPTION_KEY_PATH`: the operator must select the existing key
+     file before starting. With a key, `serve` can create and reopen the
+     encrypted database; an unreadable, malformed or incorrect key fails the
+     start rather than opening plaintext;
    - a volatile profile.
 4. `open_from_spec` on the `serve` surface probes the database (a file left by
    a killed `serve` first gets redb's crash recovery, as with every opener),
-   opens an existing one with `open_database_with_ops`, which loads its
-   persisted RBAC state, plans the spec against it or against the absent
-   target and decides with `serve_startup_decision`:
+   opens an existing one with `open_database_with_ops` and the configured
+   encryption key, which loads its persisted RBAC state, plans the spec against
+   it or against the absent target and decides with `serve_startup_decision`:
 
 | target | `verify` | `create` | `additive` |
 | --- | --- | --- | --- |
@@ -891,28 +917,32 @@ provisioning applied survive any restart, with or without spec mode: every
 opener loads the persisted RBAC state, and the bootstrap only adds the
 reserved `admin` role and principal when they are missing.
 
-**Known limit:** audit is chained with the development key
-(`enforced_with_development_key` and `AUDIT_DEVELOPMENT_KEY`): `serve` has no
-audit key setting. A database whose audit chain was written with a configured
-key (on the Rust API) is refused with `PROVISION_AUDIT_KEY_MISMATCH` whenever
-a start would change it, and `serve` itself appends its admin events with the
-development key, so serve such a database only after deciding to give up its
-keyed chain.
+**Known limit:** `MULTIDB_ENCRYPTION_KEY_PATH` selects the data-encryption
+key, not an audit key. Audit in `multidb serve` still uses the development
+key (`enforced_with_development_key` and `AUDIT_DEVELOPMENT_KEY`), because
+the binary has no audit-key selector. A database whose audit chain uses an
+operator-configured key is refused with `PROVISION_AUDIT_KEY_MISMATCH` when
+a startup plan would change it. A noop can start, but subsequent admin audit
+events would use the development key. To preserve a keyed chain, serve
+through an embedder that opens the database with its matching runtime audit
+key and anchor; encryption alone does not configure them.
 
 **Embedded apps** use `open_from_spec(spec, path, mode, options, environment)`
 with the same decision table on the `rust_api` surface, as `local:embedded`.
 The target is `path`, else `deployment.storage_path` (relative to the working
 directory), else a new in-memory database, which is new at every open, so
 only `create` and `additive` build it. An existing database is opened with
-`ProvisionEnvironment.encryption` (a `LocalEnvelope` config); an encrypted
-one, whose metadata cannot be probed without the key, is opened with that
+`ProvisionEnvironment.encryption` (a `LocalEnvelope` or file-key config); an
+encrypted one, whose metadata cannot be probed without the key, is opened with that
 config and the storage profile of the spec, and the open checks both against
 the decrypted metadata. The open never creates a keyring for a file that
 already holds tables: when the keyring is missing (a path typo or an
 unmounted volume), every start mode fails and writes no keyring, since a new
-one could never decrypt the data. `ProvisionEnvironment.audit` is applied to the handle
-afterwards, because `open_database_with_ops` does not apply an audit config:
-the audit chain then stays on the caller's key across opens. An audit key file that cannot be read
+one could never decrypt the data. `ProvisionEnvironment.audit` supplies the
+runtime audit key and anchor, so the audit chain stays on the caller's key
+across opens. The `open_*_with_ops` APIs also honor
+`OperationalConfig.security.audit` without replacing persisted RBAC state.
+An audit key file that cannot be read
 or parsed fails the open. A refusal is `ProvisionError::StartupRefused` with
 a `StartupRefusal` (`mode`, `reason`, the `plan`, and the `applied` report of
 a startup apply that failed part-way); a start returns the database and a
@@ -995,9 +1025,13 @@ except for a query governor knob that `MULTIDB_MAX_CONCURRENT_QUERIES` or
 set, a retune of the other knob waits for the restart. The Control Plane never
 creates a database and never opens a path from a request: a spec
 `deployment.storage_path` is reported as the Advice
-`PROVISION_STORAGE_PATH_IGNORED`. Encryption at rest is not enforceable here
-(`GUARANTEE_NOT_ENFORCEABLE`), and audit is chained with the development key
-(`enforced_with_development_key`).
+`PROVISION_STORAGE_PATH_IGNORED`. The Control Plane cannot accept a new key
+config or encrypt a plaintext database in place. An already-encrypted served
+database reports `encryption.at_rest: enforced`; a plaintext one cannot
+enforce an `at_rest: true` spec (`PROVISION_ENCRYPTION_MISMATCH`). Audit uses
+the runtime configuration of the served handle: the `multidb serve` binary
+uses the development key (`enforced_with_development_key`), while an embedder
+can supply its audit key and anchor when opening the database.
 
 **Known limits:**
 
@@ -1022,7 +1056,7 @@ defaults above.
 | `game-save` | `saves.document_indexes: [{path: slot}]`; embedded with no `storage_path` (the app chooses; `init --apply` uses `<out dir>/<sanitized name>.redb`) | ready |
 | `desktop-embedded` | `documents.document_indexes: [{path: title}]`; `usage_metrics` `chunk_millis: 3600000`, `retention_millis: 2592000000` | ready |
 | `ai-memory` | `memories: {dim: 1536, metric: cosine}`; `facts.document_indexes: [{path: subject}]` | ready |
-| `secure-saas` | `tenants.document_indexes: [{path: tenant_id}]`; `encryption.at_rest: true` | blocked by `GUARANTEE_NOT_ENFORCEABLE` alone; ready on the Rust API with a `LocalEnvelope` key |
+| `secure-saas` | `tenants.document_indexes: [{path: tenant_id}]`; `encryption.at_rest: true` | ready with `MULTIDB_ENCRYPTION_KEY_PATH` pointing to an existing valid key file; without a key config, blocked by `GUARANTEE_NOT_ENFORCEABLE`. The Rust API also accepts `LocalEnvelope` |
 | `analytics` | `metrics.chunk_millis: 3600000`; `aggregates`: a typed columnar table (`id`, `bucket`, `metric` str, `value` float, primary key `id`) | ready |
 
 A vector `dim` and table columns are fixed at creation: edit them in the spec
@@ -1033,7 +1067,9 @@ indexes, a full-text and a geo index, a versioned ledger table, a vector
 collection and a columnar table in a `HighDurability` row-class database,
 with a managed role and principal. `scripts/templates-smoke.ps1` runs `init
 --apply`, `config drift` and a re-apply (a noop) for every template and
-checks that `secure-saas` exits 2.
+checks that `secure-saas` exits 2 when no encryption key is selected. To
+apply that template, provide the key selector described in the CLI section;
+the same selector enables its encrypted `serve` create/verify flow.
 
 ## The provision record
 

@@ -303,7 +303,7 @@ async fn phase21_workload_system_view_requires_rbac_and_records_queries()
 
     database.set_authz_policy(AuthzPolicy::new([Role::new("reader")
         .grant(Resource::Table("users".to_owned()), Permission::Read)
-        .grant(Resource::System, Permission::Read)]));
+        .grant(Resource::System, Permission::Admin)]));
     database
         .query_as(&reader, "SELECT name FROM users WHERE age = 37")
         .await?;

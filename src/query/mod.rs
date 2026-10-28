@@ -681,14 +681,7 @@ impl RelTable {
     /// A columnar table also fails with a conflict when other writers keep changing it.
     pub fn insert(&self, row: Row) -> Result<(), QueryError> {
         if self.layout == TableLayout::Columnar {
-            let primary_key = self.primary_key_value_for_row(&row)?;
-            return self.rewrite_columnar_rows(|rows| {
-                if row_with_primary_key(self.schema.as_ref(), rows, &primary_key).is_some() {
-                    return Err(QueryError::DuplicatePrimaryKey);
-                }
-                rows.push(row.clone());
-                Ok(true)
-            });
+            return self.append_columnar_rows(&[row]);
         }
 
         let row_key = self.row_key(&row)?;
@@ -912,6 +905,45 @@ impl RelTable {
 
         self.scan_with_keys()
             .map(|rows| rows.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Counts stored rows without decoding every row when segment metadata is available.
+    /// # Errors
+    /// Fails when storage, segment metadata, or a legacy segment cannot be read.
+    pub fn row_count(&self) -> Result<usize, QueryError> {
+        if self.layout == TableLayout::Columnar {
+            return self.columnar_segments_with_meta()?.into_iter().try_fold(
+                0_usize,
+                |count, (_, bytes, meta)| {
+                    let rows = match meta {
+                        Some(meta) => usize::try_from(meta.row_count).map_err(|_| {
+                            QueryError::ResourceLimit("table row count exceeds usize".to_owned())
+                        })?,
+                        None => self.decode_columnar_rows(Some(&bytes))?.len(),
+                    };
+                    count.checked_add(rows).ok_or_else(|| {
+                        QueryError::ResourceLimit("table row count exceeds usize".to_owned())
+                    })
+                },
+            );
+        }
+        let (start, end) = table_range_bounds(&self.name);
+        let mut count = 0_usize;
+        self.repl.scan_range_batches(
+            REL_ROWS_TABLE,
+            &start,
+            &end,
+            ReadConsistency::Strong,
+            COLUMNAR_SEGMENT_ROWS,
+            &|| false,
+            &mut |batch| {
+                count = count.checked_add(batch.len()).ok_or_else(|| {
+                    ReplError::Unsupported("table row count exceeds usize".to_owned())
+                })?;
+                Ok(true)
+            },
+        )?;
+        Ok(count)
     }
 
     /// Scans a bounded page of rows in primary-key order.
@@ -1183,6 +1215,7 @@ impl RelTable {
                 }
             }
         }
+        let rows = self.sorted_columnar_rows(rows)?;
         Ok(RelQueryResult {
             plan: RelPlanKind::FullScan,
             examined_rows,
@@ -1349,14 +1382,8 @@ impl RelTable {
     }
 
     fn columnar_insert_ops(&self, row: Row) -> Result<Vec<Op>, QueryError> {
-        let primary_key = self.primary_key_value_for_row(&row)?;
-        let mut rows = self.columnar_rows()?;
-        if row_with_primary_key(self.schema.as_ref(), &rows, &primary_key).is_some() {
-            return Err(QueryError::DuplicatePrimaryKey);
-        }
-
-        rows.push(row);
-        self.columnar_replace_ops_from_rows(rows)
+        let segments = self.columnar_segments()?;
+        self.columnar_append_ops(&segments, &[row])
     }
 
     fn columnar_update_ops(&self, row: Row) -> Result<Vec<Op>, QueryError> {
@@ -1413,7 +1440,167 @@ impl RelTable {
         for (_, bytes) in segments {
             rows.extend(self.decode_columnar_rows(Some(bytes))?);
         }
-        Ok(rows)
+        self.sorted_columnar_rows(rows)
+    }
+
+    fn sorted_columnar_rows(&self, rows: Vec<Row>) -> Result<Vec<Row>, QueryError> {
+        let mut keyed_rows = rows
+            .into_iter()
+            .map(|row| self.row_key(&row).map(|key| (key, row)))
+            .collect::<Result<Vec<_>, _>>()?;
+        keyed_rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(keyed_rows.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Appends without re-encoding closed segments. Existing rows are still read to
+    /// enforce primary-key uniqueness; only a partial tail and new chunks are written.
+    pub(crate) fn columnar_append_ops(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: &[Row],
+    ) -> Result<Vec<Op>, QueryError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut keys = BTreeSet::new();
+        for existing in self.decode_columnar_segments(segments)? {
+            keys.insert(self.row_key(&existing)?);
+        }
+        for row in rows {
+            if !keys.insert(self.row_key(row)?) {
+                return Err(QueryError::DuplicatePrimaryKey);
+            }
+        }
+
+        let mut pending = rows.to_vec();
+        let mut next_id = 0;
+        let mut ops = Vec::new();
+        if let Some((key, bytes)) = segments.last() {
+            let id = columnar_segment_id(&self.name, key).ok_or_else(|| {
+                QueryError::Storage(StorageError::Corruption(
+                    "invalid columnar segment key".to_owned(),
+                ))
+            })?;
+            let mut tail = self.decode_columnar_rows(Some(bytes))?;
+            if tail.len() < COLUMNAR_SEGMENT_ROWS {
+                tail.extend(pending);
+                pending = tail;
+                next_id = id;
+            } else {
+                next_id = id.checked_add(1).ok_or_else(|| {
+                    QueryError::ResourceLimit("columnar segment ids exhausted".to_owned())
+                })?;
+                // Keep a shared write-version conflict marker for snapshot transactions.
+                // This also preserves an immutable tiered pointer without modifying its object.
+                ops.push(Op::Put {
+                    table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                    key: key.clone(),
+                    value: bytes.clone(),
+                });
+            }
+        }
+        let pending = self.sorted_columnar_rows(pending)?;
+        for chunk in pending.chunks(COLUMNAR_SEGMENT_ROWS) {
+            let key = columnar_segment_key(&self.name, next_id);
+            let value = rows_to_parquet_bytes(self.required_schema()?, chunk)?;
+            let meta = columnar_segment_meta(
+                &self.name,
+                next_id,
+                self.required_schema()?,
+                chunk,
+                value.len(),
+            );
+            ops.push(Op::Put {
+                table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                key: key.clone(),
+                value,
+            });
+            ops.push(Op::Put {
+                table: REL_COLUMNAR_SEGMENT_META_TABLE.to_owned(),
+                key,
+                value: serde_json::to_vec(&meta)
+                    .map_err(|error| QueryError::Serde(error.to_string()))?,
+            });
+            next_id = next_id.checked_add(1).ok_or_else(|| {
+                QueryError::ResourceLimit("columnar segment ids exhausted".to_owned())
+            })?;
+        }
+        Ok(ops)
+    }
+
+    fn columnar_append_batch(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: &[Row],
+    ) -> Result<ConditionalBatch, QueryError> {
+        let ops = self.columnar_append_ops(segments, rows)?;
+        let mut conditions = segments
+            .iter()
+            .map(|(key, bytes)| {
+                (
+                    key.clone(),
+                    WriteCondition::ValueEquals {
+                        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                        key: key.clone(),
+                        expected: Some(bytes.clone()),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for op in &ops {
+            if let Op::Put { table, key, .. } = op
+                && table == REL_COLUMNAR_SEGMENTS_TABLE
+            {
+                conditions
+                    .entry(key.clone())
+                    .or_insert(WriteCondition::KeyMissing {
+                        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                        key: key.clone(),
+                    });
+            }
+        }
+        let next_id = segments
+            .last()
+            .and_then(|(key, _)| columnar_segment_id(&self.name, key))
+            .map_or(Some(0), |id| id.checked_add(1))
+            .ok_or_else(|| {
+                QueryError::ResourceLimit("columnar segment ids exhausted".to_owned())
+            })?;
+        let key = columnar_segment_key(&self.name, next_id);
+        conditions
+            .entry(key.clone())
+            .or_insert(WriteCondition::KeyMissing {
+                table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                key,
+            });
+        Ok(ConditionalBatch::new(
+            conditions.into_values().collect(),
+            ops,
+        ))
+    }
+
+    fn append_columnar_rows(&self, rows: &[Row]) -> Result<(), QueryError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..=WRITE_CONFLICT_RETRIES {
+            let segments = self.columnar_segments()?;
+            let batch = self.columnar_append_batch(&segments, rows)?;
+            match self.repl.propose_conditional_batch(batch) {
+                Ok(()) => return Ok(()),
+                Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
+                    thread::yield_now();
+                }
+                Err(ReplError::Unsupported(_)) => {
+                    let segments = self.columnar_segments()?;
+                    self.repl
+                        .propose_batch(self.columnar_append_ops(&segments, rows)?)?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(QueryError::Repl(ReplError::Conflict))
     }
 
     /// Rewrites the columnar rows with `change`, applied to the rows currently stored.
@@ -2053,6 +2240,87 @@ impl SqlEngine {
         }
 
         last.ok_or_else(|| QueryError::Unsupported("empty SQL".to_owned()))
+    }
+
+    /// Plans one statement and returns its output schema without scanning data or writing.
+    /// The caller must check write/admin requirements separately, as for execution.
+    /// # Errors
+    /// Fails when SQL is unsupported, cannot be planned, or the guard denies a read.
+    pub(crate) async fn describe_with_read_guard(
+        &self,
+        sql: &str,
+        guard: &mut dyn SqlReadGuard,
+    ) -> Result<Option<SchemaRef>, QueryError> {
+        let statements = parse_with_limits(sql, &self.performance.query)?;
+        let [statement] = statements.as_slice() else {
+            return Err(QueryError::Unsupported(
+                "Describe requires exactly one SQL statement".to_owned(),
+            ));
+        };
+        let policies = guard.relation_policies();
+        let select_sql = match statement {
+            Statement::Query(_) => statement.to_string(),
+            Statement::Insert(insert) => {
+                let Some(returning) = &insert.returning else {
+                    return Ok(None);
+                };
+                let name = match &insert.table {
+                    SqlTableObject::TableName(name) => name,
+                    other => return Err(QueryError::Unsupported(other.to_string())),
+                };
+                let table = object_name_to_string(name)?;
+                if policies.contains_key(&table) {
+                    return Err(QueryError::Unsupported(format!(
+                        "INSERT ... RETURNING into {table} is unsupported while it has row or masking policies"
+                    )));
+                }
+                // RETURNING supports stored columns and aliases, not arbitrary expressions.
+                let relation = self
+                    .tables
+                    .get(&table)
+                    .ok_or_else(|| QueryError::MissingTable(table.clone()))?;
+                returning_rows(relation.schema.as_ref(), returning, &[])?;
+                let projection = returning
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("SELECT {projection} FROM {name}")
+            }
+            Statement::Explain { statement, .. } => {
+                let simple = self
+                    .simple_select_plan(&statement.to_string())?
+                    .ok_or_else(explain_unsupported)?;
+                if policies.contains_key(&simple.table) {
+                    return Err(QueryError::Unsupported(format!(
+                        "EXPLAIN over {} is unsupported while it has row or masking policies",
+                        simple.table
+                    )));
+                }
+                guard
+                    .authorize_reads(&BTreeSet::from([SqlReadTarget::Catalog(simple.table)]))
+                    .map_err(QueryError::AuthzDenied)?;
+                return Ok(Some(Arc::new(Schema::new(vec![
+                    Field::new("operator", DataType::Utf8, false),
+                    Field::new("access_path", DataType::Utf8, false),
+                    Field::new("est_rows", DataType::Int64, false),
+                    Field::new("actual_rows", DataType::Int64, true),
+                    Field::new("cost", DataType::Float64, false),
+                    Field::new("actual_ms", DataType::Float64, true),
+                    Field::new("details", DataType::Utf8, false),
+                ]))));
+            }
+            // These commands have no normal row description on the wire. Their
+            // write/admin checks are the Database caller's responsibility.
+            Statement::Analyze(_) => return Ok(None),
+            other => return Err(QueryError::Unsupported(other.to_string())),
+        };
+        let (ctx, providers) = self.datafusion_catalog_context(&policies)?;
+        let plan = self.plan_datafusion_select(&ctx, &select_sql).await?;
+        guard
+            .authorize_reads(&planned_read_targets(&plan, &providers)?)
+            .map_err(QueryError::AuthzDenied)?;
+        Ok(Some(Arc::clone(plan.schema().inner())))
     }
 
     /// Plans one statement without running it. Returns the relations it reads,
@@ -4503,6 +4771,10 @@ fn apply_columnar_insert_rows_atomic(
     rows: &[Row],
     insert: &sqlparser::ast::Insert,
 ) -> Result<Vec<Row>, QueryError> {
+    if insert.on.is_none() {
+        table.append_columnar_rows(rows)?;
+        return Ok(rows.to_vec());
+    }
     let mut affected = Vec::new();
     table.rewrite_columnar_rows(|current| {
         affected.clear();

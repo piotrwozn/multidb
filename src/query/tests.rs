@@ -306,6 +306,164 @@ fn columnar_rewrite_conflicts_when_segments_change_after_the_read()
 }
 
 #[test]
+fn columnar_append_keeps_closed_segments_and_primary_key_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    let original = (0..2_500).map(row).collect::<Vec<_>>();
+    repl.propose_batch(table.columnar_replace_ops(original)?)?;
+    let before = table.columnar_segments()?;
+    assert_eq!(before.len(), 3);
+
+    let ops = table.columnar_append_ops(&before, &[row(-1)])?;
+    assert_eq!(
+        ops.len(),
+        2,
+        "only the partial tail and its metadata are written"
+    );
+    table.insert(row(-1))?;
+    let after = table.columnar_segments()?;
+    assert_eq!(
+        &after[..2],
+        &before[..2],
+        "closed Parquet segments must stay byte-for-byte unchanged"
+    );
+    assert_ne!(after[2], before[2]);
+    assert_eq!(table.scan()?, (-1..2_500).map(row).collect::<Vec<_>>());
+    assert_eq!(table.row_count()?, 2_501);
+    assert_eq!(table.scan_page(0, 2)?, vec![row(-1), row(0)]);
+    assert!(matches!(
+        table.insert(row(1_500)),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    assert_eq!(
+        table.columnar_segments()?,
+        after,
+        "a rejected duplicate must write nothing"
+    );
+
+    // Missing metadata in older/raw-written databases still counts correctly.
+    repl.propose(Op::Delete {
+        table: super::REL_COLUMNAR_SEGMENT_META_TABLE.to_owned(),
+        key: after[1].0.clone(),
+    })?;
+    assert_eq!(table.row_count()?, 2_501);
+    Ok(())
+}
+
+#[test]
+fn columnar_append_rejects_stale_batches_and_batch_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    repl.propose_batch(table.columnar_replace_ops((0..1_024).map(row).collect())?)?;
+    let before = table.columnar_segments()?;
+    let stale = table.columnar_append_batch(&before, &[row(2_000)])?;
+    table.insert(row(2_001))?;
+    assert!(matches!(
+        repl.propose_conditional_batch(stale),
+        Err(ReplError::Conflict)
+    ));
+    assert_eq!(table.get(&Value::Int(2_000))?, None);
+    assert_eq!(table.get(&Value::Int(2_001))?, Some(row(2_001)));
+    assert_eq!(table.columnar_segments()?[0], before[0]);
+
+    let before_duplicate = table.columnar_segments()?;
+    assert!(matches!(
+        table.append_columnar_rows(&[row(3_000), row(3_000)]),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    assert_eq!(table.columnar_segments()?, before_duplicate);
+    Ok(())
+}
+
+#[tokio::test]
+async fn columnar_sql_insert_appends_without_rewriting_closed_segments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let mut engine = SqlEngine::with_layout(repl.clone(), TableLayout::Columnar);
+    engine.create_table("statuses", Some(status_schema()), Vec::new())?;
+    let table = engine.table("statuses").ok_or("missing statuses")?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    repl.propose_batch(table.columnar_replace_ops((0..2_048).map(row).collect())?)?;
+    let before = table.columnar_segments()?;
+    engine
+        .execute("INSERT INTO statuses VALUES (-1, 'early'), (3000, 'late')")
+        .await?;
+    let after = table.columnar_segments()?;
+    assert_eq!(&after[..2], before.as_slice());
+    assert_eq!(after.len(), 3);
+    assert_eq!(table.row_count()?, 2_050);
+    assert_eq!(table.scan_page(0, 1)?[0][0], Value::Int(-1));
+    assert!(matches!(
+        engine
+            .execute("INSERT INTO statuses VALUES (4000, 'new'), (2, 'duplicate')")
+            .await,
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    assert_eq!(table.get(&Value::Int(4_000))?, None);
+    assert_eq!(table.columnar_segments()?, after);
+    Ok(())
+}
+
+#[test]
+fn columnar_append_keeps_tiered_segments_immutable_and_counts_without_downloading()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::cloud::{ObjectStoreConfig, TieredSegmentPointer, encode_tiered_segment_pointer};
+
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    repl.propose_batch(table.columnar_replace_ops((0..2_048).map(row).collect())?)?;
+    let before = table.columnar_segments()?;
+    let objects = tempfile::tempdir()?;
+    let object_path = objects.path().join("closed.parquet");
+    std::fs::write(&object_path, &before[0].1)?;
+    let pointer = encode_tiered_segment_pointer(&TieredSegmentPointer {
+        uri: ObjectStoreConfig::local_dir(objects.path()).uri,
+        path: "closed.parquet".to_owned(),
+        bytes: u64::try_from(before[0].1.len())?,
+        checksum: crc32fast::hash(&before[0].1),
+    })?;
+    repl.propose(Op::Put {
+        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+        key: before[0].0.clone(),
+        value: pointer.clone(),
+    })?;
+    table.insert(row(-1))?;
+    assert_eq!(table.columnar_segments()?[0].1, pointer);
+    assert_eq!(std::fs::read(&object_path)?, before[0].1);
+    assert_eq!(table.row_count()?, 2_049);
+
+    // Catalog counts use the paired row-count metadata even if the object store
+    // is unavailable; actual data reads must still fail rather than invent rows.
+    std::fs::remove_file(object_path)?;
+    assert_eq!(table.row_count()?, 2_049);
+    assert!(table.scan().is_err());
+    Ok(())
+}
+
+#[test]
 fn columnar_zone_map_skips_segments_for_simple_filter() -> Result<(), Box<dyn std::error::Error>> {
     let repl = memory_repl()?;
     let table = RelTable::create_with_layout(
@@ -1436,6 +1594,7 @@ struct RecordingReadGuard {
     allow_all: bool,
     allowed: BTreeSet<SqlReadTarget>,
     seen: BTreeSet<SqlReadTarget>,
+    policies: BTreeMap<String, super::SqlRelationPolicy>,
 }
 
 impl RecordingReadGuard {
@@ -1458,6 +1617,10 @@ impl RecordingReadGuard {
 }
 
 impl SqlReadGuard for RecordingReadGuard {
+    fn relation_policies(&self) -> BTreeMap<String, super::SqlRelationPolicy> {
+        self.policies.clone()
+    }
+
     fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError> {
         self.seen.extend(reads.iter().cloned());
         for read in reads {
@@ -1484,6 +1647,60 @@ async fn guarded_engine() -> Result<SqlEngine, Box<dyn std::error::Error>> {
         .execute("insert into secrets (id, name, age, active) values (1, 'TOPSECRET', 1, true)")
         .await?;
     Ok(engine)
+}
+
+#[tokio::test]
+async fn describe_checks_all_reads_without_executing_or_writing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    for sql in [
+        "select * from secrets where id = $1",
+        "select name from public_t order by (select count(*) from secrets)",
+    ] {
+        assert!(
+            matches!(
+                engine.describe_with_read_guard(sql, &mut guard).await,
+                Err(QueryError::AuthzDenied(_))
+            ),
+            "{sql}"
+        );
+    }
+    let mut guard = RecordingReadGuard::allowing_all();
+    // The stored row's age is 1: executing this expression would divide by zero.
+    let schema = engine
+        .describe_with_read_guard("select 10 / (age - 1) as quotient from secrets", &mut guard)
+        .await?
+        .ok_or("missing SELECT schema")?;
+    assert_eq!(schema.field(0).name(), "quotient");
+    assert_eq!(
+        schema.field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Int64
+    );
+    let schema = engine.describe_with_read_guard(
+        "insert into secrets (id, name, age, active) values (2, 'new', 2, true) returning id, name as n",
+        &mut guard).await?.ok_or("missing RETURNING schema")?;
+    assert_eq!(schema.field(1).name(), "n");
+    guard.policies.insert(
+        "secrets".to_owned(),
+        super::SqlRelationPolicy {
+            masks: vec![(FieldPath::new(["age"]), Value::Str("hidden".to_owned()))],
+            ..super::SqlRelationPolicy::default()
+        },
+    );
+    let schema = engine
+        .describe_with_read_guard("select age from secrets", &mut guard)
+        .await?
+        .ok_or("missing masked schema")?;
+    assert_eq!(
+        schema.field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Utf8
+    );
+    let SqlOutput::Rows(rows) = engine.execute("select id from secrets").await? else {
+        return Err("missing rows".into());
+    };
+    assert_eq!(rows.rows, vec![vec![Value::Int(1)]]);
+    Ok(())
 }
 
 #[tokio::test]

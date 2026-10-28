@@ -21,8 +21,8 @@ use crate::{
     },
     db::{
         ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode,
-        PersistedProfileManifest, Profile, create_restore_target, decode_profile_manifest,
-        unmet_profile_floors, validate_manifest,
+        PersistedProfileManifest, Profile, ReplicationKind, create_restore_target,
+        decode_profile_manifest, unmet_profile_floors, validate_manifest,
     },
     fileio,
     model::{DOCUMENT_TABLE, INDEX_TABLE},
@@ -38,7 +38,7 @@ use crate::{
     security::AUDIT_TABLE,
     storage::{
         Bytes, ConfiguredKeyProvider, KeyProvider, ReadTransaction, StorageEngine, StorageError,
-        WriteTransaction,
+        WriteTransaction, decode_stored_value,
     },
     txn::{self, CommitLogRecord, MvccRecord, TxnId},
     vector::VECTOR_TABLE,
@@ -504,12 +504,13 @@ pub fn restore_backup_with_config(
     }
 
     let backup_keys = restore_key_provider(restore_config)?;
-    let target_lsn = resolve_target_lsn(&chain, &target, backup_keys.as_ref())?;
     let full_payload = read_backup_payload::<BackupDataPayload>(
         &chain[0].path,
         required_file(&chain[0].manifest, FULL_DATA_FILE)?,
         backup_keys.as_ref(),
     )?;
+    ensure_restore_replication_supported(&chain, &full_payload, &target)?;
+    let target_lsn = resolve_target_lsn(&chain, &target, backup_keys.as_ref())?;
     let audit_flag =
         check_incremental_payloads(&chain, backup_keys.as_ref(), &full_payload, target_lsn)?;
     let manifest = restore_target_manifest(&config, &full_payload)?;
@@ -1240,6 +1241,42 @@ fn resolve_target_lsn(
     }
 }
 
+/// Old manifests did not record replication capabilities. Read the persisted database
+/// metadata from the full payload too, so legacy AP backups cannot claim a later PITR.
+fn ensure_restore_replication_supported(
+    chain: &[ChainItem],
+    payload: &BackupDataPayload,
+    target: &RestoreTarget,
+) -> Result<(), BackupError> {
+    let Some(record) = payload
+        .records
+        .iter()
+        .find(|record| record.table == META_TABLE && record.key == b"replication")
+    else {
+        return Ok(());
+    };
+    let replication: ReplicationKind = serde_json::from_slice(&decode_stored_value(&record.value)?)
+        .map_err(|error| {
+            BackupError::Corruption(format!("invalid replication metadata: {error}"))
+        })?;
+    if replication != ReplicationKind::Ap {
+        return Ok(());
+    }
+    let first = chain
+        .first()
+        .ok_or_else(|| BackupError::Corruption("backup chain is empty".to_owned()))?;
+    if chain.len() > 1
+        || matches!(target, RestoreTarget::Time(time) if *time > first.manifest.taken_at)
+    {
+        return Err(BackupError::Unsupported(
+            "AP backups contain only a full snapshot, not commit history; restore Latest or \
+             the full snapshot LSN instead of a later point in time"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn target_lsn_for_time(
     chain: &[ChainItem],
     time: SystemTime,
@@ -1601,6 +1638,26 @@ mod tests {
             Err(BackupError::Unsupported(_))
         ));
         assert_eq!(list_backups(&root)?.len(), 1);
+
+        // This applies to legacy backups as well: no new manifest field is needed,
+        // because the full payload already carries the AP replication metadata.
+        let later_target = temp.path().join("ap-later-restore.redb");
+        assert!(matches!(
+            restore_backup(
+                &full.path,
+                DbConfig::on_disk(Profile::Balanced, &later_target),
+                RestoreTarget::Time(full.manifest.taken_at + Duration::from_secs(1)),
+            ),
+            Err(BackupError::Unsupported(_))
+        ));
+        assert!(!later_target.exists());
+        let snapshot_target = temp.path().join("ap-snapshot-restore.redb");
+        let restored = restore_backup(
+            &full.path,
+            DbConfig::on_disk(Profile::Balanced, &snapshot_target),
+            RestoreTarget::Latest,
+        )?;
+        assert_eq!(restored.restored_lsn, full.manifest.end_lsn);
         Ok(())
     }
 

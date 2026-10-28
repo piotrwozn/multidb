@@ -99,9 +99,12 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod changefeed_policy;
 mod history;
+mod lifecycle;
 mod profile_binding;
 mod provisioning;
+mod review_fixes;
 mod runtime;
 
 pub(crate) use profile_binding::{
@@ -110,7 +113,8 @@ pub(crate) use profile_binding::{
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
-    create_database_with_profile, inspect_database_metadata, recover_database_file,
+    create_database_with_profile, inspect_database_metadata,
+    inspect_database_metadata_with_encryption, recover_database_file,
 };
 use runtime::wasm_runtime_for_database;
 
@@ -833,8 +837,8 @@ impl DatabaseRepl {
         }
     }
 
-    const fn is_ap(&self) -> bool {
-        matches!(self, Self::ApDynamo(_))
+    fn is_ap(&self) -> bool {
+        !self.replication_ref().supports_commit_log()
     }
 
     const fn is_sharded(&self) -> bool {
@@ -978,6 +982,10 @@ impl HealingBackend for DatabaseHealingBackend {
 }
 
 impl Replication for DatabaseRepl {
+    fn supports_commit_log(&self) -> bool {
+        self.replication_ref().supports_commit_log()
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         let result = self.replication_ref().propose(op);
         observability::record_replication_operation(
@@ -1160,7 +1168,7 @@ impl Database {
         self.repl.propose_conditional_batch(batch)
     }
 
-    pub(crate) const fn uses_ap_replication(&self) -> bool {
+    pub(crate) fn uses_ap_replication(&self) -> bool {
         self.repl.is_ap()
     }
 
@@ -2501,7 +2509,7 @@ impl Database {
         Ok(self.workload.report(self.replication_ref(), window)?)
     }
 
-    /// Reads workload profile after checking system read permission.
+    /// Reads workload profile after checking system admin permission.
     /// # Errors
     /// Fails when authorization or workload metadata reads fail.
     pub fn workload_report_as(
@@ -2512,7 +2520,7 @@ impl Database {
         self.authorize_or_audit(
             principal,
             &Resource::System,
-            Permission::Read,
+            Permission::Admin,
             "workload_report",
         )?;
         self.workload_report(window)
@@ -3080,6 +3088,7 @@ impl Database {
         token: ResumeToken,
     ) -> Result<SubscriptionState, DbError> {
         let state = cdc::subscription_state(self.replication_ref(), name)?;
+        cdc::require_subscription_owner(&state, principal)?;
         cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
         Ok(cdc::ack_subscription(self.replication_ref(), name, token)?)
     }
@@ -3093,6 +3102,7 @@ impl Database {
         name: &str,
     ) -> Result<SubscriptionState, DbError> {
         let state = cdc::subscription_state(self.replication_ref(), name)?;
+        cdc::require_subscription_owner(&state, principal)?;
         cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
         Ok(state)
     }
@@ -3119,7 +3129,13 @@ impl Database {
         spec: &ContinuousQuerySpec,
     ) -> Result<ContinuousQueryState, DbError> {
         cdc::authorize_filter_access(&self.authz, principal, &spec.filter)?;
-        let state = self.create_continuous_query(spec)?;
+        self.ensure_commit_log_available("continuous queries")?;
+        let state = continuous::create_continuous_query_as(
+            self.replication_ref(),
+            &self.authz,
+            principal,
+            spec,
+        )?;
         self.record_audit(&AuditEvent::new(
             Some(principal),
             "create_continuous_query",
@@ -3153,6 +3169,7 @@ impl Database {
         token: ResumeToken,
     ) -> Result<ContinuousQueryState, DbError> {
         let state = cdc::subscription_state(self.replication_ref(), name)?;
+        cdc::require_subscription_owner(&state, principal)?;
         cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
         self.ack_continuous_query(name, token)
     }
@@ -3237,6 +3254,20 @@ impl Database {
             Permission::Admin,
             "create_materialized_view",
         )?;
+        let source = Resource::Table(spec.source_table.clone());
+        self.authorize_or_audit(
+            principal,
+            &source,
+            Permission::Read,
+            "create_materialized_view",
+        )?;
+        if policy_has_row_or_masking(&self.policy_config()?, &source) {
+            return Err(ExtensionError::PolicyDenied(
+                "materialized views over policy-protected sources cannot be created as a principal"
+                    .to_owned(),
+            )
+            .into());
+        }
         let rows = self.create_materialized_view_object(spec)?;
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3921,6 +3952,7 @@ impl Database {
             principal,
             action,
             policies: sql_relation_policies(&self.catalog, &policy, principal),
+            protected_views: review_fixes::protected_materialized_views(&self.catalog, &policy),
         })
     }
 
@@ -3964,6 +3996,12 @@ impl Database {
         policy: &PolicyConfig,
         mut event: ChangeEvent,
     ) -> Result<Option<ChangeEvent>, DbError> {
+        if !self.index_changefeed_event_visible_to(principal, policy, &event) {
+            return Ok(None);
+        }
+        if !self.primary_key_changefeed_event_visible(policy, &event)? {
+            return Ok(None);
+        }
         let Some(resource) = resource_for_changefeed_target(&event.target) else {
             return Ok(Some(event));
         };
@@ -3971,8 +4009,10 @@ impl Database {
             return Ok(Some(event));
         }
 
+        // Delete records carry no old row. Its visibility and masked primary
+        // key cannot be reconstructed safely, so protected feeds omit it.
         let ChangeOp::Upsert { value_after, key } = event.op else {
-            return Ok(Some(event));
+            return Ok(None);
         };
 
         let masked = match &event.target {
@@ -5075,19 +5115,8 @@ impl MultiModelTxn<'_> {
     pub fn insert_row(&mut self, table: &str, row: Row) -> Result<(), DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            let primary_key = table.primary_key_value_for_row(&row)?;
             let segments = self.columnar_segments(&table)?;
-            let mut rows = Self::columnar_rows(&table, &segments)?;
-            if rows.iter().any(|existing| {
-                table
-                    .primary_key_value_for_row(existing)
-                    .is_ok_and(|key| key == primary_key)
-            }) {
-                return Err(QueryError::DuplicatePrimaryKey.into());
-            }
-
-            rows.push(row);
-            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
+            self.queue_ops(table.columnar_append_ops(&segments, &[row])?);
             return Ok(());
         }
 
@@ -5904,6 +5933,10 @@ impl WritePipeline {
 }
 
 impl Replication for WritePipeline {
+    fn supports_commit_log(&self) -> bool {
+        self.backend.supports_commit_log()
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -6202,6 +6235,10 @@ impl Drop for Database {
 }
 
 impl Replication for Database {
+    fn supports_commit_log(&self) -> bool {
+        self.repl.supports_commit_log()
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -6392,9 +6429,8 @@ pub fn create_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
+    database.initialize_security_if_missing(ops.security)?;
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
@@ -6415,7 +6451,8 @@ pub fn open_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    let mut security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
@@ -6623,9 +6660,8 @@ pub fn create_ap_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
+    database.initialize_security_if_missing(ops.security)?;
     Ok(database)
 }
 
@@ -6646,7 +6682,8 @@ pub fn open_ap_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    let mut security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
     Ok(database)
@@ -6714,9 +6751,8 @@ pub fn create_sharded_database_with_ops(
     }
 
     let mut database = create_sharded_database(config, sharding)?;
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
+    database.initialize_security_if_missing(ops.security)?;
     Ok(database)
 }
 
@@ -6735,7 +6771,8 @@ pub fn open_sharded_database_with_ops(
     }
 
     let mut database = open_sharded_database(config, sharding)?;
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    let mut security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
     Ok(database)
@@ -7229,6 +7266,7 @@ struct SqlReadAuthorizer<'a> {
     principal: &'a Principal,
     action: &'static str,
     policies: BTreeMap<String, SqlRelationPolicy>,
+    protected_views: BTreeSet<String>,
 }
 
 impl SqlReadGuard for SqlReadAuthorizer<'_> {
@@ -7247,6 +7285,15 @@ impl SqlReadGuard for SqlReadAuthorizer<'_> {
                 .collect()
         };
         for resource in resources {
+            if let Resource::Table(name) = &resource
+                && self.protected_views.contains(name)
+            {
+                return Err(AuthzError::Denied {
+                    principal: self.principal.name().to_owned(),
+                    resource,
+                    permission: Permission::Read,
+                });
+            }
             self.database.authorize_with_audit(
                 self.principal,
                 &resource,
@@ -7346,7 +7393,7 @@ fn sql_requirements(
     }
 
     if tuning::parse_system_view(sql)?.is_some() {
-        return Ok(vec![(Resource::System, Permission::Read)]);
+        return Ok(vec![(Resource::System, Permission::Admin)]);
     }
 
     if let Some((target, _)) = crate::query::parse_analyze_for_authz(sql)? {

@@ -29,9 +29,9 @@ use crate::config_spec::{
     impact_none, knob_definition, low_risk_impact, medium_impact, merge_impact, spec_digest,
 };
 use crate::db::{
-    AuditConfig, CatalogEntry, Database, EncryptionConfig, EncryptionMode, MetadataProbe,
-    PersistedProfileManifest, Profile, QueryGovernorOverrides, ReplicationKind, SCHEMA_VERSION,
-    SCHEMA_VERSION_FRAMED, inspect_database_metadata, performance_for_manifest,
+    AuditConfig, CatalogEntry, Database, EncryptionConfig, MetadataProbe, PersistedProfileManifest,
+    Profile, QueryGovernorOverrides, ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED,
+    inspect_database_metadata, performance_for_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{CollectionId, IndexSpec};
@@ -102,8 +102,9 @@ pub struct ProvisionOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionEnvironment {
     pub surface: ProvisionSurface,
-    /// Encryption for a new database: Rust API only, `EncryptionMode::LocalEnvelope` only. With
-    /// an open database it must equal the config the database was opened with.
+    /// Encryption for a new database on the Rust API, CLI or serve surface. With an open
+    /// database it must equal the config the database was opened with. File-key configs
+    /// require an existing operator-provided key; provisioning never generates one.
     pub encryption: Option<EncryptionConfig>,
     /// The audit key and anchor of a new database. With an open database it must equal the
     /// audit config of the handle.
@@ -375,7 +376,7 @@ pub struct ProvisionPlan {
 /// # Errors
 /// Fails with `AlreadyInitialized` when a `Path` target already holds a database, `Locked` when
 /// another handle holds it, `Io` when it cannot be probed, `Config(Unsupported)` when the
-/// environment is not accepted (encryption outside the Rust API or not `LocalEnvelope`, or an
+/// environment is not accepted (encryption on the Control Plane surface, or an
 /// encryption or audit config that differs from the open database's) or the open database is
 /// not single-node, and `Db` when the live state cannot be read.
 pub fn plan_provision(
@@ -497,16 +498,10 @@ fn check_environment(
         )))
     };
     if let Some(encryption) = &env.encryption {
-        if env.surface != ProvisionSurface::RustApi {
+        if env.surface == ProvisionSurface::ControlPlane {
             return unsupported(
-                "ProvisionEnvironment.encryption is accepted on the rust_api surface only; the \
-                 CLI, serve and the Control Plane cannot encrypt a database in this build",
-            );
-        }
-        if encryption.mode == EncryptionMode::LegacyFile {
-            return unsupported(
-                "provisioned databases refuse LegacyFile encryption; use \
-                 EncryptionConfig::local_envelope",
+                "the Control Plane cannot supply an encryption config; open the database with \
+                 its operator-provided key before serving it",
             );
         }
         if let ProvisionTargetRef::Open(db) = target
@@ -1617,9 +1612,7 @@ impl PlanBuilder<'_> {
                     .is_some_and(|audit| audit.key_path.is_some()),
             ),
         };
-        let new_target_encrypted = self.env.encryption.as_ref().is_some_and(|encryption| {
-            matches!(encryption.mode, EncryptionMode::LocalEnvelope { .. })
-        });
+        let new_target_encrypted = self.env.encryption.is_some();
         let (entries, issues) = guarantees::evaluate(&GuaranteeInputs {
             spec: self.spec,
             surface: self.env.surface,

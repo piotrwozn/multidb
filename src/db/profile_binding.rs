@@ -10,12 +10,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AUTHZ_TABLE, ConfigError, Database, DbConfig, KEY_AUDIT_ENABLED, KEY_LAYOUT, KEY_PROFILE,
-    KEY_PROFILE_MANIFEST, KEY_REPLICATION, KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME, META_TABLE,
-    OperationalConfig, Profile, ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED,
-    decode_meta_value, decode_metadata, engine_for, engine_for_operational, layout_for,
-    read_catalog, read_metadata, validate, validate_operational, write_json, write_metadata,
-    write_security_to_repl,
+    AUTHZ_TABLE, ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode,
+    KEY_AUDIT_ENABLED, KEY_LAYOUT, KEY_PROFILE, KEY_PROFILE_MANIFEST, KEY_REPLICATION,
+    KEY_SCHEMA_VERSION, KEY_SCHEMA_VERSION_NAME, META_TABLE, OperationalConfig, Profile,
+    ReplicationKind, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED, decode_meta_value, decode_metadata,
+    engine_for, engine_for_operational, layout_for, read_catalog, read_metadata, validate,
+    validate_operational, write_json, write_metadata, write_security_to_repl,
 };
 use crate::config_spec::{
     CompiledPolicy, CompressionKnob, DeploymentMode, DeploymentSpec, GuaranteeFloors, ProfileKnobs,
@@ -25,8 +25,8 @@ use crate::config_spec::{
 use crate::performance::{CompressionConfig, PerformanceConfig};
 use crate::query::TableLayout;
 use crate::storage::{
-    AnyEngine, Bytes, EngineKind, ExistingRedbOpen, ReadTransaction, RedbEngine, RedbReadOnly,
-    StorageEngine, StorageError, WriteTransaction,
+    AnyEngine, Bytes, ConfiguredKeyProvider, EncryptedReadTxn, EngineKind, ExistingRedbOpen,
+    ReadTransaction, RedbEngine, RedbReadOnly, StorageEngine, StorageError, WriteTransaction,
 };
 
 /// The only `PersistedProfileManifest.manifest_version` this build reads and writes.
@@ -484,6 +484,84 @@ pub fn inspect_database_metadata(path: &Path) -> MetadataProbe {
     probe
 }
 
+/// Inspects encrypted metadata without creating, repairing or writing the
+/// database or its keyring. Missing files remain missing, and an envelope
+/// keyring must already exist. No key bytes are included in the returned probe.
+///
+/// Like [`inspect_database_metadata`], a database requiring redb crash recovery
+/// returns `NeedsRecovery`; the caller may explicitly recover it before retrying.
+#[must_use]
+pub fn inspect_database_metadata_with_encryption(
+    path: &Path,
+    encryption: &EncryptionConfig,
+) -> MetadataProbe {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return MetadataProbe::Unreadable {
+                reason: format!("{} is not a regular file", path.display()),
+            };
+        }
+        Ok(metadata) if metadata.len() == 0 => return MetadataProbe::Uninitialized,
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return MetadataProbe::NotFound,
+        Err(error) => {
+            return MetadataProbe::Unreadable {
+                reason: error.to_string(),
+            };
+        }
+    }
+    let database = match RedbReadOnly::open(path) {
+        ExistingRedbOpen::Opened(database) => database,
+        ExistingRedbOpen::Locked => return MetadataProbe::Locked,
+        ExistingRedbOpen::NeedsRepair => return MetadataProbe::NeedsRecovery,
+        ExistingRedbOpen::Failed(error) => {
+            return MetadataProbe::Unreadable {
+                reason: error.to_string(),
+            };
+        }
+    };
+    let result = (|| -> Result<_, ConfigError> {
+        let provider = match &encryption.mode {
+            EncryptionMode::LegacyFile => {
+                ConfiguredKeyProvider::file_key(encryption.key_path.clone())
+            }
+            EncryptionMode::LocalEnvelope {
+                keyring_path,
+                kek_path,
+            } => ConfiguredKeyProvider::open_local_envelope(keyring_path, kek_path)?,
+        };
+        let txn = EncryptedReadTxn::from_read_transaction(database.begin_read()?, provider)?;
+        let read = decode_metadata(|key| Ok(txn.get(META_TABLE, key)?))?;
+        let unmet_floors = match &read.manifest {
+            Some(manifest) => unmet_profile_floors(
+                manifest.knobs.floors,
+                !manifest.knobs.floors.audit
+                    || stored_audit_enabled(txn.get(AUTHZ_TABLE, KEY_AUDIT_ENABLED)?)?,
+                true,
+            ),
+            None => Vec::new(),
+        };
+        Ok(ProbedMetadata {
+            schema_version: read.metadata.schema_version,
+            storage_profile: read.metadata.profile,
+            replication: read.metadata.replication,
+            layout: read.metadata.layout,
+            manifest: read.manifest,
+            values_framed: read.values_framed,
+            unmet_floors,
+        })
+    })();
+    match result {
+        Ok(metadata) => MetadataProbe::Initialized(Box::new(metadata)),
+        Err(ConfigError::MissingMetadata { key }) if key == KEY_SCHEMA_VERSION_NAME => {
+            MetadataProbe::Uninitialized
+        }
+        Err(error) => MetadataProbe::Unreadable {
+            reason: error.to_string(),
+        },
+    }
+}
+
 /// Runs redb's crash recovery on the existing database file at `path`, for a file that
 /// `inspect_database_metadata` reports as `NeedsRecovery`.
 ///
@@ -642,4 +720,90 @@ fn write_profile_metadata(
     write_json(&mut txn, KEY_PROFILE_MANIFEST, manifest)?;
     txn.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod encrypted_probe_tests {
+    use super::{MetadataProbe, inspect_database_metadata_with_encryption};
+    use crate::db::{
+        DbConfig, EncryptionConfig, OperationalConfig, Profile, create_database_with_ops,
+    };
+
+    #[test]
+    fn encrypted_probe_reads_metadata_without_writing_database_or_keyring()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let key = temp.path().join("key.bin");
+        std::fs::write(&key, [11_u8; 32])?;
+        for envelope in [false, true] {
+            let path = temp.path().join(format!("encrypted-{envelope}.redb"));
+            let keyring = temp.path().join("keyring.json");
+            let encryption = if envelope {
+                EncryptionConfig::local_envelope(&keyring, &key)
+            } else {
+                EncryptionConfig::file_key(&key)
+            };
+            let database = create_database_with_ops(
+                DbConfig::on_disk(Profile::Transactional, &path),
+                OperationalConfig::default().with_encryption(encryption.clone()),
+            )?;
+            assert_eq!(
+                inspect_database_metadata_with_encryption(&path, &encryption),
+                MetadataProbe::Locked
+            );
+            drop(database);
+            let before = std::fs::read(&path)?;
+            let keyring_before = std::fs::read(&keyring).ok();
+            match inspect_database_metadata_with_encryption(&path, &encryption) {
+                MetadataProbe::Initialized(metadata) => {
+                    assert_eq!(metadata.storage_profile, Profile::Transactional);
+                    assert!(
+                        metadata.unmet_floors.is_empty(),
+                        "unexpected floors: {:?}",
+                        metadata.unmet_floors
+                    );
+                }
+                other => return Err(format!("encrypted probe failed: {other:?}").into()),
+            }
+            assert_eq!(std::fs::read(&path)?, before);
+            assert_eq!(std::fs::read(&keyring).ok(), keyring_before);
+
+            if envelope {
+                std::fs::remove_file(&keyring)?;
+                assert!(matches!(
+                    inspect_database_metadata_with_encryption(&path, &encryption),
+                    MetadataProbe::Unreadable { .. }
+                ));
+                assert!(!keyring.exists());
+                assert_eq!(std::fs::read(&path)?, before);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_probe_does_not_create_missing_database_or_key_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("missing.redb");
+        let keyring = temp.path().join("missing.keyring");
+        let kek = temp.path().join("missing.key");
+        let encryption = EncryptionConfig::local_envelope(&keyring, &kek);
+        assert_eq!(
+            inspect_database_metadata_with_encryption(&path, &encryption),
+            MetadataProbe::NotFound
+        );
+        assert!(!path.exists());
+        assert!(!keyring.exists());
+        assert!(!kek.exists());
+        std::fs::write(&path, [])?;
+        assert_eq!(
+            inspect_database_metadata_with_encryption(&path, &encryption),
+            MetadataProbe::Uninitialized
+        );
+        assert_eq!(std::fs::metadata(&path)?.len(), 0);
+        assert!(!keyring.exists());
+        assert!(!kek.exists());
+        Ok(())
+    }
 }

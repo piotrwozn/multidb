@@ -643,6 +643,119 @@ fn gc_runs_concurrently_with_writers() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn online_gc_requires_retention_and_bounded_work_and_keeps_the_commit_log() -> TestResult {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    seed_counter(&mut database, 20)?;
+    let before = row_count(&database, txn::COMMIT_LOG_TABLE)?;
+    let options = HistoryGcOptions {
+        batch_size: 2,
+        max_batches: Some(1),
+        mvcc_retain_lsns: Some(5),
+        ..HistoryGcOptions::default()
+    };
+    for invalid in [
+        HistoryGcOptions {
+            mvcc_retain_lsns: None,
+            ..options
+        },
+        HistoryGcOptions {
+            mvcc_retain_lsns: Some(0),
+            ..options
+        },
+        HistoryGcOptions {
+            max_batches: None,
+            ..options
+        },
+        HistoryGcOptions {
+            max_batches: Some(0),
+            ..options
+        },
+        HistoryGcOptions {
+            batch_size: 0,
+            ..options
+        },
+        HistoryGcOptions {
+            commit_log_retain_lsns: Some(5),
+            ..options
+        },
+    ] {
+        assert!(matches!(
+            database.gc_history_online(&invalid),
+            Err(DbError::Config(ConfigError::Unsupported(_)))
+        ));
+    }
+    let report = database.gc_history_online(&options)?;
+    assert!(report.batches <= 1);
+    assert!(!report.complete);
+    assert_eq!(report.commit_log_records_pruned, 0);
+    assert_eq!(row_count(&database, txn::COMMIT_LOG_TABLE)?, before);
+    assert!(report.watermark <= report.current_lsn.saturating_sub(4));
+    Ok(())
+}
+
+#[test]
+fn as_of_pin_cannot_slip_between_gc_watermark_and_horizon_advancement() -> TestResult {
+    use std::sync::{TryLockError, mpsc};
+    use std::time::Instant;
+
+    use crate::storage::{StorageEngine, WriteTransaction};
+
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    let counters = seed_counter(&mut database, 0)?;
+    let old_lsn = current_lsn(&database)?;
+    for value in 1..=10 {
+        counters.update(counter_row(value))?;
+    }
+    let database = Arc::new(database);
+    let super::DatabaseRepl::SingleNode(node) = &database.repl else {
+        return Err("expected single-node replication".into());
+    };
+    // Hold the backend writer so maintenance pauses after computing its
+    // watermark, before it can advance the horizon or delete any history.
+    let writer = node.storage().begin_write()?;
+    let gc_database = Arc::clone(&database);
+    let gc = thread::spawn(move || {
+        gc_database.gc_history_online(&HistoryGcOptions {
+            mvcc_retain_lsns: Some(1),
+            max_batches: Some(1),
+            ..HistoryGcOptions::default()
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(
+        database.history_pins.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ) {
+        if Instant::now() >= deadline {
+            writer.rollback();
+            let _ = gc.join();
+            return Err("GC did not serialize pin registration with its watermark".into());
+        }
+        thread::yield_now();
+    }
+    let (sent, received) = mpsc::channel();
+    let reader_database = Arc::clone(&database);
+    let reader = thread::spawn(move || {
+        let result = reader_database.pin_history_lsn(old_lsn).map(|_| ());
+        let _ = sent.send(result);
+    });
+    let early = received.recv_timeout(Duration::from_millis(50));
+    writer.rollback();
+    let report = gc.join().map_err(|_| "GC thread panicked")??;
+    reader.join().map_err(|_| "reader thread panicked")?;
+    assert!(
+        matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "a reader registered below the pending horizon before GC committed"
+    );
+    assert!(matches!(
+        received.recv_timeout(Duration::from_secs(5))?,
+        Err(DbError::Temporal(TemporalError::RetentionExpired { requested, earliest }))
+            if requested == old_lsn && earliest == report.history_horizon
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn gc_state_persists_across_redb_reopen() -> TestResult {
     let temp = tempfile::tempdir()?;

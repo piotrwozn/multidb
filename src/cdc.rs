@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     backup::{Lsn, TimelineId},
-    db::{CatalogEntry, ConfigError, DbError, read_catalog_entry_from_repl},
+    db::{CatalogEntry, ConfigError, Database, DbError, read_catalog_entry_from_repl},
     geo::{GEO_INDEX_TABLE, GEO_POINTS_TABLE},
     graph::{GRAPH_IN_EDGES_TABLE, GRAPH_OUT_EDGES_TABLE},
     model::{DOCUMENT_TABLE, INDEX_TABLE, Value, decode_value},
@@ -166,6 +166,14 @@ pub struct SubscriptionConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SubscriptionState {
+    /// The principal whose live permissions and policies must be checked on delivery.
+    /// Subscriptions explicitly created by trusted APIs have no owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<Principal>,
+    /// Explicit operator trust. Legacy records default to false because their original
+    /// creator cannot be inferred safely; they must be adopted before delivery.
+    #[serde(default)]
+    pub trusted: bool,
     pub config: SubscriptionConfig,
     pub last_ack: ResumeToken,
     pub created_at: SystemTime,
@@ -190,6 +198,17 @@ pub struct SubscriptionHandle {
 
 #[derive(thiserror::Error, Debug)]
 pub enum SubscriptionError {
+    #[error(
+        "principal-bound subscription requires push_subscription_once_as or SubscriptionWorker::start_as"
+    )]
+    PrincipalRequired,
+
+    #[error("subscription belongs to a different principal")]
+    PrincipalMismatch,
+
+    #[error("subscription policy: {0}")]
+    Policy(String),
+
     #[error("missing subscription: {0}")]
     MissingSubscription(String),
 
@@ -440,7 +459,7 @@ impl SubscriptionWorker {
         config: CdcWorkerConfig,
     ) -> Result<(SubscriptionHandle, mpsc::Receiver<ChangeEvent>), SubscriptionError> {
         let name = name.into();
-        let _ = subscription_state(repl.as_ref(), &name)?;
+        require_trusted_subscription(&subscription_state(repl.as_ref(), &name)?)?;
         let (sender, receiver) = mpsc::channel(config.channel_capacity.max(1));
         let (shutdown, shutdown_rx) = oneshot::channel();
         let worker_name = name.clone();
@@ -570,6 +589,7 @@ pub fn poll_changefeed_page<R: Replication + ?Sized>(
     options: &ChangefeedOptions,
     max: usize,
 ) -> Result<ChangefeedPage, FeedError> {
+    ensure_commit_log(repl)?;
     let timeline_id = timeline_id(repl)?;
     let from = map_resume_token_to_current_timeline(repl, from, &timeline_id)?;
 
@@ -668,8 +688,14 @@ pub fn create_subscription(
     config: SubscriptionConfig,
 ) -> Result<SubscriptionState, SubscriptionError> {
     authorize_filter_access(authz, principal, &config.filter)?;
+    if let Some(existing) = read_subscription(repl, &config.name)? {
+        require_subscription_owner(&existing, principal)?;
+    }
     let now = SystemTime::now();
+    ensure_commit_log(repl)?;
     let state = SubscriptionState {
+        principal: Some(principal.clone()),
+        trusted: false,
         last_ack: config.start.clone(),
         config,
         created_at: now,
@@ -688,7 +714,10 @@ pub fn create_subscription_trusted(
     config: SubscriptionConfig,
 ) -> Result<SubscriptionState, SubscriptionError> {
     let now = SystemTime::now();
+    ensure_commit_log(repl)?;
     let state = SubscriptionState {
+        principal: None,
+        trusted: true,
         last_ack: config.start.clone(),
         config,
         created_at: now,
@@ -744,6 +773,7 @@ pub async fn push_subscription_once(
     sender: &mpsc::Sender<ChangeEvent>,
 ) -> Result<ResumeToken, SubscriptionError> {
     let state = subscription_state(repl, name)?;
+    require_trusted_subscription(&state)?;
     let (events, token) = poll_changefeed(
         repl,
         catalog,
@@ -764,6 +794,273 @@ pub async fn push_subscription_once(
     Ok(token)
 }
 
+/// Pushes one batch with the principal's current database permissions and policies.
+///
+/// Unlike the trusted raw-replication API, this is safe for subscriptions created by
+/// `Database::create_subscription_as`. Permissions are checked again on every delivery.
+/// # Errors
+/// Fails when the caller is not the subscription owner, authorization or policies reject
+/// the read, or delivery/acknowledgement fails.
+pub async fn push_subscription_once_as(
+    database: &Database,
+    principal: &Principal,
+    name: &str,
+    sender: &mpsc::Sender<ChangeEvent>,
+) -> Result<ResumeToken, SubscriptionError> {
+    let state = subscription_state(database, name)?;
+    require_subscription_owner(&state, principal)?;
+    let (events, token) = database
+        .poll_changefeed_as(
+            principal,
+            &state.last_ack,
+            &state.config.filter,
+            &ChangefeedOptions::default(),
+            state.config.buffer_limit,
+        )
+        .map_err(subscription_policy_error)?;
+    let timeout = Duration::from_millis(state.config.ack_timeout_ms);
+    for event in events {
+        tokio::time::timeout(timeout, sender.send(event))
+            .await
+            .map_err(|_| SubscriptionError::BackpressureTimeout)?
+            .map_err(|_| SubscriptionError::BufferClosed)?;
+    }
+    ack_subscription(database, name, token.clone())?;
+    observability::record_subscription_push(name, token.lsn);
+    Ok(token)
+}
+
+/// Resolves a registered user and pushes one batch with their current roles and policies.
+/// # Errors
+/// Fails when the user is unmapped, ownership/authorization rejects delivery, or delivery fails.
+pub async fn push_subscription_once_for_user(
+    database: &Database,
+    pg_user: &str,
+    name: &str,
+    sender: &mpsc::Sender<ChangeEvent>,
+) -> Result<ResumeToken, SubscriptionError> {
+    let principal = database.principal_for_user(pg_user);
+    push_subscription_once_as(database, &principal, name, sender).await
+}
+
+fn require_trusted_subscription(state: &SubscriptionState) -> Result<(), SubscriptionError> {
+    if state.principal.is_some() || !state.trusted {
+        return Err(SubscriptionError::PrincipalRequired);
+    }
+    Ok(())
+}
+
+/// Assigns a principal to an existing subscription without resetting its durable cursor.
+/// This is the migration path for legacy records with unknown ownership.
+/// # Errors
+/// Fails unless the operator has System:Admin and the owner can read the filter target,
+/// or when reading/writing the subscription metadata fails.
+pub fn adopt_subscription_as(
+    repl: &dyn Replication,
+    authz: &AuthzPolicy,
+    operator: &Principal,
+    owner: &Principal,
+    name: &str,
+) -> Result<SubscriptionState, SubscriptionError> {
+    ensure_commit_log(repl)?;
+    authz.authorize(operator, &Resource::System, Permission::Admin)?;
+    let mut state = subscription_state(repl, name)?;
+    authorize_filter_access(authz, owner, &state.config.filter)?;
+    state.principal = Some(owner.clone());
+    state.trusted = false;
+    state.updated_at = SystemTime::now();
+    write_subscription(repl, &state)?;
+    Ok(state)
+}
+
+pub(crate) fn require_subscription_owner(
+    state: &SubscriptionState,
+    principal: &Principal,
+) -> Result<(), SubscriptionError> {
+    if state
+        .principal
+        .as_ref()
+        .is_none_or(|owner| owner.name() != principal.name())
+    {
+        return Err(SubscriptionError::PrincipalMismatch);
+    }
+    Ok(())
+}
+
+fn subscription_policy_error(error: DbError) -> SubscriptionError {
+    match error {
+        DbError::AuthzDenied(error) => SubscriptionError::Authz(error),
+        error => SubscriptionError::Policy(error.to_string()),
+    }
+}
+
+fn ensure_commit_log<R: Replication + ?Sized>(repl: &R) -> Result<(), ReplError> {
+    if !repl.supports_commit_log() {
+        return Err(ReplError::Unsupported(
+            "changefeeds and CDC subscriptions require a commit log".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+enum SubscriptionIdentity {
+    Principal(Principal),
+    RegisteredUser(String),
+}
+
+impl SubscriptionIdentity {
+    fn resolve(&self, database: &Database) -> Principal {
+        match self {
+            Self::Principal(principal) => principal.clone(),
+            Self::RegisteredUser(user) => database.principal_for_user(user),
+        }
+    }
+}
+
+impl SubscriptionWorker {
+    /// Starts a worker with explicit principal roles, checking live grants and policies.
+    /// Use `start_for_user` when role membership comes from the database registry.
+    /// # Errors
+    /// Fails when the database lock is poisoned, the subscription has another owner,
+    /// or the first page is not readable by the principal.
+    pub fn start_as(
+        database: Arc<RwLock<Database>>,
+        principal: Principal,
+        name: impl Into<String>,
+        config: CdcWorkerConfig,
+    ) -> Result<(SubscriptionHandle, mpsc::Receiver<ChangeEvent>), SubscriptionError> {
+        Self::start_with_identity(
+            database,
+            SubscriptionIdentity::Principal(principal),
+            name.into(),
+            config,
+        )
+    }
+
+    /// Starts a worker that resolves the registered user's principal again for every page.
+    /// Removing/remapping the user or changing their roles takes effect on the next poll.
+    /// # Errors
+    /// Fails when the database lock, subscription ownership, or live authorization rejects it.
+    pub fn start_for_user(
+        database: Arc<RwLock<Database>>,
+        pg_user: impl Into<String>,
+        name: impl Into<String>,
+        config: CdcWorkerConfig,
+    ) -> Result<(SubscriptionHandle, mpsc::Receiver<ChangeEvent>), SubscriptionError> {
+        Self::start_with_identity(
+            database,
+            SubscriptionIdentity::RegisteredUser(pg_user.into()),
+            name.into(),
+            config,
+        )
+    }
+
+    fn start_with_identity(
+        database: Arc<RwLock<Database>>,
+        identity: SubscriptionIdentity,
+        name: String,
+        config: CdcWorkerConfig,
+    ) -> Result<(SubscriptionHandle, mpsc::Receiver<ChangeEvent>), SubscriptionError> {
+        {
+            let database = database
+                .read()
+                .map_err(|_| SubscriptionError::Policy("database lock poisoned".to_owned()))?;
+            let principal = identity.resolve(&database);
+            let state = subscription_state(&*database, &name)?;
+            require_subscription_owner(&state, &principal)?;
+            database
+                .poll_changefeed_page_as(
+                    &principal,
+                    &state.last_ack,
+                    &state.config.filter,
+                    &ChangefeedOptions::default(),
+                    1,
+                )
+                .map_err(subscription_policy_error)?;
+        }
+        let (sender, receiver) = mpsc::channel(config.channel_capacity.max(1));
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let join = tokio::spawn(run_principal_subscription_worker(
+            database,
+            identity,
+            name,
+            sender,
+            shutdown_rx,
+            config,
+        ));
+        Ok((
+            SubscriptionHandle {
+                shutdown: Some(shutdown),
+                join,
+            },
+            receiver,
+        ))
+    }
+}
+
+async fn run_principal_subscription_worker(
+    database: Arc<RwLock<Database>>,
+    identity: SubscriptionIdentity,
+    name: String,
+    sender: mpsc::Sender<ChangeEvent>,
+    mut shutdown: oneshot::Receiver<()>,
+    config: CdcWorkerConfig,
+) -> Result<ResumeToken, SubscriptionError> {
+    let mut last = database
+        .read()
+        .map_err(|_| SubscriptionError::Policy("database lock poisoned".to_owned()))?
+        .subscription_state(&name)
+        .map_err(subscription_policy_error)?
+        .last_ack;
+    loop {
+        // Release the synchronous database lock before awaiting the receiver or shutdown.
+        let page = {
+            let database = database
+                .read()
+                .map_err(|_| SubscriptionError::Policy("database lock poisoned".to_owned()))?;
+            let principal = identity.resolve(&database);
+            let state = subscription_state(&*database, &name)?;
+            require_subscription_owner(&state, &principal)?;
+            database
+                .poll_changefeed_page_as(
+                    &principal,
+                    &state.last_ack,
+                    &state.config.filter,
+                    &ChangefeedOptions::default(),
+                    config.page_size.max(1),
+                )
+                .map_err(subscription_policy_error)?
+        };
+        for event in page.events {
+            tokio::select! {
+                result = tokio::time::timeout(
+                    Duration::from_millis(config.deliver_timeout_ms.max(1)),
+                    sender.send(event),
+                ) => {
+                    result
+                        .map_err(|_| SubscriptionError::BackpressureTimeout)?
+                        .map_err(|_| SubscriptionError::BufferClosed)?;
+                }
+                _ = &mut shutdown => return Ok(last),
+            }
+        }
+        last = page.next;
+        {
+            let database = database
+                .read()
+                .map_err(|_| SubscriptionError::Policy("database lock poisoned".to_owned()))?;
+            ack_subscription(&*database, &name, last.clone())?;
+        }
+        observability::record_subscription_push(&name, last.lsn);
+        if !page.has_more {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(config.poll_interval_ms.max(1))) => {}
+                _ = &mut shutdown => return Ok(last),
+            }
+        }
+    }
+}
+
 async fn run_subscription_worker(
     repl: Arc<dyn Replication>,
     catalog: Arc<BTreeMap<String, CatalogEntry>>,
@@ -778,6 +1075,7 @@ async fn run_subscription_worker(
 
     loop {
         let state = subscription_state(repl.as_ref(), &name)?;
+        require_trusted_subscription(&state)?;
         let page = poll_changefeed_page(
             repl.as_ref(),
             &catalog,
@@ -878,7 +1176,7 @@ pub fn refresh_materialized_view(
 }
 
 fn ensure_view_commit_log(database: &crate::db::Database) -> Result<(), MaterializedViewError> {
-    if database.uses_ap_replication() {
+    if !database.supports_commit_log() {
         return Err(MaterializedViewError::Unsupported(
             "AP replication does not support incremental materialized views: AP writes are not \
              recorded in the commit log"
@@ -906,6 +1204,9 @@ pub fn read_materialized_view(
 /// # Errors
 /// Fails when hook metadata cannot be written.
 pub fn register_hook(repl: &dyn Replication, hook: &HookSpec) -> Result<(), HookError> {
+    if hook.kind == HookKind::AfterCommit {
+        ensure_commit_log(repl)?;
+    }
     // A hook scoped to a missing object would match nothing, so a typo would
     // silently turn a validation hook off. Refuse it instead.
     if matches!(
@@ -2662,7 +2963,7 @@ mod tests {
             cdc::{
                 ChangeEvent, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget,
                 LogicalTarget, ResumeToken, SubscriptionConfig, TransactionBoundary,
-                push_subscription_once, retain_events_visible_to,
+                push_subscription_once, push_subscription_once_as, retain_events_visible_to,
             },
             db::{AdminCredentialRecord, Database, DbConfig, DbError, Profile, create_database},
             extension::{LimitPolicy, MaskingPolicy, POLICIES_TABLE, PolicyConfig},
@@ -3048,7 +3349,11 @@ mod tests {
             );
 
             let (sender, mut receiver) = mpsc::channel(4_096);
-            push_subscription_once(&database, database.catalog(), "feed", &sender).await?;
+            assert!(matches!(
+                push_subscription_once(&database, database.catalog(), "feed", &sender).await,
+                Err(crate::cdc::SubscriptionError::PrincipalRequired)
+            ));
+            push_subscription_once_as(&database, &alice(), "feed", &sender).await?;
             drop(sender);
             let mut delivered = Vec::new();
             while let Some(event) = receiver.recv().await {
@@ -3062,6 +3367,204 @@ mod tests {
             );
             assert!(system_tables(&delivered).is_empty(), "{delivered:?}");
             assert!(!carries(&delivered, PASSWORD_HASH));
+            assert!(!carries(&delivered, SECRET_NAME));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn principal_subscription_rechecks_revoked_read()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut database = seeded_database()?;
+            database.create_subscription_as(
+                &alice(),
+                SubscriptionConfig::new("feed", ResumeToken::default()),
+            )?;
+            let token = database.subscription_state("feed")?.last_ack;
+            database.set_authz_policy(AuthzPolicy::default());
+            let (sender, mut receiver) = mpsc::channel(4_096);
+            assert!(matches!(
+                push_subscription_once_as(&database, &alice(), "feed", &sender).await,
+                Err(crate::cdc::SubscriptionError::Authz(_))
+            ));
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(database.subscription_state("feed")?.last_ack, token);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn principal_worker_rechecks_live_permissions()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+            let start = crate::cdc::current_resume_token(&database)?;
+            database.create_subscription_as(&alice(), SubscriptionConfig::new("feed", start))?;
+            let database = std::sync::Arc::new(std::sync::RwLock::new(database));
+            let (handle, mut receiver) = crate::cdc::SubscriptionWorker::start_as(
+                database.clone(),
+                alice(),
+                "feed",
+                crate::phase30::CdcWorkerConfig {
+                    poll_interval_ms: 1,
+                    ..crate::phase30::CdcWorkerConfig::default()
+                },
+            )?;
+            database
+                .write()
+                .map_err(|_| "poisoned test lock")?
+                .set_authz_policy(AuthzPolicy::default());
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), handle.join()).await?;
+            assert!(matches!(
+                result,
+                Err(crate::cdc::SubscriptionError::Authz(_))
+            ));
+            while let Ok(event) = receiver.try_recv() {
+                assert!(!matches!(
+                    event.op,
+                    ChangeOp::Upsert { .. } | ChangeOp::Delete { .. }
+                ));
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn registered_subscription_worker_observes_removed_mapping()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut database = seeded_database()?;
+            database.set_principal_registry(
+                PrincipalRegistry::new().with_principal("pg-alice", alice()),
+            );
+            let start = crate::cdc::current_resume_token(&database)?;
+            database.create_subscription_as(&alice(), SubscriptionConfig::new("feed", start))?;
+            let database = std::sync::Arc::new(std::sync::RwLock::new(database));
+            let (handle, _receiver) = crate::cdc::SubscriptionWorker::start_for_user(
+                database.clone(),
+                "pg-alice",
+                "feed",
+                crate::phase30::CdcWorkerConfig {
+                    poll_interval_ms: 1,
+                    ..crate::phase30::CdcWorkerConfig::default()
+                },
+            )?;
+            database
+                .write()
+                .map_err(|_| "poisoned test lock")?
+                .set_principal_registry(PrincipalRegistry::new());
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), handle.join()).await?;
+            assert!(matches!(
+                result,
+                Err(crate::cdc::SubscriptionError::Authz(_)
+                    | crate::cdc::SubscriptionError::PrincipalMismatch)
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn subscription_owner_cannot_take_over_other_or_trusted_cursor()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+            let config = SubscriptionConfig::new("feed", ResumeToken::default());
+            database.create_subscription_as(&alice(), config.clone())?;
+            let bob = Principal::new("bob").with_role("reader");
+            assert!(database.create_subscription_as(&bob, config).is_err());
+            assert!(
+                database
+                    .ack_subscription_as(&bob, "feed", ResumeToken::default())
+                    .is_err()
+            );
+            assert!(database.subscription_state_as(&bob, "feed").is_err());
+            let trusted = SubscriptionConfig::new("trusted", ResumeToken::default());
+            database.create_subscription(trusted.clone())?;
+            assert!(database.create_subscription_as(&alice(), trusted).is_err());
+            let (sender, _receiver) = mpsc::channel(4_096);
+            assert!(matches!(
+                push_subscription_once_as(&database, &alice(), "trusted", &sender).await,
+                Err(crate::cdc::SubscriptionError::PrincipalMismatch)
+            ));
+            Ok(())
+        }
+
+        #[test]
+        fn principal_continuous_query_preserves_ownership_and_ack_on_reapply()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+            let spec = crate::continuous::ContinuousQuerySpec {
+                name: "watched".to_owned(),
+                sql: "SELECT * FROM users".to_owned(),
+                filter: ChangefeedFilter {
+                    target: ChangefeedTarget::Table("users".to_owned()),
+                },
+                start: ResumeToken::default(),
+                buffer_limit: 100,
+            };
+            database.create_continuous_query_as(&alice(), &spec)?;
+            assert_eq!(
+                database.subscription_state("watched")?.principal,
+                Some(alice())
+            );
+            let ack = crate::cdc::current_resume_token(&database)?;
+            database.ack_continuous_query_as(&alice(), "watched", ack.clone())?;
+            let reapplied = database.create_continuous_query_as(&alice(), &spec)?;
+            assert_eq!(reapplied.last_ack, ack);
+            assert_eq!(database.subscription_state("watched")?.last_ack, ack);
+            assert!(
+                database
+                    .create_continuous_query_as(&Principal::new("bob").with_role("reader"), &spec,)
+                    .is_err()
+            );
+            assert_eq!(
+                database.subscription_state("watched")?.principal,
+                Some(alice())
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn legacy_subscription_requires_explicit_adoption_without_cursor_reset()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let database = seeded_database()?;
+            let config = SubscriptionConfig::new("legacy", ResumeToken::default());
+            let state = database.create_subscription(config)?;
+            let token = crate::cdc::current_resume_token(&database)?;
+            database.ack_subscription("legacy", token.clone())?;
+            let mut legacy = serde_json::to_value(&state)?;
+            legacy
+                .as_object_mut()
+                .ok_or("subscription must be object")?
+                .remove("principal");
+            legacy
+                .as_object_mut()
+                .ok_or("subscription must be object")?
+                .remove("trusted");
+            legacy["last_ack"] = serde_json::to_value(&token)?;
+            let decoded: crate::cdc::SubscriptionState = serde_json::from_value(legacy)?;
+            crate::cdc::write_subscription(&database, &decoded)?;
+            let (sender, _receiver) = mpsc::channel(4_096);
+            assert!(matches!(
+                push_subscription_once(&database, database.catalog(), "legacy", &sender).await,
+                Err(crate::cdc::SubscriptionError::PrincipalRequired)
+            ));
+            assert!(
+                crate::cdc::adopt_subscription_as(
+                    &database,
+                    database.authz_policy(),
+                    &alice(),
+                    &alice(),
+                    "legacy",
+                )
+                .is_err()
+            );
+            let adopted = crate::cdc::adopt_subscription_as(
+                &database,
+                database.authz_policy(),
+                &root(),
+                &alice(),
+                "legacy",
+            )?;
+            assert_eq!(adopted.last_ack, token);
+            assert_eq!(adopted.principal, Some(alice()));
+            assert!(!adopted.trusted);
+            push_subscription_once_as(&database, &alice(), "legacy", &sender).await?;
             Ok(())
         }
 

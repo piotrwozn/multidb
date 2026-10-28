@@ -1680,6 +1680,10 @@ criteria = "safe-to-deploy"
 version = "2.0.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.signal-hook-registry]]
+version = "1.4.8"
+criteria = "safe-to-deploy"
+
 [[exemptions.signature]]
 version = "2.2.0"
 criteria = "safe-to-deploy"

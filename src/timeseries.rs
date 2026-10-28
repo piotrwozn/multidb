@@ -1,4 +1,4 @@
-use std::time::UNIX_EPOCH;
+use std::{collections::BTreeMap, time::UNIX_EPOCH};
 
 use crate::{
     keyenc,
@@ -65,6 +65,161 @@ pub enum TimeSeriesError {
 
     #[error("codec corruption: {0}")]
     Corruption(String),
+}
+
+/// Opaque position in a bounded sweep of chunks followed by latest-point entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionCursor {
+    latest: bool,
+    after_key: Bytes,
+}
+
+/// Progress of one maintenance batch. Repeat with `next_cursor` until it is `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub scanned_rows: usize,
+    pub deleted_chunks: usize,
+    pub deleted_latest: usize,
+    pub conflicted_rows: usize,
+    pub next_cursor: Option<RetentionCursor>,
+}
+
+/// Prunes expired chunks and latest-point entries without requiring a new series write.
+///
+/// Each call scans at most `batch_rows` entries (maximum 4096), and deletes only values
+/// that still equal those scanned. A concurrent writer wins a conflict; the next complete
+/// sweep retries that entry. Expiration uses server time and whole-chunk retention.
+/// Maintenance callers should use the underlying replication backend, without user hooks.
+/// # Errors
+/// Fails for invalid batch sizes or retention configs, malformed keys, or storage errors.
+pub fn sweep_retention<R: Replication + ?Sized>(
+    repl: &R,
+    configs: &BTreeMap<String, TimeSeriesConfig>,
+    cursor: Option<RetentionCursor>,
+    batch_rows: usize,
+) -> Result<RetentionReport, TimeSeriesError> {
+    sweep_retention_at(repl, configs, cursor, batch_rows, unix_millis(&SystemClock))
+}
+
+fn sweep_retention_at<R: Replication + ?Sized>(
+    repl: &R,
+    configs: &BTreeMap<String, TimeSeriesConfig>,
+    cursor: Option<RetentionCursor>,
+    batch_rows: usize,
+    now: i64,
+) -> Result<RetentionReport, TimeSeriesError> {
+    if !(1..=4096).contains(&batch_rows) {
+        return Err(TimeSeriesError::InvalidConfig(
+            "retention batch_rows must be between 1 and 4096".to_owned(),
+        ));
+    }
+    let cursor = cursor.unwrap_or(RetentionCursor {
+        latest: false,
+        after_key: Vec::new(),
+    });
+    let table = if cursor.latest {
+        TIME_SERIES_LATEST_TABLE
+    } else {
+        TIME_SERIES_CHUNKS_TABLE
+    };
+    let mut start = cursor.after_key;
+    if !start.is_empty() {
+        start.push(0);
+    }
+    let mut rows = Vec::new();
+    repl.scan_range_batches(
+        table,
+        &start,
+        &[],
+        ReadConsistency::Strong,
+        batch_rows,
+        &|| false,
+        &mut |batch| {
+            rows.extend_from_slice(batch);
+            Ok(false)
+        },
+    )?;
+    let mut report = RetentionReport {
+        scanned_rows: rows.len(),
+        ..RetentionReport::default()
+    };
+    report.next_cursor = rows
+        .last()
+        .map(|(key, _)| RetentionCursor {
+            latest: cursor.latest,
+            after_key: key.clone(),
+        })
+        .or_else(|| {
+            (!cursor.latest).then(|| RetentionCursor {
+                latest: true,
+                after_key: Vec::new(),
+            })
+        });
+    for (key, value) in rows {
+        if !retention_entry_expired(configs, &key, &value, cursor.latest, now)? {
+            continue;
+        }
+        let batch = ConditionalBatch::new(
+            vec![WriteCondition::ValueEquals {
+                table: table.to_owned(),
+                key: key.clone(),
+                expected: Some(value),
+            }],
+            vec![Op::Delete {
+                table: table.to_owned(),
+                key,
+            }],
+        );
+        match repl.propose_conditional_batch(batch) {
+            Ok(()) if cursor.latest => report.deleted_latest += 1,
+            Ok(()) => report.deleted_chunks += 1,
+            Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
+                report.conflicted_rows += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(report)
+}
+
+fn retention_entry_expired(
+    configs: &BTreeMap<String, TimeSeriesConfig>,
+    key: &[u8],
+    value: &[u8],
+    latest: bool,
+    now: i64,
+) -> Result<bool, TimeSeriesError> {
+    let mut offset = 0;
+    let name = keyenc::read_len_bytes(key, &mut offset).ok_or_else(|| {
+        TimeSeriesError::Corruption("invalid retention collection key".to_owned())
+    })?;
+    let name = std::str::from_utf8(name)
+        .map_err(|error| TimeSeriesError::Corruption(error.to_string()))?;
+    let Some(config) = configs.get(name) else {
+        return Ok(false);
+    };
+    let Some(retention) = config.retention_millis else {
+        return Ok(false);
+    };
+    validate_config(config)?;
+    validate_retention(config)?;
+    let cutoff = now.saturating_sub(retention);
+    if latest {
+        let point = decode_point(value)?;
+        // Keep the latest entry until its entire chunk expires, like stored chunks.
+        Ok(bucket_start(point.timestamp_millis, config.chunk_millis)
+            .zip(bucket_start(cutoff, config.chunk_millis))
+            .is_some_and(|(bucket, cutoff_bucket)| bucket < cutoff_bucket))
+    } else {
+        keyenc::read_len_bytes(key, &mut offset).ok_or_else(|| {
+            TimeSeriesError::Corruption("invalid retention series key".to_owned())
+        })?;
+        let encoded: [u8; 8] = key[offset..]
+            .try_into()
+            .map_err(|_| TimeSeriesError::Corruption("invalid retention bucket key".to_owned()))?;
+        let bucket = i64::from_be_bytes(encoded) ^ i64::MIN;
+        Ok(bucket_start(cutoff, config.chunk_millis).is_some_and(|end| bucket < end))
+    }
 }
 
 pub struct TimeSeriesCollection<'repl, R: Replication + ?Sized> {
@@ -342,7 +497,7 @@ pub fn time_bucket(interval_millis: i64, timestamp_millis: i64) -> Result<i64, T
 
 /// Encodes a chunk with Gorilla-style delta-of-delta timestamps and XOR float deltas.
 /// # Errors
-/// Currently only fails if an internal size conversion cannot be represented.
+/// Fails when a timestamp delta or delta-of-delta does not fit in an `i64`.
 pub fn encode_chunk(chunk: &TimeChunk) -> Result<Bytes, TimeSeriesError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(GORILLA_CHUNK_MAGIC);
@@ -356,9 +511,16 @@ pub fn encode_chunk(chunk: &TimeChunk) -> Result<Bytes, TimeSeriesError> {
     let mut previous_delta = 0_i64;
     let mut previous_bits = 0_u64;
     for point in &chunk.points {
-        let delta = point.timestamp_millis - previous_ts;
+        let delta = point
+            .timestamp_millis
+            .checked_sub(previous_ts)
+            .ok_or_else(|| {
+                TimeSeriesError::InvalidPoint("timestamp delta overflows i64".to_owned())
+            })?;
         let bits = point.value.to_bits();
-        let delta_of_delta = delta - previous_delta;
+        let delta_of_delta = delta.checked_sub(previous_delta).ok_or_else(|| {
+            TimeSeriesError::InvalidPoint("timestamp delta-of-delta overflows i64".to_owned())
+        })?;
         let xor = bits ^ previous_bits;
         if delta_of_delta == 0 && xor == 0 {
             bytes.push(0);
@@ -399,7 +561,9 @@ fn decode_gorilla_chunk(bytes: &[u8]) -> Result<TimeChunk, TimeSeriesError> {
             0 => (previous_delta, previous_bits),
             1 => {
                 let delta_of_delta = zigzag_decode(read_var_u64(bytes, &mut cursor)?);
-                let delta = previous_delta + delta_of_delta;
+                let delta = previous_delta.checked_add(delta_of_delta).ok_or_else(|| {
+                    TimeSeriesError::Corruption("timestamp delta overflows i64".to_owned())
+                })?;
                 let bits = previous_bits ^ read_xor_delta(bytes, &mut cursor)?;
                 (delta, bits)
             }
@@ -409,7 +573,9 @@ fn decode_gorilla_chunk(bytes: &[u8]) -> Result<TimeChunk, TimeSeriesError> {
                 ));
             }
         };
-        let timestamp_millis = previous_ts + delta;
+        let timestamp_millis = previous_ts
+            .checked_add(delta)
+            .ok_or_else(|| TimeSeriesError::Corruption("timestamp overflows i64".to_owned()))?;
         points.push(TimePoint {
             timestamp_millis,
             value: f64::from_bits(bits),
@@ -436,7 +602,9 @@ fn decode_legacy_chunk(bytes: &[u8]) -> Result<TimeChunk, TimeSeriesError> {
     for _ in 0..count {
         let delta = read_i64(bytes, &mut cursor)?;
         let xor = read_u64(bytes, &mut cursor)?;
-        let timestamp_millis = previous_ts + delta;
+        let timestamp_millis = previous_ts
+            .checked_add(delta)
+            .ok_or_else(|| TimeSeriesError::Corruption("timestamp overflows i64".to_owned()))?;
         let bits = previous_bits ^ xor;
         points.push(TimePoint {
             timestamp_millis,
@@ -1140,6 +1308,127 @@ mod tests {
 
     fn timestamps(points: &[TimePoint]) -> Vec<i64> {
         points.iter().map(|point| point.timestamp_millis).collect()
+    }
+
+    #[test]
+    fn retention_sweep_removes_idle_series_in_bounded_resumable_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let config = TimeSeriesConfig::new("metrics")
+            .with_chunk_millis(1_000)
+            .with_retention_millis(10_000);
+        let ts = TimeSeriesCollection::new(&database, config.clone())?;
+        for series in ["cpu", "memory", "disk"] {
+            ts.insert_point_with_clock(
+                series,
+                point(NOW - 20_000, 1.0),
+                &FixedClock(NOW - 20_000),
+            )?;
+        }
+        ts.insert_point_with_clock("active", point(NOW, 2.0), &FixedClock(NOW))?;
+        let configs = std::collections::BTreeMap::from([(config.name.clone(), config)]);
+        let mut cursor = None;
+        let mut chunks = 0;
+        let mut latest = 0;
+        for _ in 0..20 {
+            let report = super::sweep_retention_at(&database, &configs, cursor, 1, NOW)?;
+            assert!(report.scanned_rows <= 1);
+            chunks += report.deleted_chunks;
+            latest += report.deleted_latest;
+            cursor = report.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none());
+        assert_eq!(chunks, 3);
+        assert_eq!(latest, 3);
+        for series in ["cpu", "memory", "disk"] {
+            assert_eq!(ts.range(series, NOW - 30_000, NOW + 1)?, Vec::new());
+            assert!(ts.latest(series)?.is_none());
+        }
+        assert_eq!(ts.latest("active")?, Some(point(NOW, 2.0)));
+        assert!(super::sweep_retention_at(&database, &configs, None, 0, NOW).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retention_sweep_preserves_the_boundary_chunk_and_unlimited_collections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let bounded = TimeSeriesConfig::new("bounded")
+            .with_chunk_millis(1_000)
+            .with_retention_millis(10_000);
+        let unlimited = TimeSeriesConfig::new("unlimited").with_chunk_millis(1_000);
+        for config in [&bounded, &unlimited] {
+            let ts = TimeSeriesCollection::new(&database, config.clone())?;
+            ts.insert_point_with_clock("cpu", point(NOW - 10_999, 1.0), &FixedClock(NOW - 10_999))?;
+        }
+        let configs = std::collections::BTreeMap::from([
+            (bounded.name.clone(), bounded.clone()),
+            (unlimited.name.clone(), unlimited.clone()),
+        ]);
+        // Cutoff is NOW - 10_500: that chunk is kept until the entire chunk expires.
+        let report = super::sweep_retention_at(&database, &configs, None, 128, NOW - 500)?;
+        assert_eq!(report.deleted_chunks, 0);
+        let _ = super::sweep_retention_at(&database, &configs, report.next_cursor, 128, NOW - 500)?;
+        assert!(
+            TimeSeriesCollection::new(&database, bounded)?
+                .latest("cpu")?
+                .is_some()
+        );
+        assert!(
+            TimeSeriesCollection::new(&database, unlimited)?
+                .latest("cpu")?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codec_rejects_timestamp_overflow_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let span = TimeChunk {
+            series: "cpu".to_owned(),
+            bucket_start: i64::MIN,
+            points: vec![point(i64::MIN, 1.0), point(0, 2.0)],
+        };
+        assert!(matches!(
+            encode_chunk(&span),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        let delta_of_delta = TimeChunk {
+            series: "cpu".to_owned(),
+            bucket_start: 0,
+            points: vec![point(i64::MAX, 1.0), point(i64::MAX - 2, 2.0)],
+        };
+        assert!(matches!(
+            encode_chunk(&delta_of_delta),
+            Err(TimeSeriesError::InvalidPoint(_))
+        ));
+        let mut bytes = encode_chunk(&TimeChunk {
+            series: "cpu".to_owned(),
+            bucket_start: 0,
+            points: vec![point(1, 1.0)],
+        })?;
+        // Change the stored anchor so decoding the otherwise-valid delta would overflow.
+        let offset = super::GORILLA_CHUNK_MAGIC.len() + 8 + 3;
+        bytes[offset..offset + 8].copy_from_slice(&i64::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_chunk(&bytes),
+            Err(TimeSeriesError::Corruption(_))
+        ));
+        let mut legacy = Vec::new();
+        crate::keyenc::push_len_bytes(&mut legacy, b"cpu");
+        legacy.extend_from_slice(&i64::MAX.to_be_bytes());
+        legacy.extend_from_slice(&1_u64.to_be_bytes());
+        legacy.extend_from_slice(&1_i64.to_be_bytes());
+        legacy.extend_from_slice(&0_u64.to_be_bytes());
+        assert!(matches!(
+            decode_chunk(&legacy),
+            Err(TimeSeriesError::Corruption(_))
+        ));
+        Ok(())
     }
 
     struct FixedClock(i64);

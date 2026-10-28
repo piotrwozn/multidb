@@ -368,7 +368,7 @@ pub fn apply_provision(
 /// else a new in-memory database (Rust API only). The plan is computed against the absent
 /// target and confirmed as in [`apply_provision`]; the database is then created with
 /// `create_database_with_profile` (audit on, `ProvisionEnvironment.audit` as its audit config,
-/// `ProvisionEnvironment.encryption` on the Rust API, the profile's performance), the plan is
+/// `ProvisionEnvironment.encryption`, the profile's performance), the plan is
 /// recomputed against it and its steps must equal the confirmed ones minus `create_database`,
 /// and the steps run as the local operator of the surface (`local:cli`, `local:serve` or
 /// `local:embedded`). The record and the audit events carry the confirmed plan id.

@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use futures::{Sink, stream};
 use pgwire::{
     api::{
@@ -34,18 +35,11 @@ use pgwire::{
     tokio::process_socket,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use sqlparser::{
-    ast::{
-        Expr as SqlExpr, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor,
-    },
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
 use tokio::{
     net::TcpListener,
     sync::RwLock,
     sync::Semaphore,
-    task::{JoinError, spawn_blocking},
+    task::{JoinError, JoinSet, spawn_blocking},
 };
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 
@@ -54,7 +48,7 @@ use crate::{
     db::DbError,
     model::Value,
     observability,
-    query::{ColumnType, Row, SqlOutput, SqlRows},
+    query::{Row, SqlOutput, SqlRows},
 };
 
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
@@ -528,12 +522,26 @@ impl PgServer {
         let connection_timeout_ms = config.connection_timeout_ms.max(1);
         let connection_timeout = Duration::from_millis(connection_timeout_ms);
         let connection_permits = Arc::new(Semaphore::new(max_connections));
+        let blocking_tasks = u32::try_from(config.max_blocking_tasks.max(1))
+            .map_err(|_| NetworkError::Runtime("max_blocking_tasks exceeds u32".to_owned()))?;
         let factory = Arc::new(DbPgFactory::new(database, config));
+        let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                () = &mut shutdown => return Ok(()),
+                () = &mut shutdown => {
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                    // Aborting socket tasks does not cancel their spawn_blocking work.
+                    // Every queued/running database operation owns one of these permits;
+                    // acquiring all of them drains that work before the caller flushes.
+                    let _drained = Arc::clone(&factory.handler.executor.permits)
+                        .acquire_many_owned(blocking_tasks).await
+                        .map_err(|error| NetworkError::Runtime(error.to_string()))?;
+                    return Ok(());
+                },
+                _ = connections.join_next(), if !connections.is_empty() => {},
                 accepted = listener.accept() => {
                     let (socket, _) = accepted?;
                     let tls_acceptor = tls_acceptor.clone();
@@ -543,7 +551,7 @@ impl PgServer {
                         tracing::warn!(max_connections, "pgwire connection limit reached");
                         continue;
                     };
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _permit = permit;
                         match tokio::time::timeout(
                             connection_timeout,
@@ -577,7 +585,11 @@ impl BlockingDbExecutor {
         }
     }
 
-    async fn fields_from_select_sql(&self, sql: String) -> PgWireResult<Option<Vec<FieldInfo>>> {
+    async fn describe_sql_as_user(
+        &self,
+        user: String,
+        sql: String,
+    ) -> PgWireResult<Option<SchemaRef>> {
         let permit = self
             .permits
             .clone()
@@ -585,27 +597,28 @@ impl BlockingDbExecutor {
             .await
             .map_err(|error| network_to_pg(NetworkError::Runtime(error.to_string())))?;
         let database = self.database.clone();
-        let result = spawn_blocking(move || {
+        spawn_blocking(move || {
             let _permit = permit;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| network_to_pg(NetworkError::Runtime(error.to_string())))?;
+            let describe = |database: &crate::db::Database| {
+                let principal = database.principal_for_user(&user);
+                runtime
+                    .block_on(database.describe_query_as(&principal, &sql))
+                    .map_err(|error| db_error_to_pg(&error))
+            };
             match database {
-                DatabaseHandle::Direct(database) => {
-                    fields_from_select_sql(&sql, &database).map_err(|error| error.to_string())
-                }
+                DatabaseHandle::Direct(database) => describe(&database),
                 DatabaseHandle::Shared(database) => {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| error.to_string())?;
                     let database = runtime.block_on(database.read());
-                    fields_from_select_sql(&sql, &database).map_err(|error| error.to_string())
+                    describe(&database)
                 }
             }
         })
         .await
-        .map_err(NetworkError::from)
-        .map_err(network_to_pg)?;
-
-        result.map_err(|error| pg_error("ERROR", "XX000", error))
+        .map_err(|error| network_to_pg(NetworkError::from(error)))?
     }
 
     async fn execute_sql_as_user(
@@ -842,40 +855,15 @@ impl ExtendedQueryHandler for DbPgHandler {
             .map(|ty| ty.clone().unwrap_or(Type::TEXT))
             .collect::<Vec<_>>();
 
-        if is_select_like(&target.statement)
-            && let Some(describe_sql) = describe_sql_for_statement(target)?
-        {
-            let output = self
-                .executor
-                .execute_sql_as_user(client_user(client), describe_sql, true)
-                .await
-                .map_err(network_to_pg)?;
-            if let SqlOutput::Rows(rows) = output {
-                if rows.columns.is_empty()
-                    && let Some(fields) = self
-                        .executor
-                        .fields_from_select_sql(target.statement.clone())
-                        .await?
-                {
-                    return Ok(DescribeStatementResponse::new(parameters, fields));
-                }
-                return Ok(DescribeStatementResponse::new(
-                    parameters,
-                    fields_for_rows(&rows, None),
-                ));
-            }
-        }
-
-        if is_select_like(&target.statement)
-            && let Some(fields) = self
-                .executor
-                .fields_from_select_sql(target.statement.clone())
-                .await?
-        {
-            return Ok(DescribeStatementResponse::new(parameters, fields));
-        }
-
-        Ok(DescribeStatementResponse::new(parameters, Vec::new()))
+        let sql = describe_sql_for_statement(target)?.unwrap_or_else(|| target.statement.clone());
+        let schema = self
+            .executor
+            .describe_sql_as_user(client_user(client), sql)
+            .await?;
+        let fields = schema
+            .as_ref()
+            .map_or_else(Vec::new, |schema| fields_for_schema(schema, None));
+        Ok(DescribeStatementResponse::new(parameters, fields))
     }
 
     async fn do_describe_portal<C>(
@@ -890,23 +878,17 @@ impl ExtendedQueryHandler for DbPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = substitute_portal_params(target)?;
-        if !is_select_like(&sql) {
-            return Ok(DescribePortalResponse::no_data());
-        }
-
-        let output = self
+        let schema = self
             .executor
-            .execute_sql_as_user(client_user(client), sql, true)
-            .await
-            .map_err(network_to_pg)?;
-        if let SqlOutput::Rows(rows) = output {
-            return Ok(DescribePortalResponse::new(fields_for_rows(
-                &rows,
+            .describe_sql_as_user(client_user(client), sql)
+            .await?;
+        match schema {
+            Some(schema) => Ok(DescribePortalResponse::new(fields_for_schema(
+                &schema,
                 Some(&target.result_column_format),
-            )));
+            ))),
+            None => Ok(DescribePortalResponse::no_data()),
         }
-
-        Ok(DescribePortalResponse::no_data())
     }
 
     async fn do_query<C>(
@@ -1047,143 +1029,43 @@ fn pg_type_for_value(value: &Value) -> Type {
     }
 }
 
-fn fields_from_select_sql(
-    sql: &str,
-    database: &crate::db::Database,
-) -> PgWireResult<Option<Vec<FieldInfo>>> {
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .map_err(|error| pg_error("ERROR", "42601", error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(from) = select.from.first() else {
-        return Ok(None);
-    };
-    let TableFactor::Table { name, .. } = &from.relation else {
-        return Ok(None);
-    };
-    let table_name = object_name_to_string(name)?;
-    let table = database
-        .table(&table_name)
-        .map_err(|error| db_error_to_pg(&error))?;
-    let Some(schema) = table.schema() else {
-        return Ok(None);
-    };
-
-    let mut fields = Vec::new();
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                fields.extend(schema.columns.iter().map(|column| {
-                    FieldInfo::new(
-                        column.name.clone(),
-                        None,
-                        None,
-                        pg_type_for_column_type(&column.ty),
-                        FieldFormat::Text,
-                    )
-                }));
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                if let Some(field) = field_for_expr(expr, schema, None)? {
-                    fields.push(field);
-                }
-            }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                if let Some(field) = field_for_expr(expr, schema, Some(alias.value.clone()))? {
-                    fields.push(field);
-                }
-            }
-            SelectItem::ExprWithAliases { .. } => return Ok(None),
-        }
-    }
-
-    Ok((!fields.is_empty()).then_some(fields))
-}
-
-fn field_for_expr(
-    expr: &SqlExpr,
-    schema: &crate::query::TableSchema,
-    alias: Option<String>,
-) -> PgWireResult<Option<FieldInfo>> {
-    let Some((name, ty)) = expr_name_and_type(expr, schema)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(FieldInfo::new(
-        alias.unwrap_or(name),
-        None,
-        None,
-        ty,
-        FieldFormat::Text,
-    )))
-}
-
-fn expr_name_and_type(
-    expr: &SqlExpr,
-    schema: &crate::query::TableSchema,
-) -> PgWireResult<Option<(String, Type)>> {
-    match expr {
-        SqlExpr::Identifier(identifier) => {
-            let column = schema
-                .columns
-                .iter()
-                .find(|column| column.name == identifier.value)
-                .ok_or_else(|| {
-                    pg_error(
-                        "ERROR",
-                        "42703",
-                        format!("missing column {}", identifier.value),
-                    )
-                })?;
-            Ok(Some((
-                column.name.clone(),
-                pg_type_for_column_type(&column.ty),
-            )))
-        }
-        SqlExpr::CompoundIdentifier(parts) => {
-            let Some(identifier) = parts.last() else {
-                return Ok(None);
+fn fields_for_schema(schema: &SchemaRef, result_format: Option<&Format>) -> Vec<FieldInfo> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let ty = match field.data_type() {
+                DataType::Boolean => Type::BOOL,
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => Type::INT8,
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => Type::FLOAT8,
+                DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_) => Type::BYTEA,
+                DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Struct(_)
+                | DataType::Map(_, _) => Type::JSONB,
+                _ => Type::TEXT,
             };
-            expr_name_and_type(&SqlExpr::Identifier(identifier.clone()), schema)
-        }
-        SqlExpr::Function(function) => {
-            let name = function.name.to_string();
-            let ty = if name.eq_ignore_ascii_case("count") {
-                Type::INT8
-            } else if name.eq_ignore_ascii_case("avg") {
-                Type::FLOAT8
-            } else {
-                Type::TEXT
-            };
-            Ok(Some((name, ty)))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn pg_type_for_column_type(ty: &ColumnType) -> Type {
-    match ty {
-        ColumnType::Int => Type::INT8,
-        ColumnType::Float => Type::FLOAT8,
-        ColumnType::Str | ColumnType::Null => Type::TEXT,
-        ColumnType::Bool => Type::BOOL,
-        ColumnType::Bytes => Type::BYTEA,
-    }
-}
-
-fn object_name_to_string(name: &ObjectName) -> PgWireResult<String> {
-    let [part] = name.0.as_slice() else {
-        return Err(pg_error("ERROR", "0A000", name.to_string()));
-    };
-
-    match part {
-        ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
-        ObjectNamePart::Function(_) => Err(pg_error("ERROR", "0A000", name.to_string())),
-    }
+            FieldInfo::new(
+                field.name().clone(),
+                None,
+                None,
+                ty,
+                result_format.map_or(FieldFormat::Text, |format| format.format_for(index)),
+            )
+        })
+        .collect()
 }
 
 fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
@@ -1339,10 +1221,6 @@ fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
     sql.trim_start()
         .get(..keyword.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
-}
-
-fn is_select_like(sql: &str) -> bool {
-    starts_with_keyword(sql, "select") || starts_with_keyword(sql, "with")
 }
 
 fn contains_dollar_param(sql: &str) -> bool {
@@ -1575,6 +1453,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untyped_describe_requires_read_and_does_not_execute_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let TestTls {
+            server,
+            client_cert,
+        } = test_tls()?;
+        let mut database = shared_users_database()?;
+        database.create_table("secrets", Some(user_schema()), Vec::new())?;
+        let database = Arc::new(RwLock::new(database));
+        let server =
+            start_shared_test_server(TlsMode::Require(server), Arc::clone(&database)).await?;
+        let client = connect_client(server.addr, client_cert, "secret").await?;
+
+        // tokio-postgres prepare sends Parse with no parameter OIDs and Describe Statement.
+        // Previously the missing OIDs selected the schema fallback without checking RBAC.
+        let error = client
+            .prepare("select * from secrets where id = $1")
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("ungranted schema was disclosed"))?;
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        );
+        let statement = client
+            .prepare("select name, age from users where age = $1")
+            .await?;
+        assert_eq!(statement.columns()[0].name(), "name");
+        assert_eq!(
+            statement.columns()[1].type_(),
+            &tokio_postgres::types::Type::INT8
+        );
+
+        // There is a row with age=37. Preparing metadata must not evaluate its division by zero.
+        let statement = client
+            .prepare("select 10 / (age - 37) as quotient from users")
+            .await?;
+        assert_eq!(statement.columns()[0].name(), "quotient");
+        assert_eq!(
+            statement.columns()[0].type_(),
+            &tokio_postgres::types::Type::INT8
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn describe_executor_checks_current_grants() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let executor =
+            super::BlockingDbExecutor::new(super::DatabaseHandle::Shared(Arc::clone(&database)), 2);
+        let sql = "select name from users".to_owned();
+        assert!(
+            executor
+                .describe_sql_as_user("alice".to_owned(), sql.clone())
+                .await?
+                .is_some()
+        );
+        database
+            .write()
+            .await
+            .set_authz_policy(AuthzPolicy::new([]));
+        let error = executor
+            .describe_sql_as_user("alice".to_owned(), sql)
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("revoked schema was disclosed"))?;
+        let pgwire::error::PgWireError::UserError(info) = error else {
+            return Err(io::Error::other("expected authorization error").into());
+        };
+        assert_eq!(info.code, "42501");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn plaintext_is_rejected_when_tls_is_required() -> Result<(), Box<dyn std::error::Error>>
     {
         let TestTls { server, .. } = test_tls()?;
@@ -1658,6 +1611,20 @@ mod tests {
         assert_eq!(count, 1);
 
         server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_closes_idle_connections() -> Result<(), Box<dyn std::error::Error>> {
+        let TestTls {
+            server,
+            client_cert,
+        } = test_tls()?;
+        let server = start_test_server(TlsMode::Require(server)).await?;
+        let client = connect_client(server.addr, client_cert, "secret").await?;
+        client.simple_query("select name from users").await?;
+        tokio::time::timeout(Duration::from_secs(10), server.shutdown()).await??;
+        assert!(client.simple_query("select name from users").await.is_err());
         Ok(())
     }
 

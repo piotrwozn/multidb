@@ -4,6 +4,33 @@ All notable public changes will be recorded here.
 
 ## Unreleased
 
+- Control Plane table/document pages now apply row and masking policies before
+  pagination. Pgwire Describe authorizes a metadata-only plan, including untyped
+  parameters, rather than falling back to unguarded schema lookup.
+- Principal changefeeds suppress derived index data from protected collections,
+  deletes whose old-row visibility cannot be established, and table events with
+  masked primary keys. Principal subscriptions bind ownership, require policy-aware
+  delivery and can resolve live user mappings; principal continuous-query creation
+  atomically binds its subscription and preserves ACK progress on re-apply.
+  Legacy subscription delivery now fails closed until a System:Admin operator
+  adopts its owner with `adopt_subscription_as`, preserving the stored ACK.
+- Materialized view reads and principal creation fail closed when source policies
+  cannot be applied before aggregation. Workload/tuning views and
+  `workload_report_as` now require System:Admin (breaking for read-only grants).
+- AP capability checks include AP shards and low-level replay APIs; AP restores
+  refuse unsupported point-in-time targets and incremental chains before creating
+  a destination. Operational create-or-open constructors preserve stored RBAC.
+- Serve performs bounded idle time-series retention, periodic profiler flushes,
+  opt-in bounded online MVCC GC (`MULTIDB_HISTORY_RETAIN_LSNS`), and SIGINT/SIGTERM
+  connection shutdown with a final flush. Online GC serializes history pins with
+  horizon updates; commit-log truncation remains offline.
+- CLI/serve can open and provision encrypted databases with an existing key file
+  selected by `MULTIDB_ENCRYPTION_KEY_PATH`; metadata probes remain read-only.
+- Time-series timestamp codecs report unrepresentable deltas instead of
+  overflowing. Plain columnar inserts append to the tail instead of rewriting
+  all committed segments; primary-key validation still reads existing segments.
+
+
 - Hardened Control Plane `admin` login: failed password checks now lock out
   only the client IP (IPv6 /64) that made them, under a server-wide soft
   ceiling of 20x `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` per window. Other usernames

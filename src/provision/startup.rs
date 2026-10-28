@@ -151,7 +151,7 @@ pub fn serve_startup_decision(plan: &ProvisionPlan, mode: StartupMode) -> Startu
 /// else a new in-memory database (Rust API only). A file that was not closed cleanly first gets
 /// redb's crash recovery, as with every opener. An existing single-node CP database is opened
 /// with `open_database_with_ops`, which loads its persisted RBAC state, with
-/// `ProvisionEnvironment.encryption` (Rust API only); an encrypted database, whose metadata the
+/// `ProvisionEnvironment.encryption`; an encrypted database, whose metadata the
 /// probe cannot read without the key, is opened with that config and the storage profile of the
 /// spec, which the open checks against the decrypted metadata. Then `ProvisionEnvironment.audit`
 /// is applied to the handle, since `open_database_with_ops` does not apply an audit config, so
@@ -163,8 +163,8 @@ pub fn serve_startup_decision(plan: &ProvisionPlan, mode: StartupMode) -> Startu
 /// # Errors
 /// Fails with `StartupRefused` when the decision refuses, or when the startup apply fails
 /// part-way (the database is closed again, and the next start sees the interrupted apply);
-/// `Config(Unsupported)` on the CLI and Control Plane surfaces and for encryption outside the
-/// Rust API; `Config(ReplicationMismatch)` for a database that is not single-node CP; `Locked`
+/// `Config(Unsupported)` on the CLI and Control Plane surfaces;
+/// `Config(ReplicationMismatch)` for a database that is not single-node CP; `Locked`
 /// when another handle holds the database; `Io` when it cannot be probed; `Db` when the audit
 /// key cannot be read; and as [`plan_provision`], [`apply_provision`] and
 /// [`provision_new_database`].
@@ -185,12 +185,6 @@ pub fn open_from_spec(
              config plan|apply --spec, and the Control Plane provisions the database it serves",
         )
     })?;
-    if env.encryption.is_some() && env.surface != ProvisionSurface::RustApi {
-        return Err(unsupported(
-            "ProvisionEnvironment.encryption is accepted on the rust_api surface only; serve \
-             cannot open encrypted databases in this build",
-        ));
-    }
     let path = path
         .map(Path::to_path_buf)
         .or_else(|| spec.deployment.storage_path.as_deref().map(PathBuf::from));

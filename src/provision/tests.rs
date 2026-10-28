@@ -1377,26 +1377,26 @@ fn live_state_problems_block_the_plan() -> TestResult {
         temp_dir.path().join("keyring"),
         temp_dir.path().join("kek"),
     ));
-    assert!(matches!(
-        plan_provision(
+    assert_blocked(
+        &plan_provision(
             &empty,
             ProvisionTargetRef::Path(&temp_dir.path().join("new.redb")),
             &ProvisionOptions::default(),
             &encrypted_cli,
-        ),
-        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
-    ));
+        )?,
+        "PROVISION_ENCRYPTION_MISMATCH",
+    );
     let mut legacy_key = env(ProvisionSurface::RustApi);
     legacy_key.encryption = Some(EncryptionConfig::file_key(temp_dir.path().join("key")));
-    assert!(matches!(
-        plan_provision(
+    assert_blocked(
+        &plan_provision(
             &empty,
             ProvisionTargetRef::Path(&temp_dir.path().join("new.redb")),
             &ProvisionOptions::default(),
             &legacy_key,
-        ),
-        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
-    ));
+        )?,
+        "PROVISION_ENCRYPTION_MISMATCH",
+    );
 
     assert!(matches!(
         plan_path(&empty, &stale_path, ProvisionSurface::Cli),
@@ -4013,6 +4013,109 @@ fn new_databases_are_created_only_at_absent_targets() -> TestResult {
 }
 
 #[test]
+fn cli_and_serve_provision_encrypted_databases_with_explicit_file_keys() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let defaults = ProvisionOptions::default();
+    for surface in [ProvisionSurface::Cli, ProvisionSurface::Serve] {
+        let path = temp_dir.path().join(format!("{}.redb", surface.slug()));
+        let key_path = temp_dir.path().join(format!("{}.key", surface.slug()));
+        std::fs::write(&key_path, [17_u8; 32])?;
+        let mut spec = with_security(
+            orders_spec()?,
+            &json!({
+                "roles": [{
+                    "name": "reader",
+                    "grants": [{ "object": "orders", "permissions": ["read"] }]
+                }],
+                "principals": [{ "user": "orders_svc", "roles": ["reader"] }]
+            }),
+        )?;
+        spec.guarantees.encryption.at_rest = true;
+        spec.guarantees.sensitive_data = true;
+
+        // A secure spec still blocks before creating a file when the operator
+        // has not selected a key, on both user-facing creation surfaces.
+        let unkeyed = env(surface);
+        let plan = plan_provision(&spec, ProvisionTargetRef::Path(&path), &defaults, &unkeyed)?;
+        assert_blocked(&plan, "GUARANTEE_NOT_ENFORCEABLE");
+        assert!(matches!(
+            provision_new_database(
+                &spec,
+                Some(&path),
+                &Confirmation::AutoApproveAdditive,
+                &defaults,
+                &unkeyed
+            ),
+            Err(ProvisionError::Blocked(_))
+        ));
+        assert!(!path.exists());
+
+        let encryption = EncryptionConfig::file_key(&key_path);
+        let keyed = ProvisionEnvironment {
+            encryption: Some(encryption.clone()),
+            ..env(surface)
+        };
+        let plan = plan_provision(&spec, ProvisionTargetRef::Path(&path), &defaults, &keyed)?;
+        assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+        let (db, report) = provision_new_database(
+            &spec,
+            Some(&path),
+            &Confirmation::PlanId(plan.plan_id),
+            &defaults,
+            &keyed,
+        )?;
+        assert_applied(&report);
+        assert!(db.encryption_configured());
+        let security = db.authz_policy().clone();
+        let principals = db.principal_registry().clone();
+        assert!(security.roles().contains_key("reader"));
+        assert!(principals.principals().contains_key("orders_svc"));
+        db.collection("orders")?
+            .insert(&order_document("private-customer"))?;
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        for path in ["guarantees.encryption.at_rest", "guarantees.sensitive_data"] {
+            assert!(
+                record
+                    .guarantees
+                    .iter()
+                    .any(|g| g.path == path && g.status == EnforcementStatus::Enforced)
+            );
+        }
+        drop(db);
+        assert!(open_database(DbConfig::on_disk(Profile::Balanced, &path)).is_err());
+
+        let db = if surface == ProvisionSurface::Serve {
+            assert!(
+                open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &unkeyed)
+                    .is_err()
+            );
+            let (db, report) =
+                open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed)?;
+            assert_eq!(report.decision, StartupDecision::Start);
+            assert!(report.applied.is_none());
+            db
+        } else {
+            open_database_with_ops(
+                DbConfig::on_disk(Profile::Balanced, &path),
+                &OperationalConfig::new().with_encryption(encryption),
+            )?
+        };
+        assert_eq!(db.authz_policy(), &security);
+        assert_eq!(db.principal_registry(), &principals);
+        assert_eq!(db.collection("orders")?.scan()?.len(), 1);
+        let plan = plan_provision(&spec, ProvisionTargetRef::Open(&db), &defaults, &keyed)?;
+        assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.issues);
+        assert!(
+            plan.guarantees
+                .iter()
+                .any(|g| g.path == "guarantees.encryption.at_rest"
+                    && g.status == EnforcementStatus::Enforced)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn rust_api_provisions_an_encrypted_database_with_a_local_envelope() -> TestResult {
     let temp_dir = tempfile::tempdir()?;
     let path = temp_dir.path().join("encrypted.redb");
@@ -5544,7 +5647,7 @@ fn open_from_spec_builds_volatile_databases_on_the_rust_api_only() -> TestResult
     ));
     assert!(refused.reason.contains("is blocked"), "{}", refused.reason);
 
-    // The CLI and the Control Plane do not start from specs, and only the Rust API encrypts.
+    // The CLI and the Control Plane do not start from specs.
     for surface in [ProvisionSurface::Cli, ProvisionSurface::ControlPlane] {
         assert!(matches!(
             open_from_spec(&spec, None, StartupMode::Create, &defaults, &env(surface)),
@@ -5559,16 +5662,14 @@ fn open_from_spec_builds_volatile_databases_on_the_rust_api_only() -> TestResult
         )),
         ..env(ProvisionSurface::Serve)
     };
-    assert!(matches!(
-        open_from_spec(
-            &orders_spec()?,
-            Some(&temp_dir.path().join("encrypted.redb")),
-            StartupMode::Create,
-            &defaults,
-            &encrypted
-        ),
-        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
-    ));
+    let refused = refusal(open_from_spec(
+        &orders_spec()?,
+        Some(&temp_dir.path().join("encrypted.redb")),
+        StartupMode::Create,
+        &defaults,
+        &encrypted,
+    ))?;
+    assert_blocked(&refused.plan, "PROVISION_ENCRYPTION_MISMATCH");
     assert!(!temp_dir.path().join("encrypted.redb").exists());
     Ok(())
 }

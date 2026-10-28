@@ -1034,6 +1034,10 @@ impl<S: StorageEngine> ApDynamo<S> {
 }
 
 impl<S: StorageEngine> Replication for ApDynamo<S> {
+    fn supports_commit_log(&self) -> bool {
+        false
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
