@@ -20,7 +20,7 @@ from domain_common import Http
 SEED = 20261028
 DIMENSIONS = 128
 K = 10
-EF_SEARCH = 256
+EF_SEARCH = 1024
 OFFSETS = (1, 7, 31, 127)
 PASSWORD = "benchmark-pass-only"
 

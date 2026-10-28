@@ -375,7 +375,7 @@ def main():
                     require_idle()
                     subprocess.run([sys.executable, str(args.harness / "verify-results.py"), str(sql_output)], check=True, timeout=60)
                     sampler.remove_target("sql_benchmark_client")
-            recorder = Recorder(args.output / "domains")
+            recorder = Recorder(args.output / "domains") if any(domain != "sql" for domain in args.domains) else None
             for domain, module, engines in (
                 ("analytics", "domain_analytics", []),
                 ("kv", "domain_kv", ["redis"]),
@@ -424,10 +424,11 @@ def main():
                             "native_before_pid": old_pid, "native_after_pid": server.pid,
                             "native_shutdown": restart_shutdown, "redis_container": redis_name,
                             "timed": False})
-            import verify_domains
-            proof = verify_domains.verify(args.output / "domains", vars(args))
-            if not proof["passed"]:
-                raise RuntimeError(f"domain result validation failed: {proof}")
+            if recorder is not None:
+                import verify_domains
+                proof = verify_domains.verify(args.output / "domains", vars(args))
+                if not proof["passed"]:
+                    raise RuntimeError(f"domain result validation failed: {proof}")
             if server.poll() is not None:
                 raise RuntimeError("MultiDB exited during measurements")
             require_idle()

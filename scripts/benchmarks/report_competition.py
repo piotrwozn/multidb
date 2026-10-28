@@ -11,6 +11,13 @@ from pathlib import Path
 import statistics
 
 
+SUITE_DOMAINS = frozenset({'sql', 'analytics', 'kv', 'vector', 'graph', 'tensor'})
+COMMON_RUN_FIELDS = (
+    'binary_sha256', 'revision', 'rows', 'repeats', 'ops',
+    'server_cpus', 'client_cpus', 'host',
+)
+
+
 def aggregate(directory):
     directory = Path(directory)
     if (directory / 'failure.json').exists() or not (directory / 'completion.json').exists():
@@ -70,6 +77,72 @@ def aggregate(directory):
     return result
 
 
+def aggregate_campaigns(paths, *, require_full_suite=False):
+    """Combine complete, compatible campaigns with disjoint domain ownership.
+
+    A single campaign keeps the legacy report contract unless full-suite
+    coverage is explicitly requested. Multi-campaign reports additionally bind
+    every section to the same artifact, source, workload sizes and host plan.
+    """
+    paths = [Path(path) for path in paths]
+    if not paths:
+        raise ValueError('at least one campaign is required')
+    if len(paths) == 1 and not require_full_suite:
+        return aggregate(paths[0])
+
+    reference = None
+    seen_domains = set()
+    seen_cells = set()
+    combined = []
+    for directory in paths:
+        # Preserve all clean-shutdown, correctness and raw-proof checks. A
+        # successful subset of a failed campaign cannot enter a combined report.
+        rows = aggregate(directory)
+        try:
+            run = json.loads((directory / 'run.json').read_text())
+            if not isinstance(run, dict) or any(run.get(key) is None for key in COMMON_RUN_FIELDS):
+                raise ValueError('required run identity fields are missing')
+            domains = run.get('domains')
+            if (not isinstance(domains, list) or not domains
+                    or any(not isinstance(domain, str) for domain in domains)
+                    or len(set(domains)) != len(domains)
+                    or set(domains) - SUITE_DOMAINS):
+                raise ValueError('requested domains are missing or invalid')
+            complete = json.loads((directory / 'completion.json').read_text())
+            if complete.get('binary_sha256') != run['binary_sha256']:
+                raise ValueError('run binary_sha256 differs from completion')
+        except (OSError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError(f'campaign run metadata is missing or invalid: {directory}') from error
+
+        if reference is None:
+            reference = run
+        else:
+            for field in COMMON_RUN_FIELDS:
+                if run[field] != reference[field]:
+                    raise ValueError(f'campaign configuration mismatch: {field}')
+
+        requested = set(domains)
+        if {row['domain'] for row in rows} != requested:
+            raise ValueError(f'results do not match requested domains: {directory}')
+        for row in rows:
+            key = (row['domain'], row['workload'], row['dataset_size'], row['engine'])
+            if key in seen_cells:
+                raise ValueError(f'duplicate output cell: {key}')
+            seen_cells.add(key)
+        overlap = seen_domains.intersection(requested)
+        if overlap:
+            raise ValueError(f'overlapping requested domains: {sorted(overlap)}')
+        seen_domains.update(requested)
+        combined.extend(rows)
+
+    if require_full_suite and seen_domains != SUITE_DOMAINS:
+        missing = sorted(SUITE_DOMAINS - seen_domains)
+        raise ValueError(f'full suite requires all six domains; missing: {missing}')
+    return sorted(combined, key=lambda row: (
+        row['domain'], row['workload'], row['dataset_size'], row['engine'],
+    ))
+
+
 def render(rows):
     lines = ['# Pinned competitor measurements', '',
              'Median across repeated runs of each section; first operations may be cold unless the adapter explicitly warms them. Throughput includes client validation. Raw samples retain every attempted request.', '',
@@ -84,10 +157,12 @@ def render(rows):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('campaign', type=Path)
+    p.add_argument('campaign', type=Path, nargs='+')
     p.add_argument('--output-prefix', type=Path, required=True)
+    p.add_argument('--require-full-suite', action='store_true',
+                   help='require complete, disjoint coverage of all six benchmark domains')
     args = p.parse_args()
-    rows = aggregate(args.campaign)
+    rows = aggregate_campaigns(args.campaign, require_full_suite=args.require_full_suite)
     for suffix in ('.json', '.csv', '.md'):
         if args.output_prefix.with_suffix(suffix).exists():
             raise FileExistsError('existing reports are never overwritten')
