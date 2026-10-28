@@ -965,10 +965,16 @@ async fn native_columnar_guards_decoded_expansion_and_preserves_exact_projection
     engine.performance.query.memory_limit_bytes = 64 * 1_024 * 1_024;
     assert_eq!(
         engine
-            .execute("SELECT payload,id,payload FROM events LIMIT 1")
+            .execute(
+                "SELECT payload AS first_payload,id,payload AS second_payload FROM events LIMIT 1",
+            )
             .await?,
         SqlOutput::Rows(SqlRows {
-            columns: vec!["payload".to_owned(), "id".to_owned(), "payload".to_owned()],
+            columns: vec![
+                "first_payload".to_owned(),
+                "id".to_owned(),
+                "second_payload".to_owned(),
+            ],
             rows: vec![vec![
                 Value::Str(payload.clone()),
                 Value::Int(0),

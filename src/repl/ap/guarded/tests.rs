@@ -212,6 +212,75 @@ fn local_guarded_page_reserves_before_json_decode_and_releases_with_the_page() -
 }
 
 #[test]
+fn numeric_sibling_arrays_fit_16k_with_prior_results_still_reserved() -> TestResult {
+    let node = ApDynamo::new_for_test(MemEngine::new(), 1);
+    for key in 0..64_u8 {
+        node.propose(Op::Put {
+            table: "t".to_owned(),
+            key: vec![key],
+            value: vec![255; 1024],
+        })?;
+    }
+    let read_budget = TestReadBudget::new(16 * 1024, Duration::from_secs(5))?;
+    let retained = read_budget.reserve(6 * 1024)?;
+    let mut rows = 0;
+    node.visit_range(
+        "t",
+        &[],
+        &[],
+        ReadConsistency::Strong,
+        &read_budget,
+        &mut |_, value| {
+            assert_eq!(value, [255; 1024]);
+            rows += 1;
+            Ok(true)
+        },
+    )?;
+    assert_eq!(rows, 64);
+    assert_eq!(read_budget.remaining_bytes(), 10 * 1024);
+    drop(retained);
+    assert_eq!(read_budget.remaining_bytes(), 16 * 1024);
+    Ok(())
+}
+
+#[test]
+fn json_workspace_tracks_tokens_and_ignored_nesting_not_byte_array_length() -> TestResult {
+    let raw = |count| {
+        format!(
+            "[{{\"value\":[{}0],\"clock\":{{\"1\":1}},\"origin\":1}}]",
+            "255,".repeat(count)
+        )
+    };
+    let short = raw(8);
+    let long = raw(65_536);
+    assert_eq!(
+        super::value_bound::working_bytes(short.as_bytes()),
+        super::value_bound::working_bytes(long.as_bytes())
+    );
+    assert!(super::value_bound::working_bytes(long.as_bytes()) < 1024);
+    let escaped = br#"[{"valu\u0065":[1],"cl\u006fck":{"1":1},"or\u0069gin":1}]"#;
+    assert!(super::value_bound::versions_bound(escaped, 8192)? > 1024);
+    assert!(
+        super::value_bound::working_bytes(escaped)
+            > super::value_bound::working_bytes(short.as_bytes())
+    );
+    let nested = format!(
+        "[{{\"ignored\":{}null{}}}]",
+        "[".repeat(4096),
+        "]".repeat(4096)
+    );
+    assert!(super::value_bound::working_bytes(nested.as_bytes()) > 8192);
+    let malformed = format!("[{{\"value\":\"{}\"}}]", "\u{7f}".repeat(4096));
+    // serde formats unexpected typed strings into errors, even without escapes.
+    assert!(super::value_bound::working_bytes(malformed.as_bytes()) > 24 * 4096);
+    assert!(matches!(
+        super::value_bound::versions_bound(malformed.as_bytes(), 8192),
+        Err(StorageError::Corruption(_))
+    ));
+    Ok(())
+}
+
+#[test]
 fn guarded_point_and_many_preserve_missing_duplicates_tombstones_and_stop() -> TestResult {
     let node = ApDynamo::new_for_test(MemEngine::new(), 1);
     node.propose(Op::Put {

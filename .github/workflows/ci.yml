@@ -126,9 +126,10 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "4"
-      MULTIDB_DEFAULT_ARTIFACT: ${{ runner.temp }}/multidb-default-release
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set isolated qualification paths
+        run: printf 'MULTIDB_DEFAULT_ARTIFACT=%s/multidb-default-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
@@ -217,11 +218,12 @@ jobs:
     name: kubernetes-tooling
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    env:
-      MULTIDB_K8S_TOOLS: ${{ runner.temp }}/multidb-kubernetes-tools
-      MULTIDB_K8S_EVIDENCE: ${{ runner.temp }}/multidb-kubernetes-evidence
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set isolated qualification paths
+        run: |
+          printf 'MULTIDB_K8S_TOOLS=%s/multidb-kubernetes-tools\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_K8S_EVIDENCE=%s/multidb-kubernetes-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Initialize public tooling evidence
         run: |
           mkdir "$MULTIDB_K8S_EVIDENCE"
@@ -264,13 +266,14 @@ jobs:
     needs: [secure-default, kubernetes-tooling]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      MULTIDB_DEFAULT_ARTIFACT: ${{ runner.temp }}/multidb-default-release
-      MULTIDB_K8S_TOOLS: ${{ runner.temp }}/multidb-kubernetes-tools
-      MULTIDB_KIND_OUTPUT: ${{ runner.temp }}/multidb-kind-runtime
-      MULTIDB_RUNTIME_EVIDENCE: ${{ runner.temp }}/multidb-kind-bootstrap-evidence
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set isolated qualification paths
+        run: |
+          printf 'MULTIDB_DEFAULT_ARTIFACT=%s/multidb-default-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_K8S_TOOLS=%s/multidb-kubernetes-tools\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_KIND_OUTPUT=%s/multidb-kind-runtime\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_RUNTIME_EVIDENCE=%s/multidb-kind-bootstrap-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Initialize public runtime bootstrap evidence
         run: |
           mkdir "$MULTIDB_RUNTIME_EVIDENCE"

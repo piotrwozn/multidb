@@ -94,9 +94,9 @@ impl<S: StorageEngine> ApDynamo<S> {
             ));
         }
         transaction.visit_range(AP_VERSIONS_TABLE, &start, &end, budget, &mut |key, raw| {
-            // serde_json may allocate an unescape scratch string while reading
-            // field names. Charge it before both preflight and real decoding.
-            let _scratch = budget.reserve(raw.len().saturating_mul(2))?;
+            // Slice JSON borrows ordinary field names. Admit its actual token
+            // workspace before both preflight and owned sibling decoding.
+            let _scratch = budget.reserve(value_bound::working_bytes(raw))?;
             let decoded = value_bound::versions_bound(raw, budget.remaining_bytes())?;
             let cost = decoded
                 .saturating_add(key.len().saturating_mul(2))
@@ -307,7 +307,7 @@ impl<S: StorageEngine> ApDynamo<S> {
             &end,
             budget,
             &mut |encoded_key, raw| {
-                let _scratch = budget.reserve(raw.len().saturating_mul(2))?;
+                let _scratch = budget.reserve(value_bound::working_bytes(raw))?;
                 let decoded = value_bound::versions_bound(raw, budget.remaining_bytes())?;
                 let _decoded =
                     budget.reserve(decoded.saturating_add(encoded_key.len().saturating_mul(2)))?;

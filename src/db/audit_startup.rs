@@ -276,9 +276,14 @@ fn anchor_head(config: &AuditConfig, key: &[u8; 32]) -> Result<AuditHead, DbErro
         if line.is_empty() {
             break;
         }
-        if line.len() > MAX_EVENT_BYTES || line.last() != Some(&b'\n') {
+        if line.len() > MAX_EVENT_BYTES {
             return Err(integrity(
-                "audit anchor has an oversized or incomplete signed record; preserve it for investigation",
+                "audit anchor line exceeds 1048576 bytes; preserve it for investigation",
+            ));
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(integrity(
+                "audit anchor has an incomplete final JSONL record; preserve it for investigation",
             ));
         }
         let event: AuditEvent = serde_json::from_slice(&line)
@@ -357,6 +362,16 @@ fn event_from(bytes: &[u8]) -> Result<AuditEvent, StorageError> {
         .map_err(|_| StorageError::Corruption("invalid stored audit event".to_owned()))
 }
 
+// Visitor callbacks use the storage error channel. Malformed signed records remain
+// audit-integrity failures at the public boundary; transient read/budget errors retain
+// their storage classification and must not seal a read-only diagnostic request.
+fn verification_error(error: StorageError) -> DbError {
+    match error {
+        StorageError::Corruption(message) => integrity(message),
+        error => error.into(),
+    }
+}
+
 // Keep the ordinary streaming pass and the clock-regression fallback together so the
 // shared sequence/head/anchor invariants remain visible when reviewing this verifier.
 #[allow(clippy::too_many_lines)]
@@ -386,7 +401,8 @@ fn verify_snapshot(
                 .map_err(|_| StorageError::Corruption("invalid stored audit head".to_owned()))?;
         }
         Ok(false)
-    })?;
+    })
+    .map_err(verification_error)?;
     if anchor.sequence > expected.sequence {
         return Err(integrity(
             "audit anchor is ahead of the database; preserve both copies",
@@ -423,7 +439,8 @@ fn verify_snapshot(
             }
             Ok(true)
         },
-    )?;
+    )
+    .map_err(verification_error)?;
     if !ordered {
         head = AuditHead::default();
         while head.sequence < expected.sequence {
@@ -465,7 +482,7 @@ fn verify_snapshot(
                         drop(selected);
                         end = start + (end - start) / 2;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(verification_error(error)),
                 }
             };
             if u64::try_from(selected.len()).ok() != Some(end - start + 1) {

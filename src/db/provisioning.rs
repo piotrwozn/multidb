@@ -138,7 +138,10 @@ impl Database {
         if head.sequence == 0 {
             return Ok(None);
         }
-        let key = self.audit_key()?;
+        // Planning is a read-only diagnostic, including after verification sealed an
+        // invalid signer. Keep the mismatch visible without clearing admission failure.
+        let key = super::audit_startup::configured_key(&self.audit_config)?;
+        self.check_audit_key_binding(&key)?;
         let mut newest = None;
         self.repl.scan_range_batches(
             AUDIT_TABLE,

@@ -4,6 +4,73 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 
 use crate::{repl::VersionedBytes, storage::StorageError};
 
+/// Workspace of the slice decoder, distinct from the owned sibling allocations.
+/// Unescaped strings are borrowed; numeric byte-array length does not determine
+/// scratch capacity. Also cover IgnoredAny's container stack and optional
+/// serde_json number-parser features without depending on feature unification.
+pub(super) fn working_bytes(bytes: &[u8]) -> usize {
+    let mut start = None;
+    let mut escaped = false;
+    let mut has_escape = false;
+    let mut longest_string = 0_usize;
+    let mut longest_escaped = 0_usize;
+    let mut depth = 0_usize;
+    let mut max_depth = 0_usize;
+    let mut number = 0_usize;
+    let mut longest_number = 0_usize;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if let Some(begin) = start {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+                has_escape = true;
+            } else if byte == b'"' {
+                longest_string = longest_string.max(index - begin);
+                if has_escape {
+                    longest_escaped = longest_escaped.max(index - begin);
+                }
+                start = None;
+            }
+            continue;
+        }
+        if byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E') {
+            number = number.saturating_add(1);
+            longest_number = longest_number.max(number);
+        } else {
+            number = 0;
+        }
+        match byte {
+            b'"' => {
+                start = Some(index + 1);
+                has_escape = false;
+            }
+            b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                max_depth = max_depth.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        longest_string = longest_string.max(bytes.len() - begin);
+        if has_escape {
+            longest_escaped = longest_escaped.max(bytes.len() - begin);
+        }
+    }
+    // Vec capacity can grow to twice its contents. Malformed typed strings can
+    // also be quoted into serde's error: at most six output bytes per input
+    // byte, with capacity slack and overlapping formatting buffers. Reserve
+    // that workspace before parsing too; it is constant for normal field names.
+    longest_escaped
+        .saturating_mul(2)
+        .saturating_add(longest_string.saturating_mul(24))
+        .saturating_add(max_depth.saturating_mul(2))
+        .saturating_add(longest_number.saturating_mul(2))
+        .saturating_add(512)
+}
+
 pub(super) fn versions_bound(bytes: &[u8], limit: usize) -> Result<usize, StorageError> {
     let mut bound = Bound { used: 0, limit };
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
@@ -13,10 +80,10 @@ pub(super) fn versions_bound(bytes: &[u8], limit: usize) -> Result<usize, Storag
             "AP siblings exceed read budget".to_owned(),
         ));
     }
-    result.map_err(|error| StorageError::Corruption(error.to_string()))?;
+    result.map_err(|_| StorageError::Corruption("invalid stored AP siblings JSON".to_owned()))?;
     decoder
         .end()
-        .map_err(|error| StorageError::Corruption(error.to_string()))?;
+        .map_err(|_| StorageError::Corruption("invalid stored AP siblings JSON".to_owned()))?;
     Ok(bound.used)
 }
 

@@ -88,7 +88,10 @@ impl Database {
     }
 
     fn ensure_graph_rag_backend(&self) -> Result<(), DbError> {
-        if !self.replication_ref().supports_bounded_scans() {
+        if self.repl.is_ap()
+            || self.repl.is_sharded()
+            || !self.replication_ref().supports_bounded_scans()
+        {
             return Err(ConfigError::Unsupported(
                 "GraphRAG requires bounded storage scans; AP and sharded backends are outside this preview"
                     .to_owned(),

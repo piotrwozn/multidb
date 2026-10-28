@@ -389,7 +389,10 @@ impl GuardedFile {
             };
             let end = match length {
                 Some(length) => relative.checked_add(length),
-                None => Some(bytes.len()),
+                // A reader at an adjacent column's start must not match the
+                // empty suffix of the preceding column's pinned region.
+                None if relative < bytes.len() || start == self.length => Some(bytes.len()),
+                None => continue,
             };
             if let Some(end) = end.filter(|end| relative <= *end && *end <= bytes.len()) {
                 return Ok(bytes.slice(relative..end));

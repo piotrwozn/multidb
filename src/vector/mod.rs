@@ -1689,6 +1689,14 @@ mod tests {
         // One deletion is below the automatic compaction threshold. Its HNSW
         // entry remains nearest but must not expand the bounded candidate set.
         vectors.delete_vector(ids[0])?;
+        // All fixture writes were applied through this handle. Certify its
+        // complete local cache so the test exercises tombstones themselves;
+        // production generation invalidation would otherwise rebuild them away.
+        vectors
+            .state
+            .write()
+            .map_err(|_| VectorError::LockPoisoned)?
+            .source_version = database.table_data_version(VECTOR_TABLE)?;
         assert_eq!(vectors.knn_bounded(&[0.0, 0.0], 1)?, Vec::new());
         assert_eq!(vectors.knn(&[0.0, 0.0], 1)?[0].id, ids[1]);
         assert!(matches!(

@@ -1417,7 +1417,7 @@ async fn sql_policies_with_non_scalar_values_refuse_only_their_table()
     assert!(
         matches!(
             &result,
-            Err(DbError::Query(QueryError::DataFusion(message))) if message.contains("not a scalar")
+            Err(DbError::Query(QueryError::Unsupported(message))) if message.contains("not a scalar")
         ),
         "{result:?}"
     );

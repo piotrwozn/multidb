@@ -2218,13 +2218,15 @@ mod tests {
             "embedding".to_owned(),
             vec![tensor(&[128], TensorData::F32(vec![1.; 128]))],
         )]))?;
+        let mut search = TensorSearchRequest::new("embedding", vec![1.; 128]);
+        search.metric = VectorMetric::L2;
         let dataset = dataset.with_memory_limit(256);
         assert!(matches!(
             dataset.read(&TensorReadRequest::new(0, 1)),
             Err(TensorError::InvalidValue(_))
         ));
         assert!(matches!(
-            dataset.search_cpu(&TensorSearchRequest::new("embedding", vec![1.; 128])),
+            dataset.search_cpu(&search),
             Err(TensorError::InvalidValue(_))
         ));
         let dataset = dataset.with_memory_limit(256 * 1024);
@@ -2232,13 +2234,7 @@ mod tests {
             dataset.read(&TensorReadRequest::new(0, 1))?.tensors["embedding"].len(),
             1
         );
-        assert_eq!(
-            dataset
-                .search_cpu(&TensorSearchRequest::new("embedding", vec![1.; 128]))?
-                .hits[0]
-                .distance,
-            0.
-        );
+        assert_eq!(dataset.search_cpu(&search)?.hits[0].distance, 0.);
         Ok(())
     }
 

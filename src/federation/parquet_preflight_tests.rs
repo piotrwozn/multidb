@@ -480,5 +480,18 @@ fn immutable_ranges_prevent_substituting_a_page_after_preflight() -> TestResult 
     assert!(input.get_bytes(3, 5).is_err());
     assert!(input.get_bytes(4, usize::MAX).is_err());
     assert!(input.get_read(0).is_err());
+    let adjacent = super::super::GuardedFile {
+        length: 12,
+        regions: Arc::new(vec![
+            (4, bytes::Bytes::from_static(b"first")),
+            (9, bytes::Bytes::from_static(b"end")),
+        ]),
+        guard: None,
+        read_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+    let mut reader = adjacent.get_read(9)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes)?;
+    assert_eq!(bytes, b"end");
     Ok(())
 }
