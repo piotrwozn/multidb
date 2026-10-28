@@ -11,3 +11,6 @@
 *.pdb binary
 
 fuzz/corpus/** -text -diff
+
+# Preserve generated CSV bytes for evidence checksums and exact regeneration.
+docs/performance/*-production-audit.csv -text
