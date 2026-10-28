@@ -2,11 +2,12 @@ use std::time::SystemTime;
 
 use crate::{
     backup::Lsn,
-    cdc::{ChangefeedFilter, ResumeToken, SubscriptionConfig},
+    cdc::{self, ChangefeedFilter, ResumeToken, SubscriptionConfig, SubscriptionState},
     extension::{AbiVersion, UdfBudget},
     model::Value,
     query::{Row, TableSchema},
     repl::{Op, ReadConsistency, ReplError, Replication, propose_system, propose_system_batch},
+    security::{AuthzError, AuthzPolicy, Principal},
     storage::{Bytes, StorageError},
 };
 
@@ -129,6 +130,12 @@ pub enum ProcedureCommand {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ContinuousError {
+    #[error("authorization: {0}")]
+    Authz(#[from] AuthzError),
+
+    #[error("subscription: {0}")]
+    Subscription(#[from] cdc::SubscriptionError),
+
     #[error("missing continuous query: {0}")]
     MissingContinuousQuery(String),
 
@@ -171,6 +178,7 @@ pub fn create_continuous_query(
     repl: &dyn Replication,
     spec: &ContinuousQuerySpec,
 ) -> Result<ContinuousQueryState, ContinuousError> {
+    ensure_commit_log(repl, "continuous queries")?;
     validate_name(&spec.name)?;
     if spec.sql.trim().is_empty() {
         return Err(ContinuousError::Invalid(
@@ -194,6 +202,87 @@ pub fn create_continuous_query(
     Ok(state)
 }
 
+/// Creates a principal-bound continuous query and its subscription in one commit.
+/// Reapplying the query preserves both durable acknowledgement positions. Delivery must
+/// use the principal-aware CDC APIs, which check current grants and policies again.
+/// # Errors
+/// Fails when the caller lacks Read, another principal owns the subscription, the spec
+/// is invalid, or reading/writing the durable metadata fails.
+pub fn create_continuous_query_as(
+    repl: &dyn Replication,
+    authz: &AuthzPolicy,
+    principal: &Principal,
+    spec: &ContinuousQuerySpec,
+) -> Result<ContinuousQueryState, ContinuousError> {
+    ensure_commit_log(repl, "continuous queries")?;
+    cdc::authorize_filter_access(authz, principal, &spec.filter)?;
+    validate_name(&spec.name)?;
+    if spec.sql.trim().is_empty() {
+        return Err(ContinuousError::Invalid(
+            "continuous query SQL is required".to_owned(),
+        ));
+    }
+    let previous_query = match read_continuous_query_state(repl, &spec.name) {
+        Ok(state) => Some(state),
+        Err(ContinuousError::MissingContinuousQuery(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let previous_subscription = match cdc::subscription_state(repl, &spec.name) {
+        Ok(state) => {
+            cdc::require_subscription_owner(&state, principal)?;
+            Some(state)
+        }
+        Err(cdc::SubscriptionError::MissingSubscription(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let now = SystemTime::now();
+    let state = ContinuousQueryState {
+        name: spec.name.clone(),
+        last_ack: previous_query
+            .as_ref()
+            .map_or_else(|| spec.start.clone(), |state| state.last_ack.clone()),
+        created_at: previous_query
+            .as_ref()
+            .map_or(now, |state| state.created_at),
+        updated_at: now,
+    };
+    let subscription = SubscriptionState {
+        principal: Some(principal.clone()),
+        trusted: false,
+        config: spec.subscription_config(),
+        last_ack: previous_subscription
+            .as_ref()
+            .map_or_else(|| spec.start.clone(), |state| state.last_ack.clone()),
+        created_at: previous_subscription
+            .as_ref()
+            .map_or(now, |state| state.created_at),
+        updated_at: now,
+    };
+    propose_system_batch(
+        repl,
+        vec![
+            put_json(CONTINUOUS_QUERIES_TABLE, spec.name.as_bytes(), spec)?,
+            put_json(CONTINUOUS_QUERY_STATE_TABLE, spec.name.as_bytes(), &state)?,
+            put_json(
+                cdc::CDC_SUBSCRIPTIONS_TABLE,
+                spec.name.as_bytes(),
+                &subscription,
+            )?,
+        ],
+    )?;
+    Ok(state)
+}
+
+fn ensure_commit_log(repl: &dyn Replication, feature: &str) -> Result<(), ContinuousError> {
+    if !repl.supports_commit_log() {
+        return Err(ReplError::Unsupported(format!(
+            "{feature} require replication with a commit log"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Advances the durable offset for one continuous query.
 /// # Errors
 /// Fails when the query is missing, metadata is corrupt, or replication rejects the update.
@@ -202,6 +291,7 @@ pub fn ack_continuous_query(
     name: &str,
     token: ResumeToken,
 ) -> Result<ContinuousQueryState, ContinuousError> {
+    ensure_commit_log(repl, "continuous queries")?;
     let mut state = read_continuous_query_state(repl, name)?;
     state.last_ack = token;
     state.updated_at = SystemTime::now();
@@ -237,6 +327,7 @@ pub fn register_outbox_connector(
     repl: &dyn Replication,
     spec: &OutboxConnectorSpec,
 ) -> Result<(), ContinuousError> {
+    ensure_commit_log(repl, "outbox connectors")?;
     validate_name(&spec.name)?;
     propose_system(
         repl,
@@ -457,4 +548,95 @@ fn validate_name(name: &str) -> Result<(), ContinuousError> {
         return Err(ContinuousError::Invalid(format!("invalid name {name}")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{
+        geo::{GeoError, GeoIndex, GeoIndexConfig},
+        model::{CollectionId, FieldPath},
+        repl::ApDynamo,
+        storage::MemEngine,
+        text::{FullTextIndex, FullTextIndexConfig, TextError},
+    };
+
+    #[test]
+    fn low_level_ap_apis_reject_commit_log_features_before_writing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repl = ApDynamo::new_for_test(MemEngine::new(), 1);
+        let spec = ContinuousQuerySpec {
+            name: "watched".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            filter: ChangefeedFilter::default(),
+            start: ResumeToken::default(),
+            buffer_limit: 16,
+        };
+        assert!(matches!(
+            create_continuous_query(&repl, &spec),
+            Err(ContinuousError::Repl(ReplError::Unsupported(_)))
+        ));
+        assert!(
+            repl.read(
+                CONTINUOUS_QUERIES_TABLE,
+                b"watched",
+                ReadConsistency::Strong
+            )?
+            .is_none()
+        );
+        assert!(
+            repl.read(
+                CONTINUOUS_QUERY_STATE_TABLE,
+                b"watched",
+                ReadConsistency::Strong
+            )?
+            .is_none()
+        );
+        assert!(matches!(
+            ack_continuous_query(&repl, "watched", ResumeToken::default()),
+            Err(ContinuousError::Repl(ReplError::Unsupported(_)))
+        ));
+        let outbox = OutboxConnectorSpec {
+            name: "events".to_owned(),
+            filter: ChangefeedFilter::default(),
+            sink: OutboxSink::InternalTable,
+            enabled: true,
+        };
+        assert!(matches!(
+            register_outbox_connector(&repl, &outbox),
+            Err(ContinuousError::Repl(ReplError::Unsupported(_)))
+        ));
+        assert!(
+            repl.read(OUTBOX_CONNECTORS_TABLE, b"events", ReadConsistency::Strong)?
+                .is_none()
+        );
+
+        let text = FullTextIndex::new(
+            &repl,
+            FullTextIndexConfig::collection(
+                "words",
+                CollectionId::new(7),
+                FieldPath::new(["body"]),
+            ),
+        )?;
+        assert!(matches!(
+            text.refresh_incremental(&BTreeMap::new()),
+            Err(TextError::Repl(ReplError::Unsupported(_)))
+        ));
+        let geo = GeoIndex::new(
+            &repl,
+            GeoIndexConfig::new("places", CollectionId::new(7), FieldPath::new(["point"])),
+        )?;
+        assert!(matches!(
+            geo.refresh_incremental(&BTreeMap::new()),
+            Err(GeoError::Repl(ReplError::Unsupported(_)))
+        ));
+
+        // Full rebuilds remain supported without reading a nonexistent commit log.
+        assert_eq!(text.refresh_full()?.indexed_documents, 0);
+        assert_eq!(geo.refresh_full()?, 0);
+        Ok(())
+    }
 }

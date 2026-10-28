@@ -189,6 +189,19 @@ pub struct EncryptedReadTxn<T, K> {
     key_provider: Arc<K>,
 }
 
+impl<T, K: KeyProvider> EncryptedReadTxn<T, K> {
+    /// Wraps an existing read-only snapshot without opening a storage writer or
+    /// creating key material. The caller must supply a provider opened without
+    /// create semantics when inspecting an existing encrypted database.
+    pub(crate) fn from_read_transaction(inner: T, key_provider: K) -> Result<Self, StorageError> {
+        let _ = key_provider.current_key()?;
+        Ok(Self {
+            inner,
+            key_provider: Arc::new(key_provider),
+        })
+    }
+}
+
 pub struct EncryptedWriteTxn<T, K> {
     inner: T,
     key_provider: Arc<K>,

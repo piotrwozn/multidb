@@ -134,6 +134,28 @@ impl ReplError {
 }
 
 pub trait Replication: Send + Sync {
+    /// Returns an atomic data-version token for one public physical table, when
+    /// this backend maintains one. A legacy native table has token zero until
+    /// its next write. Unsupported backends and internal tables return `None`.
+    /// Cache fills must observe the same token before and after scanning data.
+    /// # Errors
+    /// Fails when a native token cannot be read consistently or is corrupt.
+    fn table_data_version(&self, _table: &str) -> Result<Option<u64>, ReplError> {
+        Ok(None)
+    }
+
+    /// Whether range callbacks stop storage iteration without first materializing
+    /// the entire range. Bounded traversals must refuse the fallback scanner.
+    fn supports_bounded_scans(&self) -> bool {
+        false
+    }
+
+    /// Whether committed writes are recorded in an ordered commit log.
+    /// Backends without this capability must reject replay-based features.
+    fn supports_commit_log(&self) -> bool {
+        true
+    }
+
     /// Proposes one write operation.
     /// # Errors
     /// Fails when the replication backend or storage rejects the write.
@@ -165,6 +187,21 @@ pub trait Replication: Send + Sync {
                 "conditional batches are not supported".to_owned(),
             ))
         }
+    }
+
+    /// Commits a validated typed tensor append through the ordinary user write path.
+    /// Only the tensor engine can issue this payload-bound capability. Wrappers that enforce
+    /// user policies must forward this method while retaining their normal checks.
+    /// # Errors
+    /// Fails for a mismatched capability or a rejected conditional write.
+    #[doc(hidden)]
+    fn propose_tensor_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: crate::tensor::TensorWriteAuthorization,
+    ) -> Result<(), ReplError> {
+        authorization.validate(&batch)?;
+        self.propose_conditional_batch(batch)
     }
 
     /// Persists a prepared distributed transaction participant record.
@@ -201,6 +238,22 @@ pub trait Replication: Send + Sync {
         key: &[u8],
         consistency: ReadConsistency,
     ) -> Result<Option<Bytes>, ReplError>;
+
+    /// Reads keys in their input order, retaining missing entries and duplicate
+    /// keys. Native single-node and CP backends use one storage snapshot; the
+    /// default preserves each backend's ordinary per-key read semantics.
+    /// # Errors
+    /// Fails on any read error, without returning a partial result.
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        keys.iter()
+            .map(|key| self.read(table, key, consistency))
+            .collect()
+    }
 
     /// Reads a half-open key range with the requested consistency level.
     /// # Errors
@@ -639,6 +692,14 @@ fn clone_storage_error(error: &StorageError) -> StorageError {
 }
 
 impl<S: StorageEngine> Replication for SingleNode<S> {
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        txn::read_table_data_version(self, table)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        true
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -736,6 +797,21 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
         Ok(txn.get(table, key)?)
     }
 
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        _consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.storage.begin_read()?;
+        keys.iter()
+            .map(|key| txn.get(table, key).map_err(Into::into))
+            .collect()
+    }
+
     fn range(
         &self,
         table: &str,
@@ -779,6 +855,9 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod read_many_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    ops::ControlFlow,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     thread,
@@ -10,10 +11,10 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use sqlparser::{
     ast::{
-        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-        JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query as SqlQuery, SelectItem,
-        SetExpr, Statement, TableFactor as SqlTableFactor, TableObject as SqlTableObject,
-        UnaryOperator, Value as SqlValue,
+        Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+        ObjectNamePart, Query as SqlQuery, SelectItem, SetExpr, Statement,
+        TableFactor as SqlTableFactor, TableObject as SqlTableObject, UnaryOperator,
+        Value as SqlValue, Visit, Visitor,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -61,8 +62,8 @@ use crate::query::{
     AnalyzeMode, AnalyzeReport, AnalyzeTarget, CostProfile, DocField, ExplainOptions,
     ExplainReport, PlanCache, PlanCacheMetrics, PlannerFeedback, QueryError,
     REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexSpec, RelTable, Row,
-    SqlEngine, SqlOutput, SqlRows, StatsCatalog, TableLayout, TableSchema, decode_row_bytes,
-    parse_with_limits,
+    SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, SqlRelationPolicy, SqlRows, StatsCatalog,
+    TableLayout, TableSchema, decode_row_bytes, parse_with_limits,
 };
 use crate::repl::{
     ApClusterConfig, ApDynamo, ConditionalBatch, CpClusterConfig, CpRaft, HealingAction,
@@ -77,8 +78,8 @@ use crate::runtime_advisor::{
     RuntimeAdvisorError,
 };
 use crate::security::{
-    AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditEvent, AuditHead, AuditOutcome, AuditSink, AuthzError,
-    AuthzPolicy, FileAuditSink, Permission, Principal, PrincipalRegistry, Resource, Role,
+    AUDIT_HEAD_TABLE, AUDIT_TABLE, AuditEvent, AuditHead, AuditOutcome, AuthzError, AuthzPolicy,
+    Permission, Principal, PrincipalRegistry, Resource, Role,
 };
 use crate::storage::{
     AnyEngine, AnyReadTxn, Bytes, EngineKind, ReadTransaction, ReencryptionReport, StorageEngine,
@@ -98,10 +99,17 @@ use crate::vector::{
     VectorCollectionConfig, VectorError, VectorIndexState, VectorMetric,
 };
 
+mod audit_batch;
+mod changefeed_policy;
+mod graphrag;
 mod history;
+mod lifecycle;
 mod profile_binding;
 mod provisioning;
+mod review_fixes;
 mod runtime;
+mod sql_cache;
+mod tensor;
 
 pub(crate) use profile_binding::{
     MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
@@ -109,7 +117,8 @@ pub(crate) use profile_binding::{
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
-    create_database_with_profile, inspect_database_metadata, recover_database_file,
+    create_database_with_profile, inspect_database_metadata,
+    inspect_database_metadata_with_encryption, recover_database_file,
 };
 use runtime::wasm_runtime_for_database;
 
@@ -177,11 +186,12 @@ pub enum Profile {
     HighDurability,
     #[default]
     Balanced,
+    Tensor,
 }
 
 impl Profile {
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 9] {
         [
             Self::InMemory,
             Self::Transactional,
@@ -191,6 +201,7 @@ impl Profile {
             Self::TimeSeries,
             Self::HighDurability,
             Self::Balanced,
+            Self::Tensor,
         ]
     }
 
@@ -202,6 +213,12 @@ impl Profile {
     #[must_use]
     pub const fn is_on_disk(self) -> bool {
         !self.is_in_memory()
+    }
+
+    /// Whether opening this profile requires a physical GPU compute adapter.
+    #[must_use]
+    pub const fn requires_gpu(self) -> bool {
+        matches!(self, Self::Tensor)
     }
 }
 
@@ -496,6 +513,9 @@ pub enum CatalogEntry {
         schema: TableSchema,
         retention: TemporalRetention,
     },
+    TensorDataset {
+        config: crate::tensor::TensorDatasetConfig,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -504,7 +524,7 @@ pub enum DbError {
     Config(#[from] ConfigError),
 
     #[error("query: {0}")]
-    Query(#[from] QueryError),
+    Query(#[source] QueryError),
 
     #[error("model: {0}")]
     Model(#[from] ModelError),
@@ -520,6 +540,12 @@ pub enum DbError {
 
     #[error("graph: {0}")]
     Graph(#[from] GraphError),
+
+    #[error("GraphRAG: {0}")]
+    GraphRag(#[from] crate::graphrag::GraphRagError),
+
+    #[error("tensor: {0}")]
+    Tensor(#[from] crate::tensor::TensorError),
 
     #[error("geo: {0}")]
     Geo(#[from] GeoError),
@@ -589,12 +615,27 @@ pub enum DbError {
     TransactionAborted(String),
 }
 
+impl From<QueryError> for DbError {
+    fn from(error: QueryError) -> Self {
+        match error {
+            QueryError::AuthzDenied(error) => Self::AuthzDenied(error),
+            error => Self::Query(error),
+        }
+    }
+}
+
 impl DbError {
     #[must_use]
     pub fn is_conflict(&self) -> bool {
         matches!(
             self,
             Self::Storage(StorageError::Conflict)
+                | Self::Tensor(
+                    crate::tensor::TensorError::Storage(StorageError::Conflict)
+                        | crate::tensor::TensorError::Repl(
+                            ReplError::Conflict | ReplError::Storage(StorageError::Conflict)
+                        )
+                )
                 | Self::Repl(ReplError::Conflict | ReplError::Storage(StorageError::Conflict))
                 | Self::Query(
                     QueryError::Storage(StorageError::Conflict)
@@ -651,9 +692,11 @@ pub struct Database {
     audit_enabled: bool,
     audit_config: AuditConfig,
     audit_lock: Arc<Mutex<()>>,
+    audit_batch: Arc<audit_batch::AuditBatchCoordinator>,
     history_pins: Arc<Mutex<txn::ActiveSnapshotRegistry>>,
     encryption: Option<EncryptionConfig>,
     plan_cache: Arc<Mutex<PlanCache>>,
+    sql_catalog_cache: sql_cache::SqlCatalogCache,
     performance: PerformanceConfig,
     performance_cache: PerformanceCache,
     query_permits: Arc<Semaphore>,
@@ -823,8 +866,8 @@ impl DatabaseRepl {
         }
     }
 
-    const fn is_ap(&self) -> bool {
-        matches!(self, Self::ApDynamo(_))
+    fn is_ap(&self) -> bool {
+        !self.replication_ref().supports_commit_log()
     }
 
     const fn is_sharded(&self) -> bool {
@@ -968,6 +1011,41 @@ impl HealingBackend for DatabaseHealingBackend {
 }
 
 impl Replication for DatabaseRepl {
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        tracing::trace!(
+            table,
+            key_count = keys.len(),
+            ?consistency,
+            "replication batch read"
+        );
+        let result = self.replication_ref().read_many(table, keys, consistency);
+        observability::record_replication_operation(
+            "read_many",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(error) = &result {
+            observability::record_replication_error(error.metric_kind());
+        }
+        result
+    }
+
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.replication_ref().table_data_version(table)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        self.replication_ref().supports_bounded_scans()
+    }
+
+    fn supports_commit_log(&self) -> bool {
+        self.replication_ref().supports_commit_log()
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         let result = self.replication_ref().propose(op);
         observability::record_replication_operation(
@@ -1150,7 +1228,7 @@ impl Database {
         self.repl.propose_conditional_batch(batch)
     }
 
-    pub(crate) const fn uses_ap_replication(&self) -> bool {
+    pub(crate) fn uses_ap_replication(&self) -> bool {
         self.repl.is_ap()
     }
 
@@ -1230,6 +1308,7 @@ impl Database {
             self.query_governor_overrides.queue_timeout_ms = true;
         }
         self.query_permits = query_permits_for(&self.performance);
+        self.invalidate_plan_cache();
         Ok(())
     }
 
@@ -1994,6 +2073,7 @@ impl Database {
         source: ForeignSource,
         options: ForeignTableOptions,
     ) -> Result<(), DbError> {
+        self.ensure_non_tensor_model_allowed("create_foreign_table")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         validate_foreign_source(&source)?;
@@ -2068,6 +2148,7 @@ impl Database {
         fields: Vec<DocField>,
         indexes: Vec<IndexSpec>,
     ) -> Result<DocumentCollection<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_collection")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         self.ensure_collection_id_available(collection_id)?;
@@ -2118,6 +2199,7 @@ impl Database {
         name: impl Into<String>,
         config: VectorCollectionConfig,
     ) -> Result<VectorCollection<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_vector_collection")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         self.ensure_collection_id_available(config.collection_id)?;
@@ -2176,6 +2258,7 @@ impl Database {
         &mut self,
         config: FullTextIndexConfig,
     ) -> Result<FullTextIndex<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_full_text_index")?;
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
         let TextSource::Collection { collection_id, .. } = &config.source;
@@ -2206,6 +2289,7 @@ impl Database {
         &mut self,
         config: TimeSeriesConfig,
     ) -> Result<TimeSeriesCollection<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_time_series")?;
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
         {
@@ -2236,6 +2320,7 @@ impl Database {
         name: impl Into<String>,
         graph_id: GraphId,
     ) -> Result<Graph<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_graph")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         self.ensure_graph_id_available(graph_id)?;
@@ -2276,6 +2361,7 @@ impl Database {
         &mut self,
         config: GeoIndexConfig,
     ) -> Result<GeoIndex<'_, dyn Replication + '_>, DbError> {
+        self.ensure_non_tensor_model_allowed("create_geo_index")?;
         let name = config.name.clone();
         self.ensure_name_available(&name)?;
         self.ensure_document_collection(config.collection_id)?;
@@ -2491,7 +2577,7 @@ impl Database {
         Ok(self.workload.report(self.replication_ref(), window)?)
     }
 
-    /// Reads workload profile after checking system read permission.
+    /// Reads workload profile after checking system admin permission.
     /// # Errors
     /// Fails when authorization or workload metadata reads fail.
     pub fn workload_report_as(
@@ -2502,7 +2588,7 @@ impl Database {
         self.authorize_or_audit(
             principal,
             &Resource::System,
-            Permission::Read,
+            Permission::Admin,
             "workload_report",
         )?;
         self.workload_report(window)
@@ -2733,6 +2819,7 @@ impl Database {
         )?;
         self.performance_cache = PerformanceCache::new(&self.performance.cache);
         self.query_permits = query_permits_for(&self.performance);
+        self.invalidate_plan_cache();
         tuning::write_tuning_log(self.replication_ref(), &entry)?;
         Ok(entry)
     }
@@ -2775,6 +2862,7 @@ impl Database {
             tuning::rollback_decision_in_config(&mut self.performance, &applied, reason)?;
         self.performance_cache = PerformanceCache::new(&self.performance.cache);
         self.query_permits = query_permits_for(&self.performance);
+        self.invalidate_plan_cache();
         tuning::write_tuning_log(self.replication_ref(), &rollback)?;
         observability::record_tuning_rollback(&rollback.decision.id);
         Ok(rollback)
@@ -3070,6 +3158,7 @@ impl Database {
         token: ResumeToken,
     ) -> Result<SubscriptionState, DbError> {
         let state = cdc::subscription_state(self.replication_ref(), name)?;
+        cdc::require_subscription_owner(&state, principal)?;
         cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
         Ok(cdc::ack_subscription(self.replication_ref(), name, token)?)
     }
@@ -3083,6 +3172,7 @@ impl Database {
         name: &str,
     ) -> Result<SubscriptionState, DbError> {
         let state = cdc::subscription_state(self.replication_ref(), name)?;
+        cdc::require_subscription_owner(&state, principal)?;
         cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
         Ok(state)
     }
@@ -3109,7 +3199,13 @@ impl Database {
         spec: &ContinuousQuerySpec,
     ) -> Result<ContinuousQueryState, DbError> {
         cdc::authorize_filter_access(&self.authz, principal, &spec.filter)?;
-        let state = self.create_continuous_query(spec)?;
+        self.ensure_commit_log_available("continuous queries")?;
+        let state = continuous::create_continuous_query_as(
+            self.replication_ref(),
+            &self.authz,
+            principal,
+            spec,
+        )?;
         self.record_audit(&AuditEvent::new(
             Some(principal),
             "create_continuous_query",
@@ -3143,6 +3239,7 @@ impl Database {
         token: ResumeToken,
     ) -> Result<ContinuousQueryState, DbError> {
         let state = cdc::subscription_state(self.replication_ref(), name)?;
+        cdc::require_subscription_owner(&state, principal)?;
         cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
         self.ack_continuous_query(name, token)
     }
@@ -3184,6 +3281,7 @@ impl Database {
         &self,
         spec: &MaterializedViewSpec,
     ) -> Result<MaterializedViewRows, DbError> {
+        self.ensure_non_tensor_model_allowed("create_materialized_view")?;
         Ok(cdc::create_materialized_view(self, spec)?)
     }
 
@@ -3194,6 +3292,7 @@ impl Database {
         &mut self,
         spec: &MaterializedViewSpec,
     ) -> Result<MaterializedViewRows, DbError> {
+        self.ensure_non_tensor_model_allowed("create_materialized_view_object")?;
         self.ensure_name_available(&spec.name)?;
         let source_schema = self
             .table(&spec.source_table)?
@@ -3227,6 +3326,20 @@ impl Database {
             Permission::Admin,
             "create_materialized_view",
         )?;
+        let source = Resource::Table(spec.source_table.clone());
+        self.authorize_or_audit(
+            principal,
+            &source,
+            Permission::Read,
+            "create_materialized_view",
+        )?;
+        if policy_has_row_or_masking(&self.policy_config()?, &source) {
+            return Err(ExtensionError::PolicyDenied(
+                "materialized views over policy-protected sources cannot be created as a principal"
+                    .to_owned(),
+            )
+            .into());
+        }
         let rows = self.create_materialized_view_object(spec)?;
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3561,10 +3674,20 @@ impl Database {
     /// # Errors
     /// Fails when catalog metadata is invalid or query execution fails.
     pub async fn query(&self, sql: &str) -> Result<SqlOutput, DbError> {
+        self.query_with_read_guard(sql, None).await
+    }
+
+    async fn query_with_read_guard(
+        &self,
+        sql: &str,
+        guard: Option<&mut dyn SqlReadGuard>,
+    ) -> Result<SqlOutput, DbError> {
         let started = Instant::now();
         let _query_permit = self.acquire_query_permit().await.map_err(DbError::from)?;
         if let Some((rewritten, point)) = parse_as_of_query(sql)? {
-            let result = self.query_as_of(&rewritten, point).await;
+            let result = self
+                .query_as_of_with_read_guard(&rewritten, point, guard)
+                .await;
             return self.finish_query(sql, started, result);
         }
         if let Some((name, args)) = parse_call_procedure_sql(sql)? {
@@ -3613,7 +3736,10 @@ impl Database {
             return self.finish_query(sql, started, result);
         }
         let engine = self.sql_engine()?;
-        let result = engine.execute(sql).await.map_err(DbError::from);
+        let result = engine
+            .execute_with_read_guard(sql, guard)
+            .await
+            .map_err(DbError::from);
         self.finish_query(sql, started, result)
     }
 
@@ -3621,6 +3747,15 @@ impl Database {
     /// # Errors
     /// Fails when the temporal point is outside retention, unsupported, or execution fails.
     pub async fn query_as_of(&self, sql: &str, point: TemporalPoint) -> Result<SqlOutput, DbError> {
+        self.query_as_of_with_read_guard(sql, point, None).await
+    }
+
+    async fn query_as_of_with_read_guard(
+        &self,
+        sql: &str,
+        point: TemporalPoint,
+        guard: Option<&mut dyn SqlReadGuard>,
+    ) -> Result<SqlOutput, DbError> {
         if self.repl.is_ap() {
             return Err(TemporalError::Unsupported(
                 "AP replication does not support temporal AS OF".to_owned(),
@@ -3636,8 +3771,8 @@ impl Database {
         let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
         let _history_pin = self.pin_history_lsn(lsn)?;
-        let engine = self.sql_engine()?.with_snapshot_lsn(lsn);
-        Ok(engine.execute(sql).await?)
+        let engine = self.sql_engine()?.as_ref().clone().with_snapshot_lsn(lsn);
+        Ok(engine.execute_with_read_guard(sql, guard).await?)
     }
 
     fn finish_query(
@@ -3804,10 +3939,10 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query")?;
         }
 
-        let result = self
-            .query(sql)
-            .await
-            .and_then(|output| self.apply_query_policies(principal, output, &requirements));
+        let result = match self.sql_read_authorizer(principal, "query", &requirements) {
+            Ok(mut authorizer) => self.query_with_read_guard(sql, Some(&mut authorizer)).await,
+            Err(error) => Err(error),
+        };
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3837,10 +3972,13 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
 
-        let result = self
-            .query_as_of(sql, point)
-            .await
-            .and_then(|output| self.apply_query_policies(principal, output, &requirements));
+        let result = match self.sql_read_authorizer(principal, "query_as_of", &requirements) {
+            Ok(mut authorizer) => {
+                self.query_as_of_with_read_guard(sql, point, Some(&mut authorizer))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -3856,24 +3994,22 @@ impl Database {
         result
     }
 
-    fn apply_query_policies(
-        &self,
-        principal: &Principal,
-        output: SqlOutput,
+    /// Builds the read guard of SQL run as `principal`, carrying the row and masking policies
+    /// the engine applies where it scans each catalog object.
+    /// Index searches return source documents without going through the engine, so they are
+    /// refused while the source collection has row or masking policies.
+    fn sql_read_authorizer<'a>(
+        &'a self,
+        principal: &'a Principal,
+        action: &'static str,
         requirements: &[(Resource, Permission)],
-    ) -> Result<SqlOutput, DbError> {
-        let SqlOutput::Rows(rows) = output else {
-            return Ok(output);
-        };
+    ) -> Result<SqlReadAuthorizer<'a>, DbError> {
         let policy = self.policy_config()?;
-        let resources = policy_resources(requirements);
-        // Index search rows do not carry the source document's field names, so the source
-        // collection's row and masking policies cannot be applied to them.
         let searches_index = requirements.iter().any(|(resource, _)| {
             matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
         });
         if searches_index
-            && resources
+            && policy_resources(requirements)
                 .iter()
                 .any(|resource| policy_has_row_or_masking(&policy, resource))
         {
@@ -3883,33 +4019,13 @@ impl Database {
             )
             .into());
         }
-        if resources.len() != 1 {
-            if resources
-                .iter()
-                .any(|resource| policy_has_row_or_masking(&policy, resource))
-            {
-                return Err(ExtensionError::PolicyDenied(
-                    "multi-resource queries with row or masking policies require column lineage"
-                        .to_owned(),
-                )
-                .into());
-            }
-            return Ok(SqlOutput::Rows(rows));
-        }
-        let resource = resources[0];
-        let mut filtered = Vec::new();
-        for row in rows.rows {
-            let object = row_to_policy_object(&rows.columns, &row);
-            if !policy.row_visible(principal, resource, &object) {
-                continue;
-            }
-            let masked = policy.mask_value(resource, &object);
-            filtered.push(policy_object_to_row(&rows.columns, &masked, row));
-        }
-        Ok(SqlOutput::Rows(crate::query::SqlRows {
-            columns: rows.columns,
-            rows: filtered,
-        }))
+        Ok(SqlReadAuthorizer {
+            database: self,
+            principal,
+            action,
+            policies: sql_relation_policies(&self.catalog, &policy, principal),
+            protected_views: review_fixes::protected_materialized_views(&self.catalog, &policy),
+        })
     }
 
     /// Checks RBAC for a changefeed poll: `System:Admin` first, audited, when the poll can return
@@ -3952,6 +4068,12 @@ impl Database {
         policy: &PolicyConfig,
         mut event: ChangeEvent,
     ) -> Result<Option<ChangeEvent>, DbError> {
+        if !self.index_changefeed_event_visible_to(principal, policy, &event) {
+            return Ok(None);
+        }
+        if !self.primary_key_changefeed_event_visible(policy, &event)? {
+            return Ok(None);
+        }
         let Some(resource) = resource_for_changefeed_target(&event.target) else {
             return Ok(Some(event));
         };
@@ -3959,8 +4081,10 @@ impl Database {
             return Ok(Some(event));
         }
 
+        // Delete records carry no old row. Its visibility and masked primary
+        // key cannot be reconstructed safely, so protected feeds omit it.
         let ChangeOp::Upsert { value_after, key } = event.op else {
-            return Ok(Some(event));
+            return Ok(None);
         };
 
         let masked = match &event.target {
@@ -4041,10 +4165,21 @@ impl Database {
     /// # Errors
     /// Fails when an audit row is missing integrity metadata, has been changed, or the chain is broken.
     pub fn verify_audit_chain(&self) -> Result<(), DbError> {
+        let _audit_guard = self
+            .audit_lock
+            .lock()
+            .map_err(|_| DbError::AuditIntegrity("audit lock poisoned".to_owned()))?;
         let key = self.audit_key()?;
+        let mut events = self.audit_events()?;
+        events.sort_by_key(|event| {
+            event
+                .integrity
+                .as_ref()
+                .map_or(0, |integrity| integrity.sequence)
+        });
         let mut previous_hash = None;
         let mut expected_sequence = 0_u64;
-        for event in self.audit_events()? {
+        for event in events {
             expected_sequence = expected_sequence
                 .checked_add(1)
                 .ok_or_else(|| DbError::AuditIntegrity("audit sequence overflow".to_owned()))?;
@@ -4234,9 +4369,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4267,9 +4404,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4300,9 +4439,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4332,9 +4473,11 @@ impl Database {
             audit_enabled: true,
             audit_config: AuditConfig::default(),
             audit_lock: Arc::new(Mutex::new(())),
+            audit_batch: Arc::new(audit_batch::AuditBatchCoordinator::default()),
             history_pins: Arc::new(Mutex::new(txn::ActiveSnapshotRegistry::default())),
             encryption: None,
             plan_cache: Arc::new(Mutex::new(PlanCache::default())),
+            sql_catalog_cache: sql_cache::SqlCatalogCache::default(),
             performance,
             performance_cache,
             query_permits,
@@ -4369,9 +4512,12 @@ impl Database {
 
     fn write_pipeline(&self) -> WritePipeline {
         WritePipeline {
+            tensor_only: self.profile().requires_gpu(),
+            typed_tensor_write: false,
             backend: self.repl.replication_handle(),
             tenant: self.tenant.clone(),
             wasm_runtime: Arc::clone(&self.wasm_runtime),
+            sql_schema_epoch: Arc::clone(&self.sql_catalog_cache.schema_epoch),
         }
     }
 
@@ -4408,7 +4554,7 @@ impl Database {
             .clone())
     }
 
-    fn sql_engine(&self) -> Result<SqlEngine, DbError> {
+    fn build_sql_engine(&self) -> Result<SqlEngine, DbError> {
         let mut engine = SqlEngine::with_layout_profile_cache_and_performance(
             self.replication_handle(),
             self.layout(),
@@ -4459,7 +4605,8 @@ impl Database {
                 | CatalogEntry::FullTextIndex { .. }
                 | CatalogEntry::TimeSeries { .. }
                 | CatalogEntry::Graph { .. }
-                | CatalogEntry::GeoIndex { .. } => {}
+                | CatalogEntry::GeoIndex { .. }
+                | CatalogEntry::TensorDataset { .. } => {}
             }
         }
 
@@ -4475,6 +4622,7 @@ impl Database {
             }
         }
         for name in names {
+            let name = sql_relation_catalog_name(&self.catalog, &name);
             for entry in self.catalog.values() {
                 if let CatalogEntry::TemporalTable {
                     base_table,
@@ -4491,6 +4639,7 @@ impl Database {
     }
 
     fn invalidate_plan_cache(&self) {
+        self.sql_catalog_cache.invalidate();
         if let Ok(mut cache) = self.plan_cache.lock() {
             cache.invalidate_all();
         }
@@ -4510,7 +4659,8 @@ impl Database {
                 | CatalogEntry::FullTextIndex { .. }
                 | CatalogEntry::TimeSeries { .. }
                 | CatalogEntry::Graph { .. }
-                | CatalogEntry::GeoIndex { .. } => None,
+                | CatalogEntry::GeoIndex { .. }
+                | CatalogEntry::TensorDataset { .. } => None,
             })
             .collect()
     }
@@ -4536,7 +4686,8 @@ impl Database {
                 | CatalogEntry::FullTextIndex { .. }
                 | CatalogEntry::TimeSeries { .. }
                 | CatalogEntry::Graph { .. }
-                | CatalogEntry::GeoIndex { .. } => None,
+                | CatalogEntry::GeoIndex { .. }
+                | CatalogEntry::TensorDataset { .. } => None,
             })
             .collect::<BTreeMap<_, _>>();
         PgCatalogSnapshot::from_catalog(&self.catalog, &schemas)
@@ -4549,6 +4700,17 @@ impl Database {
         permission: Permission,
         action: &str,
     ) -> Result<(), DbError> {
+        self.authorize_with_audit(principal, resource, permission, action)
+            .map_err(DbError::AuthzDenied)
+    }
+
+    fn authorize_with_audit(
+        &self,
+        principal: &Principal,
+        resource: &Resource,
+        permission: Permission,
+        action: &str,
+    ) -> Result<(), AuthzError> {
         match self.authz.authorize(principal, resource, permission) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -4564,7 +4726,7 @@ impl Database {
                     tracing::warn!("failed to write denied authorization audit event");
                 }
                 observability::record_authz_denied(action, resource, permission);
-                Err(DbError::AuthzDenied(error))
+                Err(error)
             }
         }
     }
@@ -4573,55 +4735,8 @@ impl Database {
         if !self.audit_enabled {
             return Ok(());
         }
-
-        let _audit_guard = self
-            .audit_lock
-            .lock()
-            .map_err(|_| DbError::AuditIntegrity("audit lock poisoned".to_owned()))?;
-        let key = self.audit_key()?;
-        let head = self.audit_head()?;
-        let sequence = head
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| DbError::AuditIntegrity("audit sequence overflow".to_owned()))?;
-        let event = event
-            .clone()
-            .with_integrity(head.hash.clone(), sequence, &key)
-            .map_err(DbError::AuditIntegrity)?;
-        let new_head = AuditHead {
-            sequence,
-            hash: event
-                .integrity
-                .as_ref()
-                .map(|integrity| integrity.hash.clone()),
-        };
-        let value =
-            serde_json::to_vec(&event).map_err(|error| DbError::Serde(error.to_string()))?;
-        let head_value =
-            serde_json::to_vec(&new_head).map_err(|error| DbError::Serde(error.to_string()))?;
-        let result = propose_system_batch(
-            &self.repl,
-            vec![
-                Op::Put {
-                    table: AUDIT_TABLE.to_owned(),
-                    key: event.key(),
-                    value,
-                },
-                Op::Put {
-                    table: AUDIT_HEAD_TABLE.to_owned(),
-                    key: b"head".to_vec(),
-                    value: head_value,
-                },
-            ],
-        );
-        observability::record_audit_write(if result.is_ok() { "ok" } else { "error" });
-        result?;
-        if let Some(anchor_path) = &self.audit_config.anchor_path {
-            FileAuditSink::new(anchor_path)
-                .append(&event)
-                .map_err(DbError::AuditIntegrity)?;
-        }
-        Ok(())
+        self.audit_batch
+            .record(event, |events| self.persist_audit_batch(events))
     }
 
     fn audit_head(&self) -> Result<AuditHead, DbError> {
@@ -4679,6 +4794,7 @@ impl Database {
             runtime.reconcile_storage_bytes(self.estimate_tenant_storage_bytes());
             runtime
         });
+        self.invalidate_plan_cache();
     }
 
     fn estimate_tenant_storage_bytes(&self) -> u64 {
@@ -4687,6 +4803,10 @@ impl Database {
             REL_ROWS_TABLE,
             REL_COLUMNAR_SEGMENTS_TABLE,
             DOCUMENT_TABLE,
+            crate::tensor::TENSOR_CHUNKS_TABLE,
+            crate::tensor::TENSOR_META_TABLE,
+            crate::tensor::TENSOR_SAMPLE_INDEX_TABLE,
+            crate::tensor::TENSOR_REVISIONS_TABLE,
             AUDIT_TABLE,
             AUDIT_HEAD_TABLE,
             ADMIN_AUTH_TABLE,
@@ -4711,6 +4831,16 @@ impl Database {
             })
         })
         .sum()
+    }
+
+    fn ensure_non_tensor_model_allowed(&self, operation: &str) -> Result<(), DbError> {
+        if self.profile().requires_gpu() {
+            return Err(ConfigError::Unsupported(format!(
+                "{operation} is unavailable in the Tensor profile; create a typed tensor dataset"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     fn ensure_name_available(&self, name: &str) -> Result<(), DbError> {
@@ -5051,19 +5181,8 @@ impl MultiModelTxn<'_> {
     pub fn insert_row(&mut self, table: &str, row: Row) -> Result<(), DbError> {
         let table = self.database.table(table)?;
         if table.layout() == TableLayout::Columnar {
-            let primary_key = table.primary_key_value_for_row(&row)?;
             let segments = self.columnar_segments(&table)?;
-            let mut rows = Self::columnar_rows(&table, &segments)?;
-            if rows.iter().any(|existing| {
-                table
-                    .primary_key_value_for_row(existing)
-                    .is_ok_and(|key| key == primary_key)
-            }) {
-                return Err(QueryError::DuplicatePrimaryKey.into());
-            }
-
-            rows.push(row);
-            self.queue_ops(table.columnar_rewrite_ops(&segments, rows)?);
+            self.queue_ops(table.columnar_append_ops(&segments, &[row])?);
             return Ok(());
         }
 
@@ -5101,11 +5220,12 @@ impl MultiModelTxn<'_> {
 
         let row_key = table.row_key_for_row(&row)?;
 
-        if let Some(old) = self.get_row_by_key(&row_key)? {
-            self.queue_ops(table.index_delete_ops_for_key(&old, &row_key)?);
-        }
-
-        self.queue_ops(table.put_ops_for_key(row, &row_key)?);
+        let ops = if let Some(old) = self.get_row_by_key(&row_key)? {
+            table.update_ops_for_key(&old, row, &row_key)?
+        } else {
+            table.put_ops_for_key(row, &row_key)?
+        };
+        self.queue_ops(ops);
         Ok(())
     }
 
@@ -5356,9 +5476,12 @@ fn validate_serializable_reads(
 /// bypass every stage.
 #[derive(Clone)]
 struct WritePipeline {
+    tensor_only: bool,
+    typed_tensor_write: bool,
     backend: Arc<dyn Replication>,
     tenant: Option<TenantRuntime>,
     wasm_runtime: Arc<WasmRuntime>,
+    sql_schema_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Maps rejections raised before the commit into the caller's error type.
@@ -5516,6 +5639,13 @@ impl WritePipeline {
         commit: impl FnOnce(ConditionalBatch) -> Result<(), E>,
     ) -> Result<(), E> {
         let ConditionalBatch { conditions, ops } = batch;
+        if self.tensor_only && !self.typed_tensor_write && !ops.is_empty() {
+            return Err(ReplError::Unsupported(
+                "the Tensor profile accepts user writes only from validated typed tensor appends"
+                    .to_owned(),
+            )
+            .into());
+        }
         let triggers = self.resolved_triggers(&ops).map_err(E::trigger)?;
         let (ops, invocations) = if triggers.is_empty() {
             (ops, Vec::new())
@@ -5545,6 +5675,7 @@ impl WritePipeline {
             )),
             None => None,
         };
+        let schema_changed = sql_cache::schema_changed(&ops);
         if let Err(error) = commit(ConditionalBatch::new(conditions, ops)) {
             if let Some((tenant, reservation, _)) = &reservation {
                 tenant.release(reservation);
@@ -5553,6 +5684,10 @@ impl WritePipeline {
         }
 
         // The write is durable from here on: nothing below may return an error.
+        if schema_changed {
+            self.sql_schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         if let Some((tenant, reservation, committed)) = &reservation {
             tenant.commit_successful_ops(committed, reservation);
         }
@@ -5880,6 +6015,32 @@ impl WritePipeline {
 }
 
 impl Replication for WritePipeline {
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend.read_many(table, keys, consistency)
+    }
+
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.backend.table_data_version(table)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        self.backend.supports_bounded_scans()
+    }
+
+    fn supports_commit_log(&self) -> bool {
+        self.backend.supports_commit_log()
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -5895,11 +6056,30 @@ impl Replication for WritePipeline {
         ops: Vec<Op>,
         authorization: txn::WriteAuthorization,
     ) -> Result<(), ReplError> {
-        self.backend.propose_authorized_batch(ops, authorization)
+        let schema_changed = sql_cache::schema_changed(&ops);
+        self.backend.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(())
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
         self.execute(batch, None, |batch| {
+            self.backend.propose_conditional_batch(batch)
+        })
+    }
+
+    fn propose_tensor_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: crate::tensor::TensorWriteAuthorization,
+    ) -> Result<(), ReplError> {
+        authorization.validate(&batch)?;
+        let mut pipeline = self.clone();
+        pipeline.typed_tensor_write = true;
+        pipeline.execute(batch, None, |batch| {
             self.backend.propose_conditional_batch(batch)
         })
     }
@@ -6178,6 +6358,32 @@ impl Drop for Database {
 }
 
 impl Replication for Database {
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.repl.read_many(table, keys, consistency)
+    }
+
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.repl.table_data_version(table)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        self.repl.supports_bounded_scans()
+    }
+
+    fn supports_commit_log(&self) -> bool {
+        self.repl.supports_commit_log()
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -6194,13 +6400,27 @@ impl Replication for Database {
         ops: Vec<Op>,
         authorization: txn::WriteAuthorization,
     ) -> Result<(), ReplError> {
-        self.repl.propose_authorized_batch(ops, authorization)
+        let schema_changed = sql_cache::schema_changed(&ops);
+        self.repl.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_catalog_cache.invalidate();
+        }
+        Ok(())
     }
 
     fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
         self.write_pipeline().execute(batch, None, |batch| {
             self.repl.propose_conditional_batch(batch)
         })
+    }
+
+    fn propose_tensor_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: crate::tensor::TensorWriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.write_pipeline()
+            .propose_tensor_batch(batch, authorization)
     }
 
     fn read(
@@ -6368,9 +6588,8 @@ pub fn create_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
+    database.initialize_security_if_missing(ops.security)?;
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
@@ -6391,7 +6610,8 @@ pub fn open_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_with_performance(config, engine, catalog, performance)?;
     database.encryption.clone_from(&ops.encryption);
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    let mut security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
@@ -6599,9 +6819,8 @@ pub fn create_ap_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
+    database.initialize_security_if_missing(ops.security)?;
     Ok(database)
 }
 
@@ -6622,7 +6841,8 @@ pub fn open_ap_database_with_ops(
     let catalog = read_catalog(&engine)?;
     let mut database = Database::new_ap(config, engine, catalog, cluster)?;
     database.encryption.clone_from(&ops.encryption);
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    let mut security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
     Ok(database)
@@ -6636,6 +6856,11 @@ pub fn create_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
 ) -> Result<Database, ConfigError> {
+    if config.profile.requires_gpu() {
+        return Err(ConfigError::Unsupported(
+            "Tensor GPU databases do not support sharding".to_owned(),
+        ));
+    }
     validate(&config)?;
     let repl = Arc::new(build_sharded_replication(sharding, true)?);
 
@@ -6664,6 +6889,11 @@ pub fn open_sharded_database(
     config: DbConfig,
     sharding: ShardedDatabaseConfig,
 ) -> Result<Database, ConfigError> {
+    if config.profile.requires_gpu() {
+        return Err(ConfigError::Unsupported(
+            "Tensor GPU databases do not support sharding".to_owned(),
+        ));
+    }
     validate(&config)?;
     let repl = Arc::new(build_sharded_replication(sharding, false)?);
     let read = read_metadata_from_repl(repl.as_ref())?;
@@ -6690,9 +6920,8 @@ pub fn create_sharded_database_with_ops(
     }
 
     let mut database = create_sharded_database(config, sharding)?;
-    write_security_to_repl(database.replication_ref(), &ops.security)?;
     database.apply_tenant_config(ops.tenant.clone());
-    database.apply_security_config(ops.security);
+    database.initialize_security_if_missing(ops.security)?;
     Ok(database)
 }
 
@@ -6711,10 +6940,19 @@ pub fn open_sharded_database_with_ops(
     }
 
     let mut database = open_sharded_database(config, sharding)?;
-    let security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    let mut security = read_security_from_repl(database.replication_ref())?.unwrap_or_default();
+    security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
     Ok(database)
+}
+
+fn ensure_tensor_gpu_ready(config: &DbConfig) -> Result<(), ConfigError> {
+    if config.profile.requires_gpu() {
+        crate::tensor_gpu::TensorGpuEngine::shared()
+            .map_err(|error| ConfigError::Unsupported(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Maps a profile to the concrete storage engine used in this phase.
@@ -6722,6 +6960,7 @@ pub fn open_sharded_database_with_ops(
 /// Fails when the config is invalid or the selected storage cannot open.
 pub fn engine_for(config: &DbConfig) -> Result<AnyEngine, ConfigError> {
     validate(config)?;
+    ensure_tensor_gpu_ready(config)?;
 
     if config.profile.is_in_memory() {
         return Ok(AnyEngine::memory());
@@ -6746,6 +6985,7 @@ pub fn engine_for_operational(
     ops: &OperationalConfig,
 ) -> Result<AnyEngine, ConfigError> {
     validate_operational(config, ops)?;
+    ensure_tensor_gpu_ready(config)?;
     let compression = ops
         .performance
         .as_ref()
@@ -7034,6 +7274,11 @@ fn force_wasm_runtime_init_failure(enabled: bool) {
 /// # Errors
 /// Fails when the selected profile contradicts the provided path.
 pub fn validate(config: &DbConfig) -> Result<(), ConfigError> {
+    if config.profile.requires_gpu() && config.replication != ReplicationKind::Cp {
+        return Err(ConfigError::Unsupported(
+            "the Tensor GPU profile requires native single-node CP storage".to_owned(),
+        ));
+    }
     if config.profile.is_in_memory() && config.path.is_some() {
         return Err(ConfigError::VolatileWithPath {
             profile: config.profile,
@@ -7171,6 +7416,12 @@ pub fn profile_validation_report(
             capabilities.insert("redb-commit");
             capabilities.insert("compression-lz4");
         }
+        Profile::Tensor => {
+            capabilities.insert("tensor-datasets");
+            capabilities.insert("typed-tensor-chunks");
+            capabilities.insert("gpu-compute-required");
+            capabilities.insert("dataset-revisions");
+        }
         Profile::Balanced => {
             capabilities.insert("row-layout");
             capabilities.insert("multi-model");
@@ -7198,6 +7449,130 @@ pub fn profile_validation_report(
     })
 }
 
+/// Authorizes the relations of a planned SQL statement for one principal and
+/// hands the engine that principal's row and masking policies.
+struct SqlReadAuthorizer<'a> {
+    database: &'a Database,
+    principal: &'a Principal,
+    action: &'static str,
+    policies: BTreeMap<String, SqlRelationPolicy>,
+    protected_views: BTreeSet<String>,
+}
+
+impl SqlReadGuard for SqlReadAuthorizer<'_> {
+    fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError> {
+        let resources = if reads.is_empty() {
+            BTreeSet::from([Resource::Database])
+        } else {
+            reads
+                .iter()
+                .map(|read| match read {
+                    SqlReadTarget::Catalog(name) => {
+                        resource_for_catalog_name(&self.database.catalog, name)
+                    }
+                    SqlReadTarget::Builtin(_) => Resource::Database,
+                })
+                .collect()
+        };
+        for resource in resources {
+            if let Resource::Table(name) = &resource
+                && self.protected_views.contains(name)
+            {
+                return Err(AuthzError::Denied {
+                    principal: self.principal.name().to_owned(),
+                    resource,
+                    permission: Permission::Read,
+                });
+            }
+            self.database.authorize_with_audit(
+                self.principal,
+                &resource,
+                Permission::Read,
+                self.action,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn relation_policies(&self) -> BTreeMap<String, SqlRelationPolicy> {
+        self.policies.clone()
+    }
+}
+
+/// Translates the row and masking policies of every catalog object SQL can scan into what
+/// the engine applies for `principal`. A row policy shows a row whose value at its path
+/// equals the policy's value or the principal's name. A table's history holds the table's
+/// own rows, so it is read under the table's policies as well as under its own.
+fn sql_relation_policies(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    policy: &PolicyConfig,
+    principal: &Principal,
+) -> BTreeMap<String, SqlRelationPolicy> {
+    let mut policies = BTreeMap::new();
+    if policy.row_policies.is_empty() && policy.masking.is_empty() {
+        return policies;
+    }
+    for (name, entry) in catalog {
+        if !is_sql_relation(entry) {
+            continue;
+        }
+        let mut resources = Vec::with_capacity(2);
+        if let CatalogEntry::TemporalTable { base_table, .. } = entry {
+            resources.push(resource_for_catalog_name(catalog, base_table));
+        }
+        // The relation's own masks come last, so they win over the base table's.
+        resources.push(resource_for_catalog_name(catalog, name));
+        let mut relation = SqlRelationPolicy::default();
+        for resource in &resources {
+            let any_of = policy
+                .row_policies
+                .iter()
+                .filter(|row_policy| &row_policy.resource == resource)
+                .flat_map(|row_policy| {
+                    [
+                        (row_policy.path.clone(), row_policy.equals.clone()),
+                        (
+                            row_policy.path.clone(),
+                            Value::Str(principal.name().to_owned()),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            if !any_of.is_empty() {
+                relation.visible_when.push(any_of);
+            }
+            relation.masks.extend(
+                policy
+                    .masking
+                    .iter()
+                    .filter(|masking| &masking.resource == resource)
+                    .flat_map(|masking| {
+                        masking
+                            .paths
+                            .iter()
+                            .map(|path| (path.clone(), masking.replacement.clone()))
+                    }),
+            );
+        }
+        if relation != SqlRelationPolicy::default() {
+            policies.insert(name.clone(), relation);
+        }
+    }
+    policies
+}
+
+/// Whether the SQL engine registers `entry` as a relation queries can scan.
+const fn is_sql_relation(entry: &CatalogEntry) -> bool {
+    matches!(
+        entry,
+        CatalogEntry::Table { .. }
+            | CatalogEntry::Collection { .. }
+            | CatalogEntry::ForeignTable { .. }
+            | CatalogEntry::MaterializedView { .. }
+            | CatalogEntry::TemporalTable { .. }
+    )
+}
+
 fn sql_requirements(
     sql: &str,
     catalog: &BTreeMap<String, CatalogEntry>,
@@ -7208,7 +7583,7 @@ fn sql_requirements(
     }
 
     if tuning::parse_system_view(sql)?.is_some() {
-        return Ok(vec![(Resource::System, Permission::Read)]);
+        return Ok(vec![(Resource::System, Permission::Admin)]);
     }
 
     if let Some((target, _)) = crate::query::parse_analyze_for_authz(sql)? {
@@ -7246,11 +7621,10 @@ fn sql_requirements(
                 if names.is_empty() {
                     requirements.push((Resource::Database, Permission::Read));
                 } else {
-                    requirements.extend(
-                        names.into_iter().map(|name| {
-                            (resource_for_catalog_name(catalog, &name), Permission::Read)
-                        }),
-                    );
+                    requirements.extend(names.into_iter().map(|name| {
+                        let name = sql_relation_catalog_name(catalog, &name);
+                        (resource_for_catalog_name(catalog, &name), Permission::Read)
+                    }));
                 }
             }
             Statement::Insert(insert) => {
@@ -7258,10 +7632,12 @@ fn sql_requirements(
                     SqlTableObject::TableName(name) => object_name_to_string(name)?,
                     other => return Err(QueryError::Unsupported(other.to_string()).into()),
                 };
-                requirements.push((
-                    resource_for_catalog_name(catalog, &table_name),
-                    Permission::Write,
-                ));
+                let resource = resource_for_catalog_name(catalog, &table_name);
+                // RETURNING hands back stored rows, as PostgreSQL's SELECT privilege rule says.
+                if insert.returning.is_some() {
+                    requirements.push((resource.clone(), Permission::Read));
+                }
+                requirements.push((resource, Permission::Write));
             }
             Statement::Analyze(analyze) => {
                 if let Some(name) = analyze.table_name {
@@ -7312,7 +7688,7 @@ fn phase19_requirements(
 }
 
 /// Index searches return source document text, ids and points, so they also need Read on the
-/// source collection; its row and masking policies then deny the multi-resource result.
+/// source collection, and are refused while it has row or masking policies.
 fn index_with_source_requirements(
     index: Resource,
     name: &str,
@@ -7556,20 +7932,48 @@ fn collect_query_tables(query: &SqlQuery, names: &mut BTreeSet<String>) -> Resul
     collect_query_tables_scoped(query, names, &BTreeSet::new())
 }
 
+/// Collects the catalog names a query reads, skipping names that resolve to a
+/// CTE in scope. Every clause is walked; relation shapes that cannot be mapped
+/// to a catalog name fail closed with `Unsupported`.
 fn collect_query_tables_scoped(
     query: &SqlQuery,
     names: &mut BTreeSet<String>,
     cte_names: &BTreeSet<String>,
 ) -> Result<(), QueryError> {
+    let SqlQuery {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+
+    // CTE names are normalized like DataFusion does: quoted names keep their
+    // case, unquoted names are lowercased. A CTE is only in scope after its
+    // own body, so a self-reference (even under WITH RECURSIVE) still counts
+    // as a table read.
     let mut scoped_ctes = cte_names.clone();
-    if let Some(with) = &query.with {
+    if let Some(with) = with {
         for cte in &with.cte_tables {
             collect_query_tables_scoped(&cte.query, names, &scoped_ctes)?;
-            scoped_ctes.insert(cte.alias.name.value.to_ascii_lowercase());
+            scoped_ctes.insert(normalized_ident(&cte.alias.name));
         }
     }
 
-    collect_set_expr_tables(query.body.as_ref(), names, &scoped_ctes)
+    collect_set_expr_tables(body, names, &scoped_ctes)?;
+    collect_nested_tables(order_by, names, &scoped_ctes)?;
+    collect_nested_tables(limit_clause, names, &scoped_ctes)?;
+    collect_nested_tables(fetch, names, &scoped_ctes)?;
+    collect_nested_tables(locks, names, &scoped_ctes)?;
+    collect_nested_tables(for_clause, names, &scoped_ctes)?;
+    collect_nested_tables(settings, names, &scoped_ctes)?;
+    collect_nested_tables(format_clause, names, &scoped_ctes)?;
+    collect_nested_tables(pipe_operators, names, &scoped_ctes)
 }
 
 fn collect_set_expr_tables(
@@ -7578,238 +7982,111 @@ fn collect_set_expr_tables(
     cte_names: &BTreeSet<String>,
 ) -> Result<(), QueryError> {
     match expr {
-        SetExpr::Select(select) => {
-            for table in &select.from {
-                collect_table_factor(&table.relation, names, cte_names)?;
-                for join in &table.joins {
-                    collect_table_factor(&join.relation, names, cte_names)?;
-                    collect_join_operator_tables(&join.join_operator, names, cte_names)?;
-                }
-            }
-            for item in &select.projection {
-                collect_select_item_tables(item, names, cte_names)?;
-            }
-            if let Some(selection) = &select.selection {
-                collect_expr_tables(selection, names, cte_names)?;
-            }
-            if let GroupByExpr::Expressions(expressions, _) = &select.group_by {
-                for expression in expressions {
-                    collect_expr_tables(expression, names, cte_names)?;
-                }
-            }
-            if let Some(having) = &select.having {
-                collect_expr_tables(having, names, cte_names)?;
-            }
-        }
-        SetExpr::Query(query) => collect_query_tables_scoped(query, names, cte_names)?,
+        SetExpr::Select(select) => collect_nested_tables(select.as_ref(), names, cte_names),
+        SetExpr::Query(query) => collect_query_tables_scoped(query, names, cte_names),
         SetExpr::SetOperation { left, right, .. } => {
             collect_set_expr_tables(left, names, cte_names)?;
-            collect_set_expr_tables(right, names, cte_names)?;
+            collect_set_expr_tables(right, names, cte_names)
         }
-        SetExpr::Values(_) => {}
-        other => return Err(QueryError::Unsupported(other.to_string())),
-    }
-    Ok(())
-}
-
-fn collect_table_factor(
-    factor: &SqlTableFactor,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match factor {
-        SqlTableFactor::Table { name, .. } => {
-            let name = object_name_to_string(name)?;
-            if !cte_names.contains(&name.to_ascii_lowercase()) {
-                names.insert(name);
-            }
-            Ok(())
-        }
-        SqlTableFactor::Derived { subquery, .. } => {
-            collect_query_tables_scoped(subquery, names, cte_names)
-        }
+        SetExpr::Values(values) => collect_nested_tables(values, names, cte_names),
         other => Err(QueryError::Unsupported(other.to_string())),
     }
 }
 
-fn collect_select_item_tables(
-    item: &SelectItem,
+/// Walks every node of `node` and collects the relations it reads. Nested
+/// queries are handed to `collect_query_tables_scoped` so their WITH scopes are
+/// honoured.
+fn collect_nested_tables<T: Visit + ?Sized>(
+    node: &T,
     names: &mut BTreeSet<String>,
     cte_names: &BTreeSet<String>,
 ) -> Result<(), QueryError> {
-    match item {
-        SelectItem::UnnamedExpr(expr)
-        | SelectItem::ExprWithAlias { expr, .. }
-        | SelectItem::ExprWithAliases { expr, .. } => collect_expr_tables(expr, names, cte_names),
-        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => Ok(()),
+    let mut collector = NestedTableCollector {
+        names,
+        cte_names,
+        depth: 0,
+    };
+    match node.visit(&mut collector) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(*error),
     }
 }
 
-fn collect_join_operator_tables(
-    operator: &JoinOperator,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::StraightJoin(constraint) => {
-            collect_join_constraint_tables(constraint, names, cte_names)
-        }
-        JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => {
-            collect_expr_tables(match_condition, names, cte_names)?;
-            collect_join_constraint_tables(constraint, names, cte_names)
-        }
-        JoinOperator::CrossApply
-        | JoinOperator::OuterApply
-        | JoinOperator::ArrayJoin
-        | JoinOperator::LeftArrayJoin
-        | JoinOperator::InnerArrayJoin => Ok(()),
-    }
+struct NestedTableCollector<'a> {
+    names: &'a mut BTreeSet<String>,
+    cte_names: &'a BTreeSet<String>,
+    /// Number of enclosing nested queries. Relations inside a nested query
+    /// were already collected when that query was entered.
+    depth: usize,
 }
 
-fn collect_join_constraint_tables(
-    constraint: &JoinConstraint,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match constraint {
-        JoinConstraint::On(expr) => collect_expr_tables(expr, names, cte_names),
-        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
-    }
-}
+impl Visitor for NestedTableCollector<'_> {
+    type Break = Box<QueryError>;
 
-fn collect_expr_tables(
-    expr: &SqlExpr,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match expr {
-        SqlExpr::IsFalse(expr)
-        | SqlExpr::IsNotFalse(expr)
-        | SqlExpr::IsTrue(expr)
-        | SqlExpr::IsNotTrue(expr)
-        | SqlExpr::IsNull(expr)
-        | SqlExpr::IsNotNull(expr)
-        | SqlExpr::IsUnknown(expr)
-        | SqlExpr::IsNotUnknown(expr)
-        | SqlExpr::Nested(expr)
-        | SqlExpr::UnaryOp { expr, .. }
-        | SqlExpr::Cast { expr, .. }
-        | SqlExpr::AtTimeZone {
-            timestamp: expr, ..
+    fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+        if self.depth == 0
+            && let Err(error) = collect_query_tables_scoped(query, self.names, self.cte_names)
+        {
+            return ControlFlow::Break(Box::new(error));
         }
-        | SqlExpr::Extract { expr, .. }
-        | SqlExpr::Ceil { expr, .. }
-        | SqlExpr::Floor { expr, .. } => collect_expr_tables(expr, names, cte_names),
-        SqlExpr::IsDistinctFrom(left, right)
-        | SqlExpr::IsNotDistinctFrom(left, right)
-        | SqlExpr::BinaryOp { left, right, .. }
-        | SqlExpr::AnyOp { left, right, .. }
-        | SqlExpr::AllOp { left, right, .. } => {
-            collect_expr_tables(left, names, cte_names)?;
-            collect_expr_tables(right, names, cte_names)
-        }
-        SqlExpr::InList { expr, list, .. } => {
-            collect_expr_tables(expr, names, cte_names)?;
-            for item in list {
-                collect_expr_tables(item, names, cte_names)?;
-            }
-            Ok(())
-        }
-        SqlExpr::InSubquery { expr, subquery, .. } => {
-            collect_expr_tables(expr, names, cte_names)?;
-            collect_query_tables_scoped(subquery, names, cte_names)
-        }
-        SqlExpr::Between {
-            expr, low, high, ..
-        } => {
-            collect_expr_tables(expr, names, cte_names)?;
-            collect_expr_tables(low, names, cte_names)?;
-            collect_expr_tables(high, names, cte_names)
-        }
-        SqlExpr::Exists { subquery, .. } | SqlExpr::Subquery(subquery) => {
-            collect_query_tables_scoped(subquery, names, cte_names)
-        }
-        SqlExpr::Function(function) => {
-            collect_function_arguments_tables(&function.args, names, cte_names)
-        }
-        SqlExpr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                collect_expr_tables(operand, names, cte_names)?;
-            }
-            for condition in conditions {
-                collect_expr_tables(&condition.condition, names, cte_names)?;
-                collect_expr_tables(&condition.result, names, cte_names)?;
-            }
-            if let Some(else_result) = else_result {
-                collect_expr_tables(else_result, names, cte_names)?;
-            }
-            Ok(())
-        }
-        SqlExpr::Tuple(expressions) => {
-            for expr in expressions {
-                collect_expr_tables(expr, names, cte_names)?;
-            }
-            Ok(())
-        }
-        SqlExpr::GroupingSets(groups) | SqlExpr::Cube(groups) | SqlExpr::Rollup(groups) => {
-            for expr in groups.iter().flatten() {
-                collect_expr_tables(expr, names, cte_names)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+        self.depth += 1;
+        ControlFlow::Continue(())
     }
-}
 
-fn collect_function_arguments_tables(
-    args: &FunctionArguments,
-    names: &mut BTreeSet<String>,
-    cte_names: &BTreeSet<String>,
-) -> Result<(), QueryError> {
-    match args {
-        FunctionArguments::None => Ok(()),
-        FunctionArguments::Subquery(query) => collect_query_tables_scoped(query, names, cte_names),
-        FunctionArguments::List(list) => {
-            for arg in &list.args {
-                match arg {
-                    FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
-                        if let FunctionArgExpr::Expr(expr) = arg {
-                            collect_expr_tables(expr, names, cte_names)?;
-                        }
-                    }
-                    FunctionArg::ExprNamed { name, arg, .. } => {
-                        collect_expr_tables(name, names, cte_names)?;
-                        if let FunctionArgExpr::Expr(expr) = arg {
-                            collect_expr_tables(expr, names, cte_names)?;
-                        }
-                    }
+    fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.depth = self.depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &SqlTableFactor) -> ControlFlow<Self::Break> {
+        if self.depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        match factor {
+            SqlTableFactor::Table { name, .. } => {
+                let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+                    return ControlFlow::Break(Box::new(QueryError::Unsupported(name.to_string())));
+                };
+                let name = normalized_ident(ident);
+                if !self.cte_names.contains(&name) {
+                    self.names.insert(name);
                 }
+                ControlFlow::Continue(())
             }
-            Ok(())
+            SqlTableFactor::Derived { .. } => ControlFlow::Continue(()),
+            other => ControlFlow::Break(Box::new(QueryError::Unsupported(other.to_string()))),
         }
     }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        ControlFlow::Break(Box::new(QueryError::Unsupported(statement.to_string())))
+    }
+}
+
+/// Normalizes an identifier the way `DataFusion` resolves it.
+fn normalized_ident(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
+    }
+}
+
+/// Maps a relation name as `DataFusion` resolves it (see `normalized_ident`) to the catalog
+/// object the planner reads under that name. The engine registers every SQL relation under
+/// its lowercased catalog name, so `orders`, `ORDERS` and `"orders"` all read the object
+/// `ORDERS`, while `"ORDERS"` reads nothing. A name that reads no object is returned as is;
+/// planning then fails.
+fn sql_relation_catalog_name(catalog: &BTreeMap<String, CatalogEntry>, resolved: &str) -> String {
+    if resolved.bytes().any(|byte| byte.is_ascii_uppercase())
+        || catalog.get(resolved).is_some_and(is_sql_relation)
+    {
+        return resolved.to_owned();
+    }
+    catalog
+        .iter()
+        .find(|(name, entry)| is_sql_relation(entry) && name.eq_ignore_ascii_case(resolved))
+        .map_or_else(|| resolved.to_owned(), |(name, _)| name.clone())
 }
 
 fn apply_procedure_commands(
@@ -7960,7 +8237,9 @@ fn resource_for_catalog_name(catalog: &BTreeMap<String, CatalogEntry>, name: &st
     }
 
     match catalog.get(name) {
-        Some(CatalogEntry::Collection { .. }) => Resource::Collection(name.to_owned()),
+        Some(CatalogEntry::Collection { .. } | CatalogEntry::TensorDataset { .. }) => {
+            Resource::Collection(name.to_owned())
+        }
         Some(CatalogEntry::Vector { .. }) => Resource::VectorCollection(name.to_owned()),
         Some(CatalogEntry::FullTextIndex { .. }) => Resource::FullTextIndex(name.to_owned()),
         Some(CatalogEntry::TimeSeries { .. }) => Resource::TimeSeries(name.to_owned()),
@@ -8182,7 +8461,7 @@ fn ensure_ap_supported(config: &DbConfig, cluster: &ApClusterConfig) -> Result<(
 #[must_use]
 pub const fn layout_for(profile: Profile) -> TableLayout {
     match profile {
-        Profile::Analytical => TableLayout::Columnar,
+        Profile::Analytical | Profile::Tensor => TableLayout::Columnar,
         Profile::InMemory
         | Profile::Transactional
         | Profile::Document
@@ -8196,7 +8475,7 @@ pub const fn layout_for(profile: Profile) -> TableLayout {
 const fn cost_profile_for(profile: Profile) -> CostProfile {
     match profile {
         Profile::InMemory => CostProfile::InMemory,
-        Profile::Analytical => CostProfile::Analytical,
+        Profile::Analytical | Profile::Tensor => CostProfile::Analytical,
         Profile::Transactional | Profile::HighDurability => CostProfile::Transactional,
         Profile::Document | Profile::Vector | Profile::TimeSeries | Profile::Balanced => {
             CostProfile::Balanced
@@ -8661,6 +8940,7 @@ fn kind_mismatch(name: &str, expected: &'static str, entry: &CatalogEntry) -> Db
             CatalogEntry::ForeignTable { .. } => "foreign table",
             CatalogEntry::MaterializedView { .. } => "materialized view",
             CatalogEntry::TemporalTable { .. } => "temporal table",
+            CatalogEntry::TensorDataset { .. } => "tensor dataset",
         },
     }
 }
@@ -8674,6 +8954,9 @@ fn write_json<T: serde::Serialize>(
     txn.put(META_TABLE, key, &bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod read_many_tests;
 
 #[cfg(test)]
 mod tests;

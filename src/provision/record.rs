@@ -49,6 +49,7 @@ pub enum ObjectKind {
     ForeignTable,
     /// A live object provisioning never creates.
     MaterializedView,
+    TensorDataset,
 }
 
 impl ObjectKind {
@@ -66,6 +67,7 @@ impl ObjectKind {
             Self::History => "history",
             Self::ForeignTable => "foreign_table",
             Self::MaterializedView => "materialized_view",
+            Self::TensorDataset => "tensor_dataset",
         }
     }
 }

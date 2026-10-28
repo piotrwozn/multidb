@@ -94,7 +94,13 @@ export type CustomProfileSpec = JsonObject & {
   };
 };
 
-export type PhysicalKind = "document" | "table" | "vector" | "time_series" | "graph";
+export type PhysicalKind =
+  | "document"
+  | "table"
+  | "vector"
+  | "time_series"
+  | "graph"
+  | "tensor_dataset";
 export type PhysicalColumnType = "int" | "float" | "str" | "bool" | "bytes";
 
 /**

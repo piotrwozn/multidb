@@ -264,6 +264,7 @@ impl Database {
         indexes: Vec<RelIndexSpec>,
         layout: TableLayout,
     ) -> Result<RelTable, DbError> {
+        self.ensure_non_tensor_model_allowed("create_table")?;
         let name = name.into();
         self.ensure_name_available(&name)?;
         let table = RelTable::handle_with_layout(

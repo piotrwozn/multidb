@@ -3,6 +3,7 @@
 FROM rust:1.89-bookworm AS rust-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY compat ./compat
 COPY src ./src
 COPY benches ./benches
 COPY docs/openapi ./docs/openapi
@@ -24,18 +25,21 @@ ENV VITE_MULTIDB_API_BASE=/api
 RUN npm run build
 
 FROM debian:bookworm-slim AS runtime
+# Headless Vulkan loader/ICDs; the host must also expose a compatible GPU.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 multidb \
     && useradd --system --uid 10001 --gid multidb --home-dir /var/lib/multidb multidb \
-    && mkdir -p /var/lib/multidb /usr/share/multidb/studio \
-    && chown -R multidb:multidb /var/lib/multidb /usr/share/multidb
+    && mkdir -p /var/lib/multidb /usr/share/multidb/studio /tmp/multidb-runtime \
+    && chmod 0700 /tmp/multidb-runtime \
+    && chown -R multidb:multidb /var/lib/multidb /usr/share/multidb /tmp/multidb-runtime
 
 COPY --from=rust-builder /tmp/multidb /usr/local/bin/multidb
 COPY --from=studio-builder /studio/dist/ /usr/share/multidb/studio/
 
-ENV MULTIDB_BIND=0.0.0.0:8080 \
+ENV XDG_RUNTIME_DIR=/tmp/multidb-runtime \
+    MULTIDB_BIND=0.0.0.0:8080 \
     MULTIDB_PG_BIND=0.0.0.0:5432 \
     MULTIDB_DB_PATH=/var/lib/multidb/multidb.redb \
     MULTIDB_PROFILE=transactional \

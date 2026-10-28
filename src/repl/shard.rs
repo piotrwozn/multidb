@@ -548,6 +548,12 @@ impl ShardedReplication {
 }
 
 impl Replication for ShardedReplication {
+    fn supports_commit_log(&self) -> bool {
+        self.shards
+            .values()
+            .all(|shard| shard.supports_commit_log())
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -827,6 +833,23 @@ mod tests {
         shards.insert(2, two_repl);
         let map = ShardMap::balanced(PartitionStrategy::HashSlots { partitions: 16 }, [1, 2])?;
         Ok((ShardedReplication::new(map, shards, 1)?, one, two))
+    }
+
+    #[test]
+    fn commit_log_capability_includes_every_shard() -> Result<(), ReplError> {
+        let (cp_only, _, _) = sharded()?;
+        assert!(cp_only.supports_commit_log());
+
+        let mut shards: BTreeMap<u32, Arc<dyn Replication>> = BTreeMap::new();
+        shards.insert(1, Arc::new(SingleNode::new(MemEngine::new())));
+        shards.insert(
+            2,
+            Arc::new(crate::repl::ApDynamo::new_for_test(MemEngine::new(), 2)),
+        );
+        let map = ShardMap::balanced(PartitionStrategy::HashSlots { partitions: 16 }, [1, 2])?;
+        let mixed = ShardedReplication::new(map, shards, 1)?;
+        assert!(!mixed.supports_commit_log());
+        Ok(())
     }
 
     fn two_keys_on_different_shards(

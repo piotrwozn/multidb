@@ -531,7 +531,8 @@
             "table",
             "vector",
             "time_series",
-            "graph"
+            "graph",
+            "tensor_dataset"
           ],
           "type": "string"
         },
@@ -616,6 +617,64 @@
             "type": "object"
           },
           "maxItems": 64,
+          "type": "array"
+        },
+        "tensor_chunk_samples": {
+          "description": "tensor_dataset: maximum samples per chunk (default 64).",
+          "maximum": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tensor_max_chunk_bytes": {
+          "description": "tensor_dataset: maximum encoded chunk bytes (default 4194304).",
+          "maximum": 16777216,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "tensors": {
+          "description": "tensor_dataset: immutable typed tensor columns; required at provisioning, at most 64 unique columns.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "dtype": {
+                "enum": [
+                  "u8",
+                  "i64",
+                  "f32",
+                  "f64",
+                  "bool",
+                  "utf8"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "description": "Tensor column name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "shape": {
+                "items": {
+                  "maximum": 4000000,
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "maxItems": 8,
+                "type": "array"
+              }
+            },
+            "required": [
+              "name",
+              "dtype",
+              "shape"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "minItems": 1,
           "type": "array"
         }
       },

@@ -17,7 +17,7 @@ use axum::{
     Extension, Json, Router,
     extract::{
         ConnectInfo, DefaultBodyLimit, OriginalUri, Path as AxumPath, Query as AxumQuery, State,
-        rejection::JsonRejection,
+        rejection::{JsonRejection, QueryRejection},
     },
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -45,8 +45,10 @@ use crate::{
         AdminCredentialRecord, CatalogEntry, ConfigError, ConfigPlanSource, Database, DbError,
         PersistedProfileManifest, Profile, ReplicationKind, bootstrap_admin_identity,
     },
+    extension::{ExtensionError, PolicyConfig},
     geo::GeoIndexConfig,
-    graph::GraphId,
+    graph::{GraphId, GraphNodeId},
+    graphrag::{GraphRagError, GraphRagRequest},
     model::{CollectionId, DocumentId, FieldPath, IndexId, IndexSpec, Value as ModelValue},
     observability,
     provision::{
@@ -56,17 +58,21 @@ use crate::{
         StartupMode, StepOutcome,
     },
     query::{
-        DocField, QueryError, RelIndexExpression, RelIndexSpec, Row, SqlOutput, TableLayout,
-        TableSchema,
+        DocField, QueryError, RelIndexExpression, RelIndexSpec, RelTable, Row, SqlOutput,
+        TableLayout, TableSchema,
     },
     runtime_advisor::{RuntimeAdviceDecisionRequest, RuntimeAdvicePlanRequest},
     security::{
         AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource,
         Role,
     },
+    tensor::{
+        TensorBatch, TensorComputeRequest, TensorDatasetConfig, TensorError, TensorReadRequest,
+        TensorSearchRequest,
+    },
     text::FullTextIndexConfig,
     timeseries::{DEFAULT_MAX_FUTURE_SKEW_MILLIS, TimePoint, TimeSeriesConfig, TimeSeriesError},
-    vector::{HnswParams, VectorCollectionConfig, VectorHit, VectorMetric},
+    vector::{HnswParams, VectorCollectionConfig, VectorError, VectorHit, VectorMetric},
 };
 
 const MAX_CONTROL_PLANE_BODY_BYTES: usize = 1024 * 1024;
@@ -347,6 +353,20 @@ const CONTROL_PLANE_OPERATIONS: &[ControlPlaneOperation] = &[
         stability: "stable",
     },
     ControlPlaneOperation {
+        method: "POST",
+        path: "/graphrag/query",
+        operation_id: "queryGraphRag",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/graphs/{name}/edges",
+        operation_id: "addGraphEdge",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
         method: "GET",
         path: "/data/time-series/{name}/points",
         operation_id: "listTimeSeriesPoints",
@@ -359,6 +379,48 @@ const CONTROL_PLANE_OPERATIONS: &[ControlPlaneOperation] = &[
         operation_id: "insertTimeSeriesPoint",
         auth_required: true,
         stability: "stable",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/builder/tensor-dataset",
+        operation_id: "createTensorDataset",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "GET",
+        path: "/data/tensor-datasets/{name}",
+        operation_id: "getTensorDataset",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/append",
+        operation_id: "appendTensors",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/read",
+        operation_id: "readTensors",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/search",
+        operation_id: "searchTensors",
+        auth_required: true,
+        stability: "preview",
+    },
+    ControlPlaneOperation {
+        method: "POST",
+        path: "/data/tensor-datasets/{name}/compute",
+        operation_id: "computeTensors",
+        auth_required: true,
+        stability: "preview",
     },
     ControlPlaneOperation {
         method: "POST",
@@ -1104,6 +1166,16 @@ pub struct CreateGraphRequest {
     pub graph_id: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphEdgeRequest {
+    pub source: String,
+    pub label: String,
+    pub target: String,
+    #[serde(default)]
+    pub props: JsonValue,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct VectorInsertRequest {
     pub metadata: JsonValue,
@@ -1126,6 +1198,18 @@ pub struct VectorHitSummary {
     pub id: String,
     pub distance: f32,
     pub metadata: Option<JsonValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TensorAppendRequest {
+    pub tensors: TensorBatch,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TensorInfoQuery {
+    revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -1562,9 +1646,35 @@ fn api_router() -> Router<AdminState> {
         )
         .route("/data/vectors/{name}/vectors", post(vector_insert_handler))
         .route("/data/vectors/{name}/search", post(vector_search_handler))
+        .route("/graphrag/query", post(graph_rag_query_handler))
+        .route("/data/graphs/{name}/edges", post(graph_edge_insert_handler))
         .route(
             "/data/time-series/{name}/points",
             get(time_series_range_handler).post(time_series_insert_handler),
+        )
+        .route(
+            "/builder/tensor-dataset",
+            post(create_tensor_dataset_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}",
+            get(tensor_dataset_info_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/append",
+            post(tensor_append_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/read",
+            post(tensor_read_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/search",
+            post(tensor_search_handler),
+        )
+        .route(
+            "/data/tensor-datasets/{name}/compute",
+            post(tensor_compute_handler),
         )
         .route("/builder/table", post(create_table_handler))
         .route("/builder/collection", post(create_collection_handler))
@@ -2077,7 +2187,8 @@ async fn table_rows_handler(
         }
         let page = data_page(&query);
         match database.table(&name).and_then(|table| {
-            let mut rows = table.scan_page(page.offset, page.limit.saturating_add(1))?;
+            let policy = database.policy_config()?;
+            let mut rows = policy_table_page(&table, &policy, &principal, &name, page)?;
             let has_more = rows.len() > page.limit;
             if has_more {
                 rows.truncate(page.limit);
@@ -2185,7 +2296,25 @@ async fn documents_handler(
         }
         let page = data_page(&query);
         match database.collection(&name).and_then(|collection| {
-            let mut documents = collection.scan_page(page.offset, page.limit.saturating_add(1))?;
+            let policy = database.policy_config()?;
+            let resource = Resource::Collection(name.clone());
+            let has_row_policy = policy.row_policies.iter().any(|p| p.resource == resource);
+            // Offset and the lookahead count visible documents, so a hidden document
+            // cannot create an empty page or leak its presence through has_more.
+            let mut documents = if has_row_policy {
+                collection
+                    .scan()?
+                    .into_iter()
+                    .filter(|(_, document)| policy.row_visible(&principal, &resource, document))
+                    .skip(page.offset)
+                    .take(page.limit.saturating_add(1))
+                    .collect::<Vec<_>>()
+            } else {
+                collection.scan_page(page.offset, page.limit.saturating_add(1))?
+            };
+            for (_, document) in &mut documents {
+                *document = policy.mask_value(&resource, document);
+            }
             let has_more = documents.len() > page.limit;
             if has_more {
                 documents.truncate(page.limit);
@@ -2455,11 +2584,271 @@ async fn vector_search_handler(
         ) {
             return db_error(&DbError::from(error));
         }
-        match database.vector_collection(&name).and_then(|vectors| {
+        let resource = Resource::VectorCollection(name.clone());
+        let result = (|| {
+            let policy = database.policy_config()?;
+            let vectors = database.vector_collection(&name)?;
             let hits = vectors.knn(&request.vector, request.k)?;
-            vector_hits_with_metadata(&vectors, hits)
-        }) {
+            vector_hits_with_metadata(&vectors, hits, &principal, &resource, &policy)
+        })();
+        match result {
             Ok(hits) => api_ok(StatusCode::OK, VectorSearchResponse { hits }),
+            Err(error) => db_error(&error),
+        }
+    })
+    .await
+}
+
+async fn create_tensor_dataset_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<TensorDatasetConfig>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(config) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let mut database = Arc::clone(&state.database).write_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        let result = database
+            .create_tensor_dataset_as(&principal, config)
+            .and_then(|dataset| Ok(dataset.info(None)?));
+        match result {
+            Ok(info) => api_ok(StatusCode::OK, info),
+            Err(error) => tensor_error(&error),
+        }
+    })
+    .await
+}
+
+async fn tensor_dataset_info_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    query: Result<AxumQuery<TensorInfoQuery>, QueryRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let AxumQuery(query) = match query {
+        Ok(query) => query,
+        Err(error) => return invalid_json_value(error.to_string()),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.tensor_dataset_info_as(&principal, &name, query.revision) {
+            Ok(info) => api_ok(StatusCode::OK, info),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_append_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorAppendRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.append_tensors_as(&principal, &name, &request.tensors) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_read_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorReadRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.read_tensors_as(&principal, &name, &request) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_search_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorSearchRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.search_tensors_as(&principal, &name, &request) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+async fn tensor_compute_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<TensorComputeRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(
+        move || match database.compute_tensors_as(&principal, &name, &request) {
+            Ok(result) => api_ok(StatusCode::OK, result),
+            Err(error) => tensor_error(&error),
+        },
+    )
+    .await
+}
+
+fn tensor_error(error: &DbError) -> Response {
+    match error {
+        DbError::Config(ConfigError::Unsupported(_)) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tensor_unsupported",
+            error.to_string(),
+        ),
+        DbError::Tensor(TensorError::Config(_) | TensorError::InvalidValue(_)) => {
+            invalid_json_value(error.to_string())
+        }
+        DbError::Tensor(TensorError::MissingDataset(_) | TensorError::MissingRevision(_)) => {
+            api_error(StatusCode::NOT_FOUND, "not_found", error.to_string())
+        }
+        DbError::Tensor(TensorError::GpuUnsupported(_)) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tensor_gpu_unsupported",
+            error.to_string(),
+        ),
+        DbError::Tensor(TensorError::GpuUnavailable(_)) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tensor_gpu_unavailable",
+            error.to_string(),
+        ),
+        _ => db_error(error),
+    }
+}
+
+async fn graph_rag_query_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    body: Result<Json<GraphRagRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    if let Err(error) = request.validate() {
+        return invalid_json_value(error.to_string());
+    }
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || match database.graph_rag_as(&principal, &request) {
+        Ok(result) => api_ok(StatusCode::OK, result),
+        Err(error) => graph_rag_error(&error),
+    })
+    .await
+}
+
+fn graph_rag_error(error: &DbError) -> Response {
+    if matches!(error, DbError::Config(ConfigError::Unsupported(_))) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "graphrag_unsupported",
+            error.to_string(),
+        );
+    }
+    db_error(error)
+}
+
+async fn graph_edge_insert_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<GraphEdgeRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_token(&state, &headers).await {
+        return response;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(error) => return invalid_json(&error),
+    };
+    for (field, value, max_bytes) in [
+        ("graph", name.as_str(), 256),
+        ("source", request.source.as_str(), 256),
+        ("target", request.target.as_str(), 256),
+        ("label", request.label.as_str(), 128),
+    ] {
+        if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control)
+        {
+            return invalid_json_value(format!(
+                "{field} must contain 1 to {max_bytes} bytes and no control characters"
+            ));
+        }
+    }
+    let props = match json_to_model_value(request.props) {
+        Ok(value) => value,
+        Err(message) => return invalid_json_value(message),
+    };
+    let database = Arc::clone(&state.database).read_owned().await;
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || {
+        match database.add_graph_edge_as(
+            &principal,
+            &name,
+            GraphNodeId::from_str_id(&request.source),
+            &request.label,
+            GraphNodeId::from_str_id(&request.target),
+            &props,
+        ) {
+            Ok(()) => api_ok(StatusCode::OK, json!({ "written": true })),
             Err(error) => db_error(&error),
         }
     })
@@ -3217,6 +3606,8 @@ async fn profiles_handler(State(state): State<AdminState>, headers: HeaderMap) -
                 "aliases": profile.aliases,
                 "status": profile.status,
                 "description": profile.description,
+                "requires_gpu": resolve_named_profile(profile.slug, &ProfileKnobOverrides::default())
+                    .resolved().is_some_and(|resolved| resolved.storage_profile.requires_gpu()),
                 "default_domain": consistency_domain_definition(profile.default_domain)
                     .map_or("unknown", |domain| domain.slug),
                 "compatible_roles": profile
@@ -3400,6 +3791,10 @@ async fn studio_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
                 "full_text_builder",
                 "geo_builder",
                 "graph_builder",
+                "graph_edges_preview",
+                "graphrag_preview",
+                "tensor_datasets_preview",
+                "tensor_gpu_compute_preview",
                 "security_rbac",
                 "audit_log",
             ],
@@ -3436,11 +3831,18 @@ fn catalog_response(database: &Database) -> Result<CatalogResponse, DbError> {
         let (schema, row_count) = match entry {
             CatalogEntry::Table { .. } => {
                 let table = database.table(name)?;
-                (table.schema().cloned(), Some(table.scan()?.len()))
+                (table.schema().cloned(), Some(table.row_count()?))
             }
             CatalogEntry::Collection { .. } => {
                 let collection = database.collection(name)?;
                 (None, Some(collection.scan()?.len()))
+            }
+            CatalogEntry::TensorDataset { .. } => {
+                let info = database.tensor_dataset(name)?.info(None)?;
+                (
+                    None,
+                    Some(usize::try_from(info.samples).unwrap_or(usize::MAX)),
+                )
             }
             _ => (None, None),
         };
@@ -3467,6 +3869,7 @@ fn catalog_kind(entry: &CatalogEntry) -> &'static str {
         CatalogEntry::ForeignTable { .. } => "foreign_table",
         CatalogEntry::MaterializedView { .. } => "materialized_view",
         CatalogEntry::TemporalTable { .. } => "temporal_table",
+        CatalogEntry::TensorDataset { .. } => "tensor_dataset",
     }
 }
 
@@ -3561,18 +3964,25 @@ fn model_value_to_json(value: &ModelValue) -> JsonValue {
 fn vector_hits_with_metadata(
     vectors: &crate::vector::VectorCollection<'_, dyn crate::repl::Replication + '_>,
     hits: Vec<VectorHit>,
+    principal: &Principal,
+    resource: &Resource,
+    policy: &PolicyConfig,
 ) -> Result<Vec<VectorHitSummary>, DbError> {
-    hits.into_iter()
-        .map(|hit| {
-            Ok(VectorHitSummary {
-                id: document_id_to_hex(hit.id),
-                distance: hit.distance,
-                metadata: vectors
-                    .get_metadata(hit.id)?
-                    .map(|metadata| model_value_to_json(&metadata)),
-            })
-        })
-        .collect()
+    let mut visible = Vec::new();
+    for hit in hits {
+        let Some(metadata) = vectors.get_metadata(hit.id)? else {
+            continue;
+        };
+        if !policy.row_visible(principal, resource, &metadata) {
+            continue;
+        }
+        visible.push(VectorHitSummary {
+            id: document_id_to_hex(hit.id),
+            distance: hit.distance,
+            metadata: Some(model_value_to_json(&policy.mask_value(resource, &metadata))),
+        });
+    }
+    Ok(visible)
 }
 
 fn security_state(database: &Database) -> SecurityStateResponse {
@@ -3614,6 +4024,94 @@ fn data_page(query: &DataPageQuery) -> DataPage {
         limit,
         capped: requested != limit,
     }
+}
+
+/// Reads one page after row policies, with the same column-name matching and
+/// scalar replacements as principal-scoped SQL. The extra visible row is the
+/// caller's lookahead for `has_more`.
+fn policy_table_page(
+    table: &RelTable,
+    policy: &PolicyConfig,
+    principal: &Principal,
+    name: &str,
+    page: DataPage,
+) -> Result<Vec<Row>, DbError> {
+    let resource = Resource::Table(name.to_owned());
+    let has_row_policy = policy.row_policies.iter().any(|p| p.resource == resource);
+    let masks = policy
+        .masking
+        .iter()
+        .filter(|p| p.resource == resource)
+        .collect::<Vec<_>>();
+    if !has_row_policy && masks.is_empty() {
+        return Ok(table.scan_page(page.offset, page.limit.saturating_add(1))?);
+    }
+    // Positional rows without a schema cannot be matched to policy paths.
+    // Refuse the request rather than returning the original values.
+    let schema = table.schema().ok_or_else(|| {
+        ExtensionError::PolicyDenied(format!(
+            "reading table {name} with row or masking policies requires schema"
+        ))
+    })?;
+    let replacements = schema
+        .columns
+        .iter()
+        .map(|column| {
+            let column_path = [column.name.clone()];
+            masks
+                .iter()
+                .rev()
+                .find(|mask| {
+                    mask.paths
+                        .iter()
+                        .any(|path| column_path.starts_with(path.segments()))
+                })
+                .map(|mask| mask.replacement.clone())
+        })
+        .collect::<Vec<_>>();
+    if replacements.iter().flatten().any(|value| {
+        matches!(
+            value,
+            ModelValue::Array(_)
+                | ModelValue::Object(_)
+                | ModelValue::Vector(_)
+                | ModelValue::GeoPoint { .. }
+        )
+    }) {
+        return Err(ExtensionError::PolicyDenied(format!(
+            "table {name} has a masking policy whose replacement is not a scalar"
+        ))
+        .into());
+    }
+    let mut rows = if has_row_policy {
+        table
+            .scan()?
+            .into_iter()
+            .filter(|row| {
+                let object = ModelValue::Object(
+                    schema
+                        .columns
+                        .iter()
+                        .zip(row)
+                        .map(|(column, value)| (column.name.clone(), value.clone()))
+                        .collect(),
+                );
+                policy.row_visible(principal, &resource, &object)
+            })
+            .skip(page.offset)
+            .take(page.limit.saturating_add(1))
+            .collect::<Vec<_>>()
+    } else {
+        table.scan_page(page.offset, page.limit.saturating_add(1))?
+    };
+    for row in &mut rows {
+        for (value, replacement) in row.iter_mut().zip(&replacements) {
+            if let Some(replacement) = replacement {
+                *value = replacement.clone();
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn role_summary(role: &Role) -> RoleSummary {
@@ -4198,8 +4696,41 @@ fn invalid_json_value(message: impl Into<String>) -> Response {
 /// time-series config or point is `400 invalid_value`, and everything else is
 /// `500 internal_error`.
 fn db_error(error: &DbError) -> Response {
-    if matches!(error, DbError::AuthzDenied(_)) {
+    if matches!(
+        error,
+        DbError::AuthzDenied(_) | DbError::GraphRag(GraphRagError::Policy(_))
+    ) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(error, DbError::Extension(ExtensionError::PolicyDenied(_))) {
+        return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
+    }
+    if matches!(error, DbError::Config(ConfigError::Unsupported(_))) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported",
+            error.to_string(),
+        );
+    }
+    if matches!(error, DbError::MissingCatalogObject(_)) {
+        return api_error(StatusCode::NOT_FOUND, "not_found", error.to_string());
+    }
+    if matches!(
+        error,
+        DbError::CatalogKindMismatch { .. }
+            | DbError::InvalidCatalogName(_)
+            | DbError::Graph(crate::graph::GraphError::InvalidInput(_))
+            | DbError::GraphRag(
+                GraphRagError::InvalidRequest(_)
+                    | GraphRagError::Graph(crate::graph::GraphError::InvalidInput(_))
+            )
+    ) || match error {
+        DbError::Vector(error) | DbError::GraphRag(GraphRagError::Vector(error)) => {
+            invalid_vector_input(error)
+        }
+        _ => false,
+    } {
+        return invalid_json_value(error.to_string());
     }
     if matches!(error, DbError::Query(QueryError::Busy(_))) {
         let mut response = api_error(StatusCode::SERVICE_UNAVAILABLE, "busy", error.to_string());
@@ -4222,6 +4753,18 @@ fn db_error(error: &DbError) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
         error.to_string(),
+    )
+}
+
+fn invalid_vector_input(error: &VectorError) -> bool {
+    matches!(
+        error,
+        VectorError::InvalidDimension { .. }
+            | VectorError::EmptyDimension
+            | VectorError::NonFiniteValue
+            | VectorError::ZeroVector
+            | VectorError::InvalidHnswParams(_)
+            | VectorError::InvalidIndexConfig(_)
     )
 }
 
@@ -4430,6 +4973,7 @@ mod tests {
     use serde::Serialize;
     use serde_json::Value;
     use std::{
+        collections::BTreeMap,
         convert::Infallible,
         fs,
         net::{IpAddr, SocketAddr},
@@ -6052,7 +6596,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await?;
         let profiles = body["data"].as_array().ok_or("profiles is not an array")?;
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), 7);
         for profile in profiles {
             let variants = profile["variants"]
                 .as_array()
@@ -6100,6 +6644,15 @@ mod tests {
         assert_eq!(high_durability["canonical"], false);
         // The listed knobs are the canonical variant's: transactional commits immediately.
         assert_eq!(secure["knobs"]["durability"]["commit"], "immediate");
+        let tensor = find("tensor_dataset")?;
+        assert_eq!(tensor["requires_gpu"], true);
+        assert_eq!(game["requires_gpu"], false);
+        assert_eq!(
+            tensor["variants"],
+            serde_json::json!([
+                { "name":"tensor", "storage_profile":"Tensor", "canonical":true }
+            ])
+        );
         Ok(())
     }
 
@@ -6839,6 +7392,827 @@ mod tests {
             )?)
             .await?;
         assert_eq!(delete_doc.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    struct TensorFixture {
+        app: axum::Router,
+        database: Arc<RwLock<crate::db::Database>>,
+        batch: Value,
+        revision: u64,
+    }
+
+    fn tensor_dataset_config() -> Value {
+        serde_json::json!({"name":"training","chunk_samples":2,"tensors":[
+            {"name":"image","dtype":"u8","shape":[null,null,3]},
+            {"name":"caption","dtype":"utf8","shape":[]},
+            {"name":"embedding","dtype":"f32","shape":[3]}
+        ]})
+    }
+
+    fn tensor_dataset_batch() -> Value {
+        serde_json::json!({"tensors":{
+            "image":[{"shape":[1,1,3],"data":{"u8":[255,0,0]}},
+                     {"shape":[1,2,3],"data":{"u8":[0,255,0,0,0,255]}}],
+            "caption":[{"shape":[],"data":{"utf8":["red pixel"]}},
+                       {"shape":[],"data":{"utf8":["green and blue pixels"]}}],
+            "embedding":[{"shape":[3],"data":{"f32":[1.0,0.0,0.0]}},
+                         {"shape":[3],"data":{"f32":[0.0,1.0,0.0]}}]
+        }})
+    }
+
+    async fn tensor_fixture() -> Result<TensorFixture, Box<dyn std::error::Error>> {
+        // A normal embedded profile exercises the explicitly labelled CPU reference path;
+        // the Tensor profile's real GPU requirement is tested by GPU/startup tests.
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router_with_api_prefix(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        let info = graph_rag_post_ok(
+            &app,
+            "/api/builder/tensor-dataset",
+            &tensor_dataset_config(),
+        )
+        .await?;
+        assert_eq!(info["samples"], 0);
+        assert_eq!(
+            info["config"]["tensors"][0]["shape"],
+            serde_json::json!([null, null, 3])
+        );
+        let batch = tensor_dataset_batch();
+        let appended =
+            graph_rag_post_ok(&app, "/api/data/tensor-datasets/training/append", &batch).await?;
+        assert_eq!(appended["start"], 0);
+        assert_eq!(appended["end"], 2);
+        let revision = appended["revision"].as_u64().ok_or("missing revision")?;
+        Ok(TensorFixture {
+            app,
+            database,
+            batch,
+            revision,
+        })
+    }
+
+    #[tokio::test]
+    async fn tensor_http_preserves_ragged_samples_projection_and_append_revisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let appended = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/append",
+            &fixture.batch,
+        )
+        .await?;
+        assert_eq!(appended["start"], 2);
+        assert_eq!(appended["end"], 4);
+        assert!(
+            appended["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > fixture.revision)
+        );
+        let read = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/read",
+            &serde_json::json!({
+                "start":0,"limit":100,"columns":["image","caption"],"revision":fixture.revision
+            }),
+        )
+        .await?;
+        assert_eq!(read["start"], 0);
+        assert_eq!(read["end"], 2);
+        assert_eq!(read["total_samples"], 2);
+        assert_eq!(read["revision"], fixture.revision);
+        assert_eq!(read["tensors"]["image"], fixture.batch["tensors"]["image"]);
+        assert_eq!(
+            read["tensors"]["caption"],
+            fixture.batch["tensors"]["caption"]
+        );
+        assert!(read["tensors"].get("embedding").is_none());
+        let (status, body) = get_as(
+            &fixture.app,
+            &format!(
+                "/api/data/tensor-datasets/training?revision={}",
+                fixture.revision
+            ),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["samples"], 2);
+        let (status, body) =
+            get_as(&fixture.app, "/api/data/tensor-datasets/training", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["samples"], 4);
+        let (status, catalog) = get_as(&fixture.app, "/api/catalog", "root").await?;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        assert!(
+            catalog["data"]["objects"]
+                .as_array()
+                .is_some_and(
+                    |objects| objects.iter().any(|entry| entry["name"] == "training"
+                        && entry["kind"] == "tensor_dataset"
+                        && entry["row_count"] == 4)
+                )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_search_reports_actual_reference_execution_and_compute_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let result = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/search",
+            &serde_json::json!({
+                "tensor":"embedding","query":[1.0,0.0,0.0],"k":1,"max_samples":1
+            }),
+        )
+        .await?;
+        assert_eq!(result["hits"][0]["index"], 0);
+        assert_eq!(result["hits"][0]["distance"], 0.0);
+        assert_eq!(result["scanned_samples"], 1);
+        assert_eq!(result["next_start"], 1);
+        assert_eq!(result["execution"]["device"], "cpu");
+        assert!(result["execution"].get("adapter").is_some());
+        assert!(result["execution"].get("backend").is_some());
+        let computed=graph_rag_post_ok(&fixture.app,"/api/data/tensor-datasets/training/compute",&serde_json::json!({
+            "tensor":"embedding","operation":"sum","start":0,"limit":2,"revision":fixture.revision
+        })).await?;
+        assert_eq!(computed["values"], serde_json::json!([1.0, 1.0]));
+        assert_eq!(computed["execution"]["device"], "cpu");
+        assert_eq!(computed["revision"], fixture.revision);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_invalid_appends_are_atomic_and_json_blobs_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let mut wrong_shape = fixture.batch.clone();
+        wrong_shape["tensors"]["image"][0]["shape"] = serde_json::json!([2, 2, 3]);
+        let mut wrong_dtype = fixture.batch.clone();
+        wrong_dtype["tensors"]["image"][0]["data"] = serde_json::json!({"f32":[1.0,2.0,3.0]});
+        let mut unequal = fixture.batch.clone();
+        unequal["tensors"]["caption"]
+            .as_array_mut()
+            .ok_or("captions not array")?
+            .pop();
+        let mut json_blob = fixture.batch.clone();
+        json_blob["tensors"]["caption"][0]["data"] = serde_json::json!({"json":{"untyped":"blob"}});
+        for request in [wrong_shape, wrong_dtype, unequal, json_blob] {
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/data/tensor-datasets/training/append",
+                &request,
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["ok"], false);
+        }
+        let (_, info) = get_as(&fixture.app, "/api/data/tensor-datasets/training", "root").await?;
+        assert_eq!(info["data"]["samples"], 2);
+        assert_eq!(info["data"]["revision"], fixture.revision);
+        for (path, request) in [
+            ("read", serde_json::json!({"limit":0})),
+            (
+                "search",
+                serde_json::json!({"tensor":"embedding","query":[1.0],"k":0}),
+            ),
+            (
+                "compute",
+                serde_json::json!({"tensor":"embedding","operation":"unknown"}),
+            ),
+            ("read", serde_json::json!({"columns":[]})),
+        ] {
+            let (status, body) = post_as(
+                &fixture.app,
+                &format!("/api/data/tensor-datasets/training/{path}"),
+                &request,
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let (status, body) = post_as(
+            &fixture.app,
+            "/api/data/tensor-datasets/training/read",
+            &serde_json::json!({"revision":999_999}),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_read_and_write_grants_are_checked_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tensor_fixture().await?;
+        let missing = fixture
+            .app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/data/tensor-datasets/training/read",
+                &serde_json::json!({}),
+            )?)
+            .await?;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        for permission in [Permission::Read, Permission::Write] {
+            {
+                let mut database = fixture.database.write().await;
+                database.set_authz_policy(AuthzPolicy::new([Role::new("limited")
+                    .grant(Resource::Collection("training".to_owned()), permission)]));
+                database.set_principal_registry(
+                    PrincipalRegistry::new()
+                        .with_principal("root", Principal::new("root").with_role("limited")),
+                );
+            }
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/data/tensor-datasets/training/read",
+                &serde_json::json!({}),
+                "root",
+            )
+            .await?;
+            assert_eq!(
+                status,
+                if permission == Permission::Read {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{body}"
+            );
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/data/tensor-datasets/training/append",
+                &fixture.batch,
+                "root",
+            )
+            .await?;
+            assert_eq!(
+                status,
+                if permission == Permission::Write {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{body}"
+            );
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/builder/tensor-dataset",
+                &tensor_dataset_config(),
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_row_and_masking_policies_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{FieldPath, Value as ModelValue},
+        };
+        let fixture = tensor_fixture().await?;
+        for policy in [
+            PolicyConfig {
+                row_policies: vec![RowPolicy {
+                    resource: Resource::Collection("training".to_owned()),
+                    path: FieldPath::new(["visible"]),
+                    equals: ModelValue::Bool(true),
+                }],
+                ..PolicyConfig::default()
+            },
+            PolicyConfig {
+                masking: vec![MaskingPolicy {
+                    resource: Resource::Collection("training".to_owned()),
+                    paths: vec![FieldPath::new(["caption"])],
+                    replacement: ModelValue::Str("masked".to_owned()),
+                }],
+                ..PolicyConfig::default()
+            },
+        ] {
+            fixture.database.read().await.set_policy_config(&policy)?;
+            for (path, request) in [
+                ("read", serde_json::json!({})),
+                (
+                    "search",
+                    serde_json::json!({"tensor":"embedding","query":[1.0,0.0,0.0]}),
+                ),
+                (
+                    "compute",
+                    serde_json::json!({"tensor":"embedding","operation":"sum"}),
+                ),
+            ] {
+                let (status, body) = post_as(
+                    &fixture.app,
+                    &format!("/api/data/tensor-datasets/training/{path}"),
+                    &request,
+                    "root",
+                )
+                .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert!(body["data"].is_null());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tensor_http_errors_and_openapi_expose_device_and_body_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::tensor::TensorError;
+        for (error, status, code) in [
+            (
+                DbError::Tensor(TensorError::GpuUnavailable("no adapter".to_owned())),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tensor_gpu_unavailable",
+            ),
+            (
+                DbError::Tensor(TensorError::GpuUnsupported("unsupported tensor".to_owned())),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tensor_gpu_unsupported",
+            ),
+            (
+                DbError::Config(crate::db::ConfigError::Unsupported(
+                    "native backend required".to_owned(),
+                )),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tensor_unsupported",
+            ),
+        ] {
+            let response = super::tensor_error(&error);
+            assert_eq!(response.status(), status);
+            assert_eq!(json_body(response).await?["error"]["code"], code);
+        }
+        let fixture = tensor_fixture().await?;
+        let oversized = fixture
+            .app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/data/tensor-datasets/training/append")
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .header("x-multidb-principal", "root")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        " ".repeat(super::MAX_CONTROL_PLANE_BODY_BYTES + 1),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(oversized).await?["error"]["code"], "invalid_json");
+        let api: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        for operation in [
+            "createTensorDataset",
+            "getTensorDataset",
+            "appendTensors",
+            "readTensors",
+            "searchTensors",
+            "computeTensors",
+        ] {
+            assert_eq!(
+                api["components"]["pathItems"][operation]["x-multidb-stability"],
+                "preview"
+            );
+        }
+        assert_eq!(
+            api["components"]["schemas"]["TensorData"]["oneOf"]
+                .as_array()
+                .ok_or("missing dtype variants")?
+                .len(),
+            6
+        );
+        assert!(
+            api["components"]["requestBodies"]["TensorAppendRequest"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("1 MiB"))
+        );
+        Ok(())
+    }
+
+    struct GraphRagFixture {
+        app: axum::Router,
+        database: Arc<RwLock<crate::db::Database>>,
+        seed: String,
+        neighbor: String,
+    }
+
+    fn graph_rag_request() -> Value {
+        serde_json::json!({
+            "vector_collection": "knowledge", "graph": "links",
+            "query_vector": [1.0, 0.0], "seed_k": 1
+        })
+    }
+
+    async fn graph_rag_post_ok(
+        app: &axum::Router,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let (status, response) = post_as(app, path, body, "root").await?;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["ok"], true);
+        Ok(response["data"].clone())
+    }
+
+    /// Builds the whole ingestion path over HTTP, including the graph edge joining the
+    /// canonical document IDs returned by vector insertion.
+    async fn graph_rag_fixture() -> Result<GraphRagFixture, Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(admin_database()?));
+        let app = super::router_with_api_prefix(
+            AdminState::from_database_handle(Arc::clone(&database)).with_admin_token("secret"),
+        );
+        graph_rag_post_ok(
+            &app,
+            "/api/builder/vector",
+            &serde_json::json!({
+                "name": "knowledge", "dim": 2, "metric": "Cosine"
+            }),
+        )
+        .await?;
+        graph_rag_post_ok(
+            &app,
+            "/api/builder/graph",
+            &serde_json::json!({
+                "name": "links", "graph_id": 101
+            }),
+        )
+        .await?;
+        let mut ids = Vec::new();
+        for (text, source, visible, vector) in [
+            ("seed fact", "seed.txt", true, [1.0, 0.0]),
+            ("neighbor fact", "neighbor.txt", false, [0.0, 1.0]),
+        ] {
+            let response = graph_rag_post_ok(
+                &app,
+                "/api/data/vectors/knowledge/vectors",
+                &serde_json::json!({
+                    "metadata": { "text": text, "source": source, "visible": visible },
+                    "vector": vector
+                }),
+            )
+            .await?;
+            ids.push(
+                response["id"]
+                    .as_str()
+                    .ok_or("missing document ID")?
+                    .to_owned(),
+            );
+        }
+        let seed = ids.remove(0);
+        let neighbor = ids.remove(0);
+        graph_rag_post_ok(
+            &app,
+            "/api/data/graphs/links/edges",
+            &serde_json::json!({
+                "source": seed, "label": "related", "target": neighbor
+            }),
+        )
+        .await?;
+        Ok(GraphRagFixture {
+            app,
+            database,
+            seed,
+            neighbor,
+        })
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_ingestion_expands_vector_seed_into_neighbor_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        let data =
+            graph_rag_post_ok(&fixture.app, "/api/graphrag/query", &graph_rag_request()).await?;
+        assert!(
+            data["context"]
+                .as_str()
+                .is_some_and(|text| text.contains("seed fact") && text.contains("neighbor fact"))
+        );
+        assert_eq!(
+            data["sources"]
+                .as_array()
+                .ok_or("sources must be an array")?
+                .len(),
+            2
+        );
+        assert_eq!(data["sources"][0]["document_id"], fixture.seed);
+        assert_eq!(data["sources"][0]["seed_id"], fixture.seed);
+        assert_eq!(data["sources"][0]["depth"], 0);
+        assert_eq!(data["sources"][1]["document_id"], fixture.neighbor);
+        assert_eq!(data["sources"][1]["source"], "neighbor.txt");
+        assert_eq!(data["sources"][1]["depth"], 1);
+        assert_eq!(
+            data["relationships"],
+            serde_json::json!([{
+                "source": fixture.seed, "label": "related", "target": fixture.neighbor
+            }])
+        );
+        assert_eq!(data["truncated"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_requires_token_and_read_grants_on_both_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        let no_token = fixture
+            .app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/graphrag/query",
+                &graph_rag_request(),
+            )?)
+            .await?;
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(no_token).await?["error"]["code"],
+            "missing_admin_token"
+        );
+        for granted in [
+            None,
+            Some(Resource::Graph("links".to_owned())),
+            Some(Resource::VectorCollection("knowledge".to_owned())),
+        ] {
+            let mut role = Role::new("limited");
+            if let Some(resource) = granted {
+                role = role.grant(resource, Permission::Read);
+            }
+            {
+                let mut database = fixture.database.write().await;
+                database.set_authz_policy(AuthzPolicy::new([role]));
+                database.set_principal_registry(
+                    PrincipalRegistry::new()
+                        .with_principal("root", Principal::new("root").with_role("limited")),
+                );
+            }
+            let (status, body) = post_as(
+                &fixture.app,
+                "/api/graphrag/query",
+                &graph_rag_request(),
+                "root",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["error"]["code"], "forbidden");
+        }
+        let (status, body) = post_as(
+            &fixture.app,
+            "/api/data/graphs/links/edges",
+            &serde_json::json!({
+                "source": fixture.seed, "label": "related", "target": fixture.neighbor
+            }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_applies_row_filtering_and_masking_before_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{FieldPath, Value as ModelValue},
+        };
+        let fixture = graph_rag_fixture().await?;
+        fixture
+            .database
+            .read()
+            .await
+            .set_policy_config(&PolicyConfig {
+                row_policies: vec![RowPolicy {
+                    resource: Resource::VectorCollection("knowledge".to_owned()),
+                    path: FieldPath::new(["visible"]),
+                    equals: ModelValue::Bool(true),
+                }],
+                masking: vec![MaskingPolicy {
+                    resource: Resource::VectorCollection("knowledge".to_owned()),
+                    paths: vec![FieldPath::new(["text"])],
+                    replacement: ModelValue::Str("[redacted]".to_owned()),
+                }],
+                ..PolicyConfig::default()
+            })?;
+        let data =
+            graph_rag_post_ok(&fixture.app, "/api/graphrag/query", &graph_rag_request()).await?;
+        assert_eq!(
+            data["sources"].as_array().ok_or("missing sources")?.len(),
+            1
+        );
+        assert_eq!(data["sources"][0]["document_id"], fixture.seed);
+        assert_eq!(data["sources"][0]["text"], "[redacted]");
+        let context = data["context"].as_str().ok_or("missing context")?;
+        assert!(context.contains("[redacted]"));
+        assert!(!context.contains("seed fact") && !context.contains("neighbor fact"));
+        assert_eq!(data["relationships"], serde_json::json!([]));
+        let search = graph_rag_post_ok(
+            &fixture.app,
+            "/api/data/vectors/knowledge/search",
+            &serde_json::json!({
+                "vector": [1.0, 0.0], "k": 2
+            }),
+        )
+        .await?;
+        let hits = search["hits"].as_array().ok_or("missing vector hits")?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], fixture.seed);
+        assert_eq!(hits[0]["metadata"]["text"], "[redacted]");
+        assert!(!search.to_string().contains("neighbor fact"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_rejects_bounds_invalid_vectors_and_unknown_objects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        for (field, value) in [
+            ("seed_k", serde_json::json!(0)),
+            ("seed_k", serde_json::json!(65)),
+            ("max_depth", serde_json::json!(9)),
+            ("max_nodes", serde_json::json!(0)),
+            ("max_nodes", serde_json::json!(1025)),
+            ("max_edges", serde_json::json!(10001)),
+            ("max_context_bytes", serde_json::json!(0)),
+            ("max_context_bytes", serde_json::json!(1_048_577)),
+            ("query_vector", serde_json::json!([])),
+            ("query_vector", serde_json::json!([1.0])),
+            ("query_vector", serde_json::json!([0.0, 0.0])),
+            ("labels", serde_json::json!([])),
+            ("labels", serde_json::json!(["bad\nlabel"])),
+            ("text_field", serde_json::json!([])),
+            ("source_field", serde_json::json!([""])),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let mut request = graph_rag_request();
+            request[field] = value;
+            let (status, response) =
+                post_as(&fixture.app, "/api/graphrag/query", &request, "root").await?;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{field}: {request}: {response}"
+            );
+            assert_eq!(response["ok"], false);
+        }
+        for field in ["vector_collection", "graph"] {
+            let mut request = graph_rag_request();
+            request[field] = serde_json::json!("missing");
+            let (status, response) =
+                post_as(&fixture.app, "/api/graphrag/query", &request, "root").await?;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+            assert_eq!(response["error"]["code"], "not_found");
+        }
+        for edge in [
+            serde_json::json!({"source":"", "label":"related", "target":"b"}),
+            serde_json::json!({"source":"a", "label":"bad\nlabel", "target":"b"}),
+            serde_json::json!({"source":"a", "label":"related", "target":"b".repeat(257)}),
+        ] {
+            let (status, response) =
+                post_as(&fixture.app, "/api/data/graphs/links/edges", &edge, "root").await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_and_vector_search_fail_closed_on_corrupt_policies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        crate::repl::propose_system(
+            &*fixture.database.read().await,
+            crate::repl::Op::Put {
+                table: crate::extension::POLICIES_TABLE.to_owned(),
+                key: b"policy".to_vec(),
+                value: b"invalid policy bytes".to_vec(),
+            },
+        )?;
+        for (path, request) in [
+            ("/api/graphrag/query", graph_rag_request()),
+            (
+                "/api/data/vectors/knowledge/search",
+                serde_json::json!({"vector":[1.0,0.0],"k":2}),
+            ),
+        ] {
+            let (status, response) = post_as(&fixture.app, path, &request, "root").await?;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{path}: {response}"
+            );
+            assert!(response["data"].is_null());
+            assert!(!response.to_string().contains("seed fact"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_malformed_json_and_graph_edge_validation_use_error_envelopes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = super::router_with_api_prefix(test_state()?);
+        for path in ["/api/graphrag/query", "/api/data/graphs/links/edges"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .header("x-multidb-principal", "root")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{"))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = json_body(response).await?;
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], "invalid_json");
+        }
+        let (status, body) = post_as(
+            &app,
+            "/api/data/graphs/missing/edges",
+            &serde_json::json!({
+                "source":"a", "label":"related", "target":"b", "props": {"weight":1}
+            }),
+            "root",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_unsupported_backend_has_a_specific_preview_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response =
+            super::graph_rag_error(&DbError::Config(crate::db::ConfigError::Unsupported(
+                "GraphRAG requires bounded storage scans".to_owned(),
+            )));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(response).await?;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "graphrag_unsupported");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graphrag_http_preview_manifest_and_openapi_document_exact_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = graph_rag_fixture().await?;
+        let response = fixture
+            .app
+            .oneshot(authed_request(Method::GET, "/api/studio", None::<&()>)?)
+            .await?;
+        let manifest = json_body(response).await?;
+        let capabilities = manifest["data"]["capabilities"]
+            .as_array()
+            .ok_or("missing capabilities")?;
+        assert!(capabilities.iter().any(|value| value == "graphrag_preview"));
+        let operations = manifest["data"]["operations"]
+            .as_array()
+            .ok_or("missing operations")?;
+        for id in ["queryGraphRag", "addGraphEdge"] {
+            assert!(operations.iter().any(|op| op["operation_id"] == id
+                && op["auth_required"] == true
+                && op["stability"] == "preview"));
+        }
+        let api: Value = serde_json::from_str(super::CONTROL_PLANE_OPENAPI_JSON)?;
+        for (path, schema) in [
+            ("/graphrag/query", "GraphRagRequest"),
+            ("/data/graphs/{name}/edges", "GraphEdgeRequest"),
+        ] {
+            let operation = resolve_openapi_operation(&api, &api["paths"][path]["post"])?;
+            assert_eq!(operation["x-multidb-stability"], "preview");
+            let request = resolve_openapi_operation(&api, &operation["requestBody"])?;
+            assert_eq!(
+                request["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+            for status in ["400", "401", "403", "404", "503"] {
+                assert!(!operation["responses"][status].is_null(), "{path} {status}");
+            }
+        }
+        let properties = &api["components"]["schemas"]["GraphRagRequest"]["properties"];
+        assert_eq!(properties["seed_k"]["maximum"], 64);
+        assert_eq!(properties["max_context_bytes"]["maximum"], 1_048_576);
+        assert_eq!(
+            properties["text_field"]["default"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            properties["source_field"]["default"],
+            serde_json::json!(["source"])
+        );
         Ok(())
     }
 
@@ -8358,6 +9732,308 @@ mod tests {
             Body::empty()
         };
         Ok(builder.body(body)?)
+    }
+
+    #[tokio::test]
+    async fn sql_rbac_denies_tables_read_through_case_variant_grants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let schema = crate::query::TableSchema::new(
+            vec![
+                crate::query::ColumnDef::new("id", crate::query::ColumnType::Int, false),
+                crate::query::ColumnDef::new("amount", crate::query::ColumnType::Float, false),
+            ],
+            0,
+        );
+        database.create_table("users", Some(schema.clone()), Vec::new())?;
+        database.create_table("orders", Some(schema), Vec::new())?;
+        database.set_authz_policy(AuthzPolicy::new([Role::new("reader")
+            .grant(Resource::Table("users".to_owned()), Permission::Read)
+            .grant(Resource::Table("ORDERS".to_owned()), Permission::Read)]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("root", Principal::new("root").with_role("reader")),
+        );
+
+        let response =
+            super::router(AdminState::from_database(database).with_admin_token("secret"))
+                .oneshot(authed_request(
+                    Method::POST,
+                    "/sql",
+                    Some(&serde_json::json!({ "sql": "SELECT amount FROM ORDERS" })),
+                )?)
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await?;
+        assert_eq!(body["error"]["code"], "forbidden");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("lacks Read on Table(\"orders\")"),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_table_pages_filter_before_pagination_and_mask_stored_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{FieldPath, Value as ModelValue},
+            query::{ColumnDef, ColumnType, TableSchema},
+        };
+
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let table = database.create_table(
+            "people",
+            Some(TableSchema::new(
+                vec![
+                    ColumnDef::new("id", ColumnType::Int, false),
+                    ColumnDef::new("owner", ColumnType::Str, false),
+                    ColumnDef::new("secret", ColumnType::Str, false),
+                ],
+                0,
+            )),
+            Vec::new(),
+        )?;
+        for (id, owner) in [
+            (0, "bob"),
+            (1, "alice"),
+            (2, "bob"),
+            (3, "alice"),
+            (4, "bob"),
+        ] {
+            table.insert(vec![
+                ModelValue::Int(id),
+                ModelValue::Str(owner.to_owned()),
+                ModelValue::Str(format!("secret-{id}")),
+            ])?;
+        }
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("reader").grant(Resource::Table("people".to_owned()), Permission::Read)
+        ]));
+        database.set_principal_registry(
+            PrincipalRegistry::new()
+                .with_principal("alice", Principal::new("alice").with_role("reader")),
+        );
+        database.set_policy_config(&PolicyConfig {
+            row_policies: vec![RowPolicy {
+                resource: Resource::Table("people".to_owned()),
+                path: FieldPath::new(["owner"]),
+                equals: ModelValue::Str("public".to_owned()),
+            }],
+            masking: vec![MaskingPolicy {
+                resource: Resource::Table("people".to_owned()),
+                paths: vec![FieldPath::new(["secret"])],
+                replacement: ModelValue::Str("***".to_owned()),
+            }],
+            ..PolicyConfig::default()
+        })?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for (offset, expected, more) in [
+            (0, serde_json::json!([[1, "alice", "***"]]), true),
+            (1, serde_json::json!([[3, "alice", "***"]]), false),
+            (2, serde_json::json!([]), false),
+        ] {
+            let (status, body) = get_as(
+                &app,
+                &format!("/data/tables/people/rows?offset={offset}&limit=1"),
+                "alice",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let page = &body["data"];
+            assert_eq!(page["rows"], expected);
+            assert_eq!(page["has_more"], more);
+            assert_eq!(page["returned"], usize::from(offset < 2));
+            assert_eq!(
+                page["next_offset"],
+                if more {
+                    serde_json::json!(offset + 1)
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(!body.to_string().contains("secret-"));
+        }
+        let (status, _) = get_as(&app, "/data/tables/people/rows", "nobody").await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_document_pages_use_stored_document_policies_and_mask_nested_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig, RowPolicy},
+            model::{CollectionId, FieldPath, Value as ModelValue},
+        };
+
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let collection = database.create_collection(
+            "profiles",
+            CollectionId::new(7),
+            vec![crate::query::DocField::document_id("id")],
+            Vec::new(),
+        )?;
+        for owner in [
+            Some(ModelValue::Str("bob".to_owned())),
+            Some(ModelValue::Str("alice".to_owned())),
+            Some(ModelValue::Null),
+            None,
+            Some(ModelValue::Int(3)),
+        ] {
+            let mut document = BTreeMap::from([(
+                "profile".to_owned(),
+                ModelValue::Object(BTreeMap::from([(
+                    "city".to_owned(),
+                    ModelValue::Str("private-city".to_owned()),
+                )])),
+            )]);
+            if let Some(owner) = owner {
+                document.insert("owner".to_owned(), owner);
+            }
+            collection.insert(&ModelValue::Object(document))?;
+        }
+        let resource = Resource::Collection("profiles".to_owned());
+        let policy = PolicyConfig {
+            row_policies: vec![RowPolicy {
+                resource: resource.clone(),
+                path: FieldPath::new(["owner"]),
+                equals: ModelValue::Null,
+            }],
+            masking: vec![MaskingPolicy {
+                resource: resource.clone(),
+                paths: vec![FieldPath::new(["profile", "city"])],
+                replacement: ModelValue::Str("***".to_owned()),
+            }],
+            ..PolicyConfig::default()
+        };
+        let principal = Principal::new("alice").with_role("reader");
+        let expected = collection
+            .scan()?
+            .into_iter()
+            .filter(|(_, document)| policy.row_visible(&principal, &resource, document))
+            .map(|(id, document)| {
+                serde_json::json!({
+                    "id": super::document_id_to_hex(id),
+                    "document": super::model_value_to_json(&policy.mask_value(&resource, &document)),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 2);
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("reader").grant(resource, Permission::Read)
+        ]));
+        database
+            .set_principal_registry(PrincipalRegistry::new().with_principal("alice", principal));
+        database.set_policy_config(&policy)?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for offset in 0..=2 {
+            let (status, body) = get_as(
+                &app,
+                &format!("/data/collections/profiles/documents?offset={offset}&limit=1"),
+                "alice",
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["data"]["documents"],
+                serde_json::json!(expected.iter().skip(offset).take(1).collect::<Vec<_>>())
+            );
+            assert_eq!(body["data"]["has_more"], offset == 0);
+            assert_eq!(
+                body["data"]["next_offset"],
+                if offset == 0 {
+                    serde_json::json!(1)
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(!body.to_string().contains("private-city"));
+        }
+        let (status, _) = get_as(&app, "/data/collections/profiles/documents", "nobody").await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_table_pages_refuse_policies_they_cannot_apply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            extension::{MaskingPolicy, PolicyConfig},
+            model::{FieldPath, Value as ModelValue},
+            query::{ColumnDef, ColumnType, TableSchema},
+        };
+
+        let mut database = admin_database()?;
+        database
+            .create_table("schemaless", None, Vec::new())?
+            .insert(vec![ModelValue::Str("private-value".to_owned())])?;
+        database
+            .create_table(
+                "typed",
+                Some(TableSchema::new(
+                    vec![ColumnDef::new("secret", ColumnType::Str, false)],
+                    0,
+                )),
+                Vec::new(),
+            )?
+            .insert(vec![ModelValue::Str("private-value".to_owned())])?;
+        database.set_policy_config(&PolicyConfig {
+            masking: vec![
+                MaskingPolicy {
+                    resource: Resource::Table("schemaless".to_owned()),
+                    paths: vec![FieldPath::new(["secret"])],
+                    replacement: ModelValue::Str("***".to_owned()),
+                },
+                MaskingPolicy {
+                    resource: Resource::Table("typed".to_owned()),
+                    paths: vec![FieldPath::new(["secret"])],
+                    replacement: ModelValue::Array(vec![ModelValue::Null]),
+                },
+            ],
+            ..PolicyConfig::default()
+        })?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for name in ["schemaless", "typed"] {
+            let (status, body) = get_as(&app, &format!("/data/tables/{name}/rows"), "root").await?;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert!(!body.to_string().contains("private-value"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_pages_fail_closed_when_policy_metadata_is_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = admin_database()?;
+        database.create_table("people", None, Vec::new())?;
+        database.create_collection(
+            "profiles",
+            crate::model::CollectionId::new(7),
+            vec![crate::query::DocField::document_id("id")],
+            Vec::new(),
+        )?;
+        crate::repl::propose_system(
+            &database,
+            crate::repl::Op::Put {
+                table: crate::extension::POLICIES_TABLE.to_owned(),
+                key: b"policy".to_vec(),
+                value: b"invalid policy bytes".to_vec(),
+            },
+        )?;
+        let app = super::router(AdminState::from_database(database).with_admin_token("secret"));
+        for path in [
+            "/data/tables/people/rows",
+            "/data/collections/profiles/documents",
+        ] {
+            let (status, body) = get_as(&app, path, "root").await?;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert!(body["data"].is_null(), "{body}");
+        }
+        Ok(())
     }
 
     #[tokio::test]

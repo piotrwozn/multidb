@@ -8,6 +8,10 @@ use crate::repl::{Op, WriteCondition};
 use crate::storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction};
 
 pub mod history;
+mod table_version;
+
+pub use table_version::TABLE_DATA_VERSION_TABLE;
+pub(crate) use table_version::read_table_data_version;
 
 pub type TxnId = u64;
 pub type WriteKey = (String, Bytes);
@@ -450,7 +454,8 @@ where
 ///
 /// The live commit path and backup replay share this routine, so a replayed commit rebuilds
 /// the base rows, `__txn_versions`, `__txn_mvcc` history, the keyspace registry, the commit
-/// log, `current_txn_id` and the persisted HLC from the record alone. The stored HLC only
+/// log, public table data-version tokens, `current_txn_id` and the persisted HLC from the
+/// record alone. The stored HLC only
 /// moves forward: it becomes the larger of its current value and the record's HLC, and a
 /// legacy record without an HLC leaves it unchanged. The caller is responsible for conflict
 /// checks and for committing `txn`.
@@ -484,6 +489,22 @@ pub(crate) fn apply_commit_record_in_txn<T: WriteTransaction>(
         txn.put(
             TXN_VERSIONS_TABLE,
             &version_key(&write.table, &write.key)?,
+            &encode_txn_id(record.txn_id),
+        )?;
+    }
+
+    // Track physical public tables, including deletes, once per commit. Internal
+    // audit/profiler writes do not churn data caches or add token writes.
+    let public_tables = record
+        .writes
+        .iter()
+        .map(|write| write.table.as_str())
+        .filter(|table| !table_is_reserved(table))
+        .collect::<BTreeSet<_>>();
+    for table in public_tables {
+        txn.put(
+            TABLE_DATA_VERSION_TABLE,
+            table.as_bytes(),
             &encode_txn_id(record.txn_id),
         )?;
     }
@@ -712,6 +733,9 @@ fn keyspaces_for_commit<'a>(tables: impl IntoIterator<Item = &'a str>) -> BTreeS
     keyspaces.insert(KEYSPACE_REGISTRY_TABLE.to_owned());
     keyspaces.insert(HLC_TABLE.to_owned());
     for table in tables {
+        if !table_is_reserved(table) {
+            keyspaces.insert(TABLE_DATA_VERSION_TABLE.to_owned());
+        }
         keyspaces.insert(table.to_owned());
     }
     keyspaces

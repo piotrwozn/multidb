@@ -67,7 +67,7 @@ pub(crate) struct GuaranteeInputs<'a> {
     pub surface: ProvisionSurface,
     /// `Some(encrypted)` for an existing database, `None` for a new one.
     pub existing_encrypted: Option<bool>,
-    /// A new database gets a `LocalEnvelope` encryption config from the environment.
+    /// A new database gets an encryption config from the operator's environment.
     pub new_target_encrypted: bool,
     /// Audit events are chained with a configured key: on the open handle, or in
     /// `ProvisionEnvironment.audit` for a new database.
@@ -294,32 +294,28 @@ fn at_rest_status(inputs: &GuaranteeInputs<'_>, matrix: &mut Matrix) -> Enforcem
             ));
             status
         }
-        (true, None)
-            if inputs.surface == ProvisionSurface::RustApi && inputs.new_target_encrypted =>
-        {
+        (true, None) if inputs.new_target_encrypted => {
             matrix.push(
                 PATH,
                 "true",
                 EnforcementStatus::Enforced,
-                "the new database is created with the LocalEnvelope encryption config of the \
-                 environment",
+                "the new database is created with the encryption config of the environment",
                 "",
             );
             EnforcementStatus::Enforced
         }
         (true, None) => {
-            let (detail, remediation) = if inputs.surface == ProvisionSurface::RustApi {
-                (
-                    "no encryption config was supplied for the new database",
-                    "Set ProvisionEnvironment.encryption to a LocalEnvelope EncryptionConfig.",
-                )
-            } else {
-                (
-                    "encryption at rest is available on the Rust API only in this build; the \
-                     CLI, serve and the Control Plane cannot encrypt a database",
-                    "Provision the database through the Rust API with a LocalEnvelope encryption \
-                     config, or set guarantees.encryption.at_rest to false.",
-                )
+            let detail = "no encryption config was supplied for the new database";
+            let remediation = match inputs.surface {
+                ProvisionSurface::RustApi => {
+                    "Set ProvisionEnvironment.encryption to an EncryptionConfig backed by an operator-provided key."
+                }
+                ProvisionSurface::Cli | ProvisionSurface::Serve => {
+                    "Set MULTIDB_ENCRYPTION_KEY_PATH to an existing encryption key file, or supply ProvisionEnvironment.encryption when embedding this surface."
+                }
+                ProvisionSurface::ControlPlane => {
+                    "Create the encrypted database through the Rust API or CLI with an operator-provided key, then serve that database."
+                }
             };
             matrix.push(
                 PATH,

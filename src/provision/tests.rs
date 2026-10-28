@@ -59,6 +59,8 @@ use crate::vector::{VectorCollectionConfig, VectorMetric};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type Error = Box<dyn std::error::Error>;
 
+mod tensor_tests;
+
 fn spec(profile: &str, collections: &JsonValue) -> Result<DatabaseSpec, Error> {
     let mut spec =
         DatabaseSpec::from_db_config("app", &DbConfig::on_disk(Profile::Balanced, "app.redb"));
@@ -1377,26 +1379,26 @@ fn live_state_problems_block_the_plan() -> TestResult {
         temp_dir.path().join("keyring"),
         temp_dir.path().join("kek"),
     ));
-    assert!(matches!(
-        plan_provision(
+    assert_blocked(
+        &plan_provision(
             &empty,
             ProvisionTargetRef::Path(&temp_dir.path().join("new.redb")),
             &ProvisionOptions::default(),
             &encrypted_cli,
-        ),
-        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
-    ));
+        )?,
+        "PROVISION_ENCRYPTION_MISMATCH",
+    );
     let mut legacy_key = env(ProvisionSurface::RustApi);
     legacy_key.encryption = Some(EncryptionConfig::file_key(temp_dir.path().join("key")));
-    assert!(matches!(
-        plan_provision(
+    assert_blocked(
+        &plan_provision(
             &empty,
             ProvisionTargetRef::Path(&temp_dir.path().join("new.redb")),
             &ProvisionOptions::default(),
             &legacy_key,
-        ),
-        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
-    ));
+        )?,
+        "PROVISION_ENCRYPTION_MISMATCH",
+    );
 
     assert!(matches!(
         plan_path(&empty, &stale_path, ProvisionSurface::Cli),
@@ -4013,6 +4015,109 @@ fn new_databases_are_created_only_at_absent_targets() -> TestResult {
 }
 
 #[test]
+fn cli_and_serve_provision_encrypted_databases_with_explicit_file_keys() -> TestResult {
+    let temp_dir = tempfile::tempdir()?;
+    let defaults = ProvisionOptions::default();
+    for surface in [ProvisionSurface::Cli, ProvisionSurface::Serve] {
+        let path = temp_dir.path().join(format!("{}.redb", surface.slug()));
+        let key_path = temp_dir.path().join(format!("{}.key", surface.slug()));
+        std::fs::write(&key_path, [17_u8; 32])?;
+        let mut spec = with_security(
+            orders_spec()?,
+            &json!({
+                "roles": [{
+                    "name": "reader",
+                    "grants": [{ "object": "orders", "permissions": ["read"] }]
+                }],
+                "principals": [{ "user": "orders_svc", "roles": ["reader"] }]
+            }),
+        )?;
+        spec.guarantees.encryption.at_rest = true;
+        spec.guarantees.sensitive_data = true;
+
+        // A secure spec still blocks before creating a file when the operator
+        // has not selected a key, on both user-facing creation surfaces.
+        let unkeyed = env(surface);
+        let plan = plan_provision(&spec, ProvisionTargetRef::Path(&path), &defaults, &unkeyed)?;
+        assert_blocked(&plan, "GUARANTEE_NOT_ENFORCEABLE");
+        assert!(matches!(
+            provision_new_database(
+                &spec,
+                Some(&path),
+                &Confirmation::AutoApproveAdditive,
+                &defaults,
+                &unkeyed
+            ),
+            Err(ProvisionError::Blocked(_))
+        ));
+        assert!(!path.exists());
+
+        let encryption = EncryptionConfig::file_key(&key_path);
+        let keyed = ProvisionEnvironment {
+            encryption: Some(encryption.clone()),
+            ..env(surface)
+        };
+        let plan = plan_provision(&spec, ProvisionTargetRef::Path(&path), &defaults, &keyed)?;
+        assert_eq!(plan.outcome, PlanOutcome::Ready, "{:#?}", plan.issues);
+        let (db, report) = provision_new_database(
+            &spec,
+            Some(&path),
+            &Confirmation::PlanId(plan.plan_id),
+            &defaults,
+            &keyed,
+        )?;
+        assert_applied(&report);
+        assert!(db.encryption_configured());
+        let security = db.authz_policy().clone();
+        let principals = db.principal_registry().clone();
+        assert!(security.roles().contains_key("reader"));
+        assert!(principals.principals().contains_key("orders_svc"));
+        db.collection("orders")?
+            .insert(&order_document("private-customer"))?;
+        let record = db.provision_state()?.ok_or("a provision record")?;
+        for path in ["guarantees.encryption.at_rest", "guarantees.sensitive_data"] {
+            assert!(
+                record
+                    .guarantees
+                    .iter()
+                    .any(|g| g.path == path && g.status == EnforcementStatus::Enforced)
+            );
+        }
+        drop(db);
+        assert!(open_database(DbConfig::on_disk(Profile::Balanced, &path)).is_err());
+
+        let db = if surface == ProvisionSurface::Serve {
+            assert!(
+                open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &unkeyed)
+                    .is_err()
+            );
+            let (db, report) =
+                open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed)?;
+            assert_eq!(report.decision, StartupDecision::Start);
+            assert!(report.applied.is_none());
+            db
+        } else {
+            open_database_with_ops(
+                DbConfig::on_disk(Profile::Balanced, &path),
+                &OperationalConfig::new().with_encryption(encryption),
+            )?
+        };
+        assert_eq!(db.authz_policy(), &security);
+        assert_eq!(db.principal_registry(), &principals);
+        assert_eq!(db.collection("orders")?.scan()?.len(), 1);
+        let plan = plan_provision(&spec, ProvisionTargetRef::Open(&db), &defaults, &keyed)?;
+        assert_eq!(plan.outcome, PlanOutcome::Noop, "{:#?}", plan.issues);
+        assert!(
+            plan.guarantees
+                .iter()
+                .any(|g| g.path == "guarantees.encryption.at_rest"
+                    && g.status == EnforcementStatus::Enforced)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn rust_api_provisions_an_encrypted_database_with_a_local_envelope() -> TestResult {
     let temp_dir = tempfile::tempdir()?;
     let path = temp_dir.path().join("encrypted.redb");
@@ -4846,6 +4951,103 @@ async fn a_spec_granted_role_runs_sql_and_others_are_denied() -> TestResult {
     Ok(())
 }
 
+/// A spec-granted role reads through SQL only the objects it is granted: a query that also
+/// reads another object of the spec, or the history table of a granted one, is denied before
+/// it runs, wherever the query reads it.
+#[tokio::test]
+async fn a_spec_granted_role_cannot_read_other_objects_through_subqueries() -> TestResult {
+    use crate::security::AuthzError;
+    use crate::temporal::TemporalPoint;
+
+    let temp_dir = tempfile::tempdir()?;
+    let objects = spec(
+        "balanced",
+        &json!([
+            {
+                "name": "ledger", "role": "event_log", "domain": "primary", "indexes": ["primary"],
+                "physical": {
+                    "kind": "table",
+                    "columns": [
+                        { "name": "entry_id", "type": "int" },
+                        { "name": "amount", "type": "float" }
+                    ],
+                    "primary_key": "entry_id",
+                    "system_versioning": true
+                }
+            },
+            {
+                "name": "payroll", "role": "document_entity", "domain": "primary",
+                "indexes": ["primary"],
+                "physical": {
+                    "kind": "table",
+                    "columns": [
+                        { "name": "employee_id", "type": "int" },
+                        { "name": "salary", "type": "float" }
+                    ],
+                    "primary_key": "employee_id"
+                }
+            }
+        ]),
+    )?;
+    let spec = with_security(
+        objects,
+        &json!({
+            "roles": [{
+                "name": "ledger_reader",
+                "grants": [{ "object": "ledger", "permissions": ["read"] }]
+            }],
+            "principals": [{ "user": "analyst", "roles": ["ledger_reader"] }]
+        }),
+    )?;
+    let mut db = create_with_profile(&temp_dir.path().join("subqueries.redb"), &spec)?;
+    assert_applied(&apply_cli(&mut db, &spec, &ProvisionOptions::default())?);
+    db.query("INSERT INTO ledger (entry_id, amount) VALUES (1, 2.5)")
+        .await?;
+    db.query("INSERT INTO payroll (employee_id, salary) VALUES (7, 9000.0)")
+        .await?;
+    let analyst = db.principal_for_user("analyst");
+    let lsn = TemporalPoint::Lsn(db.commit_lsn()?);
+
+    let payroll_reads = [
+        "SELECT entry_id FROM ledger ORDER BY (SELECT max(salary) FROM payroll)",
+        "SELECT entry_id FROM ledger LIMIT (SELECT count(*) FROM payroll)",
+        "SELECT abs((SELECT max(salary) FROM payroll)) FROM ledger",
+        "SELECT * FROM (VALUES ((SELECT max(salary) FROM payroll))) AS v(leak)",
+        "WITH \"Payroll\" AS (SELECT 1.0 AS salary) SELECT salary FROM payroll",
+    ];
+    let history_read =
+        "SELECT entry_id FROM ledger WHERE entry_id IN (SELECT entry_id FROM ledger_history)";
+    let denied = payroll_reads.map(|sql| (sql, "payroll"));
+    for (sql, table) in denied.into_iter().chain([(history_read, "ledger_history")]) {
+        for result in [
+            db.query_as(&analyst, sql).await,
+            db.query_as_of_as(&analyst, sql, lsn).await,
+        ] {
+            match result {
+                Err(DbError::AuthzDenied(AuthzError::Denied {
+                    resource: Resource::Table(name),
+                    permission: Permission::Read,
+                    ..
+                })) if name == table => {}
+                other => panic!("{sql} should be denied Read on {table}, got {other:?}"),
+            }
+        }
+    }
+
+    assert_eq!(
+        db.query_as(
+            &analyst,
+            "SELECT entry_id FROM ledger WHERE amount > (SELECT min(amount) - 1.0 FROM ledger)"
+        )
+        .await?,
+        SqlOutput::Rows(SqlRows {
+            columns: vec!["entry_id".to_owned()],
+            rows: vec![vec![Value::Int(1)]],
+        })
+    );
+    Ok(())
+}
+
 /// `SECURITY_INDEX_GRANT_WITHOUT_SOURCE_READ` warns about exactly what the runtime refuses:
 /// a role that reads a full-text index but not its source collection cannot search it.
 #[tokio::test]
@@ -5447,7 +5649,7 @@ fn open_from_spec_builds_volatile_databases_on_the_rust_api_only() -> TestResult
     ));
     assert!(refused.reason.contains("is blocked"), "{}", refused.reason);
 
-    // The CLI and the Control Plane do not start from specs, and only the Rust API encrypts.
+    // The CLI and the Control Plane do not start from specs.
     for surface in [ProvisionSurface::Cli, ProvisionSurface::ControlPlane] {
         assert!(matches!(
             open_from_spec(&spec, None, StartupMode::Create, &defaults, &env(surface)),
@@ -5462,16 +5664,14 @@ fn open_from_spec_builds_volatile_databases_on_the_rust_api_only() -> TestResult
         )),
         ..env(ProvisionSurface::Serve)
     };
-    assert!(matches!(
-        open_from_spec(
-            &orders_spec()?,
-            Some(&temp_dir.path().join("encrypted.redb")),
-            StartupMode::Create,
-            &defaults,
-            &encrypted
-        ),
-        Err(ProvisionError::Config(ConfigError::Unsupported(_)))
-    ));
+    let refused = refusal(open_from_spec(
+        &orders_spec()?,
+        Some(&temp_dir.path().join("encrypted.redb")),
+        StartupMode::Create,
+        &defaults,
+        &encrypted,
+    ))?;
+    assert_blocked(&refused.plan, "PROVISION_ENCRYPTION_MISMATCH");
     assert!(!temp_dir.path().join("encrypted.redb").exists());
     Ok(())
 }

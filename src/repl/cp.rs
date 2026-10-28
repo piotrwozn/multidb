@@ -997,6 +997,15 @@ impl<S: StorageEngine> CpRaft<S> {
 }
 
 impl<S: StorageEngine> Replication for CpRaft<S> {
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        // `read` retains CP's strong-read barrier before observing the token.
+        txn::read_table_data_version(self, table)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        true
+    }
+
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.propose_batch(vec![op])
     }
@@ -1142,6 +1151,28 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
 
         let txn = self.storage.begin_read()?;
         Ok(txn.get(table, key)?)
+    }
+
+    fn read_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+    ) -> Result<Vec<Option<Bytes>>, ReplError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        let txn = self.storage.begin_read()?;
+        keys.iter()
+            .map(|key| txn.get(table, key).map_err(Into::into))
+            .collect()
     }
 
     fn range(

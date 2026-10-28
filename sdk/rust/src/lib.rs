@@ -17,6 +17,20 @@ pub const MIN_MULTIDB_VERSION: &str = "0.1.0";
 
 pub type JsonValue = Value;
 
+mod graphrag;
+pub use graphrag::{
+    GraphEdgeRequest, GraphEdgeResponse, GraphRagRelationship, GraphRagRequest, GraphRagResult,
+    GraphRagSource,
+};
+
+mod tensor;
+pub use tensor::{
+    Tensor, TensorAppendResult, TensorBatch, TensorColumn, TensorComputeRequest,
+    TensorComputeResult, TensorDType, TensorData, TensorDatasetConfig, TensorDatasetInfo,
+    TensorDevice, TensorExecution, TensorGpuOperation, TensorMetric, TensorReadBatch,
+    TensorReadRequest, TensorSearchHit, TensorSearchRequest, TensorSearchResult,
+};
+
 #[derive(Clone)]
 pub struct ControlPlaneClient {
     base_url: String,

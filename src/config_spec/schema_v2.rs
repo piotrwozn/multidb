@@ -16,6 +16,7 @@ const PHYSICAL_KINDS: &[PhysicalKind] = &[
     PhysicalKind::Vector,
     PhysicalKind::TimeSeries,
     PhysicalKind::Graph,
+    PhysicalKind::TensorDataset,
 ];
 const COLUMN_TYPES: &[ColumnTypeSpec] = &[
     ColumnTypeSpec::Int,
@@ -149,6 +150,30 @@ fn physical_schema() -> JsonValue {
                 "All kinds: the runtime object. Defaults to the first kind the role allows.",
                 PHYSICAL_KINDS,
             ),
+            "tensors": {
+                "description": "tensor_dataset: immutable typed tensor columns; required at provisioning, at most 64 unique columns.",
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "dtype", "shape"],
+                    "properties": {
+                        "name": name_schema("Tensor column name."),
+                        "dtype": {"type": "string", "enum": ["u8", "i64", "f32", "f64", "bool", "utf8"]},
+                        "shape": {"type": "array", "maxItems": 8, "items": {"type": ["integer", "null"], "minimum": 0, "maximum": 4_000_000}}
+                    }
+                }
+            },
+            "tensor_chunk_samples": {
+                "description": "tensor_dataset: maximum samples per chunk (default 64).",
+                "type": "integer", "minimum": 1, "maximum": 1024
+            },
+            "tensor_max_chunk_bytes": {
+                "description": "tensor_dataset: maximum encoded chunk bytes (default 4194304).",
+                "type": "integer", "minimum": 1024, "maximum": 16_777_216
+            },
             "collection_id": id_schema("document, vector: a pinned collection id; unpinned ids are allocated at creation."),
             "fields": {
                 "description": "document: SQL-visible fields; empty means one field id holding the document id.",
@@ -492,6 +517,7 @@ mod tests {
             PhysicalKind::Vector => 2,
             PhysicalKind::TimeSeries => 3,
             PhysicalKind::Graph => 4,
+            PhysicalKind::TensorDataset => 5,
         };
         let column = |ty: ColumnTypeSpec| match ty {
             ColumnTypeSpec::Int => 0,
@@ -560,7 +586,7 @@ mod tests {
                 PERMISSIONS.len(),
                 UNMANAGED_POLICIES.len()
             ],
-            [5, 5, 2, 2, 2, 1, 3, 3]
+            [6, 5, 2, 2, 2, 1, 3, 3]
         );
     }
 
@@ -979,6 +1005,11 @@ mod tests {
             retention_millis: Some(1_000),
             max_future_skew_millis: Some(Some(0)),
             graph_id: Some(1),
+            tensors: serde_json::from_value(
+                json!([{"name":"embedding","dtype":"f32","shape":[3]}]),
+            )?,
+            tensor_chunk_samples: Some(64),
+            tensor_max_chunk_bytes: Some(4_194_304),
         })?;
         let fields = documented.as_object().cloned().unwrap_or_default();
         assert_eq!(

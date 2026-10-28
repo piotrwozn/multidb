@@ -21,8 +21,8 @@ use crate::{
     },
     db::{
         ConfigError, Database, DbConfig, EncryptionConfig, EncryptionMode,
-        PersistedProfileManifest, Profile, create_restore_target, decode_profile_manifest,
-        unmet_profile_floors, validate_manifest,
+        PersistedProfileManifest, Profile, ReplicationKind, create_restore_target,
+        decode_profile_manifest, unmet_profile_floors, validate_manifest,
     },
     fileio,
     model::{DOCUMENT_TABLE, INDEX_TABLE},
@@ -38,7 +38,7 @@ use crate::{
     security::AUDIT_TABLE,
     storage::{
         Bytes, ConfiguredKeyProvider, KeyProvider, ReadTransaction, StorageEngine, StorageError,
-        WriteTransaction,
+        WriteTransaction, decode_stored_value,
     },
     txn::{self, CommitLogRecord, MvccRecord, TxnId},
     vector::VECTOR_TABLE,
@@ -504,12 +504,14 @@ pub fn restore_backup_with_config(
     }
 
     let backup_keys = restore_key_provider(restore_config)?;
-    let target_lsn = resolve_target_lsn(&chain, &target, backup_keys.as_ref())?;
     let full_payload = read_backup_payload::<BackupDataPayload>(
         &chain[0].path,
         required_file(&chain[0].manifest, FULL_DATA_FILE)?,
         backup_keys.as_ref(),
     )?;
+    ensure_tensor_restore_profile(&chain, &config, &full_payload)?;
+    ensure_restore_replication_supported(&chain, &full_payload, &target)?;
+    let target_lsn = resolve_target_lsn(&chain, &target, backup_keys.as_ref())?;
     let audit_flag =
         check_incremental_payloads(&chain, backup_keys.as_ref(), &full_payload, target_lsn)?;
     let manifest = restore_target_manifest(&config, &full_payload)?;
@@ -713,6 +715,7 @@ fn default_keyspaces() -> BTreeSet<String> {
         PLANNER_META_TABLE,
         txn::TXN_META_TABLE,
         txn::TXN_VERSIONS_TABLE,
+        txn::TABLE_DATA_VERSION_TABLE,
         txn::COMMIT_LOG_TABLE,
         txn::KEYSPACE_REGISTRY_TABLE,
         "__raft_log",
@@ -1240,6 +1243,102 @@ fn resolve_target_lsn(
     }
 }
 
+/// A Tensor profile cannot be restored through another profile to bypass its GPU gate,
+/// or import ordinary user models through the raw restore transaction. Legacy/plain
+/// databases have no profile manifest, so check the storage profile independently.
+fn ensure_tensor_restore_profile(
+    chain: &[ChainItem],
+    config: &DbConfig,
+    payload: &BackupDataPayload,
+) -> Result<(), BackupError> {
+    let first = chain
+        .first()
+        .ok_or_else(|| BackupError::Corruption("backup chain is empty".to_owned()))?;
+    let mut profiles = payload
+        .records
+        .iter()
+        .filter(|record| record.table == META_TABLE && record.key == b"profile");
+    let stored = profiles
+        .next()
+        .map(|record| decode_backup_profile(&record.value))
+        .transpose()?;
+    if profiles.next().is_some() {
+        return Err(BackupError::Corruption(
+            "full backup contains duplicate profile metadata".to_owned(),
+        ));
+    }
+    if !config.profile.requires_gpu()
+        && !stored.is_some_and(Profile::requires_gpu)
+        && !chain
+            .iter()
+            .any(|item| item.manifest.profile.requires_gpu())
+    {
+        return Ok(());
+    }
+    if first.manifest.profile != config.profile {
+        return Err(BackupError::Config(ConfigError::ProfileMismatch {
+            expected: config.profile,
+            found: first.manifest.profile,
+        }));
+    }
+    if stored != Some(first.manifest.profile) {
+        return Err(BackupError::Corruption(
+            "Tensor backup profile does not match persisted database profile metadata".to_owned(),
+        ));
+    }
+    if let Some(item) = chain
+        .iter()
+        .find(|item| item.manifest.profile != first.manifest.profile)
+    {
+        return Err(BackupError::Config(ConfigError::ProfileMismatch {
+            expected: first.manifest.profile,
+            found: item.manifest.profile,
+        }));
+    }
+    Ok(())
+}
+
+fn decode_backup_profile(bytes: &[u8]) -> Result<Profile, BackupError> {
+    serde_json::from_slice(&decode_stored_value(bytes)?)
+        .map_err(|error| BackupError::Corruption(format!("invalid profile metadata: {error}")))
+}
+
+/// Old manifests did not record replication capabilities. Read the persisted database
+/// metadata from the full payload too, so legacy AP backups cannot claim a later PITR.
+fn ensure_restore_replication_supported(
+    chain: &[ChainItem],
+    payload: &BackupDataPayload,
+    target: &RestoreTarget,
+) -> Result<(), BackupError> {
+    let Some(record) = payload
+        .records
+        .iter()
+        .find(|record| record.table == META_TABLE && record.key == b"replication")
+    else {
+        return Ok(());
+    };
+    let replication: ReplicationKind = serde_json::from_slice(&decode_stored_value(&record.value)?)
+        .map_err(|error| {
+            BackupError::Corruption(format!("invalid replication metadata: {error}"))
+        })?;
+    if replication != ReplicationKind::Ap {
+        return Ok(());
+    }
+    let first = chain
+        .first()
+        .ok_or_else(|| BackupError::Corruption("backup chain is empty".to_owned()))?;
+    if chain.len() > 1
+        || matches!(target, RestoreTarget::Time(time) if *time > first.manifest.taken_at)
+    {
+        return Err(BackupError::Unsupported(
+            "AP backups contain only a full snapshot, not commit history; restore Latest or \
+             the full snapshot LSN instead of a later point in time"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn target_lsn_for_time(
     chain: &[ChainItem],
     time: SystemTime,
@@ -1334,6 +1433,11 @@ fn check_incremental_payloads(
     full_payload: &BackupDataPayload,
     target_lsn: Lsn,
 ) -> Result<Option<Bytes>, BackupError> {
+    let source_profile = chain
+        .first()
+        .ok_or_else(|| BackupError::Corruption("backup chain is empty".to_owned()))?
+        .manifest
+        .profile;
     let is_flag = |table: &str, key: &[u8]| table == AUTHZ_TABLE && key == KEY_AUDIT_ENABLED;
     let mut flag = full_payload
         .records
@@ -1349,9 +1453,26 @@ fn check_incremental_payloads(
             .iter()
             .filter(|record| record.txn_id <= target_lsn)
             .flat_map(|record| &record.writes)
-            .filter(|write| is_flag(&write.table, &write.key))
         {
-            flag.clone_from(&write.value);
+            if is_flag(&write.table, &write.key) {
+                flag.clone_from(&write.value);
+            }
+            if write.table == META_TABLE && write.key == b"profile" {
+                let next_profile = write
+                    .value
+                    .as_deref()
+                    .map(decode_backup_profile)
+                    .transpose()?;
+                if (source_profile.requires_gpu()
+                    || next_profile.is_some_and(Profile::requires_gpu))
+                    && next_profile != Some(source_profile)
+                {
+                    return Err(BackupError::Corruption(
+                        "incremental backup changes or removes the Tensor storage profile"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
     }
     Ok(flag)
@@ -1574,6 +1695,176 @@ mod tests {
         Ok(())
     }
 
+    fn plain_profile_backup(root: &Path) -> Result<BackupReport, Box<dyn Error>> {
+        let database = create_database(DbConfig::on_disk(
+            Profile::Balanced,
+            root.join("source.redb"),
+        ))?;
+        database.propose(Op::Put {
+            table: "user_data".to_owned(),
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        })?;
+        Ok(full_backup(
+            &database,
+            root.join("backups"),
+            &BackupConfig::default(),
+        )?)
+    }
+
+    /// Reproduces a legacy Tensor snapshot's metadata without requiring a GPU to create
+    /// the test fixture. The backup file and its checksums stay valid, and there is no
+    /// profile manifest on which restore could rely for the storage-profile check.
+    fn set_backup_profiles(
+        backup: &mut BackupReport,
+        stored: Profile,
+        reported: Profile,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut payload: BackupDataPayload = read_backup_payload(
+            &backup.path,
+            required_file(&backup.manifest, super::FULL_DATA_FILE)?,
+            None,
+        )?;
+        assert!(
+            !payload
+                .records
+                .iter()
+                .any(|record| record.table == META_TABLE && record.key == KEY_PROFILE_MANIFEST)
+        );
+        let profile = payload
+            .records
+            .iter_mut()
+            .find(|record| record.table == META_TABLE && record.key == b"profile")
+            .ok_or("fixture has no profile metadata")?;
+        profile.value = serde_json::to_vec(&stored)?;
+        let entry = write_compressed_json(
+            &backup.path,
+            super::FULL_DATA_FILE,
+            &payload,
+            &BackupConfig::default(),
+            None,
+        )?;
+        backup.manifest.files = vec![entry];
+        backup.manifest.profile = reported;
+        write_manifest(&backup.path, &backup.manifest)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_cannot_cross_tensor_profile_boundary_without_a_profile_manifest()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let mut backup = plain_profile_backup(temp.path())?;
+        let tensor_target = temp.path().join("tensor-target.redb");
+        assert!(matches!(
+            restore_backup(
+                &backup.path,
+                DbConfig::on_disk(Profile::Tensor, &tensor_target),
+                RestoreTarget::Latest
+            ),
+            Err(BackupError::Config(ConfigError::ProfileMismatch {
+                expected: Profile::Tensor,
+                found: Profile::Balanced
+            }))
+        ));
+        assert!(!tensor_target.exists());
+
+        set_backup_profiles(&mut backup, Profile::Tensor, Profile::Tensor)?;
+        let balanced_target = temp.path().join("balanced-target.redb");
+        assert!(matches!(
+            restore_backup(
+                &backup.path,
+                DbConfig::on_disk(Profile::Balanced, &balanced_target),
+                RestoreTarget::Latest
+            ),
+            Err(BackupError::Config(ConfigError::ProfileMismatch {
+                expected: Profile::Balanced,
+                found: Profile::Tensor
+            }))
+        ));
+        assert!(!balanced_target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_detects_tensor_profile_hidden_in_full_payload_before_creating_target()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let mut backup = plain_profile_backup(temp.path())?;
+        set_backup_profiles(&mut backup, Profile::Tensor, Profile::Balanced)?;
+        let target = temp.path().join("hidden-tensor.redb");
+        assert!(matches!(
+            restore_backup(&backup.path, DbConfig::on_disk(Profile::Balanced, &target), RestoreTarget::Latest),
+            Err(BackupError::Corruption(message)) if message.contains("profile")
+        ));
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_restore_gate_preserves_ordinary_cross_profile_restore_behavior()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let backup = plain_profile_backup(temp.path())?;
+        let target = temp.path().join("ordinary-target.redb");
+        restore_backup(
+            &backup.path,
+            DbConfig::on_disk(Profile::Transactional, &target),
+            RestoreTarget::Latest,
+        )?;
+        let restored = open_database(DbConfig::on_disk(Profile::Balanced, &target))?;
+        assert_eq!(
+            restored.read("user_data", b"key", ReadConsistency::Strong)?,
+            Some(b"value".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_restore_cannot_introduce_tensor_profile_after_the_full_snapshot()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let database = create_database(DbConfig::on_disk(
+            Profile::Balanced,
+            temp.path().join("source.redb"),
+        ))?;
+        let root = temp.path().join("backups");
+        let full = full_backup(&database, &root, &BackupConfig::default())?;
+        database.propose(put_item(b"later", b"value"))?;
+        let mut incremental =
+            incremental_backup(&database, &root, &full.path, &BackupConfig::default())?;
+        let mut payload: CommitLogPayload = read_backup_payload(
+            &incremental.path,
+            required_file(&incremental.manifest, WAL_DATA_FILE)?,
+            None,
+        )?;
+        payload
+            .records
+            .last_mut()
+            .ok_or("fixture has no incremental commit")?
+            .writes
+            .push(crate::txn::CommitLogWrite {
+                table: META_TABLE.to_owned(),
+                key: b"profile".to_vec(),
+                value: Some(serde_json::to_vec(&Profile::Tensor)?),
+            });
+        incremental.manifest.files = vec![write_compressed_json(
+            &incremental.path,
+            WAL_DATA_FILE,
+            &payload,
+            &BackupConfig::default(),
+            None,
+        )?];
+        write_manifest(&incremental.path, &incremental.manifest)?;
+        let target = temp.path().join("incremental-target.redb");
+        assert!(matches!(
+            restore_backup(&incremental.path, DbConfig::on_disk(Profile::Balanced, &target), RestoreTarget::Latest),
+            Err(BackupError::Corruption(message)) if message.contains("profile")
+        ));
+        assert!(!target.exists());
+        Ok(())
+    }
+
     #[test]
     fn ap_database_rejects_incremental_backup_but_allows_full_backup()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1601,6 +1892,26 @@ mod tests {
             Err(BackupError::Unsupported(_))
         ));
         assert_eq!(list_backups(&root)?.len(), 1);
+
+        // This applies to legacy backups as well: no new manifest field is needed,
+        // because the full payload already carries the AP replication metadata.
+        let later_target = temp.path().join("ap-later-restore.redb");
+        assert!(matches!(
+            restore_backup(
+                &full.path,
+                DbConfig::on_disk(Profile::Balanced, &later_target),
+                RestoreTarget::Time(full.manifest.taken_at + Duration::from_secs(1)),
+            ),
+            Err(BackupError::Unsupported(_))
+        ));
+        assert!(!later_target.exists());
+        let snapshot_target = temp.path().join("ap-snapshot-restore.redb");
+        let restored = restore_backup(
+            &full.path,
+            DbConfig::on_disk(Profile::Balanced, &snapshot_target),
+            RestoreTarget::Latest,
+        )?;
+        assert_eq!(restored.restored_lsn, full.manifest.end_lsn);
         Ok(())
     }
 

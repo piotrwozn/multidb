@@ -114,9 +114,11 @@ impl Database {
     /// indexes start from the current rows and LSN instead of replaying LSN 0.
     ///
     /// Only local single-node databases are supported, and the redb file does
-    /// not shrink. `multidb maintenance gc` runs this offline and needs
-    /// exclusive access to the database file, so stop `multidb serve` first;
-    /// `serve` does not run GC in the background.
+    /// not shrink. `multidb maintenance gc` opens the file exclusively, so stop
+    /// `multidb serve` before using that CLI command. For live maintenance use
+    /// [`Self::gc_history_online`], which requires explicit retention and a
+    /// bounded batch budget and refuses commit-log truncation. Pin registration
+    /// remains serialized with horizon advancement throughout each GC run.
     /// # Errors
     /// Fails with `ConfigError::Unsupported` for replicated or sharded databases
     /// or when `mvcc_retain_lsns` or `commit_log_retain_lsns` is zero. Fails
@@ -140,6 +142,40 @@ impl Database {
             progress.commit_log_records_pruned,
         );
         result
+    }
+
+    /// Runs bounded MVCC maintenance while the database serves reads and writes.
+    ///
+    /// Online maintenance requires an explicit history retention and a finite
+    /// batch limit. It never truncates the commit log, so it cannot invalidate
+    /// incremental backup chains or race after-commit delivery. Existing
+    /// transactions keep their storage snapshots and active `AS OF` reads pin
+    /// the history they need. Run this synchronous method on a blocking worker.
+    /// # Errors
+    /// Fails when retention or batch bounds are missing or zero, commit-log
+    /// truncation is requested, or [`Self::gc_history`] cannot complete a batch.
+    pub fn gc_history_online(
+        &self,
+        options: &HistoryGcOptions,
+    ) -> Result<HistoryGcReport, DbError> {
+        if options.mvcc_retain_lsns.is_none_or(|retain| retain == 0)
+            || options.max_batches.is_none_or(|batches| batches == 0)
+            || options.batch_size == 0
+        {
+            return Err(ConfigError::Unsupported(
+                "online history GC requires positive mvcc_retain_lsns, batch_size and max_batches"
+                    .to_owned(),
+            )
+            .into());
+        }
+        if options.commit_log_retain_lsns.is_some() {
+            return Err(ConfigError::Unsupported(
+                "online history GC cannot truncate the commit log; use offline maintenance"
+                    .to_owned(),
+            )
+            .into());
+        }
+        self.gc_history(options)
     }
 
     /// Pins `lsn` for an `AS OF` read, then rejects it when history GC already
@@ -222,7 +258,16 @@ impl Database {
             .into());
         }
 
-        let watermark = self.mvcc_watermark(node, options.mvcc_retain_lsns)?;
+        // Keep pin registration serialized with horizon advancement. Otherwise
+        // an AS OF reader could register an older pin after the watermark was
+        // computed, observe the old horizon, and then lose its history to GC.
+        // Online calls have a finite batch budget, bounding this critical section.
+        let pins = self.history_pins.lock().map_err(|_| {
+            DbError::Storage(StorageError::Backend(
+                "history retention registry poisoned".to_owned(),
+            ))
+        })?;
+        let watermark = self.mvcc_watermark(node, options.mvcc_retain_lsns, &pins)?;
         let floor_target = options
             .commit_log_retain_lsns
             .map(|retain| self.commit_log_floor_target(&watermark, retain))
@@ -249,6 +294,7 @@ impl Database {
         let pending_commit_log_records =
             target_lsn.map_or(0, |target| target.saturating_sub(state.commit_log_floor));
         let watermark_note = current_watermark_note(&watermark, options.mvcc_retain_lsns.is_some());
+        drop(pins);
         Ok(HistoryGcReport {
             dry_run: options.dry_run,
             current_lsn: watermark.current,
@@ -273,16 +319,10 @@ impl Database {
         &self,
         node: &SingleNode<AnyEngine>,
         retain_lsns: Option<u64>,
+        pins: &txn::ActiveSnapshotRegistry,
     ) -> Result<MvccWatermark, DbError> {
-        let (current, pinned) = {
-            let pins = self.history_pins.lock().map_err(|_| {
-                DbError::Storage(StorageError::Backend(
-                    "history retention registry poisoned".to_owned(),
-                ))
-            })?;
-            let current = node.current_txn_id()?;
-            (current, pins.watermark(current))
-        };
+        let current = node.current_txn_id()?;
+        let pinned = pins.watermark(current);
 
         let mut watermark = MvccWatermark {
             current,

@@ -2,6 +2,140 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export type JsonObject = { [key: string]: JsonValue };
 
+/** Bounded vector-seeded graph retrieval. The server assembles context locally, without an LLM. */
+export type GraphRagRequest = {
+  vector_collection: string;
+  graph: string;
+  query_vector: number[];
+  /** Default: 8. */
+  seed_k?: number;
+  /** Default: 2. */
+  max_depth?: number;
+  /** Default: 64. */
+  max_nodes?: number;
+  /** Default: 256. */
+  max_edges?: number;
+  /** Default: 16384 UTF-8 bytes. */
+  max_context_bytes?: number;
+  /** Default: ["related"]. */
+  labels?: string[];
+  /** Metadata path. Default: ["text"]. */
+  text_field?: string[];
+  /** Metadata path. Default: ["source"]. */
+  source_field?: string[];
+};
+
+export type GraphRagSource = {
+  document_id: string;
+  text: string;
+  source: string | null;
+  seed_distance: number;
+  depth: number;
+  seed_id: string;
+};
+
+export type GraphRagRelationship = {
+  source: string;
+  label: string;
+  target: string;
+};
+
+export type GraphRagResult = {
+  context: string;
+  sources: GraphRagSource[];
+  relationships: GraphRagRelationship[];
+  truncated: boolean;
+};
+
+/** GraphRAG node names are the lowercase 32-character hex ids returned by insertVector. */
+export type GraphEdgeRequest = {
+  source: string;
+  label: string;
+  target: string;
+  props?: JsonValue;
+};
+
+export type GraphEdgeWriteResult = { written: true };
+export type VectorInsertResult = { id: string };
+
+/** Preview typed tensor storage. Shape dimensions belong to one sample; null schema dimensions are ragged. */
+export type TensorDType = "u8" | "i64" | "f32" | "f64" | "bool" | "utf8";
+type TensorVariant<K extends TensorDType, V> = { [P in K]: V[] } & {
+  [P in Exclude<TensorDType, K>]?: never;
+};
+/** i64 values must remain within JavaScript's safe integer range when using JSON from this SDK. */
+export type TensorData =
+  | TensorVariant<"u8", number>
+  | TensorVariant<"i64", number>
+  | TensorVariant<"f32", number>
+  | TensorVariant<"f64", number>
+  | TensorVariant<"bool", boolean>
+  | TensorVariant<"utf8", string>;
+export type Tensor = { shape: number[]; data: TensorData };
+export type TensorColumn = { name: string; dtype: TensorDType; shape: (number | null)[] };
+export type TensorDatasetConfig = {
+  name: string;
+  tensors: TensorColumn[];
+  /** Server default: 64. */
+  chunk_samples?: number;
+  /** Server default: 4194304 bytes. HTTP request bodies remain limited to 1 MiB. */
+  max_chunk_bytes?: number;
+};
+export type TensorBatch = Record<string, Tensor[]>;
+export type TensorAppendRequest = { tensors: TensorBatch };
+export type TensorDatasetInfo = { config: TensorDatasetConfig; samples: number; revision: number };
+export type TensorAppendResult = { start: number; end: number; revision: number };
+export type TensorReadRequest = {
+  start?: number;
+  /** Server default: 100; maximum: 1024. */
+  limit?: number;
+  columns?: string[] | null;
+  revision?: number | null;
+};
+export type TensorReadBatch = {
+  start: number;
+  end: number;
+  total_samples: number;
+  revision: number;
+  tensors: TensorBatch;
+};
+export type TensorDevice = "cpu" | "gpu";
+export type TensorExecution = { device: TensorDevice; adapter: string | null; backend: string | null };
+export type TensorSearchRequest = {
+  tensor: string;
+  query: number[];
+  k?: number;
+  metric?: "Cosine" | "L2";
+  start?: number;
+  max_samples?: number;
+  revision?: number | null;
+};
+export type TensorSearchHit = { index: number; distance: number };
+export type TensorSearchResult = {
+  hits: TensorSearchHit[];
+  scanned_samples: number;
+  next_start: number | null;
+  total_samples: number;
+  revision: number;
+  skipped_samples: number;
+  execution: TensorExecution;
+};
+export type TensorGpuOperation = "sum" | "mean" | "l2_norm";
+export type TensorComputeRequest = {
+  tensor: string;
+  operation: TensorGpuOperation;
+  start?: number;
+  limit?: number;
+  revision?: number | null;
+};
+export type TensorComputeResult = {
+  start: number;
+  end: number;
+  revision: number;
+  values: number[];
+  execution: TensorExecution;
+};
+
 export type ApiErrorBody = {
   code: string;
   message: string;
@@ -106,7 +240,7 @@ export type CustomProfileSpec = JsonObject & {
   };
 };
 
-export type PhysicalKind = "document" | "table" | "vector" | "time_series" | "graph";
+export type PhysicalKind = "document" | "table" | "vector" | "time_series" | "graph" | "tensor_dataset";
 export type PhysicalColumnType = "int" | "float" | "str" | "bool" | "bytes";
 
 /**
@@ -118,6 +252,12 @@ export type PhysicalObjectSpec = JsonObject & {
   kind?: PhysicalKind;
   collection_id?: number;
   graph_id?: number;
+  /** tensor_dataset: 1..64 immutable typed columns, with null for ragged shape dimensions. */
+  tensors?: TensorColumn[];
+  /** tensor_dataset: samples per chunk, 1..1024 (default 64). */
+  tensor_chunk_samples?: number;
+  /** tensor_dataset: encoded chunk byte bound, 1024..16777216 (default 4194304). */
+  tensor_max_chunk_bytes?: number;
   fields?: (JsonObject & { name: string; path: string; type: PhysicalColumnType })[];
   document_indexes?: (JsonObject & { path: string; id?: number })[];
   full_text?: (JsonObject & {
@@ -474,6 +614,8 @@ export type ProfileSummary = {
   aliases: string[];
   status: string;
   description: string;
+  /** True when opening the canonical profile requires a native GPU adapter. */
+  requires_gpu?: boolean;
   default_domain: string;
   compatible_roles: string[];
   /** The product's variants; exactly one is canonical. */
@@ -1056,12 +1198,56 @@ export class ControlPlaneClient {
     return this.request<JsonObject>("/builder/geo", { method: "POST", body: request });
   }
 
+  createTensorDataset(request: TensorDatasetConfig): Promise<TensorDatasetInfo> {
+    return this.request<TensorDatasetInfo>("/builder/tensor-dataset", { method: "POST", body: request });
+  }
+
+  tensorDatasetInfo(dataset: string, revision?: number): Promise<TensorDatasetInfo> {
+    const query = revision === undefined ? "" : `?revision=${revision}`;
+    return this.request<TensorDatasetInfo>(`/data/tensor-datasets/${encodeURIComponent(dataset)}${query}`);
+  }
+
+  appendTensors(dataset: string, tensors: TensorBatch): Promise<TensorAppendResult> {
+    return this.request<TensorAppendResult>(`/data/tensor-datasets/${encodeURIComponent(dataset)}/append`, {
+      method: "POST", body: { tensors },
+    });
+  }
+
+  readTensors(dataset: string, request: TensorReadRequest = {}): Promise<TensorReadBatch> {
+    return this.request<TensorReadBatch>(`/data/tensor-datasets/${encodeURIComponent(dataset)}/read`, {
+      method: "POST", body: request,
+    });
+  }
+
+  searchTensors(dataset: string, request: TensorSearchRequest): Promise<TensorSearchResult> {
+    return this.request<TensorSearchResult>(`/data/tensor-datasets/${encodeURIComponent(dataset)}/search`, {
+      method: "POST", body: request,
+    });
+  }
+
+  computeTensors(dataset: string, request: TensorComputeRequest): Promise<TensorComputeResult> {
+    return this.request<TensorComputeResult>(`/data/tensor-datasets/${encodeURIComponent(dataset)}/compute`, {
+      method: "POST", body: request,
+    });
+  }
+
   createGraph(request: JsonObject): Promise<JsonObject> {
     return this.request<JsonObject>("/builder/graph", { method: "POST", body: request });
   }
 
-  insertVector(collection: string, metadata: JsonValue, vector: number[]): Promise<JsonObject> {
-    return this.request<JsonObject>(`/data/vectors/${encodeURIComponent(collection)}/vectors`, {
+  addGraphEdge(graph: string, request: GraphEdgeRequest): Promise<GraphEdgeWriteResult> {
+    return this.request<GraphEdgeWriteResult>(`/data/graphs/${encodeURIComponent(graph)}/edges`, {
+      method: "POST",
+      body: request,
+    });
+  }
+
+  graphRagQuery(request: GraphRagRequest): Promise<GraphRagResult> {
+    return this.request<GraphRagResult>("/graphrag/query", { method: "POST", body: request });
+  }
+
+  insertVector(collection: string, metadata: JsonValue, vector: number[]): Promise<VectorInsertResult> {
+    return this.request<VectorInsertResult>(`/data/vectors/${encodeURIComponent(collection)}/vectors`, {
       method: "POST",
       body: { metadata, vector },
     });

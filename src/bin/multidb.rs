@@ -35,9 +35,10 @@ use multidb::{
         suggest_profile_name,
     },
     db::{
-        Database, DbConfig, DbError, MetadataProbe, OperationalConfig, PersistedProfileManifest,
-        ProbedMetadata, Profile, ReplicationKind, create_database, inspect_database_metadata,
-        open_database, open_database_with_ops, recover_database_file,
+        Database, DbConfig, DbError, EncryptionConfig, MetadataProbe, OperationalConfig,
+        PersistedProfileManifest, ProbedMetadata, Profile, ReplicationKind,
+        create_database_with_ops, inspect_database_metadata,
+        inspect_database_metadata_with_encryption, open_database_with_ops, recover_database_file,
     },
     migration::{
         ExportFormat, ImportOptions, MigrationError, export_table_csv, export_table_jsonl,
@@ -125,8 +126,11 @@ struct ServeConfig {
     pg_user: String,
     pg_password: String,
     pg_tls: ServePgTls,
+    pg_limits: ServePgLimits,
     studio_dir: PathBuf,
     query_governor: ServeQueryGovernor,
+    history_retain_lsns: Option<u64>,
+    encryption_key_path: Option<PathBuf>,
     /// Spec mode, when `MULTIDB_SPEC_PATH` is set.
     spec: Option<ServeSpecConfig>,
 }
@@ -161,6 +165,15 @@ enum ProfileSelection {
 struct ServeQueryGovernor {
     max_concurrent_queries: Option<usize>,
     queue_timeout_ms: Option<u64>,
+}
+
+/// Optional process-local pgwire limits; unset values retain `NetworkConfig` defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ServePgLimits {
+    handshake_timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    max_frame_bytes: Option<usize>,
 }
 
 /// Upper bound for `MULTIDB_MAX_CONCURRENT_QUERIES`.
@@ -828,7 +841,7 @@ fn open_spec_target(path: Option<&Path>) -> Result<SpecTarget, TargetRefusal> {
     let Some(path) = path else {
         return Ok(SpecTarget::NoPath);
     };
-    let probe = match inspect_database_metadata(path) {
+    let probe = match inspect_cli_database_metadata(path) {
         MetadataProbe::NeedsRecovery => {
             recover_database_file(path).map_err(|error| {
                 TargetRefusal::Unreadable(format!(
@@ -836,7 +849,7 @@ fn open_spec_target(path: Option<&Path>) -> Result<SpecTarget, TargetRefusal> {
                     path.display()
                 ))
             })?;
-            inspect_database_metadata(path)
+            inspect_cli_database_metadata(path)
         }
         probe => probe,
     };
@@ -871,7 +884,7 @@ fn open_spec_target(path: Option<&Path>) -> Result<SpecTarget, TargetRefusal> {
             }
             let config = DbConfig::on_disk(metadata.storage_profile, path);
             let db =
-                open_database_with_ops(config, &OperationalConfig::new()).map_err(|error| {
+                open_database_with_ops(config, &cli_operational_config()).map_err(|error| {
                     TargetRefusal::Unreadable(format!(
                         "{} cannot be opened: {error}",
                         path.display()
@@ -885,8 +898,35 @@ fn open_spec_target(path: Option<&Path>) -> Result<SpecTarget, TargetRefusal> {
     }
 }
 
-const fn cli_environment() -> ProvisionEnvironment {
-    ProvisionEnvironment::new(ProvisionSurface::Cli)
+fn encryption_from_sources(get_env: &impl Fn(&str) -> Option<String>) -> Option<EncryptionConfig> {
+    get_env("MULTIDB_ENCRYPTION_KEY_PATH")
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| EncryptionConfig::file_key(PathBuf::from(path)))
+}
+
+fn cli_operational_config() -> OperationalConfig {
+    OperationalConfig {
+        encryption: encryption_from_sources(&|name| env::var(name).ok()),
+        ..OperationalConfig::default()
+    }
+}
+
+fn inspect_with_encryption(path: &Path, encryption: Option<&EncryptionConfig>) -> MetadataProbe {
+    encryption.map_or_else(
+        || inspect_database_metadata(path),
+        |key| inspect_database_metadata_with_encryption(path, key),
+    )
+}
+
+fn inspect_cli_database_metadata(path: &Path) -> MetadataProbe {
+    inspect_with_encryption(path, cli_operational_config().encryption.as_ref())
+}
+
+fn cli_environment() -> ProvisionEnvironment {
+    ProvisionEnvironment {
+        encryption: cli_operational_config().encryption,
+        ..ProvisionEnvironment::new(ProvisionSurface::Cli)
+    }
 }
 
 /// The plan of the spec against its target, on the CLI surface.
@@ -1987,7 +2027,7 @@ fn ensure_export_out_target(out_path: &Path, db_path: &Path, force: bool) -> Res
         )));
     }
     if matches!(
-        inspect_database_metadata(out_path),
+        inspect_cli_database_metadata(out_path),
         MetadataProbe::Initialized(_) | MetadataProbe::Locked | MetadataProbe::NeedsRecovery
     ) {
         return Err(CliError::Usage(format!(
@@ -2167,7 +2207,7 @@ fn init_provision(
             2,
         ))
     };
-    let refusal = match inspect_database_metadata(&db_path) {
+    let refusal = match inspect_cli_database_metadata(&db_path) {
         MetadataProbe::NotFound | MetadataProbe::Uninitialized => None,
         MetadataProbe::Locked => Some(("in_use", in_use_message(Some(&db_path)), 1)),
         MetadataProbe::Initialized(_) | MetadataProbe::NeedsRecovery => existing(format!(
@@ -2504,6 +2544,7 @@ fn run_profile_list(args: &[String]) -> Result<CliRun, CliError> {
                         .iter()
                         .map(|role| role_slug(*role))
                         .collect::<Vec<_>>(),
+                    "requires_gpu": named_profile(profile.slug).is_some_and(|resolved| resolved.storage_profile.requires_gpu()),
                     "variants": product_variants(profile.slug)
                         .map(|variant| {
                             json!({
@@ -2560,7 +2601,7 @@ fn run_profile_show(args: &[String]) -> Result<CliRun, CliError> {
 }
 
 fn run_profile_show_db(path: &Path, output: &str) -> Result<CliRun, CliError> {
-    let probe = inspect_database_metadata(path);
+    let probe = inspect_cli_database_metadata(path);
     let initialized = matches!(probe, MetadataProbe::Initialized(_));
     let message = if output == "json" {
         serde_json::to_string_pretty(&probe)?
@@ -2680,6 +2721,7 @@ fn resolution_run(resolution: &ProfileResolution, output: &str) -> Result<CliRun
             ProfileResolution::Resolved { profile, issues } => json!({
                 "resolution": "resolved",
                 "profile": profile,
+                "requires_gpu": profile.storage_profile.requires_gpu(),
                 "rows": knob_rows_json(&profile.knobs, Some(&profile.provenance))?,
                 "issues": issues,
             }),
@@ -2928,7 +2970,8 @@ fn run_backup(args: &[String]) -> Result<String, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
     let dest = PathBuf::from(required_value(args, "--dest")?);
     let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
-    let database = open_database(cli_db_config(selection, db)?)?;
+    let database =
+        open_database_with_ops(cli_db_config(selection, db)?, &cli_operational_config())?;
     let config = BackupConfig::default();
 
     match kind.as_str() {
@@ -3324,7 +3367,7 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         4096,
         ScramCredential::from_password(&config.pg_password, 4096)?,
     );
-    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries);
+    let pg_config = serve_pg_config(tls, pg_auth, max_concurrent_queries, config.pg_limits);
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -3346,29 +3389,142 @@ fn run_serve(args: &[String]) -> Result<String, CliError> {
         let pg_listener = tokio::net::TcpListener::bind(config.pg_bind).await?;
         let pg_database = Arc::clone(&database);
 
-        let admin_task = tokio::spawn(async move {
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let admin_shutdown = shutdown.clone();
+        let pg_shutdown = shutdown.clone();
+        let maintenance_database = Arc::clone(&database);
+        let mut maintenance_task = tokio::spawn(run_server_maintenance(
+            maintenance_database, shutdown, config.history_retain_lsns,
+        ));
+        let mut admin_task = tokio::spawn(async move {
             axum::serve(
                 admin_listener,
                 admin_router.into_make_service_with_connect_info::<SocketAddr>(),
             )
+            .with_graceful_shutdown(wait_for_server_stop(admin_shutdown))
             .await
             .map_err(CliError::Io)
         });
-        let pg_task = tokio::spawn(async move {
-            PgServer::serve_shared(pg_listener, pg_database, pg_config)
+        let mut pg_task = tokio::spawn(async move {
+            PgServer::serve_shared_until_shutdown(
+                pg_listener, pg_database, pg_config, wait_for_server_stop(pg_shutdown),
+            )
                 .await
                 .map_err(CliError::Network)
         });
-
-        tokio::select! {
-            result = admin_task => flatten_serve_task(result)?,
-            result = pg_task => flatten_serve_task(result)?,
-        }
+        let mut admin_done = false;
+        let mut pg_done = false;
+        let mut maintenance_done = false;
+        let result = tokio::select! {
+            result = &mut admin_task => { admin_done = true; flatten_serve_task(result) },
+            result = &mut pg_task => { pg_done = true; flatten_serve_task(result) },
+            result = &mut maintenance_task => { maintenance_done = true; flatten_serve_task(result) },
+            result = server_shutdown_signal() => result.map_err(CliError::Io),
+        };
+        let _ = stop.send(true);
+        let admin_result = if admin_done { Ok(()) } else { flatten_serve_task(admin_task.await) };
+        let pg_result = if pg_done { Ok(()) } else { flatten_serve_task(pg_task.await) };
+        let maintenance_result = if maintenance_done { Ok(()) } else { flatten_serve_task(maintenance_task.await) };
+        let flush_result = flush_server_workload(database).await;
+        result?;
+        admin_result?;
+        pg_result?;
+        maintenance_result?;
+        flush_result?;
 
         Ok::<(), CliError>(())
     })?;
 
     Ok("serve stopped".to_owned())
+}
+
+async fn wait_for_server_stop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if !*shutdown.borrow() {
+        let _ = shutdown.changed().await;
+    }
+}
+
+async fn server_shutdown_signal() -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+/// Performs one bounded retention/GC batch per second. History pruning requires an explicit
+/// operator retention; commit-log truncation is never performed by a running server.
+async fn run_server_maintenance(
+    database: Arc<tokio::sync::RwLock<Database>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    history_retain_lsns: Option<u64>,
+) -> Result<(), CliError> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = None;
+    let mut ticks = 0_u64;
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_server_stop(shutdown.clone()) => break,
+            _ = interval.tick() => {},
+        }
+        let handle = Arc::clone(&database);
+        let result = tokio::task::spawn_blocking(move || {
+            let database = handle.blocking_read();
+            let next_cursor = match database.sweep_time_series_retention(cursor, 128) {
+                Ok(report) => report.next_cursor,
+                Err(error) => {
+                    tracing::warn!(%error, "time-series retention sweep failed");
+                    None
+                }
+            };
+            if ticks.is_multiple_of(10) {
+                if let Err(error) = database.flush_workload_samples() {
+                    tracing::warn!(%error, "periodic workload flush failed");
+                }
+                if let Some(retain) = history_retain_lsns {
+                    let options = HistoryGcOptions {
+                        batch_size: 64,
+                        max_batches: Some(1),
+                        mvcc_retain_lsns: Some(retain),
+                        ..HistoryGcOptions::default()
+                    };
+                    if let Err(error) = database.gc_history_online(&options) {
+                        tracing::warn!(%error, "periodic history GC failed");
+                    }
+                }
+            }
+            next_cursor
+        })
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+        cursor = result;
+        ticks = ticks.wrapping_add(1);
+        // Keep the receiver alive until the in-flight blocking batch has finished.
+        if *shutdown.borrow_and_update() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn flush_server_workload(
+    database: Arc<tokio::sync::RwLock<Database>>,
+) -> Result<(), CliError> {
+    tokio::task::spawn_blocking(move || {
+        // All listeners and their request tasks have stopped before this barrier.
+        let database = database.blocking_write();
+        database.flush_workload_samples().map_err(CliError::Db)
+    })
+    .await
+    .map_err(|error| CliError::Runtime(error.to_string()))?
 }
 
 /// [`serve_database_with_spec_mode`] without the spec mode.
@@ -3393,19 +3549,33 @@ fn serve_database_with_spec_mode(
         return Ok((database, Some(spec_mode)));
     }
     // Resolved first, so `auto` on a missing path fails before any directory is created.
-    let db_config = cli_db_config(config.profile, config.db_path.clone())?;
+    let encryption = config
+        .encryption_key_path
+        .as_ref()
+        .map(EncryptionConfig::file_key);
+    let db_config =
+        cli_db_config_with_encryption(config.profile, config.db_path.clone(), encryption.as_ref())?;
     if let Some(parent) = config.db_path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    Ok((create_database(db_config)?, None))
+    Ok((
+        create_database_with_ops(
+            db_config,
+            OperationalConfig {
+                encryption,
+                ..OperationalConfig::default()
+            },
+        )?,
+        None,
+    ))
 }
 
 /// `serve` in spec mode (`MULTIDB_SPEC_PATH`). The spec is read through `spec_io`, validated
 /// and compiled; then, before anything is opened, serve refuses an explicit `MULTIDB_PROFILE`
 /// that selects another storage profile, an explicit `MULTIDB_REPLICATION` that contradicts the
-/// spec, `encryption.at_rest` (serve cannot open encrypted databases) and a volatile profile.
+/// spec, encryption at rest without a configured key, and a volatile profile.
 /// The database path is an explicit `MULTIDB_DB_PATH`, else the spec `storage_path` resolved
 /// against the directory of the spec file, else serve's default path. `open_from_spec` on the
 /// serve surface then starts, applies an auto-approvable plan as `local:serve` when
@@ -3460,7 +3630,13 @@ fn serve_spec_database(
         Some(&db_path),
         serve_spec.mode,
         &ProvisionOptions::default(),
-        &ProvisionEnvironment::new(ProvisionSurface::Serve),
+        &ProvisionEnvironment {
+            encryption: config
+                .encryption_key_path
+                .as_ref()
+                .map(EncryptionConfig::file_key),
+            ..ProvisionEnvironment::new(ProvisionSurface::Serve)
+        },
     );
     match opened {
         Ok((database, report)) => {
@@ -3492,7 +3668,7 @@ fn serve_refusal(serve_spec: &ServeSpecConfig, reason: &str) -> CliError {
 
 /// What in serve's own configuration contradicts the spec: an explicit `MULTIDB_PROFILE` that
 /// selects another storage profile (`auto` never does), an explicit `MULTIDB_REPLICATION` other
-/// than the spec's, encryption at rest and a volatile profile.
+/// than the spec's, encryption at rest without a key, and a volatile profile.
 fn serve_spec_conflict(
     config: &ServeConfig,
     serve_spec: &ServeSpecConfig,
@@ -3520,11 +3696,10 @@ fn serve_spec_conflict(
             slug(&spec.defaults.replication)
         ));
     }
-    if spec.guarantees.encryption.at_rest {
+    if spec.guarantees.encryption.at_rest && config.encryption_key_path.is_none() {
         return Some(
-            "the spec sets guarantees.encryption.at_rest, but multidb serve cannot open \
-             encrypted databases in this build: encryption at rest is provisioned through the \
-             Rust API only (GUARANTEE_NOT_ENFORCEABLE)"
+            "the spec sets guarantees.encryption.at_rest; set MULTIDB_ENCRYPTION_KEY_PATH \
+             to the encryption key file before starting (GUARANTEE_NOT_ENFORCEABLE)"
                 .to_owned(),
         );
     }
@@ -3747,12 +3922,55 @@ fn run_admin(args: &[String]) -> Result<String, CliError> {
                     ));
                 }
                 let listener = tokio::net::TcpListener::bind(bind).await?;
-                axum::serve(
-                    listener,
-                    multidb::admin::router(state)
-                        .into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await?;
+                let (stop, shutdown) = tokio::sync::watch::channel(false);
+                let mut maintenance = tokio::spawn(run_server_maintenance(
+                    Arc::clone(&database),
+                    shutdown.clone(),
+                    None,
+                ));
+                let mut server = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        multidb::admin::router(state)
+                            .into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(wait_for_server_stop(shutdown))
+                    .await
+                });
+                let mut server_done = false;
+                let mut maintenance_done = false;
+                let result = tokio::select! {
+                    result = &mut server => {
+                        server_done = true;
+                        result.map_err(std::io::Error::other).and_then(|result| result)
+                    },
+                    result = &mut maintenance => {
+                        maintenance_done = true;
+                        flatten_serve_task(result).map_err(std::io::Error::other)
+                    },
+                    result = server_shutdown_signal() => result,
+                };
+                let _ = stop.send(true);
+                let server_result = if server_done {
+                    Ok(())
+                } else {
+                    server
+                        .await
+                        .map_err(std::io::Error::other)
+                        .and_then(|result| result)
+                };
+                let maintenance_result = if maintenance_done {
+                    Ok(())
+                } else {
+                    flatten_serve_task(maintenance.await).map_err(std::io::Error::other)
+                };
+                let flush_result = flush_server_workload(database)
+                    .await
+                    .map_err(std::io::Error::other);
+                result?;
+                server_result?;
+                maintenance_result?;
+                flush_result?;
                 Ok::<(), std::io::Error>(())
             })?;
             Ok(format!("admin server stopped on {bind}"))
@@ -3798,9 +4016,10 @@ fn format_resolution(resolution: &ProfileResolution) -> Result<String, CliError>
                     storage_summary(&profile.knobs)
                 ),
                 format!(
-                    "kind={} digest={}",
+                    "kind={} digest={} requires_gpu={}",
                     kind_label(profile.kind),
-                    profile.digest
+                    profile.digest,
+                    profile.storage_profile.requires_gpu()
                 ),
                 knob_table(&profile.knobs, Some(&profile.provenance))?,
             ]
@@ -4317,7 +4536,11 @@ fn guided_spec_for_domain(
     }
     let durable_storage = guided_profile_uses_durable_storage(profile.slug);
     DatabaseSpec {
-        version: multidb::config_spec::DATABASE_SPEC_VERSION,
+        version: if profile.slug == "tensor_dataset" {
+            DATABASE_SPEC_VERSION_V2
+        } else {
+            multidb::config_spec::DATABASE_SPEC_VERSION
+        },
         name: name.to_owned(),
         profile: profile.slug.to_owned(),
         deployment: DeploymentSpec {
@@ -4608,10 +4831,55 @@ fn flatten_serve_task(
 
 /// Runs at most as many `PostgreSQL` wire statements as the query governor admits,
 /// so a burst waits for a free statement slot instead of failing the governor queue timeout.
-fn serve_pg_config(tls: TlsMode, auth: AuthConfig, max_concurrent_queries: usize) -> NetworkConfig {
-    let config = NetworkConfig::new(tls, auth);
+fn serve_pg_config(
+    tls: TlsMode,
+    auth: AuthConfig,
+    max_concurrent_queries: usize,
+    limits: ServePgLimits,
+) -> NetworkConfig {
+    let mut config = NetworkConfig::new(tls, auth);
+    if let Some(timeout) = limits.handshake_timeout_ms {
+        config = config.with_handshake_timeout_ms(timeout);
+    }
+    if let Some(timeout) = limits.idle_timeout_ms {
+        config = config.with_idle_timeout_ms(timeout);
+    }
+    if let Some(timeout) = limits.request_timeout_ms {
+        config = config.with_connection_timeout_ms(timeout);
+    }
+    if let Some(bytes) = limits.max_frame_bytes {
+        config = config.with_max_frame_bytes(bytes);
+    }
     let max_blocking_tasks = config.max_blocking_tasks.min(max_concurrent_queries.max(1));
     config.with_max_blocking_tasks(max_blocking_tasks)
+}
+
+fn serve_pg_limits_from_sources<F>(get_env: &F) -> Result<ServePgLimits, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(ServePgLimits {
+        handshake_timeout_ms: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_HANDSHAKE_TIMEOUT_MS",
+            u64::MAX,
+        )?,
+        idle_timeout_ms: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_IDLE_TIMEOUT_MS",
+            u64::MAX,
+        )?,
+        request_timeout_ms: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_REQUEST_TIMEOUT_MS",
+            u64::MAX,
+        )?,
+        max_frame_bytes: bounded_positive_from_sources(
+            get_env,
+            "MULTIDB_PG_MAX_FRAME_BYTES",
+            usize::MAX,
+        )?,
+    })
 }
 
 fn serve_config_from_env() -> Result<ServeConfig, CliError> {
@@ -4661,6 +4929,7 @@ where
         "/usr/share/multidb/studio",
     ));
     let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
+    let pg_limits = serve_pg_limits_from_sources(&get_env)?;
     let spec = serve_spec_from_sources(&get_env)?;
     let query_governor = ServeQueryGovernor {
         max_concurrent_queries: bounded_positive_from_sources(
@@ -4675,6 +4944,9 @@ where
         )?,
     };
 
+    let history_retain_lsns =
+        bounded_positive_from_sources(&get_env, "MULTIDB_HISTORY_RETAIN_LSNS", u64::MAX)?;
+
     Ok(ServeConfig {
         admin_bind,
         pg_bind,
@@ -4688,9 +4960,12 @@ where
         pg_user,
         pg_password,
         pg_tls,
+        pg_limits,
         studio_dir,
         spec,
         query_governor,
+        history_retain_lsns,
+        encryption_key_path: encryption_from_sources(&get_env).map(|config| config.key_path),
     })
 }
 
@@ -5035,13 +5310,19 @@ fn parse_export_format(value: &str) -> Result<ExportFormat, CliError> {
 fn open_cli_database(args: &[String]) -> Result<multidb::db::Database, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
     let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
-    Ok(open_database(cli_db_config(selection, db)?)?)
+    Ok(open_database_with_ops(
+        cli_db_config(selection, db)?,
+        &cli_operational_config(),
+    )?)
 }
 
 fn create_cli_database(args: &[String]) -> Result<multidb::db::Database, CliError> {
     let db = PathBuf::from(required_value(args, "--db")?);
     let selection = parse_profile_selection(&required_value(args, "--profile")?)?;
-    Ok(create_database(cli_db_config(selection, db)?)?)
+    Ok(create_database_with_ops(
+        cli_db_config(selection, db)?,
+        cli_operational_config(),
+    )?)
 }
 
 fn resume_token(args: &[String]) -> Result<ResumeToken, CliError> {
@@ -5079,7 +5360,7 @@ fn parse_profile_selection(value: &str) -> Result<ProfileSelection, CliError> {
     }
     Err(CliError::Usage(format!(
         "unknown profile {value}{}; expected a storage profile (InMemory, Transactional, \
-         Analytical, Document, Vector, TimeSeries, HighDurability, Balanced), a product profile \
+         Analytical, Document, Vector, TimeSeries, HighDurability, Balanced, Tensor), a product profile \
          slug or alias (run multidb profile list), or auto",
         did_you_mean(value)
     )))
@@ -5096,6 +5377,7 @@ fn storage_profile_name(value: &str) -> Option<Profile> {
         "TimeSeries" | "time-series" | "time_series" => Some(Profile::TimeSeries),
         "HighDurability" | "high-durability" => Some(Profile::HighDurability),
         "Balanced" | "balanced" => Some(Profile::Balanced),
+        "Tensor" | "tensor" => Some(Profile::Tensor),
         _ => None,
     }
 }
@@ -5104,16 +5386,28 @@ fn storage_profile_name(value: &str) -> Option<Profile> {
 /// only, so the replication is always CP. `auto` reads only the storage profile of the existing
 /// database, without creating anything: a database whose metadata records another replication
 /// fails with `ReplicationMismatch`, exactly as it does with a named profile. `auto` is an error
-/// for anything but an initialized database. A file that was not closed cleanly (`serve` has no
-/// graceful shutdown, so every stop by a signal leaves one) first gets redb's crash recovery,
+/// for anything but an initialized database. A file that was not closed cleanly first gets
+/// redb's crash recovery,
 /// which every opener runs anyway, also for a file that then fails the replication check; `auto`
 /// writes nothing else, and nothing at all to a cleanly closed file.
 fn cli_db_config(selection: ProfileSelection, path: PathBuf) -> Result<DbConfig, CliError> {
+    cli_db_config_with_encryption(
+        selection,
+        path,
+        cli_operational_config().encryption.as_ref(),
+    )
+}
+
+fn cli_db_config_with_encryption(
+    selection: ProfileSelection,
+    path: PathBuf,
+    encryption: Option<&EncryptionConfig>,
+) -> Result<DbConfig, CliError> {
     let ProfileSelection::Fixed(profile) = selection else {
-        let probe = match inspect_database_metadata(&path) {
+        let probe = match inspect_with_encryption(&path, encryption) {
             MetadataProbe::NeedsRecovery => {
                 recover_database_file(&path)?;
-                inspect_database_metadata(&path)
+                inspect_with_encryption(&path, encryption)
             }
             probe => probe,
         };
@@ -5260,7 +5554,7 @@ mod tests {
     #[cfg(unix)]
     use super::write_through_temp_file;
     use super::{
-        CliError, ProfileSelection, ServePgTls, ServeQueryGovernor, ServeSpecConfig,
+        CliError, ProfileSelection, ServePgLimits, ServePgTls, ServeQueryGovernor, ServeSpecConfig,
         apply_query_governor, cli_db_config, format_metadata_probe, parse_profile_selection, run,
         serve_config_from_sources, serve_database, serve_pg_config, values,
     };
@@ -5270,15 +5564,16 @@ mod tests {
             restore_backup_with_config,
         },
         config_spec::{
-            CollectionRole, CollectionRoleSpec, ConsistencyMode, DatabaseSpec, DeploymentMode,
-            GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner, PolicyCompiler, ProfileResolution,
-            RESERVED_KNOBS, WriteAck, resolve_named_profile,
+            CollectionRole, CollectionRoleSpec, ConsistencyMode, DATABASE_SPEC_VERSION_V2,
+            DatabaseSpec, DeploymentMode, GuaranteeValidator, KNOB_REGISTRY, MigrationPlanner,
+            PolicyCompiler, ProfileResolution, RESERVED_KNOBS, WriteAck, resolve_named_profile,
+            resolve_profile,
             spec_io::{MAX_SPEC_BYTES, SpecFormat, decode_spec_bytes},
         },
         db::{
             ConfigError, DbConfig, EncryptionConfig, MetadataProbe, OperationalConfig, Profile,
             ReplicationKind, create_database, create_database_with_profile,
-            inspect_database_metadata, open_database,
+            inspect_database_metadata, open_database, open_database_with_ops,
         },
         network::{AuthConfig, NetworkConfig, ScramCredential, TlsMode},
         tuning::WorkloadSample,
@@ -5307,6 +5602,105 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn serve_config_history_retention_is_explicit_and_positive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "secret"),
+        ]);
+        assert_eq!(
+            serve_config_from_sources(|name| env.get(name).cloned())?.history_retain_lsns,
+            None
+        );
+        for invalid in ["0", "-1", "abc"] {
+            env.insert("MULTIDB_HISTORY_RETAIN_LSNS".to_owned(), invalid.to_owned());
+            assert!(serve_config_from_sources(|name| env.get(name).cloned()).is_err());
+        }
+        env.insert("MULTIDB_HISTORY_RETAIN_LSNS".to_owned(), "1000".to_owned());
+        assert_eq!(
+            serve_config_from_sources(|name| env.get(name).cloned())?.history_retain_lsns,
+            Some(1000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serve_opens_encrypted_storage_and_auto_profile_with_a_key_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let key_path = temp.path().join("encryption.key");
+        let db_path = temp.path().join("encrypted.redb");
+        std::fs::write(&key_path, [7_u8; 32])?;
+        let mut env = env_map(&[
+            ("MULTIDB_RUNTIME_MODE", "local-dev"),
+            ("MULTIDB_PG_TLS_MODE", "disabled"),
+            ("MULTIDB_PG_PASSWORD", "secret"),
+            ("MULTIDB_PROFILE", "balanced"),
+        ]);
+        env.insert("MULTIDB_DB_PATH".to_owned(), db_path.display().to_string());
+        env.insert(
+            "MULTIDB_ENCRYPTION_KEY_PATH".to_owned(),
+            key_path.display().to_string(),
+        );
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert!(serve_database(&config)?.encryption_config().is_some());
+        assert!(matches!(
+            inspect_database_metadata(&db_path),
+            MetadataProbe::Unreadable { .. }
+        ));
+        env.insert("MULTIDB_PROFILE".to_owned(), "auto".to_owned());
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert!(serve_database(&config)?.encryption_config().is_some());
+        env.remove("MULTIDB_ENCRYPTION_KEY_PATH");
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert!(serve_database(&config).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_stops_cleanly_and_shutdown_flushes_buffered_workload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use multidb::{
+            repl::{ReadConsistency, Replication},
+            tuning::WORKLOAD_TABLE,
+        };
+        let database = std::sync::Arc::new(tokio::sync::RwLock::new(create_database(
+            DbConfig::new(Profile::InMemory),
+        )?));
+        database.read().await.query("SELECT 7").await?;
+        assert!(
+            Replication::range(
+                &*database.read().await,
+                WORKLOAD_TABLE,
+                &[],
+                &[],
+                ReadConsistency::Strong
+            )?
+            .is_empty()
+        );
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        stop.send(true)?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::run_server_maintenance(std::sync::Arc::clone(&database), shutdown, None),
+        )
+        .await??;
+        super::flush_server_workload(std::sync::Arc::clone(&database)).await?;
+        assert!(
+            !Replication::range(
+                &*database.read().await,
+                WORKLOAD_TABLE,
+                &[],
+                &[],
+                ReadConsistency::Strong
+            )?
+            .is_empty()
+        );
+        Ok(())
     }
 
     #[test]
@@ -5421,11 +5815,26 @@ mod tests {
         let default_tasks =
             NetworkConfig::new(TlsMode::DisabledForTests, auth.clone()).max_blocking_tasks;
 
-        let small = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 4);
+        let small = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth.clone(),
+            4,
+            ServePgLimits::default(),
+        );
         assert_eq!(small.max_blocking_tasks, 4);
-        let zero = serve_pg_config(TlsMode::DisabledForTests, auth.clone(), 0);
+        let zero = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth.clone(),
+            0,
+            ServePgLimits::default(),
+        );
         assert_eq!(zero.max_blocking_tasks, 1);
-        let large = serve_pg_config(TlsMode::DisabledForTests, auth, default_tasks + 64);
+        let large = serve_pg_config(
+            TlsMode::DisabledForTests,
+            auth,
+            default_tasks + 64,
+            ServePgLimits::default(),
+        );
         assert_eq!(large.max_blocking_tasks, default_tasks);
         Ok(())
     }
@@ -5438,6 +5847,86 @@ mod tests {
         ]);
         env.extend(env_map(extra));
         env
+    }
+
+    #[test]
+    fn serve_pg_limits_preserve_defaults_when_unset_or_blank()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for overrides in [
+            Vec::new(),
+            vec![
+                ("MULTIDB_PG_HANDSHAKE_TIMEOUT_MS", ""),
+                ("MULTIDB_PG_IDLE_TIMEOUT_MS", " "),
+                ("MULTIDB_PG_REQUEST_TIMEOUT_MS", "\t"),
+                ("MULTIDB_PG_MAX_FRAME_BYTES", ""),
+            ],
+        ] {
+            let env = local_dev_env(&overrides);
+            let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+            assert_eq!(config.pg_limits, ServePgLimits::default());
+            let auth = AuthConfig::single_user(
+                "postgres".to_owned(),
+                4096,
+                ScramCredential::from_password("pg-secret", 4096)?,
+            );
+            let network = serve_pg_config(TlsMode::DisabledForTests, auth, 4, config.pg_limits);
+            assert_eq!(network.handshake_timeout_ms, 10_000);
+            assert_eq!(network.idle_timeout_ms, 60_000);
+            assert_eq!(network.connection_timeout_ms, 300_000);
+            assert_eq!(network.max_frame_bytes, 16 * 1024 * 1024);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_limits_parse_and_reach_network_config() -> Result<(), Box<dyn std::error::Error>> {
+        let env = local_dev_env(&[
+            ("MULTIDB_PG_HANDSHAKE_TIMEOUT_MS", "12000"),
+            ("MULTIDB_PG_IDLE_TIMEOUT_MS", " 90000 "),
+            ("MULTIDB_PG_REQUEST_TIMEOUT_MS", "310000"),
+            ("MULTIDB_PG_MAX_FRAME_BYTES", "32768"),
+        ]);
+        let config = serve_config_from_sources(|name| env.get(name).cloned())?;
+        assert_eq!(
+            config.pg_limits,
+            ServePgLimits {
+                handshake_timeout_ms: Some(12_000),
+                idle_timeout_ms: Some(90_000),
+                request_timeout_ms: Some(310_000),
+                max_frame_bytes: Some(32_768),
+            }
+        );
+        let auth = AuthConfig::single_user(
+            "postgres".to_owned(),
+            4096,
+            ScramCredential::from_password("pg-secret", 4096)?,
+        );
+        let network = serve_pg_config(TlsMode::DisabledForTests, auth, 4, config.pg_limits);
+        assert_eq!(network.handshake_timeout_ms, 12_000);
+        assert_eq!(network.idle_timeout_ms, 90_000);
+        assert_eq!(network.connection_timeout_ms, 310_000);
+        assert_eq!(network.max_frame_bytes, 32_768);
+        assert_eq!(network.max_blocking_tasks, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_pg_limits_reject_zero_overflow_and_invalid_numbers() {
+        for name in [
+            "MULTIDB_PG_HANDSHAKE_TIMEOUT_MS",
+            "MULTIDB_PG_IDLE_TIMEOUT_MS",
+            "MULTIDB_PG_REQUEST_TIMEOUT_MS",
+            "MULTIDB_PG_MAX_FRAME_BYTES",
+        ] {
+            for value in ["0", "-1", "many", "1.5", "18446744073709551616"] {
+                let env = local_dev_env(&[(name, value)]);
+                let error = serve_config_from_sources(|name| env.get(name).cloned());
+                assert!(
+                    matches!(error, Err(CliError::Usage(ref message)) if message.contains(name)),
+                    "{name}={value}: unexpected result {error:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5532,6 +6021,7 @@ mod tests {
             TlsMode::DisabledForTests,
             auth,
             database.performance_config().query.max_concurrent_queries,
+            ServePgLimits::default(),
         );
         assert_eq!(pg_config.max_blocking_tasks, 3);
         Ok(())
@@ -6361,7 +6851,7 @@ mod tests {
             "--json".to_owned(),
         ])?;
         let profiles = serde_json::from_str::<serde_json::Value>(&profiles_json.message)?;
-        assert!(profiles.as_array().is_some_and(|items| items.len() == 6));
+        assert!(profiles.as_array().is_some_and(|items| items.len() == 7));
 
         let roles_json = run(vec![
             "role".to_owned(),
@@ -6627,11 +7117,14 @@ mod tests {
             ("high-durability", Profile::HighDurability),
             ("Balanced", Profile::Balanced),
             ("balanced", Profile::Balanced),
+            ("Tensor", Profile::Tensor),
+            ("tensor", Profile::Tensor),
         ];
         let aliases = [
             ("in_memory", Profile::InMemory),
             ("high_durability", Profile::HighDurability),
             ("High-Durability", Profile::HighDurability),
+            ("deeplake_like", Profile::Tensor),
         ];
         for (value, profile) in storage_names.into_iter().chain(aliases) {
             assert_eq!(
@@ -6648,6 +7141,7 @@ mod tests {
             ("secure_app", Profile::Transactional),
             ("production_cp", Profile::Transactional),
             ("analytics_columnar", Profile::Analytical),
+            ("tensor_dataset", Profile::Tensor),
         ];
         for (slug, profile) in products {
             for value in [slug.to_owned(), slug.replace('_', "-")] {
@@ -7122,12 +7616,95 @@ mod tests {
     }
 
     #[test]
+    fn tensor_profile_inspection_and_guided_init_work_without_a_gpu()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let shown = run(strings(&["profile", "show", "tensor", "--json"]))?;
+        assert_eq!(shown.exit_code, 0, "{}", shown.message);
+        let report = json_message(&shown)?;
+        assert_eq!(report["requires_gpu"], true);
+        assert_eq!(report["profile"]["product_profile"], "tensor_dataset");
+        assert_eq!(report["profile"]["variant"], "tensor");
+        assert_eq!(report["profile"]["storage_profile"], "Tensor");
+        assert_eq!(
+            report["profile"]["knobs"]["compression"]["algorithm"],
+            "lz4"
+        );
+        let listed = json_message(&run(strings(&["profile", "list", "--json"]))?)?;
+        let tensor = listed
+            .as_array()
+            .ok_or("profile list")?
+            .iter()
+            .find(|profile| profile["slug"] == "tensor_dataset")
+            .ok_or("tensor profile")?;
+        assert_eq!(tensor["requires_gpu"], true);
+        assert_eq!(
+            tensor["variants"],
+            json!([{
+                "name": "tensor", "storage_profile": "Tensor", "canonical": true,
+            }])
+        );
+        let dir = tempdir()?;
+        let path = dir.path().join("tensors.json");
+        let created = run(strings(&[
+            "init",
+            "--guided",
+            "--profile",
+            "deeplake-like",
+            "--name",
+            "Dataset",
+            "--format",
+            "json",
+            "--out",
+            &path_arg(&path),
+            "--json",
+        ]))?;
+        assert_eq!(created.exit_code, 0, "{}", created.message);
+        let spec: DatabaseSpec = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(spec.version, DATABASE_SPEC_VERSION_V2);
+        assert_eq!(spec.profile, "tensor_dataset");
+        assert_eq!(
+            resolve_profile(&spec)
+                .resolved()
+                .ok_or("resolved tensor")?
+                .storage_profile,
+            Profile::Tensor
+        );
+        assert!(spec.collections.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_profile_open_is_gpu_gated_and_auto_preserves_its_storage_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("tensors.redb");
+        match create_database(DbConfig::on_disk(Profile::Tensor, &path)) {
+            Err(error) => {
+                assert!(error.to_string().contains("GPU"), "{error}");
+                assert!(
+                    !path.exists(),
+                    "an unavailable GPU must refuse before creating the database"
+                );
+            }
+            Ok(db) => {
+                assert_eq!(db.profile(), Profile::Tensor);
+                drop(db);
+                let auto = cli_db_config(ProfileSelection::Auto, path.clone())?;
+                assert_eq!(auto.profile, Profile::Tensor);
+                let db = open_database_with_ops(auto, &OperationalConfig::new())?;
+                assert_eq!(db.profile(), Profile::Tensor);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn profile_list_json_adds_variants_and_knobs() -> Result<(), Box<dyn std::error::Error>> {
         let outcome = run(strings(&["profile", "list", "--json"]))?;
         let report = json_message(&outcome)?;
         let profiles = report.as_array().ok_or("profile list is not an array")?;
 
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), 7);
         for profile in profiles {
             let variants = profile["variants"].as_array().ok_or("missing variants")?;
             assert_eq!(
@@ -9611,6 +10188,26 @@ mod tests {
             matches!(replication, Err(CliError::Usage(ref message)) if message.contains("unsupported MULTIDB_REPLICATION raft")),
             "unexpected result: {replication:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn serve_spec_encryption_requires_and_uses_the_configured_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let key_path = temp.path().join("encryption.key");
+        std::fs::write(&key_path, [9_u8; 32])?;
+        let spec_path = temp.path().join("multidb.yaml");
+        let mut spec = provision_spec(&json!([document_collection("orders")]))?;
+        spec.guarantees.encryption.at_rest = true;
+        spec.deployment.storage_path = Some("encrypted.redb".to_owned());
+        write_yaml_spec(&spec_path, &spec)?;
+        let mut config = spec_serve_config(&spec_path, &[("MULTIDB_SPEC_APPLY", "create")])?;
+        assert!(serve_database(&config).is_err());
+        config.encryption_key_path = Some(key_path);
+        assert!(serve_database(&config)?.encryption_config().is_some());
+        config.spec.as_mut().ok_or("missing spec")?.mode = multidb::provision::StartupMode::Verify;
+        assert!(serve_database(&config)?.encryption_config().is_some());
         Ok(())
     }
 

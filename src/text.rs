@@ -117,7 +117,7 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
         Ok(Self {
             repl,
             config,
-            commit_log_available: true,
+            commit_log_available: repl.supports_commit_log(),
         })
     }
 
@@ -192,7 +192,11 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
         } = &self.config.source;
         // Take the token before scanning: a write that commits during the scan is then
         // replayed by `refresh_incremental` instead of being lost.
-        let refreshed_to = cdc::current_resume_token(self.repl)?;
+        let refreshed_to = if self.repl.supports_commit_log() {
+            cdc::current_resume_token(self.repl)?
+        } else {
+            ResumeToken::default()
+        };
         clear_index_entries(self.repl, &self.config.name)?;
 
         let (mut cursor, end) = keyenc::u32_prefix_range(collection_id.as_u32());
@@ -242,7 +246,7 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
         &self,
         catalog: &BTreeMap<String, CatalogEntry>,
     ) -> Result<FullTextIndexState, TextError> {
-        if !self.commit_log_available {
+        if !self.commit_log_available || !self.repl.supports_commit_log() {
             return Err(TextError::Repl(ReplError::Unsupported(
                 "AP replication does not support incremental full-text refresh: AP writes are \
                  not recorded in the commit log; use refresh_full"

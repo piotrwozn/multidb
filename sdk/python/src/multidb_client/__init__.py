@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Literal, Mapping, MutableMapping, Optional, Tuple, TypedDict, Union
 
 JsonValue = Any
 JsonObject = MutableMapping[str, JsonValue]
@@ -16,6 +16,250 @@ Transport = Callable[[str, str, Mapping[str, str], Optional[bytes]], Tuple[int, 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/api"
 CONTROL_PLANE_API_VERSION = 1
 MIN_MULTIDB_VERSION = "0.1.0"
+
+
+class _GraphRagOptions(TypedDict, total=False):
+    seed_k: int  # Server default: 8.
+    max_depth: int  # Server default: 2.
+    max_nodes: int  # Server default: 64.
+    max_edges: int  # Server default: 256.
+    max_context_bytes: int  # Server default: 16384 UTF-8 bytes.
+    labels: list[str]  # Server default: ["related"].
+    text_field: list[str]  # Metadata path; default: ["text"].
+    source_field: list[str]  # Metadata path; default: ["source"].
+
+
+class GraphRagRequest(_GraphRagOptions):
+    """Bounded vector-seeded graph retrieval; optional defaults are supplied by the server."""
+
+    vector_collection: str
+    graph: str
+    query_vector: list[float]
+
+
+class GraphRagSource(TypedDict):
+    document_id: str
+    text: str
+    source: Optional[str]
+    seed_distance: float
+    depth: int
+    seed_id: str
+
+
+class GraphRagRelationship(TypedDict):
+    source: str
+    label: str
+    target: str
+
+
+class GraphRagResult(TypedDict):
+    context: str
+    sources: list[GraphRagSource]
+    relationships: list[GraphRagRelationship]
+    truncated: bool
+
+
+class _GraphEdgeOptions(TypedDict, total=False):
+    props: JsonValue
+
+
+class GraphEdgeRequest(_GraphEdgeOptions):
+    """GraphRAG nodes use lowercase 32-character hex ids returned by insert_vector."""
+
+    source: str
+    label: str
+    target: str
+
+
+class GraphEdgeWriteResult(TypedDict):
+    written: Literal[True]
+
+
+class VectorInsertResult(TypedDict):
+    id: str
+
+
+TensorDType = Literal["u8", "i64", "f32", "f64", "bool", "utf8"]
+
+
+class _TensorU8Data(TypedDict):
+    u8: list[int]
+
+
+class _TensorI64Data(TypedDict):
+    i64: list[int]
+
+
+class _TensorF32Data(TypedDict):
+    f32: list[float]
+
+
+class _TensorF64Data(TypedDict):
+    f64: list[float]
+
+
+class _TensorBoolData(TypedDict):
+    bool: list[bool]
+
+
+class _TensorUtf8Data(TypedDict):
+    utf8: list[str]
+
+
+TensorData = Union[_TensorU8Data, _TensorI64Data, _TensorF32Data, _TensorF64Data, _TensorBoolData, _TensorUtf8Data]
+
+
+class Tensor(TypedDict):
+    """One typed sample. Data has exactly one dtype-tagged array, not an arbitrary JSON blob."""
+
+    shape: list[int]
+    data: TensorData
+
+
+class TensorColumn(TypedDict):
+    name: str
+    dtype: TensorDType
+    shape: list[Optional[int]]
+
+
+class _TensorPhysicalOptions(TypedDict, total=False):
+    kind: Literal["tensor_dataset"]
+    tensor_chunk_samples: int  # 1..1024, default 64.
+    tensor_max_chunk_bytes: int  # 1024..16777216, default 4194304.
+
+
+class TensorPhysicalSpec(_TensorPhysicalOptions):
+    """Version 2 collections[].physical for native typed tensor provisioning.
+
+    Use an analytics or vector_memory role. The tensor_dataset profile requires
+    a real GPU; null shape dimensions denote ragged sample dimensions.
+    """
+
+    tensors: list[TensorColumn]
+
+
+class _TensorDatasetOptions(TypedDict, total=False):
+    chunk_samples: int  # Server default: 64.
+    max_chunk_bytes: int  # Server default: 4194304; HTTP bodies remain capped at 1 MiB.
+
+
+class TensorDatasetConfig(_TensorDatasetOptions):
+    name: str
+    tensors: list[TensorColumn]
+
+
+TensorBatch = dict[str, list[Tensor]]
+
+
+class TensorAppendRequest(TypedDict):
+    tensors: TensorBatch
+
+
+class TensorDatasetInfo(TypedDict):
+    config: TensorDatasetConfig
+    samples: int
+    revision: int
+
+
+class TensorAppendResult(TypedDict):
+    start: int
+    end: int
+    revision: int
+
+
+class TensorReadRequest(TypedDict, total=False):
+    start: int
+    limit: int
+    columns: Optional[list[str]]
+    revision: Optional[int]
+
+
+class TensorReadBatch(TypedDict):
+    start: int
+    end: int
+    total_samples: int
+    revision: int
+    tensors: TensorBatch
+
+
+TensorDevice = Literal["cpu", "gpu"]
+
+
+class TensorExecution(TypedDict):
+    device: TensorDevice
+    adapter: Optional[str]
+    backend: Optional[str]
+
+
+class _TensorSearchOptions(TypedDict, total=False):
+    k: int
+    metric: Literal["Cosine", "L2"]
+    start: int
+    max_samples: int
+    revision: Optional[int]
+
+
+class TensorSearchRequest(_TensorSearchOptions):
+    tensor: str
+    query: list[float]
+
+
+class TensorSearchHit(TypedDict):
+    index: int
+    distance: float
+
+
+class TensorSearchResult(TypedDict):
+    hits: list[TensorSearchHit]
+    scanned_samples: int
+    next_start: Optional[int]
+    total_samples: int
+    revision: int
+    skipped_samples: int
+    execution: TensorExecution
+
+
+TensorGpuOperation = Literal["sum", "mean", "l2_norm"]
+
+
+class _TensorComputeOptions(TypedDict, total=False):
+    start: int
+    limit: int
+    revision: Optional[int]
+
+
+class TensorComputeRequest(_TensorComputeOptions):
+    tensor: str
+    operation: TensorGpuOperation
+
+
+class TensorComputeResult(TypedDict):
+    start: int
+    end: int
+    revision: int
+    values: list[float]
+    execution: TensorExecution
+
+
+class ProfileVariantSummary(TypedDict):
+    name: str
+    storage_profile: str
+    canonical: bool
+
+
+class _ProfileSummaryOptions(TypedDict, total=False):
+    requires_gpu: bool
+    variants: list[ProfileVariantSummary]
+    knobs: JsonObject
+
+
+class ProfileSummary(_ProfileSummaryOptions):
+    slug: str
+    aliases: list[str]
+    status: str
+    description: str
+    default_domain: str
+    compatible_roles: list[str]
 
 
 class ControlPlaneError(Exception):
@@ -149,10 +393,36 @@ class ControlPlaneClient:
     def create_geo_index(self, request: JsonObject) -> JsonObject:
         return self._request("POST", "/builder/geo", request)
 
+    def create_tensor_dataset(self, request: TensorDatasetConfig) -> TensorDatasetInfo:
+        return self._request("POST", "/builder/tensor-dataset", request)
+
+    def tensor_dataset_info(self, dataset: str, revision: Optional[int] = None) -> TensorDatasetInfo:
+        query = "" if revision is None else f"?revision={revision}"
+        return self._request("GET", f"/data/tensor-datasets/{_quote(dataset)}{query}")
+
+    def append_tensors(self, dataset: str, tensors: TensorBatch) -> TensorAppendResult:
+        return self._request("POST", f"/data/tensor-datasets/{_quote(dataset)}/append", {"tensors": tensors})
+
+    def read_tensors(self, dataset: str, request: Optional[TensorReadRequest] = None) -> TensorReadBatch:
+        return self._request("POST", f"/data/tensor-datasets/{_quote(dataset)}/read", {} if request is None else request)
+
+    def search_tensors(self, dataset: str, request: TensorSearchRequest) -> TensorSearchResult:
+        return self._request("POST", f"/data/tensor-datasets/{_quote(dataset)}/search", request)
+
+    def compute_tensors(self, dataset: str, request: TensorComputeRequest) -> TensorComputeResult:
+        return self._request("POST", f"/data/tensor-datasets/{_quote(dataset)}/compute", request)
+
     def create_graph(self, request: JsonObject) -> JsonObject:
         return self._request("POST", "/builder/graph", request)
 
-    def insert_vector(self, collection: str, metadata: JsonValue, vector: list[float]) -> JsonObject:
+    def add_graph_edge(self, graph: str, request: GraphEdgeRequest) -> GraphEdgeWriteResult:
+        return self._request("POST", f"/data/graphs/{_quote(graph)}/edges", request)
+
+    def graph_rag_query(self, request: GraphRagRequest) -> GraphRagResult:
+        """Returns retrieved context and provenance, assembled locally without an LLM."""
+        return self._request("POST", "/graphrag/query", request)
+
+    def insert_vector(self, collection: str, metadata: JsonValue, vector: list[float]) -> VectorInsertResult:
         return self._request(
             "POST",
             f"/data/vectors/{_quote(collection)}/vectors",
@@ -231,7 +501,7 @@ class ControlPlaneClient:
         """The served database described as a spec (preview)."""
         return self._request("GET", "/config/live")
 
-    def profiles(self) -> JsonValue:
+    def profiles(self) -> list[ProfileSummary]:
         return self._request("GET", "/profiles")
 
     def roles(self) -> JsonValue:
@@ -327,6 +597,13 @@ def _quote(value: str) -> str:
 __all__ = [
     "ControlPlaneClient",
     "ControlPlaneError",
+    "GraphRagRequest",
+    "GraphRagSource",
+    "GraphRagRelationship",
+    "GraphRagResult",
+    "GraphEdgeRequest",
+    "GraphEdgeWriteResult",
+    "VectorInsertResult",
     "CONTROL_PLANE_API_VERSION",
     "DEFAULT_BASE_URL",
     "MIN_MULTIDB_VERSION",

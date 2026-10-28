@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -13,13 +13,14 @@ use super::{
     AccessPath, AnalyzeMode, AnalyzeTarget, CardinalityEstimator, ColumnDef, ColumnType,
     ExplainOptions, MostCommonValue, QueryError, QueryFingerprint, REL_COLUMNAR_SEGMENTS_TABLE,
     REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexExpression, RelIndexSpec, RelPlanKind, RelPredicate,
-    RelTable, SqlEngine, SqlOutput, StatsCatalog, TableLayout, TableSchema, Value,
-    datafusion_to_query_error, make_row_key, parse,
+    RelTable, SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, StatsCatalog, TableLayout,
+    TableSchema, Value, datafusion_to_query_error, make_row_key, parse,
 };
 use crate::{
     db::{DbConfig, Profile, create_database, open_database},
     model::{CollectionId, FieldPath},
-    repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication},
+    repl::{ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition},
+    security::{AuthzError, Permission, Resource},
     storage::Bytes,
     txn::WriteAuthorization,
 };
@@ -305,6 +306,164 @@ fn columnar_rewrite_conflicts_when_segments_change_after_the_read()
 }
 
 #[test]
+fn columnar_append_keeps_closed_segments_and_primary_key_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    let original = (0..2_500).map(row).collect::<Vec<_>>();
+    repl.propose_batch(table.columnar_replace_ops(original)?)?;
+    let before = table.columnar_segments()?;
+    assert_eq!(before.len(), 3);
+
+    let ops = table.columnar_append_ops(&before, &[row(-1)])?;
+    assert_eq!(
+        ops.len(),
+        2,
+        "only the partial tail and its metadata are written"
+    );
+    table.insert(row(-1))?;
+    let after = table.columnar_segments()?;
+    assert_eq!(
+        &after[..2],
+        &before[..2],
+        "closed Parquet segments must stay byte-for-byte unchanged"
+    );
+    assert_ne!(after[2], before[2]);
+    assert_eq!(table.scan()?, (-1..2_500).map(row).collect::<Vec<_>>());
+    assert_eq!(table.row_count()?, 2_501);
+    assert_eq!(table.scan_page(0, 2)?, vec![row(-1), row(0)]);
+    assert!(matches!(
+        table.insert(row(1_500)),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    assert_eq!(
+        table.columnar_segments()?,
+        after,
+        "a rejected duplicate must write nothing"
+    );
+
+    // Missing metadata in older/raw-written databases still counts correctly.
+    repl.propose(Op::Delete {
+        table: super::REL_COLUMNAR_SEGMENT_META_TABLE.to_owned(),
+        key: after[1].0.clone(),
+    })?;
+    assert_eq!(table.row_count()?, 2_501);
+    Ok(())
+}
+
+#[test]
+fn columnar_append_rejects_stale_batches_and_batch_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    repl.propose_batch(table.columnar_replace_ops((0..1_024).map(row).collect())?)?;
+    let before = table.columnar_segments()?;
+    let stale = table.columnar_append_batch(&before, &[row(2_000)])?;
+    table.insert(row(2_001))?;
+    assert!(matches!(
+        repl.propose_conditional_batch(stale),
+        Err(ReplError::Conflict)
+    ));
+    assert_eq!(table.get(&Value::Int(2_000))?, None);
+    assert_eq!(table.get(&Value::Int(2_001))?, Some(row(2_001)));
+    assert_eq!(table.columnar_segments()?[0], before[0]);
+
+    let before_duplicate = table.columnar_segments()?;
+    assert!(matches!(
+        table.append_columnar_rows(&[row(3_000), row(3_000)]),
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    assert_eq!(table.columnar_segments()?, before_duplicate);
+    Ok(())
+}
+
+#[tokio::test]
+async fn columnar_sql_insert_appends_without_rewriting_closed_segments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repl = memory_repl()?;
+    let mut engine = SqlEngine::with_layout(repl.clone(), TableLayout::Columnar);
+    engine.create_table("statuses", Some(status_schema()), Vec::new())?;
+    let table = engine.table("statuses").ok_or("missing statuses")?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    repl.propose_batch(table.columnar_replace_ops((0..2_048).map(row).collect())?)?;
+    let before = table.columnar_segments()?;
+    engine
+        .execute("INSERT INTO statuses VALUES (-1, 'early'), (3000, 'late')")
+        .await?;
+    let after = table.columnar_segments()?;
+    assert_eq!(&after[..2], before.as_slice());
+    assert_eq!(after.len(), 3);
+    assert_eq!(table.row_count()?, 2_050);
+    assert_eq!(table.scan_page(0, 1)?[0][0], Value::Int(-1));
+    assert!(matches!(
+        engine
+            .execute("INSERT INTO statuses VALUES (4000, 'new'), (2, 'duplicate')")
+            .await,
+        Err(QueryError::DuplicatePrimaryKey)
+    ));
+    assert_eq!(table.get(&Value::Int(4_000))?, None);
+    assert_eq!(table.columnar_segments()?, after);
+    Ok(())
+}
+
+#[test]
+fn columnar_append_keeps_tiered_segments_immutable_and_counts_without_downloading()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::cloud::{ObjectStoreConfig, TieredSegmentPointer, encode_tiered_segment_pointer};
+
+    let repl = memory_repl()?;
+    let table = RelTable::create_with_layout(
+        repl.clone(),
+        "statuses",
+        Some(status_schema()),
+        Vec::new(),
+        TableLayout::Columnar,
+    )?;
+    let row = |id: i64| vec![Value::Int(id), Value::Str(format!("value-{id}"))];
+    repl.propose_batch(table.columnar_replace_ops((0..2_048).map(row).collect())?)?;
+    let before = table.columnar_segments()?;
+    let objects = tempfile::tempdir()?;
+    let object_path = objects.path().join("closed.parquet");
+    std::fs::write(&object_path, &before[0].1)?;
+    let pointer = encode_tiered_segment_pointer(&TieredSegmentPointer {
+        uri: ObjectStoreConfig::local_dir(objects.path()).uri,
+        path: "closed.parquet".to_owned(),
+        bytes: u64::try_from(before[0].1.len())?,
+        checksum: crc32fast::hash(&before[0].1),
+    })?;
+    repl.propose(Op::Put {
+        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+        key: before[0].0.clone(),
+        value: pointer.clone(),
+    })?;
+    table.insert(row(-1))?;
+    assert_eq!(table.columnar_segments()?[0].1, pointer);
+    assert_eq!(std::fs::read(&object_path)?, before[0].1);
+    assert_eq!(table.row_count()?, 2_049);
+
+    // Catalog counts use the paired row-count metadata even if the object store
+    // is unavailable; actual data reads must still fail rather than invent rows.
+    std::fs::remove_file(object_path)?;
+    assert_eq!(table.row_count()?, 2_049);
+    assert!(table.scan().is_err());
+    Ok(())
+}
+
+#[test]
 fn columnar_zone_map_skips_segments_for_simple_filter() -> Result<(), Box<dyn std::error::Error>> {
     let repl = memory_repl()?;
     let table = RelTable::create_with_layout(
@@ -350,6 +509,7 @@ struct ScriptedRepl {
     writes: Mutex<VecDeque<Vec<Op>>>,
     conflicts: AtomicUsize,
     conditional_writes: bool,
+    interleave_at_commit: AtomicBool,
 }
 
 impl ScriptedRepl {
@@ -363,6 +523,7 @@ impl ScriptedRepl {
             writes: Mutex::new(VecDeque::new()),
             conflicts: AtomicUsize::new(0),
             conditional_writes,
+            interleave_at_commit: AtomicBool::new(false),
         }))
     }
 
@@ -425,6 +586,14 @@ impl Replication for ScriptedRepl {
                 "conditional batches are not supported".to_owned(),
             ));
         }
+        if self.interleave_at_commit.load(Ordering::SeqCst)
+            && batch.conditions.iter().any(|condition| match condition {
+                WriteCondition::KeyMissing { table, .. }
+                | WriteCondition::ValueEquals { table, .. } => table == self.interleave_after,
+            })
+        {
+            self.interleave(self.interleave_after)?;
+        }
         let result = self.inner.propose_conditional_batch(batch);
         if matches!(result, Err(ReplError::Conflict)) {
             self.conflicts.fetch_add(1, Ordering::SeqCst);
@@ -439,7 +608,9 @@ impl Replication for ScriptedRepl {
         consistency: ReadConsistency,
     ) -> Result<Option<Bytes>, ReplError> {
         let value = self.inner.read(table, key, consistency)?;
-        self.interleave(table)?;
+        if !self.interleave_at_commit.load(Ordering::SeqCst) {
+            self.interleave(table)?;
+        }
         Ok(value)
     }
 
@@ -451,7 +622,9 @@ impl Replication for ScriptedRepl {
         consistency: ReadConsistency,
     ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
         let rows = self.inner.range(table, start, end, consistency)?;
-        self.interleave(table)?;
+        if !self.interleave_at_commit.load(Ordering::SeqCst) {
+            self.interleave(table)?;
+        }
         Ok(rows)
     }
 }
@@ -789,6 +962,7 @@ async fn multi_row_insert_is_atomic_when_late_row_duplicates_primary_key()
 async fn row_insert_that_loses_a_race_maps_its_conflict_by_on_conflict_clause()
 -> Result<(), Box<dyn std::error::Error>> {
     let repl = ScriptedRepl::new(REL_ROWS_TABLE, true)?;
+    repl.interleave_at_commit.store(true, Ordering::SeqCst);
     let mut engine = SqlEngine::new(repl.clone());
     engine.create_table("users", Some(user_schema()), Vec::new())?;
     let table = RelTable::open(repl.clone(), "users", Vec::new())?;
@@ -801,8 +975,9 @@ async fn row_insert_that_loses_a_race_maps_its_conflict_by_on_conflict_clause()
         ]
     };
 
-    // Another writer inserts the key after the INSERT read it as missing: a
-    // plain INSERT reports the duplicate key instead of retrying.
+    // Another writer inserts the key immediately before the atomic commit: a
+    // plain INSERT reports the duplicate key instead of retrying, without a
+    // speculative read of that key.
     repl.queue(table.insert_ops(user(1, "Ada", 36))?)?;
     let result = engine
         .execute("INSERT INTO users (id, name, age, active) VALUES (1, 'Mine', 1, true)")
@@ -1425,5 +1600,313 @@ async fn explain_analyze_records_feedback_for_bad_stats() -> Result<(), Box<dyn 
     let feedback = StatsCatalog::read_feedback(repl.as_ref())?;
     assert_eq!(feedback.len(), 1);
     assert!(feedback[0].ratio >= 10.0);
+    Ok(())
+}
+
+/// Records every read it is asked about and denies catalog reads outside
+/// `allowed`, unless `allow_all` is set.
+#[derive(Default)]
+struct RecordingReadGuard {
+    allow_all: bool,
+    allowed: BTreeSet<SqlReadTarget>,
+    seen: BTreeSet<SqlReadTarget>,
+    policies: BTreeMap<String, super::SqlRelationPolicy>,
+}
+
+impl RecordingReadGuard {
+    fn allowing(names: &[&str]) -> Self {
+        Self {
+            allowed: names
+                .iter()
+                .map(|name| SqlReadTarget::Catalog((*name).to_owned()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn allowing_all() -> Self {
+        Self {
+            allow_all: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl SqlReadGuard for RecordingReadGuard {
+    fn relation_policies(&self) -> BTreeMap<String, super::SqlRelationPolicy> {
+        self.policies.clone()
+    }
+
+    fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError> {
+        self.seen.extend(reads.iter().cloned());
+        for read in reads {
+            if let SqlReadTarget::Catalog(name) = read
+                && !self.allow_all
+                && !self.allowed.contains(read)
+            {
+                return Err(AuthzError::Denied {
+                    principal: "tester".to_owned(),
+                    resource: Resource::Table(name.clone()),
+                    permission: Permission::Read,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn guarded_engine() -> Result<SqlEngine, Box<dyn std::error::Error>> {
+    let mut engine = SqlEngine::new(memory_repl()?);
+    engine.create_table("public_t", Some(user_schema()), Vec::new())?;
+    engine.create_table("secrets", Some(user_schema()), Vec::new())?;
+    engine
+        .execute("insert into secrets (id, name, age, active) values (1, 'TOPSECRET', 1, true)")
+        .await?;
+    Ok(engine)
+}
+
+#[tokio::test]
+async fn describe_checks_all_reads_without_executing_or_writing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    for sql in [
+        "select * from secrets where id = $1",
+        "select name from public_t order by (select count(*) from secrets)",
+    ] {
+        assert!(
+            matches!(
+                engine.describe_with_read_guard(sql, &mut guard).await,
+                Err(QueryError::AuthzDenied(_))
+            ),
+            "{sql}"
+        );
+    }
+    let mut guard = RecordingReadGuard::allowing_all();
+    // The stored row's age is 1: executing this expression would divide by zero.
+    let schema = engine
+        .describe_with_read_guard("select 10 / (age - 1) as quotient from secrets", &mut guard)
+        .await?
+        .ok_or("missing SELECT schema")?;
+    assert_eq!(schema.field(0).name(), "quotient");
+    assert_eq!(
+        schema.field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Int64
+    );
+    let schema = engine.describe_with_read_guard(
+        "insert into secrets (id, name, age, active) values (2, 'new', 2, true) returning id, name as n",
+        &mut guard).await?.ok_or("missing RETURNING schema")?;
+    assert_eq!(schema.field(1).name(), "n");
+    guard.policies.insert(
+        "secrets".to_owned(),
+        super::SqlRelationPolicy {
+            masks: vec![(FieldPath::new(["age"]), Value::Str("hidden".to_owned()))],
+            ..super::SqlRelationPolicy::default()
+        },
+    );
+    let schema = engine
+        .describe_with_read_guard("select age from secrets", &mut guard)
+        .await?
+        .ok_or("missing masked schema")?;
+    assert_eq!(
+        schema.field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Utf8
+    );
+    let SqlOutput::Rows(rows) = engine.execute("select id from secrets").await? else {
+        return Err("missing rows".into());
+    };
+    assert_eq!(rows.rows, vec![vec![Value::Int(1)]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_guard_reports_planned_tables_in_subqueries() -> Result<(), Box<dyn std::error::Error>>
+{
+    let engine = guarded_engine().await?;
+    let secrets = SqlReadTarget::Catalog("secrets".to_owned());
+
+    // DataFusion plans each of these, so the guard must see `secrets`.
+    for sql in [
+        "select trim((select name from secrets limit 1)) from public_t",
+        "select name from public_t where name like (select name from secrets limit 1)",
+        "select (select name from secrets limit 1) from public_t",
+        "select name from public_t where exists (select 1 from secrets)",
+        "select name from public_t where name in (select name from secrets)",
+        "select name from public_t order by (select count(*) from secrets)",
+        "select name from public_t union select name from secrets",
+        "select n from (select name as n from secrets) as d",
+        "with \"Secrets\" as (select 1 as id) select name from secrets",
+    ] {
+        let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+        let result = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(
+            matches!(result, Err(QueryError::AuthzDenied(_))),
+            "{sql}: {result:?}"
+        );
+        assert!(guard.seen.contains(&secrets), "{sql}: {:?}", guard.seen);
+    }
+
+    // DataFusion may reject these shapes while planning; either way nothing
+    // may run unless the guard saw `secrets`.
+    for sql in [
+        "select substring((select name from secrets limit 1) from 1 for 3) from public_t",
+        "select name from public_t limit (select count(*) from secrets)",
+        "select name from public_t limit 1 offset (select count(*) from secrets)",
+        "select count(*) from public_t group by (select name from secrets limit 1)",
+        "select * from (values ((select name from secrets limit 1))) as v(leak)",
+        "select row_number() over (partition by (select name from secrets limit 1)) from public_t",
+    ] {
+        let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+        let result = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(result.is_err(), "{sql}: {result:?}");
+        assert!(
+            guard.seen.is_empty() || guard.seen.contains(&secrets),
+            "{sql}: {:?}",
+            guard.seen
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_guard_maps_scans_to_registered_names() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = guarded_engine().await?;
+    engine.register_collection(
+        "profiles",
+        CollectionId::new(7),
+        vec![super::DocField::path(
+            "city",
+            FieldPath::new(["city"]),
+            ColumnType::Str,
+        )],
+        Vec::new(),
+    )?;
+    engine.create_table("Mixed", Some(status_schema()), Vec::new())?;
+    let catalog = |name: &str| BTreeSet::from([SqlReadTarget::Catalog(name.to_owned())]);
+
+    for (sql, expected) in [
+        (
+            "with c as (select * from public_t) select * from c",
+            catalog("public_t"),
+        ),
+        ("select city from profiles", catalog("profiles")),
+        ("select status from MIXED", catalog("Mixed")),
+        ("select status from mixed", catalog("Mixed")),
+        ("select 1", BTreeSet::new()),
+        (
+            "with recursive r as (select 1 as n union all select n + 1 from r where n < 3) \
+             select * from r",
+            BTreeSet::new(),
+        ),
+    ] {
+        let mut guard = RecordingReadGuard::allowing_all();
+        engine
+            .execute_with_read_guard(sql, Some(&mut guard))
+            .await?;
+        assert_eq!(guard.seen, expected, "{sql}");
+    }
+
+    for sql in [
+        "select table_name from information_schema.tables",
+        "select * from generate_series(1, 3)",
+    ] {
+        let mut guard = RecordingReadGuard::allowing_all();
+        engine
+            .execute_with_read_guard(sql, Some(&mut guard))
+            .await?;
+        assert!(!guard.seen.is_empty(), "{sql}");
+        assert!(
+            guard
+                .seen
+                .iter()
+                .all(|read| matches!(read, SqlReadTarget::Builtin(_))),
+            "{sql}: {:?}",
+            guard.seen
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_guard_denies_before_any_statement_runs() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    let result = engine
+        .execute_with_read_guard(
+            "insert into public_t (id, name, age, active) values (1, 'Ada', 37, true); \
+             select name from secrets",
+            Some(&mut guard),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(QueryError::AuthzDenied(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        engine.execute("select id from public_t").await?,
+        SqlOutput::Rows(super::SqlRows {
+            columns: vec!["id".to_owned()],
+            rows: Vec::new(),
+        })
+    );
+
+    for sql in [
+        "explain select name from secrets where id = 1",
+        "explain analyze select name from secrets where id = 1",
+    ] {
+        let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+        let result = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(
+            matches!(result, Err(QueryError::AuthzDenied(_))),
+            "{sql}: {result:?}"
+        );
+    }
+
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    assert!(matches!(
+        engine
+            .execute_with_read_guard(
+                "explain select name from public_t where id = 1",
+                Some(&mut guard)
+            )
+            .await?,
+        SqlOutput::Rows(_)
+    ));
+    assert_eq!(
+        guard.seen,
+        BTreeSet::from([SqlReadTarget::Catalog("public_t".to_owned())])
+    );
+
+    let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+    match engine
+        .execute_with_read_guard(
+            "explain select name from public_t where name like (select name from secrets)",
+            Some(&mut guard),
+        )
+        .await
+    {
+        Err(QueryError::AuthzDenied(_)) => {}
+        other => panic!("non-simple EXPLAIN must authorize subquery reads, got {other:?}"),
+    }
+    assert_eq!(
+        guard.seen,
+        BTreeSet::from([
+            SqlReadTarget::Catalog("public_t".to_owned()),
+            SqlReadTarget::Catalog("secrets".to_owned()),
+        ])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn datafusion_read_plans_reject_non_read_nodes() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+
+    let result = engine.execute("select name into t2 from public_t").await;
+    assert!(
+        matches!(result, Err(QueryError::Unsupported(_))),
+        "{result:?}"
+    );
     Ok(())
 }

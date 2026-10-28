@@ -1,0 +1,28 @@
+[package]
+name = "zstd"
+version = "0.13.4"
+edition = "2021"
+rust-version = "1.64"
+license = "MIT"
+publish = false
+description = "MultiDB compatibility facade forwarding zstd 0.13 callers to patched zstd 0.14"
+
+[dependencies]
+zstd-upstream = { package = "zstd", version = "0.14.3", default-features = false }
+
+[features]
+default = ["legacy", "arrays", "zdict_builder"]
+arrays = ["zstd-upstream/arrays"]
+bindgen = ["zstd-upstream/bindgen"]
+debug = ["zstd-upstream/debug"]
+doc-cfg = ["zstd-upstream/doc-cfg"]
+experimental = ["zstd-upstream/experimental"]
+fat-lto = ["zstd-upstream/fat-lto"]
+legacy = ["zstd-upstream/legacy"]
+no_asm = ["zstd-upstream/no_asm"]
+pkg-config = ["zstd-upstream/pkg-config"]
+thin = ["zstd-upstream/thin"]
+thin-lto = ["zstd-upstream/thin-lto"]
+wasm = ["zstd-upstream/wasm"]
+zdict_builder = ["zstd-upstream/zdict_builder"]
+zstdmt = ["zstd-upstream/zstdmt"]

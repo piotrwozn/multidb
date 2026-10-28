@@ -332,6 +332,68 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         )
     }
 
+    /// HNSW-only candidates for bounded graph retrieval. Never scans the full vector map
+    /// as a fallback or expands the candidate set to include every tombstone. Deleted
+    /// candidates can therefore make this approximate search return fewer than requested.
+    pub(crate) fn knn_bounded(
+        &self,
+        query: &[f32],
+        max_candidates: usize,
+    ) -> Result<Vec<VectorHit>, VectorError> {
+        if !(1..=1_024).contains(&max_candidates) {
+            return Err(VectorError::InvalidIndexConfig(
+                "bounded search requires between 1 and 1024 candidates".to_owned(),
+            ));
+        }
+        validate_query(&self.config, query)?;
+        let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
+        let requested = max_candidates.min(state.hnsw_to_doc.len());
+        if requested == 0 {
+            return Ok(Vec::new());
+        }
+        // The dependency multiplies f32 cosine components before accumulating
+        // in f64. A finite but huge query can otherwise create inf/inf and panic.
+        // Normalization also prevents tiny nonzero queries underflowing to zero.
+        let normalized_query = (self.config.metric == VectorMetric::Cosine).then(|| {
+            let norm = query
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            query
+                .iter()
+                .map(|value| normalized_cosine_component(*value, norm))
+                .collect::<Vec<_>>()
+        });
+        let index_query = normalized_query.as_deref().unwrap_or(query);
+        let mut hits = BTreeMap::new();
+        for (hnsw_id, _) in state.hnsw.search(index_query, requested, max_candidates) {
+            let Some(id) = state.hnsw_to_doc.get(&hnsw_id) else {
+                continue;
+            };
+            if state.deleted.contains(id) {
+                continue;
+            }
+            if let Some(vector) = state.vectors.get(id) {
+                hits.insert(
+                    *id,
+                    VectorHit {
+                        id: *id,
+                        distance: if self.config.metric == VectorMetric::Cosine {
+                            bounded_cosine_distance(query, vector)
+                        } else {
+                            distance(self.config.metric, query, vector)
+                        },
+                    },
+                );
+            }
+        }
+        let mut hits = hits.into_values().collect::<Vec<_>>();
+        sort_hits(&mut hits);
+        hits.truncate(max_candidates);
+        Ok(hits)
+    }
+
     /// Searches nearest vectors with filtering/rerank options.
     /// # Errors
     /// Fails when the query vector is invalid, metadata cannot be read, or the index lock is poisoned.
@@ -899,6 +961,31 @@ fn distance(metric: VectorMetric, left: &[f32], right: &[f32]) -> f32 {
     }
 }
 
+// Dividing by the positive f64 norm bounds each component to [-1, 1].
+// Rounding to f32 is intentional because the HNSW index stores f32 vectors.
+#[allow(clippy::cast_possible_truncation)]
+fn normalized_cosine_component(value: f32, norm: f64) -> f32 {
+    (f64::from(value) / norm) as f32
+}
+
+// The result is clamped to [0, 2], so narrowing only rounds its precision.
+#[allow(clippy::cast_possible_truncation)]
+fn bounded_cosine_distance(left: &[f32], right: &[f32]) -> f32 {
+    let (dot, left_norm, right_norm) = left.iter().zip(right).fold(
+        (0.0_f64, 0.0_f64, 0.0_f64),
+        |(dot, left_norm, right_norm), (left, right)| {
+            let left = f64::from(*left);
+            let right = f64::from(*right);
+            (
+                dot + left * right,
+                left_norm + left * left,
+                right_norm + right * right,
+            )
+        },
+    );
+    (1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())).clamp(0.0, 2.0) as f32
+}
+
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
     let mut dot = 0.0;
     let mut left_norm = 0.0;
@@ -1105,6 +1192,57 @@ mod tests {
         let hits = vectors.knn(&[0.0, 0.0], 1)?;
 
         assert!((hits[0].distance - 5.0).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_knn_does_not_expand_tombstones_or_fall_back_to_a_full_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let vectors = VectorCollection::new(
+            &database,
+            VectorCollectionConfig::new(CollectionId::new(19), 2).with_metric(VectorMetric::L2),
+        )?;
+        let mut ids = Vec::new();
+        for coordinate in 0..10_i16 {
+            ids.push(
+                vectors.insert_vector(&metadata("evidence"), vec![f32::from(coordinate), 0.0])?,
+            );
+        }
+        // One deletion is below the automatic compaction threshold. Its HNSW
+        // entry remains nearest but must not expand the bounded candidate set.
+        vectors.delete_vector(ids[0])?;
+        assert_eq!(vectors.knn_bounded(&[0.0, 0.0], 1)?, Vec::new());
+        assert_eq!(vectors.knn(&[0.0, 0.0], 1)?[0].id, ids[1]);
+        assert!(matches!(
+            vectors.knn_bounded(&[0.0, 0.0], 0),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        assert!(matches!(
+            vectors.knn_bounded(&[0.0, 0.0], 1_025),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_cosine_knn_handles_huge_and_tiny_finite_queries_without_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let vectors = VectorCollection::new(
+            &database,
+            VectorCollectionConfig::new(CollectionId::new(20), 2),
+        )?;
+        let along_x = vectors.insert_vector(&metadata("x"), vec![10.0, 0.0])?;
+        vectors.insert_vector(&metadata("y"), vec![0.0, 10.0])?;
+        vectors.insert_vector(&metadata("opposite"), vec![-10.0, 0.0])?;
+        for magnitude in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+            let hits = vectors.knn_bounded(&[magnitude, 0.0], 8)?;
+            assert_eq!(hits[0].id, along_x);
+            assert_eq!(hits[0].distance, 0.0);
+            assert!(hits.iter().all(|hit| hit.distance.is_finite()));
+            assert_eq!(hits.len(), 3);
+        }
         Ok(())
     }
 

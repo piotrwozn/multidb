@@ -156,7 +156,6 @@ impl PerformanceConfig {
     #[must_use]
     pub fn for_profile(profile: Profile) -> Self {
         let threads = std::thread::available_parallelism().map_or(1, usize::from);
-        let target_partitions = threads.max(1);
         let common_benchmark = BenchmarkConfig::default();
         let query = QueryExecutionConfig::for_profile(profile, threads);
 
@@ -168,11 +167,11 @@ impl PerformanceConfig {
                 io: IoConfig::direct(),
                 parallelism: ParallelismConfig {
                     max_threads: threads,
-                    target_partitions,
+                    target_partitions: threads,
                 },
                 query,
             },
-            Profile::Analytical => Self {
+            Profile::Analytical | Profile::Tensor => Self {
                 benchmark: common_benchmark,
                 cache: CacheConfig {
                     enabled: true,
@@ -180,8 +179,16 @@ impl PerformanceConfig {
                     scan_bypass_threshold_rows: 512,
                 },
                 compression: CompressionConfig {
-                    algorithm: CompressionAlgorithm::Zstd,
-                    min_bytes: 1_024,
+                    algorithm: if profile == Profile::Tensor {
+                        CompressionAlgorithm::Lz4
+                    } else {
+                        CompressionAlgorithm::Zstd
+                    },
+                    min_bytes: if profile == Profile::Tensor {
+                        256
+                    } else {
+                        1_024
+                    },
                     zstd_level: 3,
                 },
                 io: IoConfig {
@@ -190,7 +197,7 @@ impl PerformanceConfig {
                 },
                 parallelism: ParallelismConfig {
                     max_threads: threads,
-                    target_partitions: target_partitions.max(2),
+                    target_partitions: threads.max(2),
                 },
                 query,
             },
@@ -205,7 +212,7 @@ impl PerformanceConfig {
                 io: IoConfig::direct(),
                 parallelism: ParallelismConfig {
                     max_threads: threads,
-                    target_partitions,
+                    target_partitions: threads,
                 },
                 query,
             },
@@ -223,7 +230,7 @@ impl PerformanceConfig {
                 },
                 parallelism: ParallelismConfig {
                     max_threads: threads,
-                    target_partitions,
+                    target_partitions: threads,
                 },
                 query,
             },
@@ -244,7 +251,7 @@ impl PerformanceConfig {
                 },
                 parallelism: ParallelismConfig {
                     max_threads: threads,
-                    target_partitions,
+                    target_partitions: threads,
                 },
                 query,
             },
@@ -347,7 +354,7 @@ impl QueryExecutionConfig {
     pub fn for_profile(profile: Profile, threads: usize) -> Self {
         let memory_limit_bytes = match profile {
             Profile::InMemory => 512 * 1024 * 1024,
-            Profile::Analytical | Profile::Vector => 2 * 1024 * 1024 * 1024,
+            Profile::Analytical | Profile::Vector | Profile::Tensor => 2 * 1024 * 1024 * 1024,
             Profile::HighDurability => 768 * 1024 * 1024,
             Profile::Transactional
             | Profile::Document
@@ -630,6 +637,14 @@ mod tests {
                 .group_commit_window_ms,
             0
         );
+        let tensor = PerformanceConfig::for_profile(Profile::Tensor);
+        assert_eq!(
+            tensor.compression.algorithm,
+            super::CompressionAlgorithm::Lz4
+        );
+        assert_eq!(tensor.cache.max_capacity, 4_096);
+        assert_eq!(tensor.query.memory_limit_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(tensor.io.group_commit_window_ms, 0);
     }
 
     #[test]

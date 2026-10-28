@@ -4,6 +4,75 @@ All notable public changes will be recorded here.
 
 ## Unreleased
 
+- SQL primary-key equality and ordered Int64 ranges now use bounded row-store
+  access, including ASC/DESC, OFFSET and LIMIT, with execution deadlines and
+  retained-result memory limits. Row scans build projected Arrow batches rather
+  than retaining every payload column. A shared, bounded raw-batch cache uses
+  atomically committed table versions; authorization and policies remain fresh.
+- Reuse immutable SQL catalog templates and retain the plan cache between queries.
+  Fix column-name, primary-key, histogram and MCV cardinality estimates. EXPLAIN
+  supports real range paths and metadata-only DataFusion logical plans; unknown
+  estimates/costs are NULL and ANALYZE counts rows after LIMIT.
+- Native indexed row fetches read up to 256 keys in one storage snapshot. Plain
+  INSERT avoids redundant pre-reads while retaining atomic uniqueness checks;
+  upserts and transactional updates avoid rewriting unchanged index entries.
+- Concurrent audit requests share durable batches without an added single-caller
+  wait window. Every event retains its integrity sequence and is acknowledged
+  after database and configured anchor persistence; events can share a commit LSN.
+- Pgwire reuses its Tokio runtime, applies separate handshake, idle and request
+  deadlines instead of a total session lifetime, and checks frontend frame sizes
+  before decoding. Successful logins release their authentication reservation
+  without spending the failed-login budget. CLI timeout/frame overrides are
+  documented in `docs/docker.md`.
+- Added a reproducible local before/after SQL benchmark runner with binary/source
+  provenance, raw latency verification and all nine supplied workloads. See
+  `docs/performance-local-benchmarks.md`.
+- Updated the zstd implementation to the fixed 0.14.3 / zstd-safe 8.2 codec
+  stack, including Arrow/Parquet callers through a small local compatibility
+  re-export; the vulnerable registry codec versions are no longer resolved.
+- Added the preview `tensor_dataset` / `tensor` profile: durable binary typed
+  tensor chunks, aligned and ragged samples, atomic append revisions and projected
+  reads. GPU search and batch reductions dispatch WGSL kernels through wgpu;
+  the profile requires a hardware adapter and refuses CPU fallback. Added six
+  authenticated API operations, four SDKs, spec-v2 provisioning and a runnable
+  example. Other native profiles can use tensor datasets with explicit CPU
+  reference execution. See `docs/tensor-datasets.md` for limits and device support.
+- Added preview GraphRAG retrieval: bounded vector seeds, graph expansion,
+  deduplicated cited context and source provenance through the Rust API,
+  `POST /graphrag/query`, and TypeScript/Python/Go/Rust SDKs. Added a graph-edge
+  write endpoint and a runnable local example. Principal retrieval requires both
+  vector and graph Read, applies metadata policies before traversal, and refuses
+  unsupported graph policies/backends. Vector search responses now also filter
+  and mask metadata, closing an alternate read path around GraphRAG policies.
+
+
+- Control Plane table/document pages now apply row and masking policies before
+  pagination. Pgwire Describe authorizes a metadata-only plan, including untyped
+  parameters, rather than falling back to unguarded schema lookup.
+- Principal changefeeds suppress derived index data from protected collections,
+  deletes whose old-row visibility cannot be established, and table events with
+  masked primary keys. Principal subscriptions bind ownership, require policy-aware
+  delivery and can resolve live user mappings; principal continuous-query creation
+  atomically binds its subscription and preserves ACK progress on re-apply.
+  Legacy subscription delivery now fails closed until a System:Admin operator
+  adopts its owner with `adopt_subscription_as`, preserving the stored ACK.
+- Materialized view reads and principal creation fail closed when source policies
+  cannot be applied before aggregation. Workload/tuning views and
+  `workload_report_as` now require System:Admin (breaking for read-only grants).
+- AP capability checks include AP shards and low-level replay APIs; AP restores
+  refuse unsupported point-in-time targets and incremental chains before creating
+  a destination. Operational create-or-open constructors preserve stored RBAC.
+- Serve performs bounded idle time-series retention, periodic profiler flushes,
+  opt-in bounded online MVCC GC (`MULTIDB_HISTORY_RETAIN_LSNS`), and SIGINT/SIGTERM
+  connection shutdown with a final flush. Online GC serializes history pins with
+  horizon updates; commit-log truncation remains offline.
+- CLI/serve can open and provision encrypted databases with an existing key file
+  selected by `MULTIDB_ENCRYPTION_KEY_PATH`; metadata probes remain read-only.
+- Time-series timestamp codecs report unrepresentable deltas instead of
+  overflowing. Plain columnar inserts append to the tail instead of rewriting
+  all committed segments; primary-key validation still reads existing segments.
+
+
 - Hardened Control Plane `admin` login: failed password checks now lock out
   only the client IP (IPv6 /64) that made them, under a server-wide soft
   ceiling of 20x `MULTIDB_ADMIN_LOGIN_MAX_FAILURES` per window. Other usernames
@@ -294,6 +363,75 @@ All notable public changes will be recorded here.
   `multidb cdc poll --include-system` still return system rows to the local
   operator, credential hashes included, so treat their output like the
   database file.
+- Fixed a SQL read authorization bypass. Under RBAC, SQL reads (`query_as`,
+  `query_as_of_as`, PostgreSQL wire with RBAC, the Control Plane `/sql` and
+  the SDKs that call it) were authorized by a walk over part of the parsed
+  statement. The walk missed tables read from many positions: subqueries in
+  `ORDER BY`, `LIMIT`/`OFFSET`, `VALUES`, window and `FILTER` clauses, and
+  inside expressions such as `LIKE`, `TRIM`, `SUBSTRING` or `POSITION`. A
+  quoted CTE name such as `"Secrets"` also hid the table `secrets` from the
+  check while the query still read the table, and grants were matched to the
+  name as spelled, so a grant on `ORDERS` authorized reads of `orders`. A
+  principal with `Read` on any one table could therefore read every other
+  table, collection, foreign table, materialized view and `*_history` table.
+  Reads are now authorized against every table the planned DataFusion query
+  reads, including subqueries in any position, before anything runs, and the
+  plan that was authorized is the plan that runs. A multi-statement batch runs
+  nothing until all of its reads are authorized. Table reads are matched to
+  the catalog object the planner resolves: unquoted names are lowercased, so
+  `ORDERS` and `Orders` read `orders` and need `Read` on it, and a quoted
+  `"ORDERS"` names no table. SQL shapes the check cannot analyse fail closed
+  with `Unsupported` and `SELECT ... INTO` returns `Unsupported`. The check
+  counts a recursive CTE's reference to itself as a read of a table named
+  like the CTE, so recursive CTEs need Database read (or `Read` on that name),
+  and a denial names the CTE. `INSERT ... RETURNING` returns stored rows (for
+  `ON CONFLICT DO UPDATE`, the existing row), so it now needs `Read` on the
+  table as well as `Write`; before, `Write` alone could read any row by key.
+  Not covered by this fix: extended-protocol Describe over PostgreSQL wire
+  still returns the column names and types of catalog tables (no rows)
+  without an RBAC check; the separate PostgreSQL wire extended-protocol fix
+  closes it.
+- Fixed SQL bypasses of row and masking policies. SQL run as a principal applied
+  them to the query result, matched to its columns by name, so a principal with
+  `Read` on a policy-protected table could see the rows its row policies hide
+  and the values its masking policies mask: through an alias
+  (`SELECT ssn AS x`), an expression (`upper(ssn)`), a literal column named like
+  the row policy's column, an aggregate, a subquery over the same table, or a
+  filter or sort key on a masked column. Collection policies were matched to SQL
+  column names, so a policy on the document path `profile.city` did not mask the
+  SQL column `city` that reads it, and a row policy that shows documents whose
+  field is null also showed documents without the field or with a value of
+  another type, which SQL reads as NULL. A table's `*_history` table was read
+  without the table's policies. Row and masking policies are now applied
+  where SQL scans the table: the scan returns only the rows the row policies let
+  through, with masked values replaced, before any filter, sort, join, aggregate
+  or subquery of the query reads them, so a predicate that fails on some value
+  (such as a division by zero) cannot reveal a hidden row either. Collection
+  row policies are decided on the stored document, as for changefeeds: a
+  document is visible when its value at the policy's path equals the policy's
+  value or the principal's name, so a document without the path, or with a
+  value of another type, stays hidden. A collection mask covers the SQL
+  columns that read its path or a path below it. A query that joins a
+  policy-protected table with other tables now runs with the policies applied
+  instead of being rejected. A masked column takes the type of its
+  replacement (a `'***'` mask makes an integer column a string column), and
+  SQL reads of a table whose mask replacement is not a scalar (an array,
+  object, vector or point) fail. On tables and other relations, whose SQL
+  columns hold only scalars, a row policy value that is not a scalar matches
+  no row. `EXPLAIN` of a table with row or masking policies and
+  `INSERT ... RETURNING` into one return `Unsupported`, since both report
+  stored rows. Each SQL scan of such a table reads all of the rows its row
+  policies let through before the query filters them, so single-table
+  equality `SELECT`s on it run through DataFusion instead of the direct lookup
+  path. A table's policies also apply to its `*_history` table, matched to
+  its columns by name, together with the history table's own: a row must pass
+  both, and the history table's own masks win. A materialized view over a
+  protected table needs policies of its own.
+  These policies apply to SQL run as a principal, not to `Database::query`.
+  This fix does not cover the Control Plane data routes
+  `GET /data/tables/{name}/rows` and `GET /data/collections/{name}/documents`,
+  or the SDK and Studio calls that use them: they still return stored rows
+  and documents, unfiltered and unmasked, to any principal with `Read`.
 
 ### Added
 
@@ -889,6 +1027,9 @@ All notable public changes will be recorded here.
   unless the principal holds `System:Admin` (a grant on `Resource::System`, or
   `Admin` on `Resource::Database`). Grant it to the principals that need
   system rows, or read them through the trusted `Database::poll_changefeed`.
+- `QueryError` gains `AuthzDenied` (SQLSTATE 42501), returned by
+  `SqlEngine::execute_with_read_guard` when its read guard refuses a read;
+  `Database` methods report it as `DbError::AuthzDenied`.
 
 ## 0.1.0-preview.1
 

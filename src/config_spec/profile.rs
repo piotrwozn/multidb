@@ -503,6 +503,12 @@ const PROFILE_VARIANTS: &[ProfileVariant] = &[
         canonical: false,
         storage_profile: Profile::TimeSeries,
     },
+    ProfileVariant {
+        product: "tensor_dataset",
+        name: "tensor",
+        canonical: true,
+        storage_profile: Profile::Tensor,
+    },
 ];
 
 /// The per-variant columns of the preset table (`docs/profiles.md`).
@@ -843,6 +849,16 @@ pub fn resolve_profile(spec: &DatabaseSpec) -> ProfileResolution {
     else {
         return unknown_profile(&spec.profile, &context);
     };
+    if product.slug == "tensor_dataset" && !context.strict {
+        return ProfileResolution::Invalid(vec![validation_issue(
+            "FIELD_REQUIRES_SPEC_V2",
+            ValidationSeverity::Error,
+            "profile",
+            "tensor datasets require spec version 2",
+            "Set version to 2 before selecting tensor_dataset or its aliases.",
+            CertificationImpact::BlocksCertified,
+        )]);
+    }
     let identity = ProfileIdentity {
         slug: key.to_owned(),
         kind: built_in_kind(product, key),
@@ -937,7 +953,11 @@ pub(crate) fn preset_knobs(product: &ProfileSpec, variant: &ProfileVariant) -> P
             group_commit_window_ms: columns.group_commit_window_ms,
         },
         compression: CompressionKnobs {
-            algorithm: CompressionKnob::None,
+            algorithm: if variant.storage_profile == Profile::Tensor {
+                CompressionKnob::Lz4
+            } else {
+                CompressionKnob::None
+            },
             min_bytes: 256,
             zstd_level: 3,
         },
@@ -1004,6 +1024,18 @@ pub(crate) fn derive_storage_profile(
     product: &ProfileSpec,
 ) -> Result<Profile, ValidationIssue> {
     let window = knobs.durability.group_commit_window_ms;
+    if product.slug == "tensor_dataset"
+        && (knobs.storage.medium != StorageMedium::Durable
+            || knobs.storage.layout != LayoutKnob::Columnar
+            || knobs.durability.commit != CommitMode::Immediate
+            || window != 0)
+    {
+        return Err(combination_issue(
+            "storage.layout",
+            "tensor datasets require durable columnar storage, immediate commits and no group commit window",
+            "Keep the tensor preset's storage and durability settings; tensor datasets do not use relational row storage.",
+        ));
+    }
     match (
         knobs.storage.medium,
         knobs.storage.layout,
@@ -1045,7 +1077,11 @@ pub(crate) fn derive_storage_profile(
             ))
         }
         (StorageMedium::Durable, LayoutKnob::Columnar, CommitMode::Immediate) => {
-            Ok(Profile::Analytical)
+            Ok(if variant.storage_profile == Profile::Tensor {
+                Profile::Tensor
+            } else {
+                Profile::Analytical
+            })
         }
         (StorageMedium::Durable, LayoutKnob::Row, CommitMode::Immediate) => {
             Ok(match variant.storage_profile {
@@ -1054,9 +1090,10 @@ pub(crate) fn derive_storage_profile(
                 | Profile::Vector
                 | Profile::TimeSeries
                 | Profile::Balanced => variant.storage_profile,
-                Profile::InMemory | Profile::HighDurability | Profile::Analytical => {
-                    durable_row_profile(product)
-                }
+                Profile::InMemory
+                | Profile::HighDurability
+                | Profile::Analytical
+                | Profile::Tensor => durable_row_profile(product),
             })
         }
     }
@@ -1746,7 +1783,7 @@ const fn variant_columns(profile: Profile) -> VariantColumns {
         Profile::HighDurability => {
             durable_columns(LayoutKnob::Row, CommitMode::TwoPhase, 0, 2_048, 768 * MIB)
         }
-        Profile::Analytical => durable_columns(
+        Profile::Analytical | Profile::Tensor => durable_columns(
             LayoutKnob::Columnar,
             CommitMode::Immediate,
             0,
@@ -1781,6 +1818,11 @@ const fn durable_columns(
 }
 
 fn variant_for_name(product: &ProfileSpec, key: &str) -> Option<&'static ProfileVariant> {
+    let key = if product.slug == "tensor_dataset" && key == "deeplake_like" {
+        "tensor"
+    } else {
+        key
+    };
     PROFILE_VARIANTS.iter().find(|variant| {
         variant.product == product.slug
             && if product.slug == key {
@@ -2033,7 +2075,11 @@ mod tests {
             let profile = resolved(&resolution);
             let mut expected = PerformanceConfig::for_profile(storage_profile);
             expected.compression = CompressionConfig {
-                algorithm: CompressionAlgorithm::None,
+                algorithm: if storage_profile == Profile::Tensor {
+                    CompressionAlgorithm::Lz4
+                } else {
+                    CompressionAlgorithm::None
+                },
                 min_bytes: 256,
                 zstd_level: 3,
             };
@@ -2056,7 +2102,17 @@ mod tests {
                 profile.knobs.storage.medium == StorageMedium::Volatile,
                 storage_profile == Profile::InMemory
             );
-            assert!(resolution.issues().is_empty(), "{:?}", resolution.issues());
+            let expected_issues = if storage_profile == Profile::Tensor {
+                BTreeSet::from(["PROFILE_FORMAT_REQUIRES_NEW_BINARY"])
+            } else {
+                BTreeSet::new()
+            };
+            assert_eq!(
+                codes(&resolution),
+                expected_issues,
+                "{:?}",
+                resolution.issues()
+            );
         }
     }
 
@@ -2075,7 +2131,17 @@ mod tests {
             assert_eq!(profile.storage_profile, storage_profile);
             assert_eq!(profile.kind, ResolvedProfileKind::Variant);
             assert_eq!(profile.variant, spec.profile);
-            assert!(resolution.issues().is_empty(), "{:?}", resolution.issues());
+            let expected_issues = if storage_profile == Profile::Tensor {
+                BTreeSet::from(["PROFILE_FORMAT_REQUIRES_NEW_BINARY"])
+            } else {
+                BTreeSet::new()
+            };
+            assert_eq!(
+                codes(&resolution),
+                expected_issues,
+                "{:?}",
+                resolution.issues()
+            );
         }
     }
 
@@ -2088,7 +2154,12 @@ mod tests {
             else {
                 panic!("{} has no canonical variant", product.slug);
             };
-            let resolution = resolve_profile(&spec(1, product.slug, None));
+            let version = if product.slug == "tensor_dataset" {
+                2
+            } else {
+                1
+            };
+            let resolution = resolve_profile(&spec(version, product.slug, None));
             let profile = resolved(&resolution);
 
             assert_eq!(profile.kind, ResolvedProfileKind::BuiltIn);
@@ -2102,7 +2173,7 @@ mod tests {
 
     #[test]
     fn variant_table_pins_every_alias_to_one_variant() {
-        assert_eq!(profile_variants().len(), 9);
+        assert_eq!(profile_variants().len(), 10);
         for product in built_in_profiles() {
             let variants = profile_variants()
                 .iter()
@@ -2115,10 +2186,16 @@ mod tests {
                 product.slug
             );
             for alias in product.aliases {
+                let variant_name = if product.slug == "tensor_dataset" && *alias == "deeplake_like"
+                {
+                    "tensor"
+                } else {
+                    *alias
+                };
                 assert_eq!(
                     variants
                         .iter()
-                        .filter(|variant| variant.name == *alias)
+                        .filter(|variant| variant.name == variant_name)
                         .count(),
                     1,
                     "alias {alias} must map to exactly one variant"
@@ -2215,6 +2292,7 @@ mod tests {
         ]);
         let actual = profile_variants()
             .iter()
+            .filter(|variant| variant.product != "tensor_dataset")
             .map(|variant| {
                 let resolution =
                     resolve_named_profile(variant.name, &ProfileKnobOverrides::default());
@@ -2230,6 +2308,52 @@ mod tests {
         for (name, digest) in &actual {
             assert_eq!(Some(&digest.as_str()), expected.get(name), "{actual:#?}");
         }
+    }
+
+    #[test]
+    fn tensor_profile_is_gpu_required_durable_columnar_and_preserves_its_runtime_class()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for alias in ["tensor_dataset", "tensor", "deeplake_like"] {
+            assert_invalid_with(
+                &resolve_profile(&spec(1, alias, None)),
+                "FIELD_REQUIRES_SPEC_V2",
+            );
+            let resolution = resolve_profile(&spec(2, alias, None));
+            let profile = resolved(&resolution);
+            assert_eq!(profile.product_profile, "tensor_dataset");
+            assert_eq!(profile.variant, "tensor");
+            assert_eq!(profile.storage_profile, Profile::Tensor);
+            assert!(profile.storage_profile.requires_gpu());
+            assert_eq!(profile.knobs.storage.medium, StorageMedium::Durable);
+            assert_eq!(profile.knobs.storage.layout, super::LayoutKnob::Columnar);
+            assert_eq!(
+                profile.knobs.compression.algorithm,
+                super::CompressionKnob::Lz4
+            );
+            assert_eq!(profile.knobs.cache.max_entries, 4_096);
+            assert_eq!(
+                profile.knobs.compatible_roles,
+                BTreeSet::from([CollectionRole::Analytics, CollectionRole::VectorMemory])
+            );
+            let binding =
+                profile.bind(crate::db::ReplicationKind::Cp, Some("tensors.redb".into()))?;
+            assert_eq!(binding.db_config.profile, Profile::Tensor);
+            assert!(binding.manifest.storage_format.value_framing);
+            assert_eq!(
+                binding.performance.compression.algorithm,
+                CompressionAlgorithm::Lz4
+            );
+        }
+        for knobs in [
+            json!({"storage": {"layout": "row"}}),
+            json!({"storage": {"medium": "volatile"}}),
+            json!({"durability": {"commit": "two_phase"}}),
+            json!({"durability": {"group_commit_window_ms": 1}}),
+        ] {
+            let resolution = resolve_custom_spec(custom_with_knobs("tensor", knobs)?);
+            assert_invalid_with(&resolution, "PROFILE_KNOB_COMBINATION_UNSUPPORTED");
+        }
+        Ok(())
     }
 
     #[test]

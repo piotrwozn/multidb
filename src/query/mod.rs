@@ -17,16 +17,24 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     catalog::Session,
-    common::{Statistics, stats::Precision},
-    datasource::{MemTable, TableProvider, TableType},
+    common::{
+        Column as DfColumn, ScalarValue, Statistics, TableReference, stats::Precision,
+        tree_node::TreeNodeRecursion,
+    },
+    datasource::{
+        MemTable, TableProvider, TableType, cte_worktable::CteWorkTable, provider_as_source,
+        source_as_provider,
+    },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{
         disk_manager::DiskManagerBuilder, memory_pool::GreedyMemoryPool,
         runtime_env::RuntimeEnvBuilder,
     },
-    logical_expr::{Expr as DfExpr, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
-    prelude::{SessionConfig, SessionContext},
+    logical_expr::{
+        Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, lit,
+    },
+    physical_plan::{ExecutionPlan, collect},
+    prelude::{SQLOptions, SessionConfig, SessionContext},
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use rayon::prelude::*;
@@ -51,12 +59,17 @@ use crate::{
         ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition,
         propose_system,
     },
+    security::AuthzError,
     storage::{Bytes, StorageError},
     temporal::{self, TemporalRetention},
 };
 
+mod batch_cache;
+mod explain_fallback;
 mod optimizer;
 mod parser;
+mod row_scan;
+mod write_batch;
 
 pub use optimizer::{
     AccessPath, AnalyzeMode, AnalyzeReport, AnalyzeTarget, Bucket, CachedPlan,
@@ -273,7 +286,72 @@ pub enum QueryError {
 
     #[error("metadata serialization: {0}")]
     Serde(String),
+
+    #[error("authorization denied: {0}")]
+    AuthzDenied(AuthzError),
 }
+
+/// A relation that a planned SQL statement reads.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SqlReadTarget {
+    /// A catalog object registered with the engine, named as it was registered.
+    Catalog(String),
+    /// A relation outside the catalog, such as `information_schema` or a table function.
+    Builtin(String),
+}
+
+/// The row and masking policies a caller's SQL sees on one catalog relation.
+///
+/// Paths name document fields for collections and columns for every other relation. The
+/// engine applies the policies where it scans the relation, so the rest of the query only
+/// ever reads the rows they let through, with the masked values already replaced.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SqlRelationPolicy {
+    /// A row is visible only if, for every list, its value at one of the list's paths equals
+    /// the paired value. An empty list hides every row; no lists show every row. Collections
+    /// decide this on the stored document.
+    pub visible_when: Vec<Vec<(FieldPath, Value)>>,
+    /// Values at or below each path are replaced with the paired value, later entries last.
+    pub masks: Vec<(FieldPath, Value)>,
+}
+
+/// Authorizes the relations of each SQL statement before any statement runs.
+pub trait SqlReadGuard: Send {
+    /// Checks every relation one planned statement reads.
+    /// An empty set means the statement reads no relation, for example `SELECT 1`.
+    /// # Errors
+    /// Fails when the caller may not read one of `reads`.
+    fn authorize_reads(&mut self, reads: &BTreeSet<SqlReadTarget>) -> Result<(), AuthzError>;
+
+    /// Returns the row and masking policies of the caller, keyed by catalog name. Relations
+    /// without an entry are read as stored.
+    fn relation_policies(&self) -> BTreeMap<String, SqlRelationPolicy> {
+        BTreeMap::new()
+    }
+}
+
+enum PreparedStatement {
+    Select(PreparedSelect),
+    Analyze(AnalyzeTarget),
+    Explain(explain_fallback::PreparedExplain),
+    Insert(Box<sqlparser::ast::Insert>),
+}
+
+enum PreparedSelect {
+    RowRange(Box<row_scan::RowRangePlan>),
+    Simple {
+        sql: String,
+        plan: Box<SimpleSelectPlan>,
+    },
+    DataFusion {
+        ctx: SessionContext,
+        plan: Box<LogicalPlan>,
+        /// Time already spent planning; execution gets the rest of the query timeout.
+        planning: std::time::Duration,
+    },
+}
+
+type RegisteredProviders = Vec<(String, Arc<dyn TableProvider>)>;
 
 #[derive(Clone)]
 pub struct RelTable {
@@ -284,6 +362,7 @@ pub struct RelTable {
     layout: TableLayout,
 }
 
+#[derive(Clone)]
 pub struct SqlEngine {
     repl: Arc<dyn Replication>,
     tables: BTreeMap<String, RelTable>,
@@ -294,6 +373,7 @@ pub struct SqlEngine {
     layout: TableLayout,
     cost_model: CostModel,
     plan_cache: Arc<Mutex<PlanCache>>,
+    batch_cache: Arc<batch_cache::BatchCache>,
     performance: PerformanceConfig,
     snapshot_lsn: Option<u64>,
 }
@@ -304,6 +384,7 @@ struct StorageTableProvider {
     arrow_schema: SchemaRef,
     performance: PerformanceConfig,
     snapshot_lsn: Option<u64>,
+    batch_cache: Arc<batch_cache::BatchCache>,
 }
 
 #[derive(Clone)]
@@ -313,6 +394,8 @@ pub struct DocCollectionProvider {
     fields: Vec<DocField>,
     indexes: Vec<IndexSpec>,
     arrow_schema: SchemaRef,
+    /// Row policies decided on each stored document, as in `SqlRelationPolicy::visible_when`.
+    visible_when: Arc<[Vec<(FieldPath, Value)>]>,
 }
 
 #[derive(Clone)]
@@ -602,14 +685,7 @@ impl RelTable {
     /// A columnar table also fails with a conflict when other writers keep changing it.
     pub fn insert(&self, row: Row) -> Result<(), QueryError> {
         if self.layout == TableLayout::Columnar {
-            let primary_key = self.primary_key_value_for_row(&row)?;
-            return self.rewrite_columnar_rows(|rows| {
-                if row_with_primary_key(self.schema.as_ref(), rows, &primary_key).is_some() {
-                    return Err(QueryError::DuplicatePrimaryKey);
-                }
-                rows.push(row.clone());
-                Ok(true)
-            });
+            return self.append_columnar_rows(&[row]);
         }
 
         let row_key = self.row_key(&row)?;
@@ -671,11 +747,10 @@ impl RelTable {
         let old_bytes = self
             .repl
             .read(REL_ROWS_TABLE, &row_key, ReadConsistency::Strong)?;
-        let mut ops = Vec::new();
-        if let Some(old) = old_bytes.as_deref().map(decode_row).transpose()?.flatten() {
-            self.append_index_delete_ops(&mut ops, &old, &row_key)?;
-        }
-        ops.extend(self.put_ops(row, &row_key)?);
+        let ops = match old_bytes.as_deref().map(decode_row).transpose()?.flatten() {
+            Some(old) => self.update_ops_for_key(&old, row, &row_key)?,
+            None => self.put_ops(row, &row_key)?,
+        };
         let condition = WriteCondition::ValueEquals {
             table: REL_ROWS_TABLE.to_owned(),
             key: row_key,
@@ -701,14 +776,10 @@ impl RelTable {
         }
 
         let row_key = self.row_key(&row)?;
-        let mut ops = Vec::new();
-
-        if let Some(old) = self.get_by_row_key(&row_key)? {
-            self.append_index_delete_ops(&mut ops, &old, &row_key)?;
+        match self.get_by_row_key(&row_key)? {
+            Some(old) => self.update_ops_for_key(&old, row, &row_key),
+            None => self.put_ops(row, &row_key),
         }
-
-        ops.extend(self.put_ops(row, &row_key)?);
-        Ok(ops)
     }
 
     /// Deletes a row by primary key.
@@ -797,6 +868,18 @@ impl RelTable {
         self.put_ops(row, row_key)
     }
 
+    pub(crate) fn update_ops_for_key(
+        &self,
+        old: &Row,
+        row: Row,
+        row_key: &[u8],
+    ) -> Result<Vec<Op>, QueryError> {
+        if self.layout == TableLayout::Columnar {
+            return self.columnar_update_ops(row);
+        }
+        write_batch::update_ops_for_key(self, old, row, row_key)
+    }
+
     pub(crate) fn index_delete_ops_for_key(
         &self,
         row: &Row,
@@ -833,6 +916,45 @@ impl RelTable {
 
         self.scan_with_keys()
             .map(|rows| rows.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Counts stored rows without decoding every row when segment metadata is available.
+    /// # Errors
+    /// Fails when storage, segment metadata, or a legacy segment cannot be read.
+    pub fn row_count(&self) -> Result<usize, QueryError> {
+        if self.layout == TableLayout::Columnar {
+            return self.columnar_segments_with_meta()?.into_iter().try_fold(
+                0_usize,
+                |count, (_, bytes, meta)| {
+                    let rows = match meta {
+                        Some(meta) => usize::try_from(meta.row_count).map_err(|_| {
+                            QueryError::ResourceLimit("table row count exceeds usize".to_owned())
+                        })?,
+                        None => self.decode_columnar_rows(Some(&bytes))?.len(),
+                    };
+                    count.checked_add(rows).ok_or_else(|| {
+                        QueryError::ResourceLimit("table row count exceeds usize".to_owned())
+                    })
+                },
+            );
+        }
+        let (start, end) = table_range_bounds(&self.name);
+        let mut count = 0_usize;
+        self.repl.scan_range_batches(
+            REL_ROWS_TABLE,
+            &start,
+            &end,
+            ReadConsistency::Strong,
+            COLUMNAR_SEGMENT_ROWS,
+            &|| false,
+            &mut |batch| {
+                count = count.checked_add(batch.len()).ok_or_else(|| {
+                    ReplError::Unsupported("table row count exceeds usize".to_owned())
+                })?;
+                Ok(true)
+            },
+        )?;
+        Ok(count)
     }
 
     /// Scans a bounded page of rows in primary-key order.
@@ -895,18 +1017,21 @@ impl RelTable {
     ) -> Result<(RelQueryResult, AccessPath), QueryError> {
         validate_column(self.schema.as_ref(), column)?;
         let column_name = column_name(self.schema.as_ref(), column);
-        let path = cost_model.choose_eq_path(EqPathRequest {
-            layout: self.layout,
-            indexes: &self.indexes,
-            column,
-            column_name: &column_name,
-            value,
-            stats,
-            projected_columns: self
-                .schema
-                .as_ref()
-                .map_or(1, |schema| schema.columns.len()),
-        });
+        let path = cost_model.choose_eq_path_with_schema(
+            EqPathRequest {
+                layout: self.layout,
+                indexes: &self.indexes,
+                column,
+                column_name: &column_name,
+                value,
+                stats,
+                projected_columns: self
+                    .schema
+                    .as_ref()
+                    .map_or(1, |schema| schema.columns.len()),
+            },
+            self.schema.as_ref(),
+        );
 
         let result = self.query_eq_with_access_path(column, value, &path)?;
 
@@ -965,12 +1090,25 @@ impl RelTable {
             .repl
             .range(REL_INDEX_TABLE, &prefix, &end, ReadConsistency::Strong)?;
 
+        let row_keys: Vec<Bytes> = entries
+            .into_iter()
+            .filter_map(|(key, _)| row_key_from_index_key(&key).map(<[u8]>::to_vec))
+            .collect();
+        let examined_rows = row_keys.len();
         let mut rows = Vec::new();
-        let mut examined_rows = 0;
-        for (key, _) in entries {
-            if let Some(row_key) = row_key_from_index_key(&key) {
-                examined_rows += 1;
-                if let Some(row) = self.get_by_row_key(row_key)?
+        for keys in row_keys.chunks(256) {
+            let values = self
+                .repl
+                .read_many(REL_ROWS_TABLE, keys, ReadConsistency::Strong)?;
+            if values.len() != keys.len() {
+                return Err(QueryError::Storage(StorageError::Corruption(format!(
+                    "index row fetch returned {} values for {} keys",
+                    values.len(),
+                    keys.len(),
+                ))));
+            }
+            for bytes in values.into_iter().flatten() {
+                if let Some(row) = decode_row(&bytes)?
                     && predicate_matches(&row, filter)?
                 {
                     rows.push(row);
@@ -1104,6 +1242,7 @@ impl RelTable {
                 }
             }
         }
+        let rows = self.sorted_columnar_rows(rows)?;
         Ok(RelQueryResult {
             plan: RelPlanKind::FullScan,
             examined_rows,
@@ -1126,13 +1265,23 @@ impl RelTable {
 
     fn put_ops(&self, row: Row, row_key: &[u8]) -> Result<Vec<Op>, QueryError> {
         let mut ops = Vec::new();
-        self.append_index_put_ops(&mut ops, &row, row_key)?;
+        self.append_put_ops(&mut ops, row, row_key)?;
+        Ok(ops)
+    }
+
+    fn append_put_ops(
+        &self,
+        ops: &mut Vec<Op>,
+        row: Row,
+        row_key: &[u8],
+    ) -> Result<(), QueryError> {
+        self.append_index_put_ops(ops, &row, row_key)?;
         ops.push(Op::Put {
             table: REL_ROWS_TABLE.to_owned(),
             key: row_key.to_vec(),
             value: encode_value(&Value::Array(row))?,
         });
-        Ok(ops)
+        Ok(())
     }
 
     fn get_by_row_key(&self, row_key: &[u8]) -> Result<Option<Row>, QueryError> {
@@ -1270,14 +1419,8 @@ impl RelTable {
     }
 
     fn columnar_insert_ops(&self, row: Row) -> Result<Vec<Op>, QueryError> {
-        let primary_key = self.primary_key_value_for_row(&row)?;
-        let mut rows = self.columnar_rows()?;
-        if row_with_primary_key(self.schema.as_ref(), &rows, &primary_key).is_some() {
-            return Err(QueryError::DuplicatePrimaryKey);
-        }
-
-        rows.push(row);
-        self.columnar_replace_ops_from_rows(rows)
+        let segments = self.columnar_segments()?;
+        self.columnar_append_ops(&segments, &[row])
     }
 
     fn columnar_update_ops(&self, row: Row) -> Result<Vec<Op>, QueryError> {
@@ -1334,7 +1477,167 @@ impl RelTable {
         for (_, bytes) in segments {
             rows.extend(self.decode_columnar_rows(Some(bytes))?);
         }
-        Ok(rows)
+        self.sorted_columnar_rows(rows)
+    }
+
+    fn sorted_columnar_rows(&self, rows: Vec<Row>) -> Result<Vec<Row>, QueryError> {
+        let mut keyed_rows = rows
+            .into_iter()
+            .map(|row| self.row_key(&row).map(|key| (key, row)))
+            .collect::<Result<Vec<_>, _>>()?;
+        keyed_rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(keyed_rows.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Appends without re-encoding closed segments. Existing rows are still read to
+    /// enforce primary-key uniqueness; only a partial tail and new chunks are written.
+    pub(crate) fn columnar_append_ops(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: &[Row],
+    ) -> Result<Vec<Op>, QueryError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut keys = BTreeSet::new();
+        for existing in self.decode_columnar_segments(segments)? {
+            keys.insert(self.row_key(&existing)?);
+        }
+        for row in rows {
+            if !keys.insert(self.row_key(row)?) {
+                return Err(QueryError::DuplicatePrimaryKey);
+            }
+        }
+
+        let mut pending = rows.to_vec();
+        let mut next_id = 0;
+        let mut ops = Vec::new();
+        if let Some((key, bytes)) = segments.last() {
+            let id = columnar_segment_id(&self.name, key).ok_or_else(|| {
+                QueryError::Storage(StorageError::Corruption(
+                    "invalid columnar segment key".to_owned(),
+                ))
+            })?;
+            let mut tail = self.decode_columnar_rows(Some(bytes))?;
+            if tail.len() < COLUMNAR_SEGMENT_ROWS {
+                tail.extend(pending);
+                pending = tail;
+                next_id = id;
+            } else {
+                next_id = id.checked_add(1).ok_or_else(|| {
+                    QueryError::ResourceLimit("columnar segment ids exhausted".to_owned())
+                })?;
+                // Keep a shared write-version conflict marker for snapshot transactions.
+                // This also preserves an immutable tiered pointer without modifying its object.
+                ops.push(Op::Put {
+                    table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                    key: key.clone(),
+                    value: bytes.clone(),
+                });
+            }
+        }
+        let pending = self.sorted_columnar_rows(pending)?;
+        for chunk in pending.chunks(COLUMNAR_SEGMENT_ROWS) {
+            let key = columnar_segment_key(&self.name, next_id);
+            let value = rows_to_parquet_bytes(self.required_schema()?, chunk)?;
+            let meta = columnar_segment_meta(
+                &self.name,
+                next_id,
+                self.required_schema()?,
+                chunk,
+                value.len(),
+            );
+            ops.push(Op::Put {
+                table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                key: key.clone(),
+                value,
+            });
+            ops.push(Op::Put {
+                table: REL_COLUMNAR_SEGMENT_META_TABLE.to_owned(),
+                key,
+                value: serde_json::to_vec(&meta)
+                    .map_err(|error| QueryError::Serde(error.to_string()))?,
+            });
+            next_id = next_id.checked_add(1).ok_or_else(|| {
+                QueryError::ResourceLimit("columnar segment ids exhausted".to_owned())
+            })?;
+        }
+        Ok(ops)
+    }
+
+    fn columnar_append_batch(
+        &self,
+        segments: &[(Bytes, Bytes)],
+        rows: &[Row],
+    ) -> Result<ConditionalBatch, QueryError> {
+        let ops = self.columnar_append_ops(segments, rows)?;
+        let mut conditions = segments
+            .iter()
+            .map(|(key, bytes)| {
+                (
+                    key.clone(),
+                    WriteCondition::ValueEquals {
+                        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                        key: key.clone(),
+                        expected: Some(bytes.clone()),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for op in &ops {
+            if let Op::Put { table, key, .. } = op
+                && table == REL_COLUMNAR_SEGMENTS_TABLE
+            {
+                conditions
+                    .entry(key.clone())
+                    .or_insert(WriteCondition::KeyMissing {
+                        table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                        key: key.clone(),
+                    });
+            }
+        }
+        let next_id = segments
+            .last()
+            .and_then(|(key, _)| columnar_segment_id(&self.name, key))
+            .map_or(Some(0), |id| id.checked_add(1))
+            .ok_or_else(|| {
+                QueryError::ResourceLimit("columnar segment ids exhausted".to_owned())
+            })?;
+        let key = columnar_segment_key(&self.name, next_id);
+        conditions
+            .entry(key.clone())
+            .or_insert(WriteCondition::KeyMissing {
+                table: REL_COLUMNAR_SEGMENTS_TABLE.to_owned(),
+                key,
+            });
+        Ok(ConditionalBatch::new(
+            conditions.into_values().collect(),
+            ops,
+        ))
+    }
+
+    fn append_columnar_rows(&self, rows: &[Row]) -> Result<(), QueryError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..=WRITE_CONFLICT_RETRIES {
+            let segments = self.columnar_segments()?;
+            let batch = self.columnar_append_batch(&segments, rows)?;
+            match self.repl.propose_conditional_batch(batch) {
+                Ok(()) => return Ok(()),
+                Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
+                    thread::yield_now();
+                }
+                Err(ReplError::Unsupported(_)) => {
+                    let segments = self.columnar_segments()?;
+                    self.repl
+                        .propose_batch(self.columnar_append_ops(&segments, rows)?)?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(QueryError::Repl(ReplError::Conflict))
     }
 
     /// Rewrites the columnar rows with `change`, applied to the rows currently stored.
@@ -1678,6 +1981,7 @@ impl SqlEngine {
             layout,
             cost_model: CostModel::new(profile),
             plan_cache,
+            batch_cache: Arc::new(batch_cache::BatchCache::new(&performance)),
             performance,
             snapshot_lsn: None,
         }
@@ -1855,9 +2159,25 @@ impl SqlEngine {
     /// # Errors
     /// Fails when SQL is unsupported or execution fails under `ANALYZE`.
     pub fn explain(&self, sql: &str, options: ExplainOptions) -> Result<ExplainReport, QueryError> {
-        let simple = self.simple_select_plan(sql)?.ok_or_else(|| {
-            QueryError::Unsupported("EXPLAIN supports simple SELECT in this preview".to_owned())
-        })?;
+        if self.snapshot_lsn.is_none()
+            && let Some(plan) = row_scan::plan(self, sql)?
+        {
+            return self.explain_range(sql, &plan, options);
+        }
+        if self.snapshot_lsn.is_none()
+            && let Some(simple) = self.simple_select_plan(sql)?
+        {
+            return self.explain_simple(sql, &simple, options);
+        }
+        self.explain_fallback_sync(sql, options)
+    }
+
+    fn explain_simple(
+        &self,
+        sql: &str,
+        simple: &SimpleSelectPlan,
+        options: ExplainOptions,
+    ) -> Result<ExplainReport, QueryError> {
         let table = self
             .tables
             .get(&simple.table)
@@ -1880,7 +2200,9 @@ impl SqlEngine {
                 &plan.access_path,
             )?;
             (
-                Some(usize_to_u64(result.rows.len())),
+                Some(usize_to_u64(
+                    result.rows.len().min(simple.limit.unwrap_or(usize::MAX)),
+                )),
                 Some(optimizer::elapsed_ms(started)),
             )
         } else {
@@ -1914,6 +2236,21 @@ impl SqlEngine {
     /// # Errors
     /// Fails when SQL is unsupported, storage fails, or `DataFusion` fails.
     pub async fn execute(&self, sql: &str) -> Result<SqlOutput, QueryError> {
+        self.execute_with_read_guard(sql, None).await
+    }
+
+    /// Executes SQL after `guard` authorizes the relations each statement reads.
+    /// Every statement is planned and authorized before any statement runs, and
+    /// the plan that was authorized is the plan that executes. The guard's row and
+    /// masking policies are applied where each relation is scanned.
+    /// # Errors
+    /// Fails when the guard denies a read, SQL is unsupported, storage fails, or
+    /// `DataFusion` fails.
+    pub async fn execute_with_read_guard(
+        &self,
+        sql: &str,
+        mut guard: Option<&mut dyn SqlReadGuard>,
+    ) -> Result<SqlOutput, QueryError> {
         if sql.len() > self.performance.query.max_sql_bytes {
             return Err(QueryError::InputLimit(format!(
                 "SQL text is {} bytes, limit is {} bytes",
@@ -1927,79 +2264,314 @@ impl SqlEngine {
         }
 
         let statements = parse_with_limits(sql, &self.performance.query)?;
-        let mut last = None;
-
+        let policies = guard
+            .as_deref()
+            .map(SqlReadGuard::relation_policies)
+            .unwrap_or_default();
+        let mut prepared = Vec::with_capacity(statements.len());
         for statement in statements {
-            last = Some(match statement {
-                Statement::Query(_) => self.execute_select(&statement.to_string()).await?,
-                Statement::Analyze(analyze) => {
-                    let target = analyze
-                        .table_name
-                        .as_ref()
-                        .map_or(Ok(AnalyzeTarget::All), |name| {
-                            object_name_to_string(name).map(AnalyzeTarget::Named)
-                        })?;
-                    self.analyze(target, AnalyzeMode::default())?
-                        .to_sql_output()
-                }
-                Statement::Explain {
-                    analyze, statement, ..
-                } => {
-                    let report =
-                        self.explain(&statement.to_string(), ExplainOptions { analyze })?;
-                    report.to_sql_output()
-                }
-                Statement::Insert(insert) => self.execute_insert(&insert)?,
-                other => return Err(QueryError::Unsupported(other.to_string())),
-            });
+            let (statement, reads) = self.prepare_statement(statement, &policies).await?;
+            if let Some(reads) = reads
+                && let Some(guard) = guard.as_deref_mut()
+            {
+                guard
+                    .authorize_reads(&reads)
+                    .map_err(QueryError::AuthzDenied)?;
+            }
+            prepared.push(statement);
+        }
+
+        let mut last = None;
+        for statement in prepared {
+            last = Some(self.run_statement(statement).await?);
         }
 
         last.ok_or_else(|| QueryError::Unsupported("empty SQL".to_owned()))
     }
 
-    async fn execute_select(&self, sql: &str) -> Result<SqlOutput, QueryError> {
+    /// Plans one statement and returns its output schema without scanning data or writing.
+    /// The caller must check write/admin requirements separately, as for execution.
+    /// # Errors
+    /// Fails when SQL is unsupported, cannot be planned, or the guard denies a read.
+    pub(crate) async fn describe_with_read_guard(
+        &self,
+        sql: &str,
+        guard: &mut dyn SqlReadGuard,
+    ) -> Result<Option<SchemaRef>, QueryError> {
+        let statements = parse_with_limits(sql, &self.performance.query)?;
+        let [statement] = statements.as_slice() else {
+            return Err(QueryError::Unsupported(
+                "Describe requires exactly one SQL statement".to_owned(),
+            ));
+        };
+        let policies = guard.relation_policies();
+        let select_sql = match statement {
+            Statement::Query(_) => statement.to_string(),
+            Statement::Insert(insert) => {
+                let Some(returning) = &insert.returning else {
+                    return Ok(None);
+                };
+                let name = match &insert.table {
+                    SqlTableObject::TableName(name) => name,
+                    other => return Err(QueryError::Unsupported(other.to_string())),
+                };
+                let table = object_name_to_string(name)?;
+                if policies.contains_key(&table) {
+                    return Err(QueryError::Unsupported(format!(
+                        "INSERT ... RETURNING into {table} is unsupported while it has row or masking policies"
+                    )));
+                }
+                // RETURNING supports stored columns and aliases, not arbitrary expressions.
+                let relation = self
+                    .tables
+                    .get(&table)
+                    .ok_or_else(|| QueryError::MissingTable(table.clone()))?;
+                returning_rows(relation.schema.as_ref(), returning, &[])?;
+                let projection = returning
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("SELECT {projection} FROM {name}")
+            }
+            Statement::Explain { statement, .. } => {
+                let (_, reads) = self
+                    .prepare_explain(&statement.to_string(), ExplainOptions::default(), &policies)
+                    .await?;
+                guard
+                    .authorize_reads(&reads)
+                    .map_err(QueryError::AuthzDenied)?;
+                return Ok(Some(explain_fallback::schema()));
+            }
+            // These commands have no normal row description on the wire. Their
+            // write/admin checks are the Database caller's responsibility.
+            Statement::Analyze(_) => return Ok(None),
+            other => return Err(QueryError::Unsupported(other.to_string())),
+        };
+        let (ctx, providers) = self.datafusion_catalog_context(&policies)?;
+        let plan = self.plan_datafusion_select(&ctx, &select_sql).await?;
+        guard
+            .authorize_reads(&planned_read_targets(&plan, &providers)?)
+            .map_err(QueryError::AuthzDenied)?;
+        Ok(Some(Arc::clone(plan.schema().inner())))
+    }
+
+    /// Plans one statement without running it. Returns the relations it reads,
+    /// or `None` for statements that are authorized by their write/admin
+    /// requirements instead.
+    async fn prepare_statement(
+        &self,
+        statement: Statement,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
+    ) -> Result<(PreparedStatement, Option<BTreeSet<SqlReadTarget>>), QueryError> {
+        match statement {
+            Statement::Query(_) => {
+                let (select, reads) = self
+                    .prepare_select(&statement.to_string(), policies)
+                    .await?;
+                Ok((PreparedStatement::Select(select), Some(reads)))
+            }
+            Statement::Analyze(analyze) => {
+                let target = analyze
+                    .table_name
+                    .as_ref()
+                    .map_or(Ok(AnalyzeTarget::All), |name| {
+                        object_name_to_string(name).map(AnalyzeTarget::Named)
+                    })?;
+                Ok((PreparedStatement::Analyze(target), None))
+            }
+            Statement::Explain {
+                analyze, statement, ..
+            } => {
+                let (prepared, reads) = self
+                    .prepare_explain(&statement.to_string(), ExplainOptions { analyze }, policies)
+                    .await?;
+                Ok((PreparedStatement::Explain(prepared), Some(reads)))
+            }
+            Statement::Insert(insert) => {
+                // RETURNING hands back stored rows, the existing row of an
+                // ON CONFLICT DO UPDATE included, so it reads the table.
+                let reads = if insert.returning.is_some() {
+                    let table = match &insert.table {
+                        SqlTableObject::TableName(name) => object_name_to_string(name)?,
+                        other => return Err(QueryError::Unsupported(other.to_string())),
+                    };
+                    if policies.contains_key(&table) {
+                        return Err(QueryError::Unsupported(format!(
+                            "INSERT ... RETURNING into {table} is unsupported while it has row or masking policies"
+                        )));
+                    }
+                    Some(BTreeSet::from([SqlReadTarget::Catalog(table)]))
+                } else {
+                    None
+                };
+                Ok((PreparedStatement::Insert(Box::new(insert)), reads))
+            }
+            other => Err(QueryError::Unsupported(other.to_string())),
+        }
+    }
+
+    async fn run_statement(&self, statement: PreparedStatement) -> Result<SqlOutput, QueryError> {
+        match statement {
+            PreparedStatement::Select(PreparedSelect::RowRange(plan)) => {
+                row_scan::execute(self, &plan)
+            }
+            PreparedStatement::Select(PreparedSelect::Simple { sql, plan }) => {
+                self.run_simple_select(&sql, &plan)
+            }
+            PreparedStatement::Select(PreparedSelect::DataFusion {
+                ctx,
+                plan,
+                planning,
+            }) => self.run_datafusion_select(&ctx, *plan, planning).await,
+            PreparedStatement::Analyze(target) => Ok(self
+                .analyze(target, AnalyzeMode::default())?
+                .to_sql_output()),
+            PreparedStatement::Explain(prepared) => {
+                Ok(self.run_explain(prepared).await?.to_sql_output())
+            }
+            PreparedStatement::Insert(insert) => self.execute_insert(&insert),
+        }
+    }
+
+    async fn prepare_select(
+        &self,
+        sql: &str,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
+    ) -> Result<(PreparedSelect, BTreeSet<SqlReadTarget>), QueryError> {
+        // Policy-protected relations always retain their provider barrier. This fast
+        // plan has a complete literal-PK grammar and reports its catalog read to the guard.
         if self.snapshot_lsn.is_none()
-            && let Some(result) = self.execute_simple_select(sql)?
+            && let Some(plan) = row_scan::plan(self, sql)?
+            && !policies.contains_key(&plan.table)
         {
-            return Ok(result);
+            let reads = BTreeSet::from([SqlReadTarget::Catalog(plan.table.clone())]);
+            return Ok((PreparedSelect::RowRange(Box::new(plan)), reads));
+        }
+        // The simple path reads stored rows directly, so a relation with policies
+        // is always planned through `DataFusion`, where they are applied.
+        if self.snapshot_lsn.is_none()
+            && let Some(simple) = self.simple_select_plan(sql)?
+            && !policies.contains_key(&simple.table)
+        {
+            let reads = BTreeSet::from([SqlReadTarget::Catalog(simple.table.clone())]);
+            return Ok((
+                PreparedSelect::Simple {
+                    sql: sql.to_owned(),
+                    plan: Box::new(simple),
+                },
+                reads,
+            ));
         }
 
+        let (ctx, providers) = self.datafusion_catalog_context(policies)?;
+        let started = std::time::Instant::now();
+        let plan = self.plan_datafusion_select(&ctx, sql).await?;
+        let planning = started.elapsed();
+        let reads = planned_read_targets(&plan, &providers)?;
+        Ok((
+            PreparedSelect::DataFusion {
+                ctx,
+                plan: Box::new(plan),
+                planning,
+            },
+            reads,
+        ))
+    }
+
+    /// Registers every catalog object in a fresh `DataFusion` context and
+    /// returns the registered providers, so plan scans can be mapped back to
+    /// catalog names by provider identity. An object with policies is
+    /// registered behind them.
+    fn datafusion_catalog_context(
+        &self,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
+    ) -> Result<(SessionContext, RegisteredProviders), QueryError> {
         let ctx = self.datafusion_context()?;
+        let mut providers: RegisteredProviders = Vec::new();
 
         for (name, table) in &self.tables {
-            let provider = Arc::new(StorageTableProvider::new(
-                table.clone(),
-                self.performance.clone(),
-                self.snapshot_lsn,
+            providers.push((
+                name.clone(),
+                Arc::new(StorageTableProvider::new(
+                    table.clone(),
+                    self.performance.clone(),
+                    self.snapshot_lsn,
+                    Arc::clone(&self.batch_cache),
+                )),
             ));
-            ctx.register_table(name, provider)
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
         }
 
         for (name, provider) in &self.collections {
-            ctx.register_table(name, Arc::new(provider.clone()))
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
+            providers.push((name.clone(), Arc::new(provider.clone())));
         }
 
         for (name, provider) in &self.foreign_tables {
-            ctx.register_table(name, Arc::new(provider.clone()))
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
+            providers.push((name.clone(), Arc::new(provider.clone())));
         }
 
         for (name, provider) in &self.materialized_views {
-            ctx.register_table(name, Arc::new(provider.clone()))
-                .map_err(|error| QueryError::DataFusion(error.to_string()))?;
+            providers.push((name.clone(), Arc::new(provider.clone())));
         }
 
         for (name, provider) in &self.temporal_tables {
-            ctx.register_table(name, Arc::new(provider.clone()))
+            providers.push((name.clone(), Arc::new(provider.clone())));
+        }
+
+        for (name, provider) in &mut providers {
+            if let Some(policy) = policies.get(name) {
+                *provider = policy_table_provider(
+                    name,
+                    Arc::clone(provider),
+                    self.collections.get(name),
+                    policy,
+                )?;
+            }
+        }
+
+        for (name, provider) in &providers {
+            ctx.register_table(name, Arc::clone(provider))
                 .map_err(|error| QueryError::DataFusion(error.to_string()))?;
         }
 
+        Ok((ctx, providers))
+    }
+
+    async fn plan_datafusion_select(
+        &self,
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> Result<LogicalPlan, QueryError> {
         let timeout = std::time::Duration::from_millis(self.performance.query.timeout_ms);
+        let state = ctx.state();
+        let plan = tokio::time::timeout(timeout, state.create_logical_plan(sql))
+            .await
+            .map_err(|_| self.timeout_error())?
+            .map_err(|error| datafusion_to_query_error(&error))?;
+
+        // DataFusion re-parses the statement text with its own dialect, so a
+        // read statement must not plan into anything that changes state.
+        SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false)
+            .verify_plan(&plan)
+            .map_err(|error| QueryError::Unsupported(error.strip_backtrace()))?;
+        Ok(plan)
+    }
+
+    async fn run_datafusion_select(
+        &self,
+        ctx: &SessionContext,
+        plan: LogicalPlan,
+        planning: std::time::Duration,
+    ) -> Result<SqlOutput, QueryError> {
+        // Planning and execution share one `timeout_ms` budget per statement.
+        let timeout = std::time::Duration::from_millis(self.performance.query.timeout_ms)
+            .saturating_sub(planning);
         let execution = async {
             let dataframe = ctx
-                .sql(sql)
+                .execute_logical_plan(plan)
                 .await
                 .map_err(|error| datafusion_to_query_error(&error))?;
             let columns = dataframe
@@ -2015,17 +2587,18 @@ impl SqlEngine {
             Ok::<_, QueryError>((columns, batches))
         };
 
-        let (columns, batches) =
-            tokio::time::timeout(timeout, execution)
-                .await
-                .map_err(|_| {
-                    QueryError::Timeout(format!(
-                        "query exceeded {} ms",
-                        self.performance.query.timeout_ms
-                    ))
-                })??;
+        let (columns, batches) = tokio::time::timeout(timeout, execution)
+            .await
+            .map_err(|_| self.timeout_error())??;
 
         Ok(SqlOutput::Rows(record_batches_to_rows(&batches, columns)?))
+    }
+
+    fn timeout_error(&self) -> QueryError {
+        QueryError::Timeout(format!(
+            "query exceeded {} ms",
+            self.performance.query.timeout_ms
+        ))
     }
 
     fn datafusion_context(&self) -> Result<SessionContext, QueryError> {
@@ -2069,11 +2642,11 @@ impl SqlEngine {
         Ok(SqlOutput::AffectedRows(affected_rows.len()))
     }
 
-    fn execute_simple_select(&self, sql: &str) -> Result<Option<SqlOutput>, QueryError> {
-        let Some(simple) = self.simple_select_plan(sql)? else {
-            return Ok(None);
-        };
-
+    fn run_simple_select(
+        &self,
+        sql: &str,
+        simple: &SimpleSelectPlan,
+    ) -> Result<SqlOutput, QueryError> {
         let table = self
             .tables
             .get(&simple.table)
@@ -2102,10 +2675,10 @@ impl SqlEngine {
             rows.truncate(limit);
         }
 
-        Ok(Some(SqlOutput::Rows(SqlRows {
-            columns: simple.projection_names,
+        Ok(SqlOutput::Rows(SqlRows {
+            columns: simple.projection_names.clone(),
             rows,
-        })))
+        }))
     }
 
     fn simple_select_plan(&self, sql: &str) -> Result<Option<SimpleSelectPlan>, QueryError> {
@@ -2225,13 +2798,16 @@ impl SqlEngine {
             });
         }
 
-        let access_path = self.cost_model.choose_filter_path(FilterPathRequest {
-            layout: table.layout,
-            indexes: table.indexes(),
-            filter,
-            stats,
-            projection,
-        });
+        let access_path = self.cost_model.choose_filter_path_with_schema(
+            FilterPathRequest {
+                layout: table.layout,
+                indexes: table.indexes(),
+                filter,
+                stats,
+                projection,
+            },
+            table.schema.as_ref(),
+        );
         self.plan_cache
             .lock()
             .map_err(|_| {
@@ -2267,12 +2843,18 @@ impl SqlEngine {
 }
 
 impl StorageTableProvider {
-    fn new(table: RelTable, performance: PerformanceConfig, snapshot_lsn: Option<u64>) -> Self {
+    fn new(
+        table: RelTable,
+        performance: PerformanceConfig,
+        snapshot_lsn: Option<u64>,
+        batch_cache: Arc<batch_cache::BatchCache>,
+    ) -> Self {
         Self {
             arrow_schema: schema_to_arrow(table.schema.as_ref()),
             table,
             performance,
             snapshot_lsn,
+            batch_cache,
         }
     }
 }
@@ -2294,7 +2876,16 @@ impl DocCollectionProvider {
             arrow_schema: doc_fields_to_arrow(&fields),
             fields,
             indexes,
+            visible_when: Arc::from(Vec::new()),
         })
+    }
+
+    /// The same collection, scanning only the documents `visible_when` lets through.
+    fn with_visible_when(&self, visible_when: &[Vec<(FieldPath, Value)>]) -> Self {
+        Self {
+            visible_when: Arc::from(visible_when),
+            ..self.clone()
+        }
     }
 
     fn scan_record_batches(
@@ -2308,6 +2899,15 @@ impl DocCollectionProvider {
             self.indexes.clone(),
         );
         let mut documents = collection.scan()?;
+        // The same test as `PolicyConfig::row_visible`: a document without the path, or
+        // holding a value of another type, never matches, although its column reads NULL.
+        documents.retain(|(_, doc)| {
+            self.visible_when.iter().all(|any_of| {
+                any_of
+                    .iter()
+                    .any(|(path, value)| extract_path(doc, path) == Some(value))
+            })
+        });
         if let Some(limit) = limit {
             documents.truncate(limit);
         }
@@ -2510,10 +3110,16 @@ impl TableProvider for StorageTableProvider {
         if self.table.layout == TableLayout::Columnar {
             return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
         }
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if self.snapshot_lsn.is_none() && row_scan::supports_filter(&self.table, filter) {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -2529,10 +3135,34 @@ impl TableProvider for StorageTableProvider {
         let projection_for_scan = projection.clone();
         let batch_rows = self.performance.query.batch_rows;
         let snapshot_lsn = self.snapshot_lsn;
+        let row_filters = filters.to_vec();
+        let batch_cache = Arc::clone(&self.batch_cache);
 
         let batches = tokio::task::spawn_blocking(move || {
             if let Some(snapshot_lsn) = snapshot_lsn {
                 table.scan_record_batches_as_of_lsn(&schema, limit, batch_rows, snapshot_lsn)
+            } else if table.layout == TableLayout::Row {
+                let scan = || {
+                    row_scan::batches(
+                        &table,
+                        &schema,
+                        projection_for_scan.as_deref(),
+                        &row_filters,
+                        limit,
+                        batch_rows,
+                    )
+                };
+                if row_filters.is_empty() && limit.is_none() {
+                    batch_cache.batches(
+                        &table,
+                        &schema,
+                        projection_for_scan.as_deref(),
+                        batch_rows,
+                        scan,
+                    )
+                } else {
+                    scan()
+                }
             } else {
                 table.scan_record_batches(
                     &schema,
@@ -2546,13 +3176,15 @@ impl TableProvider for StorageTableProvider {
         .map_err(|error| DataFusionError::Execution(error.to_string()))?
         .map_err(query_to_datafusion)?;
 
-        if self.table.layout == TableLayout::Columnar {
+        if self.table.layout == TableLayout::Columnar || snapshot_lsn.is_none() {
             let schema = projection.as_deref().map_or_else(
                 || self.arrow_schema.clone(),
                 |projection| project_schema(&self.arrow_schema, projection),
             );
             let partitions = if batches.is_empty() {
                 vec![Vec::new()]
+            } else if self.table.layout == TableLayout::Row {
+                vec![batches]
             } else {
                 split_into_partitions(
                     batches,
@@ -2561,7 +3193,12 @@ impl TableProvider for StorageTableProvider {
             };
             observability::record_parallel_scan(self.table.name(), partitions.len());
             let mem = MemTable::try_new(schema, partitions)?;
-            return mem.scan(state, None, &[], limit).await;
+            let safe_limit = if self.table.layout == TableLayout::Row && !filters.is_empty() {
+                None
+            } else {
+                limit
+            };
+            return mem.scan(state, None, &[], safe_limit).await;
         }
 
         let mem = MemTable::try_new(self.arrow_schema.clone(), vec![batches])?;
@@ -4094,6 +4731,9 @@ fn try_apply_row_insert(
     rows: &[Row],
     insert: &sqlparser::ast::Insert,
 ) -> Result<InsertAttempt, QueryError> {
+    if insert.on.is_none() {
+        return write_batch::try_plain_insert(table, rows);
+    }
     let mut initial = BTreeMap::<Bytes, Option<(Option<Bytes>, Row)>>::new();
     let mut staged = BTreeMap::<Bytes, Row>::new();
     let mut conditions = BTreeMap::<Bytes, WriteCondition>::new();
@@ -4125,7 +4765,7 @@ fn try_apply_row_insert(
         match existing_row {
             None => {
                 ensure_insert_condition(&mut conditions, &initial, &row_key);
-                ops.extend(table.put_ops_for_key(row.clone(), &row_key)?);
+                table.append_put_ops(&mut ops, row.clone(), &row_key)?;
                 staged.insert(row_key, row.clone());
                 affected.push(row.clone());
             }
@@ -4148,8 +4788,11 @@ fn try_apply_row_insert(
                             &update.assignments,
                         )?;
                         ensure_insert_condition(&mut conditions, &initial, &row_key);
-                        ops.extend(table.index_delete_ops_for_key(&existing_row, &row_key)?);
-                        ops.extend(table.put_ops_for_key(updated.clone(), &row_key)?);
+                        ops.extend(table.update_ops_for_key(
+                            &existing_row,
+                            updated.clone(),
+                            &row_key,
+                        )?);
                         staged.insert(row_key, updated.clone());
                         affected.push(updated);
                     }
@@ -4158,23 +4801,7 @@ fn try_apply_row_insert(
         }
     }
 
-    if !ops.is_empty() {
-        let batch = ConditionalBatch::new(conditions.into_values().collect(), ops);
-        match table.repl.propose_conditional_batch(batch) {
-            Ok(()) => {}
-            Err(ReplError::Conflict | ReplError::Storage(StorageError::Conflict)) => {
-                return Ok(InsertAttempt::Conflict);
-            }
-            Err(ReplError::Unsupported(error)) => {
-                return Err(QueryError::Unsupported(format!(
-                    "atomic INSERT requires conditional batch support: {error}"
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Ok(InsertAttempt::Committed(affected))
+    write_batch::commit_insert(table, conditions.into_values().collect(), ops, affected)
 }
 
 fn ensure_insert_condition(
@@ -4208,6 +4835,10 @@ fn apply_columnar_insert_rows_atomic(
     rows: &[Row],
     insert: &sqlparser::ast::Insert,
 ) -> Result<Vec<Row>, QueryError> {
+    if insert.on.is_none() {
+        table.append_columnar_rows(rows)?;
+        return Ok(rows.to_vec());
+    }
     let mut affected = Vec::new();
     table.rewrite_columnar_rows(|current| {
         affected.clear();
@@ -4493,6 +5124,227 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, QueryError> {
     }
 }
 
+/// Collects every relation a `DataFusion` plan scans, including scans inside
+/// subqueries. Scans are mapped back to catalog names by provider identity, so
+/// a name is reported exactly as it was registered, whatever spelling the SQL
+/// used. Scans of unregistered providers are reported as builtin relations.
+fn planned_read_targets(
+    plan: &LogicalPlan,
+    providers: &[(String, Arc<dyn TableProvider>)],
+) -> Result<BTreeSet<SqlReadTarget>, QueryError> {
+    let mut reads = BTreeSet::new();
+    let mut extension = None;
+    plan.apply_with_subqueries(|node| {
+        match node {
+            LogicalPlan::Extension(node) => {
+                extension = Some(node.node.name().to_owned());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            LogicalPlan::TableScan(scan) => {
+                let target = match source_as_provider(&scan.source) {
+                    // Recursive CTE work tables only re-read the CTE's own
+                    // terms, which this walk visits anyway.
+                    Ok(provider) if provider.is::<CteWorkTable>() => None,
+                    Ok(provider) => Some(
+                        providers
+                            .iter()
+                            .find(|(_, registered)| Arc::ptr_eq(registered, &provider))
+                            .map_or_else(
+                                || SqlReadTarget::Builtin(scan.table_name.to_string()),
+                                |(name, _)| SqlReadTarget::Catalog(name.clone()),
+                            ),
+                    ),
+                    Err(_) => Some(SqlReadTarget::Builtin(scan.table_name.to_string())),
+                };
+                reads.extend(target);
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|error| datafusion_to_query_error(&error))?;
+
+    if let Some(name) = extension {
+        return Err(QueryError::Unsupported(format!(
+            "extension plan node {name} in a read query"
+        )));
+    }
+    Ok(reads)
+}
+
+/// A catalog relation as one caller's row and masking policies let it be seen.
+///
+/// The scan runs the policies to completion and serves only the rows they let
+/// through, already masked. No predicate of the query, wherever an optimizer
+/// rule pushes it, is therefore evaluated on a hidden row or an unmasked value:
+/// a predicate that fails on some value cannot reveal that a hidden row holds it.
+#[derive(Debug)]
+struct PolicyTableProvider {
+    /// The policies over the stored relation, or why SQL cannot apply them.
+    plan: Result<LogicalPlan, String>,
+    schema: SchemaRef,
+    table_type: TableType,
+}
+
+#[async_trait]
+impl TableProvider for PolicyTableProvider {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table_type
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[DfExpr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let plan = match &self.plan {
+            Ok(plan) => state.create_physical_plan(plan).await?,
+            Err(reason) => {
+                return Err(query_to_datafusion(QueryError::Unsupported(reason.clone())));
+            }
+        };
+        let batches = collect(plan, state.task_ctx()).await?;
+        let mem = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
+        mem.scan(state, projection, &[], limit).await
+    }
+}
+
+/// Puts `provider` behind `policy`. When the relation is the document
+/// `collection`, its columns read the paths its fields name and its row
+/// policies are decided on the stored documents; every other relation's column
+/// `c` reads the path `c`. A mask SQL cannot represent refuses the queries that
+/// read the relation, not every query.
+fn policy_table_provider(
+    name: &str,
+    provider: Arc<dyn TableProvider>,
+    collection: Option<&DocCollectionProvider>,
+    policy: &SqlRelationPolicy,
+) -> Result<Arc<dyn TableProvider>, QueryError> {
+    // A collection column reads NULL where a document lacks its path or holds
+    // a value of another type, so SQL predicates cannot decide its row policies.
+    let (provider, fields, row_filters): (Arc<dyn TableProvider>, _, _) = match collection {
+        Some(collection) => (
+            Arc::new(collection.with_visible_when(&policy.visible_when)),
+            Some(collection.fields.as_slice()),
+            &[][..],
+        ),
+        None => (provider, None, policy.visible_when.as_slice()),
+    };
+    let table_type = provider.table_type();
+    let schema = provider.schema();
+    let qualifier = TableReference::bare(name);
+    let column_paths = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| match fields {
+            Some(fields) => match fields.get(index).map(|field| &field.source) {
+                Some(DocFieldSource::Path(path)) => Some(path.segments().to_vec()),
+                Some(DocFieldSource::DocumentId) | None => None,
+            },
+            None => Some(vec![field.name().clone()]),
+        })
+        .collect::<Vec<_>>();
+    let column =
+        |field: &Field| DfExpr::Column(DfColumn::new(Some(qualifier.clone()), field.name()));
+
+    let mut plan = LogicalPlanBuilder::scan(qualifier.clone(), provider_as_source(provider), None)
+        .map_err(|error| datafusion_to_query_error(&error))?;
+    for any_of in row_filters {
+        let mut predicate = None::<DfExpr>;
+        for (path, value) in any_of {
+            // Columns hold scalars, so no row equals any other value.
+            let Some(scalar) = policy_scalar(value) else {
+                continue;
+            };
+            for (field, column_path) in schema.fields().iter().zip(&column_paths) {
+                if column_path.as_deref() != Some(path.segments()) {
+                    continue;
+                }
+                // A value of another type never equals what the column holds.
+                let condition = match &scalar {
+                    ScalarValue::Null => column(field).is_null(),
+                    scalar if &scalar.data_type() == field.data_type() => {
+                        column(field).eq(lit(scalar.clone()))
+                    }
+                    _ => continue,
+                };
+                predicate = Some(match predicate {
+                    Some(predicate) => predicate.or(condition),
+                    None => condition,
+                });
+            }
+        }
+        plan = plan
+            .filter(predicate.unwrap_or_else(|| lit(false)))
+            .map_err(|error| datafusion_to_query_error(&error))?;
+    }
+    if !policy.masks.is_empty() {
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (field, column_path) in schema.fields().iter().zip(&column_paths) {
+            let mask = policy.masks.iter().rev().find(|(path, _)| {
+                column_path
+                    .as_deref()
+                    .is_some_and(|column_path| column_path.starts_with(path.segments()))
+            });
+            columns.push(match mask {
+                Some((_, replacement)) => {
+                    let scalar = match policy_scalar(replacement) {
+                        Some(ScalarValue::Null) => ScalarValue::try_from(field.data_type())
+                            .map_err(|error| datafusion_to_query_error(&error))?,
+                        Some(scalar) => scalar,
+                        None => {
+                            return Ok(Arc::new(PolicyTableProvider {
+                                plan: Err(format!(
+                                    "{name} has a masking policy whose replacement is not a scalar, which SQL cannot return"
+                                )),
+                                schema: Arc::clone(&schema),
+                                table_type,
+                            }));
+                        }
+                    };
+                    lit(scalar).alias(field.name())
+                }
+                None => column(field),
+            });
+        }
+        plan = plan
+            .project(columns)
+            .map_err(|error| datafusion_to_query_error(&error))?;
+    }
+    let plan = plan
+        .build()
+        .map_err(|error| datafusion_to_query_error(&error))?;
+    let schema = Arc::clone(plan.schema().inner());
+    Ok(Arc::new(PolicyTableProvider {
+        plan: Ok(plan),
+        schema,
+        table_type,
+    }))
+}
+
+/// The SQL literal of a policy value, typed the way a column holding it is, or
+/// `None` for a value no SQL column holds.
+fn policy_scalar(value: &Value) -> Option<ScalarValue> {
+    Some(match value {
+        Value::Null => ScalarValue::Null,
+        Value::Bool(value) => ScalarValue::Boolean(Some(*value)),
+        Value::Int(value) => ScalarValue::Int64(Some(*value)),
+        Value::Float(value) => ScalarValue::Float64(Some(*value)),
+        Value::Str(value) => ScalarValue::Utf8(Some(value.clone())),
+        Value::Bytes(value) => ScalarValue::Binary(Some(value.clone())),
+        Value::Array(_) | Value::Object(_) | Value::Vector(_) | Value::GeoPoint { .. } => {
+            return None;
+        }
+    })
+}
+
 fn datafusion_to_query_error(error: &DataFusionError) -> QueryError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
@@ -4517,5 +5369,7 @@ fn query_to_datafusion(error: QueryError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
+#[cfg(test)]
+mod index_read_tests;
 #[cfg(test)]
 mod tests;

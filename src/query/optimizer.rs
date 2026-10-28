@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     BitmapOp, ColumnType, QueryError, RelIndexExpression, RelIndexSpec, RelPredicate, Row,
-    SqlOutput, SqlRows, TableLayout, encode_rel_key,
+    SqlOutput, SqlRows, TableLayout, TableSchema, encode_rel_key,
 };
 
 pub const STATS_TABLE: &str = "__stats";
@@ -182,6 +182,8 @@ pub enum AccessPath {
         estimated_rows: u64,
         cost: Cost,
     },
+    /// Metadata-only `DataFusion` logical plan; cardinality and cost are unknown.
+    DataFusionPlan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
@@ -328,10 +330,18 @@ impl ExplainReport {
                     vec![
                         Value::Str(node.operator.clone()),
                         Value::Str(node.access_path.label()),
-                        Value::Int(saturating_i64(node.estimated_rows)),
+                        if node.access_path.has_estimates() {
+                            Value::Int(saturating_i64(node.estimated_rows))
+                        } else {
+                            Value::Null
+                        },
                         node.actual_rows
                             .map_or(Value::Null, |rows| Value::Int(saturating_i64(rows))),
-                        Value::Float(node.cost.0),
+                        if node.access_path.has_cost_estimate() {
+                            Value::Float(node.cost.0)
+                        } else {
+                            Value::Null
+                        },
                         node.actual_ms.map_or(Value::Null, Value::Float),
                         Value::Str(node.details.clone()),
                     ]
@@ -387,6 +397,17 @@ impl CostModel {
 
     #[must_use]
     pub fn choose_eq_path(&self, request: EqPathRequest<'_, '_>) -> AccessPath {
+        self.choose_eq_path_with_schema(request, None)
+    }
+
+    /// Uses schema uniqueness for estimates without treating statistics as proof
+    /// that execution can omit a read.
+    #[must_use]
+    pub fn choose_eq_path_with_schema(
+        &self,
+        request: EqPathRequest<'_, '_>,
+        schema: Option<&TableSchema>,
+    ) -> AccessPath {
         let row_count = request.stats.map_or(1_000, |stats| stats.row_count);
         let selectivity = request
             .stats
@@ -395,6 +416,11 @@ impl CostModel {
                 CardinalityEstimator::eq_selectivity(stats, request.value)
             });
         let estimated_rows = estimated_rows(row_count, selectivity);
+        let estimated_rows = if schema.is_some_and(|schema| schema.primary_key == request.column) {
+            estimated_rows.min(1)
+        } else {
+            estimated_rows
+        };
 
         if request.layout == TableLayout::Columnar {
             return AccessPath::ColumnarScan {
@@ -433,9 +459,23 @@ impl CostModel {
 
     #[must_use]
     pub fn choose_filter_path(&self, request: FilterPathRequest<'_, '_>) -> AccessPath {
+        self.choose_filter_path_with_schema(request, None)
+    }
+
+    /// Resolves predicate column positions through the table schema, since the
+    /// persisted statistics are keyed by actual column names.
+    #[must_use]
+    pub fn choose_filter_path_with_schema(
+        &self,
+        request: FilterPathRequest<'_, '_>,
+        schema: Option<&TableSchema>,
+    ) -> AccessPath {
         let row_count = request.stats.map_or(1_000, |stats| stats.row_count);
-        let selectivity = estimate_filter_selectivity(request.stats, request.filter);
+        let selectivity = estimate_filter_selectivity(request.stats, request.filter, schema);
         let estimated_rows = estimated_rows(row_count, selectivity);
+        let estimated_rows = schema
+            .and_then(|schema| primary_key_upper_bound(request.filter, schema.primary_key))
+            .map_or(estimated_rows, |bound| estimated_rows.min(bound));
 
         if request.layout == TableLayout::Columnar {
             return AccessPath::ColumnarScan {
@@ -540,23 +580,41 @@ impl CardinalityEstimator {
         }
 
         if matches!(value, Value::Null) {
-            return stats.null_frac.clamp(0.0, 1.0);
+            return probability(stats.null_frac, 0.0);
         }
 
         if let Some(mcv) = stats.mcv.iter().find(|mcv| mcv.value == *value) {
-            return mcv.frequency.clamp(0.0, 1.0);
+            return probability(mcv.frequency, 0.005);
         }
 
         if stats.ndv == 0 {
             return 0.005;
         }
 
-        ((1.0 - stats.null_frac) / u64_to_f64(stats.ndv)).clamp(0.000_001, 1.0)
+        let nonnull = 1.0 - probability(stats.null_frac, 0.0);
+        let common_values = usize_to_u64(stats.mcv.len()).min(stats.ndv);
+        let common_mass = stats
+            .mcv
+            .iter()
+            .map(|mcv| probability(mcv.frequency, 0.0))
+            .sum::<f64>()
+            .min(nonnull);
+        let selectivity = if stats.ndv > common_values {
+            (nonnull - common_mass) / u64_to_f64(stats.ndv - common_values)
+        } else {
+            // A value absent from a complete MCV list can still have appeared
+            // since ANALYZE; this estimate must never suppress the actual read.
+            nonnull / u64_to_f64(stats.ndv)
+        };
+        probability(selectivity, 0.005).clamp(0.000_001, 1.0)
     }
 
     #[must_use]
     pub fn range_selectivity(stats: &ColumnStats, start: &Value, end: &Value) -> f64 {
-        if stats.row_count == 0 || stats.histogram.is_empty() {
+        if stats.row_count == 0 {
+            return 0.0;
+        }
+        if stats.histogram.is_empty() || stats.sample_count == 0 {
             return 0.30;
         }
 
@@ -566,6 +624,9 @@ impl CardinalityEstimator {
         let Ok(end_key) = encode_rel_key(end) else {
             return 0.30;
         };
+        if start_key >= end_key {
+            return 0.0;
+        }
 
         let matched = stats
             .histogram
@@ -586,33 +647,81 @@ impl CardinalityEstimator {
                 upper_key >= start_key && lower_key < end_key
             })
             .map(|bucket| bucket.count)
-            .sum::<u64>();
+            .fold(0_u64, u64::saturating_add);
 
-        (u64_to_f64(matched) / u64_to_f64(stats.row_count)).clamp(0.000_001, 1.0)
+        // Histogram counts describe the sample, not all rows in the relation.
+        (u64_to_f64(matched) / u64_to_f64(stats.sample_count)).clamp(0.0, 1.0)
     }
 }
 
-fn estimate_filter_selectivity(stats: Option<&TableStats>, filter: &RelPredicate) -> f64 {
+fn probability(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
+fn estimate_filter_selectivity(
+    stats: Option<&TableStats>,
+    filter: &RelPredicate,
+    schema: Option<&TableSchema>,
+) -> f64 {
     match filter {
         RelPredicate::Eq { expression, value } => stats
             .and_then(|stats| {
-                stats
-                    .columns
-                    .get(&fallback_column_name(expression.column()))
+                // A LowerAscii predicate has a different distribution from the
+                // original strings, so raw-column statistics cannot describe it.
+                if !matches!(expression, RelIndexExpression::Column(_)) {
+                    return None;
+                }
+                match schema {
+                    Some(schema) => schema
+                        .columns
+                        .get(expression.column())
+                        .and_then(|column| stats.columns.get(&column.name)),
+                    None => stats
+                        .columns
+                        .get(&fallback_column_name(expression.column()))
+                        .or_else(|| {
+                            stats
+                                .columns
+                                .get(&format!("column_{}", expression.column()))
+                        }),
+                }
             })
             .map_or(0.005, |stats| {
                 CardinalityEstimator::eq_selectivity(stats, value)
             }),
         RelPredicate::And(predicates) => predicates
             .iter()
-            .map(|predicate| estimate_filter_selectivity(stats, predicate))
+            .map(|predicate| estimate_filter_selectivity(stats, predicate, schema))
             .product::<f64>()
             .clamp(0.000_001, 1.0),
         RelPredicate::Or(predicates) => predicates
             .iter()
-            .map(|predicate| estimate_filter_selectivity(stats, predicate))
+            .map(|predicate| estimate_filter_selectivity(stats, predicate, schema))
             .sum::<f64>()
             .clamp(0.000_001, 1.0),
+    }
+}
+
+/// An upper bound implied by primary-key uniqueness, independent of sampled
+/// cardinalities. It affects plan estimates only, never predicate evaluation.
+fn primary_key_upper_bound(filter: &RelPredicate, primary_key: usize) -> Option<u64> {
+    match filter {
+        RelPredicate::Eq {
+            expression: RelIndexExpression::Column(column),
+            ..
+        } if *column == primary_key => Some(1),
+        RelPredicate::Eq { .. } => None,
+        RelPredicate::And(predicates) => predicates
+            .iter()
+            .filter_map(|predicate| primary_key_upper_bound(predicate, primary_key))
+            .min(),
+        RelPredicate::Or(predicates) => predicates.iter().try_fold(0_u64, |total, predicate| {
+            primary_key_upper_bound(predicate, primary_key).map(|bound| total.saturating_add(bound))
+        }),
     }
 }
 
@@ -730,6 +839,20 @@ fn predicate_implies(query: &RelPredicate, required: &RelPredicate) -> bool {
 }
 
 impl AccessPath {
+    /// Whether cardinality contains an estimate. The legacy numeric accessor
+    /// returns zero for a metadata-only logical plan; SQL EXPLAIN emits NULL.
+    #[must_use]
+    pub const fn has_estimates(&self) -> bool {
+        !matches!(self, Self::DataFusionPlan)
+    }
+
+    /// Whether a cost model supplied a cost. Range diagnostics currently have
+    /// cardinality bounds but no calibrated cost; SQL EXPLAIN emits NULL.
+    #[must_use]
+    pub const fn has_cost_estimate(&self) -> bool {
+        !matches!(self, Self::DataFusionPlan | Self::PrimaryKeyRange { .. })
+    }
+
     #[must_use]
     pub const fn cost(&self) -> Cost {
         match self {
@@ -740,6 +863,7 @@ impl AccessPath {
             | Self::BitmapIndex { cost, .. }
             | Self::ColumnarScan { cost, .. }
             | Self::KnnFirst { cost, .. } => *cost,
+            Self::DataFusionPlan => Cost(0.0),
         }
     }
 
@@ -753,6 +877,7 @@ impl AccessPath {
             | Self::BitmapIndex { estimated_rows, .. }
             | Self::ColumnarScan { estimated_rows, .. }
             | Self::KnnFirst { estimated_rows, .. } => *estimated_rows,
+            Self::DataFusionPlan => 0,
         }
     }
 
@@ -775,6 +900,7 @@ impl AccessPath {
             }
             Self::ColumnarScan { .. } => "columnar_scan".to_owned(),
             Self::KnnFirst { index_id, .. } => format!("knn_first:{index_id}"),
+            Self::DataFusionPlan => "datafusion_logical_plan".to_owned(),
         }
     }
 }
@@ -1431,6 +1557,9 @@ fn usize_to_f64(value: usize) -> f64 {
 fn u64_to_f64(value: u64) -> f64 {
     value as f64
 }
+
+#[cfg(test)]
+mod cardinality_tests;
 
 #[cfg(test)]
 mod tests {

@@ -4,6 +4,11 @@ Public preview means MultiDB has an installable, repeatable starter path with
 clear support boundaries. It is not a claim that every planned distributed
 feature is production-ready.
 
+The preview `tensor_dataset` profile adds typed tensor storage and hardware GPU
+search/reductions. Its device requirements, API and current operation limits are
+documented in [tensor-datasets.md](tensor-datasets.md). Creating or opening that
+profile without a supported GPU fails before opening its writable storage engine.
+
 ## Install And Verify
 
 Download the release binary for your platform, `SHA256SUMS`,
@@ -71,10 +76,10 @@ applies it, `config drift` exits 3 when the database no longer matches and
 templates emit version 2 specs with the physical parameters provisioning
 needs (document index paths, the 1536-dimension ai-memory vectors, time-series
 chunks and the analytics table columns), so `init --template <t> --apply`
-builds every template on the CLI except `secure-saas`: it asks for
-encryption at rest, which is provisioned through the Rust API only, so its
-plan is blocked with `GUARANTEE_NOT_ENFORCEABLE` (exit 2) and the files are
-kept. Values fixed at creation, such as the vector `dim`, are edited before
+builds every template on the CLI. `secure-saas` additionally requires an
+existing encryption key file selected by `MULTIDB_ENCRYPTION_KEY_PATH`; without
+it the plan is blocked with `GUARANTEE_NOT_ENFORCEABLE` (exit 2) and the files
+are kept. Values fixed at creation, such as the vector `dim`, are edited before
 `--apply`. A CLI plan reports audit as `enforced_with_development_key` and
 backup and PITR as `operator_managed` only when the spec asks for them.
 Version 1 specs, including the frozen copies of the earlier templates under
@@ -103,6 +108,15 @@ To smoke a release binary directly:
 ```powershell
 .\scripts\preview-smoke.ps1 -Bin .\target\release\multidb.exe
 ```
+
+## GraphRAG
+
+Retrieve cited context from vector seeds and graph-linked passages through
+`POST /api/graphrag/query` or the Rust API and SDKs. Create passage vectors,
+connect their returned document ids with `POST /api/data/graphs/{name}/edges`,
+then query with bounded nodes, edges, depth and context bytes. GraphRAG applies
+metadata policies before traversal and supports native bounded-scan backends;
+AP and sharded handles are outside this preview. See [graphrag.md](graphrag.md).
 
 ## Profiles
 
@@ -156,9 +170,8 @@ multidb profile knobs
 - Every `--profile` flag and `MULTIDB_PROFILE` accept a storage profile name
   (as before), a product slug or alias in snake or kebab case, or `auto`,
   which reads the storage profile of the existing database without writing
-  it. A database that was not closed cleanly (`serve` has no graceful
-  shutdown, so this follows every stop by a signal) first gets redb's crash
-  recovery, as with a named profile; `profile show --db` never writes and
+  it. A database that was not closed cleanly (for example after SIGKILL or a
+  crash) first gets redb's crash recovery, as with a named profile; `profile show --db` never writes and
   reports it as needing recovery. The CLI and `serve` open single-node CP
   databases only, so an AP database fails with `ReplicationMismatch` with
   `auto` as with a named profile. `restore` does not accept `auto`, because
@@ -239,10 +252,10 @@ Consistency status:
   data migrations. Provisioning (`config apply --spec`, `init --apply`,
   `multidb serve` spec mode and the `/provision/*` Control Plane endpoints) is
   a preview for embedded and single-node CP databases: it creates and adopts
-  objects, roles and the profile, never drops or alters them, and refuses
-  encryption at rest outside the Rust API. The built-in templates are
-  provisionable on the CLI except `secure-saas`, which asks for encryption at
-  rest; a vector `dim` or table columns are fixed at creation, so edit them
+  objects, roles and the profile, never drops or alters them. Encryption at
+  rest is supported through the Rust API and through CLI/serve with an explicit
+  `MULTIDB_ENCRYPTION_KEY_PATH`. The built-in `secure-saas` template requires
+  that key file; a vector `dim` or table columns are fixed at creation, so edit them
   before `init --apply`.
 - Studio v1 is read-only plus validation, catalog, advice and migration dry-run.
 - Mongo wire protocol, full PostgreSQL compatibility, public marketplace,
@@ -250,36 +263,88 @@ Consistency status:
 - The release performance baseline is a versioned smoke gate, not a dedicated
   production-hardware benchmark claim.
 - Workload-profiler statistics (`system.workload`, index advice and the Runtime
-  Advisor) are advisory. They are buffered in memory and flushed in batches;
-  the 10-second age trigger is checked on the next statement, not by a
-  background task. Samples buffered since the last flush are lost on crash or
-  when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
-  AP and sharded databases do not flush on drop.
+  Advisor) are advisory. `serve` and `admin serve` flush buffered samples every
+  10 seconds and after draining connections on SIGINT/SIGTERM. A crash or forced
+  kill can still lose the latest samples. Embedded applications should flush
+  explicitly; CP, AP and sharded handles do not flush on drop.
 - `multidb serve` runs statements concurrently, but catalog changes and
   security updates take an exclusive database lock, so a long statement or
   `/catalog` scan delays them and the requests queued behind them. The query
   governor defaults to 4 x CPUs concurrent statements and a 100 ms queue;
   `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` change
-  it for `multidb serve` but not for `multidb admin serve`. `/catalog` row
-  counts still read every row. Under steady commit traffic, filtered columnar
-  scans often skip zone-map pruning and decode every segment. Each columnar
-  `INSERT` rewrites the whole table, so
-  concurrent inserts into one columnar table retry and effectively run one at
-  a time.
-- Time-series retention follows the server wall clock and is enforced at chunk
-  granularity only when a series receives a write, so idle series keep expired
-  chunks until their next write. Points more than `max_future_skew_millis`
+  it for `multidb serve` but not for `multidb admin serve`. `/catalog` exact
+  counts still scan row-layout keys and document collections; columnar tables
+  use segment metadata when available. Under steady commit traffic, filtered columnar
+  scans often skip zone-map pruning and decode every segment. Plain columnar
+  inserts append to the tail instead of rewriting every segment, but still
+  validate primary-key uniqueness against existing segments. Concurrent inserts
+  retry on conflicts; updates and conflict-update inserts can rewrite the table.
+- Time-series retention follows the server wall clock at chunk granularity.
+  Writes prune their series; `serve` and `admin serve` also sweep idle series in
+  bounded batches. Embedded applications can call `sweep_time_series_retention`.
+  Sweeping uses conditional deletes so it cannot remove concurrently replaced
+  chunks. Points more than `max_future_skew_millis`
   (default 5 minutes for new collections) ahead of the server clock, or older
   than the retention window, are rejected.
-- Workload-profiler statistics (`system.workload`, index advice and the Runtime
-  Advisor) are advisory. They are buffered in memory and flushed in batches;
-  the 10-second age trigger is checked on the next statement, not by a
-  background task. Samples buffered since the last flush are lost on crash or
-  when `multidb serve` stops, because there is no graceful-shutdown flush. CP,
-  AP and sharded databases do not flush on drop.
-- History GC (`multidb maintenance gc`) is manual and offline; `multidb serve`
-  does not run it online or in the background yet. Commit-log truncation
-  requires a new full backup afterwards.
+- History GC is opt-in. `MULTIDB_HISTORY_RETAIN_LSNS=<positive count>` enables
+  bounded online MVCC pruning in `serve`, preserving active AS OF pins and the
+  commit log. The embedded API is `gc_history_online`. Commit-log truncation
+  remains offline through `multidb maintenance gc` and requires a new full backup
+  afterwards. GC does not shrink the redb file or remove encryption version
+  markers.
+- SQL reads under RBAC (pgwire with RBAC, Control Plane `/sql`, `query_as`,
+  `query_as_of_as`) are authorized against the planned query, including every
+  subquery and CTE, before anything executes; a multi-statement batch runs
+  nothing until all of its reads are authorized. Collections need Collection
+  read; tables, foreign tables, materialized views and `*_history` tables need
+  Table read, keyed by the catalog name the query resolves to (unquoted names
+  are lowercased, so `ORDERS` reads `orders`). Queries that scan no catalog
+  object (`SELECT 1`, `VALUES`) or call table functions such as
+  `generate_series` need Database read. The RBAC pre-check counts a recursive
+  CTE's reference to itself as a read of a table named like the CTE, so
+  recursive CTEs need Database read too (a denial names the CTE).
+  `information_schema` is readable under RBAC only as
+  `SELECT * FROM information_schema.tables` or
+  `SELECT * FROM information_schema.columns`, with Database read; other
+  queries of it are refused as unsupported. `INSERT ... RETURNING` needs Read
+  as well as Write on its table. SQL shapes the RBAC pre-check cannot analyse
+  fail closed as unsupported SQL.
+- Row and masking policies apply to SQL run as a principal where the query scans
+  each table, before any filter, join, aggregate or subquery reads it, so they
+  hold whatever the query computes from the table. Collection row policies
+  are decided on each stored document, as for changefeeds, so a document
+  without the policy's path or with a value of another type stays hidden
+  although SQL reads it as NULL; a collection mask covers the columns that
+  read its path or a path below it. A masked column takes the type of its
+  replacement; a replacement that is not a scalar makes SQL reads of the
+  table fail. `EXPLAIN` of a table with such policies,
+  `INSERT ... RETURNING` into one, and `match()` / `within_radius()` searches
+  over a collection with them are refused. Each scan
+  of such a table reads all of the rows its row policies let through before
+  the query filters them, primary-key lookups included. A table's policies
+  also apply to its `*_history` table, by column name, on top of the history
+  table's own. Principal reads of a materialized view are refused while its
+  source has row or masking policies, since filtering aggregates afterwards
+  cannot reconstruct the protected source. Principal creation of such a view
+  is also refused. Control Plane data routes `GET /data/tables/{name}/rows` and
+  `GET /data/collections/{name}/documents`, including SDK and Studio callers,
+  apply row and masking policies before visible-result pagination. A row policy
+  currently requires a full scan; corrupt policies and unsupported table masks
+  fail closed. Pgwire Describe uses authorized metadata-only planning and never
+  executes the described statement.
+- Principal changefeeds suppress FTS/geo index events when source Read is missing
+  or the source has row/masking policies. Protected deletes are omitted because
+  the log contains no old row to authorize; table events whose primary key is
+  masked are omitted so their raw keys cannot leak. Principal-bound subscriptions
+  require `push_subscription_once_as` or `SubscriptionWorker::start_as`; raw
+  workers reject them. Use the `*_for_user` variants when registry mapping
+  changes must take effect between polls. Legacy subscriptions without an explicit trust marker fail closed; a
+  System:Admin operator can bind them with `adopt_subscription_as` without
+  resetting their ACK. Explicitly trusted subscriptions remain operator APIs. State reads and ACKs
+  through principal APIs require the matching owner. Continuous queries created
+  as a principal also bind their underlying subscription.
+- Workload and tuning SQL views, and `workload_report_as`, require `System:Admin`.
+  `Database:Read` and `System:Read` no longer expose those metadata surfaces.
 
 ## Migration Guide
 

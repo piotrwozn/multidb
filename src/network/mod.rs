@@ -9,10 +9,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use futures::{Sink, stream};
 use pgwire::{
     api::{
-        ClientInfo, ClientPortalStore, METADATA_USER, PgWireServerHandlers, Type,
+        ClientInfo, ClientPortalStore, METADATA_USER, PgWireConnectionState, PgWireServerHandlers,
+        Type,
         auth::{
             AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
             sasl::{
@@ -31,21 +33,13 @@ use pgwire::{
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage},
-    tokio::process_socket,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use sqlparser::{
-    ast::{
-        Expr as SqlExpr, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor,
-    },
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
 use tokio::{
     net::TcpListener,
     sync::RwLock,
     sync::Semaphore,
-    task::{JoinError, spawn_blocking},
+    task::{JoinError, JoinSet, spawn_blocking},
 };
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 
@@ -54,8 +48,10 @@ use crate::{
     db::DbError,
     model::Value,
     observability,
-    query::{ColumnType, Row, SqlOutput, SqlRows},
+    query::{Row, SqlOutput, SqlRows},
 };
+
+mod session;
 
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
 const DEFAULT_BLOCKING_TASKS: usize = 32;
@@ -66,6 +62,8 @@ const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_AUTH_FAILURE_LIMIT: usize = 10;
 const DEFAULT_AUTH_FAILURE_WINDOW_MS: u64 = 60_000;
+const MAX_AUTH_RATE_KEYS: usize = 65_536;
+const MAX_AUTH_USERNAME_BYTES: usize = 256;
 
 #[derive(Clone)]
 pub struct NetworkConfig {
@@ -73,9 +71,15 @@ pub struct NetworkConfig {
     pub auth: AuthConfig,
     pub max_blocking_tasks: usize,
     pub max_connections: usize,
+    /// Maximum processing time for one protocol request (including response writes).
+    /// This used to cap the entire session; active sessions now have no total lifetime cap.
+    /// The database query execution/queue budgets are enforced independently.
     pub connection_timeout_ms: u64,
+    /// Total TLS/startup/SCRAM deadline, shared across all handshake messages.
     pub handshake_timeout_ms: u64,
+    /// Deadline for receiving one next frame, never time spent executing a query.
     pub idle_timeout_ms: u64,
+    /// Maximum declared frontend frame length; upstream type-specific limits also apply.
     pub max_frame_bytes: usize,
     pub auth_failure_limit: usize,
     pub auth_failure_window_ms: u64,
@@ -156,6 +160,7 @@ struct DbStartupHandler {
     startup_error: Option<String>,
     tls_required: bool,
     auth_limiter: AuthRateLimiter,
+    pending_auth: StdMutex<Option<AuthAttempt>>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,7 +184,45 @@ struct AuthRateKey {
 #[derive(Clone, Copy, Debug)]
 struct AuthRateEntry {
     window_start: Instant,
-    attempts: usize,
+    failures: usize,
+    in_flight: usize,
+}
+
+struct AuthAttempt {
+    limiter: AuthRateLimiter,
+    key: AuthRateKey,
+    completed: bool,
+}
+
+impl AuthAttempt {
+    fn succeed(mut self) {
+        self.complete(false);
+    }
+
+    fn complete(&mut self, failed: bool) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Ok(mut state) = self.limiter.state.lock()
+            && let Some(entry) = state.get_mut(&self.key)
+        {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            if failed {
+                entry.failures = entry.failures.saturating_add(1);
+            }
+            if entry.in_flight == 0 && entry.failures == 0 {
+                state.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl Drop for AuthAttempt {
+    fn drop(&mut self) {
+        // Failed or abandoned SCRAM exchanges consume the reserved failure budget.
+        self.complete(true);
+    }
 }
 
 /// Database handle shared between `PostgreSQL` wire and other in-process servers.
@@ -224,6 +267,8 @@ impl NetworkConfig {
         self
     }
 
+    /// Sets the per-protocol-request processing ceiling, not the session lifetime.
+    /// Handshake and idle limits have their own settings; the database owns query budgets.
     #[must_use]
     pub const fn with_connection_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.connection_timeout_ms = timeout_ms;
@@ -406,7 +451,16 @@ impl AuthRateLimiter {
         }
     }
 
-    fn record_attempt(&self, ip: std::net::IpAddr, user: &str) -> Result<(), NetworkError> {
+    fn reserve_attempt(
+        &self,
+        ip: std::net::IpAddr,
+        user: &str,
+    ) -> Result<AuthAttempt, NetworkError> {
+        if user.len() > MAX_AUTH_USERNAME_BYTES {
+            return Err(NetworkError::Auth(
+                "authentication username is too long".to_owned(),
+            ));
+        }
         let key = AuthRateKey {
             ip,
             user: user.to_owned(),
@@ -416,21 +470,37 @@ impl AuthRateLimiter {
             .state
             .lock()
             .map_err(|_| NetworkError::Runtime("auth rate limiter lock poisoned".to_owned()))?;
-        let entry = state.entry(key).or_insert(AuthRateEntry {
+        if !state.contains_key(&key) && state.len() >= MAX_AUTH_RATE_KEYS {
+            state.retain(|_, entry| {
+                entry.in_flight > 0 || now.duration_since(entry.window_start) < self.window
+            });
+            if state.len() >= MAX_AUTH_RATE_KEYS {
+                return Err(NetworkError::Auth(
+                    "authentication rate limit exceeded".to_owned(),
+                ));
+            }
+        }
+        let entry = state.entry(key.clone()).or_insert(AuthRateEntry {
             window_start: now,
-            attempts: 0,
+            failures: 0,
+            in_flight: 0,
         });
         if now.duration_since(entry.window_start) >= self.window {
             entry.window_start = now;
-            entry.attempts = 0;
+            entry.failures = 0;
         }
-        entry.attempts = entry.attempts.saturating_add(1);
-        if entry.attempts > self.limit {
+        // Reserve before verification so concurrent bad proofs cannot outrun the limit.
+        if entry.failures.saturating_add(entry.in_flight) >= self.limit {
             return Err(NetworkError::Auth(
                 "authentication rate limit exceeded".to_owned(),
             ));
         }
-        Ok(())
+        entry.in_flight += 1;
+        Ok(AuthAttempt {
+            limiter: self.clone(),
+            key,
+            completed: false,
+        })
     }
 }
 
@@ -525,15 +595,28 @@ impl PgServer {
             TlsMode::DisabledForTests => None,
         };
         let max_connections = config.max_connections.max(1);
-        let connection_timeout_ms = config.connection_timeout_ms.max(1);
-        let connection_timeout = Duration::from_millis(connection_timeout_ms);
+        let session_limits = session::SessionLimits::from_config(&config);
         let connection_permits = Arc::new(Semaphore::new(max_connections));
+        let blocking_tasks = u32::try_from(config.max_blocking_tasks.max(1))
+            .map_err(|_| NetworkError::Runtime("max_blocking_tasks exceeds u32".to_owned()))?;
         let factory = Arc::new(DbPgFactory::new(database, config));
+        let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                () = &mut shutdown => return Ok(()),
+                () = &mut shutdown => {
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                    // Aborting socket tasks does not cancel their spawn_blocking work.
+                    // Every queued/running database operation owns one of these permits;
+                    // acquiring all of them drains that work before the caller flushes.
+                    let _drained = Arc::clone(&factory.handler.executor.permits)
+                        .acquire_many_owned(blocking_tasks).await
+                        .map_err(|error| NetworkError::Runtime(error.to_string()))?;
+                    return Ok(());
+                },
+                _ = connections.join_next(), if !connections.is_empty() => {},
                 accepted = listener.accept() => {
                     let (socket, _) = accepted?;
                     let tls_acceptor = tls_acceptor.clone();
@@ -543,24 +626,10 @@ impl PgServer {
                         tracing::warn!(max_connections, "pgwire connection limit reached");
                         continue;
                     };
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _permit = permit;
-                        match tokio::time::timeout(
-                            connection_timeout,
-                            process_socket(socket, tls_acceptor, factory),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                tracing::warn!(error = %error, "pgwire connection failed");
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    timeout_ms = connection_timeout_ms,
-                                    "pgwire connection timed out"
-                                );
-                            }
+                        if let Err(error) = session::process_socket(socket, tls_acceptor, factory, session_limits).await {
+                            tracing::warn!(%error, "pgwire connection failed");
                         }
                     });
                 }
@@ -577,7 +646,11 @@ impl BlockingDbExecutor {
         }
     }
 
-    async fn fields_from_select_sql(&self, sql: String) -> PgWireResult<Option<Vec<FieldInfo>>> {
+    async fn describe_sql_as_user(
+        &self,
+        user: String,
+        sql: String,
+    ) -> PgWireResult<Option<SchemaRef>> {
         let permit = self
             .permits
             .clone()
@@ -585,27 +658,25 @@ impl BlockingDbExecutor {
             .await
             .map_err(|error| network_to_pg(NetworkError::Runtime(error.to_string())))?;
         let database = self.database.clone();
-        let result = spawn_blocking(move || {
+        let runtime = tokio::runtime::Handle::current();
+        spawn_blocking(move || {
             let _permit = permit;
+            let describe = |database: &crate::db::Database| {
+                let principal = database.principal_for_user(&user);
+                runtime
+                    .block_on(database.describe_query_as(&principal, &sql))
+                    .map_err(|error| db_error_to_pg(&error))
+            };
             match database {
-                DatabaseHandle::Direct(database) => {
-                    fields_from_select_sql(&sql, &database).map_err(|error| error.to_string())
-                }
+                DatabaseHandle::Direct(database) => describe(&database),
                 DatabaseHandle::Shared(database) => {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| error.to_string())?;
                     let database = runtime.block_on(database.read());
-                    fields_from_select_sql(&sql, &database).map_err(|error| error.to_string())
+                    describe(&database)
                 }
             }
         })
         .await
-        .map_err(NetworkError::from)
-        .map_err(network_to_pg)?;
-
-        result.map_err(|error| pg_error("ERROR", "XX000", error))
+        .map_err(|error| network_to_pg(NetworkError::from(error)))?
     }
 
     async fn execute_sql_as_user(
@@ -623,13 +694,10 @@ impl BlockingDbExecutor {
             .map_err(|error| NetworkError::Runtime(error.to_string()))?;
         let database = self.database.clone();
         let user_for_query = user.clone();
+        let runtime = tokio::runtime::Handle::current();
 
         let result = spawn_blocking(move || {
             let _permit = permit;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| NetworkError::Runtime(error.to_string()))?;
             if enforce_rbac {
                 match database {
                     DatabaseHandle::Direct(database) => {
@@ -736,6 +804,7 @@ impl DbStartupHandler {
             startup_error,
             tls_required,
             auth_limiter,
+            pending_auth: StdMutex::new(None),
         }
     }
 }
@@ -769,16 +838,43 @@ impl StartupHandler for DbStartupHandler {
                 .parameters
                 .get("user")
                 .map_or("unknown", String::as_str);
-            self.auth_limiter
-                .record_attempt(client.socket_addr().ip(), user)
+            let attempt = self
+                .auth_limiter
+                .reserve_attempt(client.socket_addr().ip(), user)
                 .map_err(|error| pg_error("FATAL", "28000", error.to_string()))?;
+            let mut pending = self
+                .pending_auth
+                .lock()
+                .map_err(|_| pg_error("FATAL", "08006", "authentication state lock poisoned"))?;
+            if pending.is_some() {
+                return Err(pg_error(
+                    "FATAL",
+                    "08P01",
+                    "authentication is already in progress",
+                ));
+            }
+            *pending = Some(attempt);
         }
 
         let Some(inner) = &self.inner else {
             return Err(pg_error("FATAL", "08006", "startup handler is unavailable"));
         };
 
-        inner.on_startup(client, message).await
+        let result = inner.on_startup(client, message).await;
+        if result.is_err() || matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            let attempt = self
+                .pending_auth
+                .lock()
+                .map_err(|_| pg_error("FATAL", "08006", "authentication state lock poisoned"))?
+                .take();
+            // On error, dropping the attempt records the failed exchange.
+            if let Some(attempt) = attempt
+                && result.is_ok()
+            {
+                attempt.succeed();
+            }
+        }
+        result
     }
 }
 
@@ -842,40 +938,15 @@ impl ExtendedQueryHandler for DbPgHandler {
             .map(|ty| ty.clone().unwrap_or(Type::TEXT))
             .collect::<Vec<_>>();
 
-        if is_select_like(&target.statement)
-            && let Some(describe_sql) = describe_sql_for_statement(target)?
-        {
-            let output = self
-                .executor
-                .execute_sql_as_user(client_user(client), describe_sql, true)
-                .await
-                .map_err(network_to_pg)?;
-            if let SqlOutput::Rows(rows) = output {
-                if rows.columns.is_empty()
-                    && let Some(fields) = self
-                        .executor
-                        .fields_from_select_sql(target.statement.clone())
-                        .await?
-                {
-                    return Ok(DescribeStatementResponse::new(parameters, fields));
-                }
-                return Ok(DescribeStatementResponse::new(
-                    parameters,
-                    fields_for_rows(&rows, None),
-                ));
-            }
-        }
-
-        if is_select_like(&target.statement)
-            && let Some(fields) = self
-                .executor
-                .fields_from_select_sql(target.statement.clone())
-                .await?
-        {
-            return Ok(DescribeStatementResponse::new(parameters, fields));
-        }
-
-        Ok(DescribeStatementResponse::new(parameters, Vec::new()))
+        let sql = describe_sql_for_statement(target)?.unwrap_or_else(|| target.statement.clone());
+        let schema = self
+            .executor
+            .describe_sql_as_user(client_user(client), sql)
+            .await?;
+        let fields = schema
+            .as_ref()
+            .map_or_else(Vec::new, |schema| fields_for_schema(schema, None));
+        Ok(DescribeStatementResponse::new(parameters, fields))
     }
 
     async fn do_describe_portal<C>(
@@ -890,23 +961,17 @@ impl ExtendedQueryHandler for DbPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = substitute_portal_params(target)?;
-        if !is_select_like(&sql) {
-            return Ok(DescribePortalResponse::no_data());
-        }
-
-        let output = self
+        let schema = self
             .executor
-            .execute_sql_as_user(client_user(client), sql, true)
-            .await
-            .map_err(network_to_pg)?;
-        if let SqlOutput::Rows(rows) = output {
-            return Ok(DescribePortalResponse::new(fields_for_rows(
-                &rows,
+            .describe_sql_as_user(client_user(client), sql)
+            .await?;
+        match schema {
+            Some(schema) => Ok(DescribePortalResponse::new(fields_for_schema(
+                &schema,
                 Some(&target.result_column_format),
-            )));
+            ))),
+            None => Ok(DescribePortalResponse::no_data()),
         }
-
-        Ok(DescribePortalResponse::no_data())
     }
 
     async fn do_query<C>(
@@ -1047,143 +1112,43 @@ fn pg_type_for_value(value: &Value) -> Type {
     }
 }
 
-fn fields_from_select_sql(
-    sql: &str,
-    database: &crate::db::Database,
-) -> PgWireResult<Option<Vec<FieldInfo>>> {
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .map_err(|error| pg_error("ERROR", "42601", error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(from) = select.from.first() else {
-        return Ok(None);
-    };
-    let TableFactor::Table { name, .. } = &from.relation else {
-        return Ok(None);
-    };
-    let table_name = object_name_to_string(name)?;
-    let table = database
-        .table(&table_name)
-        .map_err(|error| db_error_to_pg(&error))?;
-    let Some(schema) = table.schema() else {
-        return Ok(None);
-    };
-
-    let mut fields = Vec::new();
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                fields.extend(schema.columns.iter().map(|column| {
-                    FieldInfo::new(
-                        column.name.clone(),
-                        None,
-                        None,
-                        pg_type_for_column_type(&column.ty),
-                        FieldFormat::Text,
-                    )
-                }));
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                if let Some(field) = field_for_expr(expr, schema, None)? {
-                    fields.push(field);
-                }
-            }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                if let Some(field) = field_for_expr(expr, schema, Some(alias.value.clone()))? {
-                    fields.push(field);
-                }
-            }
-            SelectItem::ExprWithAliases { .. } => return Ok(None),
-        }
-    }
-
-    Ok((!fields.is_empty()).then_some(fields))
-}
-
-fn field_for_expr(
-    expr: &SqlExpr,
-    schema: &crate::query::TableSchema,
-    alias: Option<String>,
-) -> PgWireResult<Option<FieldInfo>> {
-    let Some((name, ty)) = expr_name_and_type(expr, schema)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(FieldInfo::new(
-        alias.unwrap_or(name),
-        None,
-        None,
-        ty,
-        FieldFormat::Text,
-    )))
-}
-
-fn expr_name_and_type(
-    expr: &SqlExpr,
-    schema: &crate::query::TableSchema,
-) -> PgWireResult<Option<(String, Type)>> {
-    match expr {
-        SqlExpr::Identifier(identifier) => {
-            let column = schema
-                .columns
-                .iter()
-                .find(|column| column.name == identifier.value)
-                .ok_or_else(|| {
-                    pg_error(
-                        "ERROR",
-                        "42703",
-                        format!("missing column {}", identifier.value),
-                    )
-                })?;
-            Ok(Some((
-                column.name.clone(),
-                pg_type_for_column_type(&column.ty),
-            )))
-        }
-        SqlExpr::CompoundIdentifier(parts) => {
-            let Some(identifier) = parts.last() else {
-                return Ok(None);
+fn fields_for_schema(schema: &SchemaRef, result_format: Option<&Format>) -> Vec<FieldInfo> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let ty = match field.data_type() {
+                DataType::Boolean => Type::BOOL,
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => Type::INT8,
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => Type::FLOAT8,
+                DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_) => Type::BYTEA,
+                DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Struct(_)
+                | DataType::Map(_, _) => Type::JSONB,
+                _ => Type::TEXT,
             };
-            expr_name_and_type(&SqlExpr::Identifier(identifier.clone()), schema)
-        }
-        SqlExpr::Function(function) => {
-            let name = function.name.to_string();
-            let ty = if name.eq_ignore_ascii_case("count") {
-                Type::INT8
-            } else if name.eq_ignore_ascii_case("avg") {
-                Type::FLOAT8
-            } else {
-                Type::TEXT
-            };
-            Ok(Some((name, ty)))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn pg_type_for_column_type(ty: &ColumnType) -> Type {
-    match ty {
-        ColumnType::Int => Type::INT8,
-        ColumnType::Float => Type::FLOAT8,
-        ColumnType::Str | ColumnType::Null => Type::TEXT,
-        ColumnType::Bool => Type::BOOL,
-        ColumnType::Bytes => Type::BYTEA,
-    }
-}
-
-fn object_name_to_string(name: &ObjectName) -> PgWireResult<String> {
-    let [part] = name.0.as_slice() else {
-        return Err(pg_error("ERROR", "0A000", name.to_string()));
-    };
-
-    match part {
-        ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
-        ObjectNamePart::Function(_) => Err(pg_error("ERROR", "0A000", name.to_string())),
-    }
+            FieldInfo::new(
+                field.name().clone(),
+                None,
+                None,
+                ty,
+                result_format.map_or(FieldFormat::Text, |format| format.format_for(index)),
+            )
+        })
+        .collect()
 }
 
 fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
@@ -1341,10 +1306,6 @@ fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
 }
 
-fn is_select_like(sql: &str) -> bool {
-    starts_with_keyword(sql, "select") || starts_with_keyword(sql, "with")
-}
-
 fn contains_dollar_param(sql: &str) -> bool {
     let mut chars = sql.chars().peekable();
 
@@ -1471,18 +1432,273 @@ mod tests {
     }
 
     #[test]
-    fn auth_rate_limiter_rejects_repeated_attempts() -> Result<(), Box<dyn std::error::Error>> {
+    fn auth_rate_limiter_rejects_failed_exchanges() -> Result<(), Box<dyn std::error::Error>> {
         let limiter = super::AuthRateLimiter::new(2, 60_000);
         let ip = "127.0.0.1".parse()?;
 
-        assert!(limiter.record_attempt(ip, "alice").is_ok());
-        assert!(limiter.record_attempt(ip, "alice").is_ok());
+        drop(limiter.reserve_attempt(ip, "alice")?);
+        drop(limiter.reserve_attempt(ip, "alice")?);
         assert!(matches!(
-            limiter.record_attempt(ip, "alice"),
+            limiter.reserve_attempt(ip, "alice"),
             Err(NetworkError::Auth(_))
         ));
-        assert!(limiter.record_attempt(ip, "bob").is_ok());
+        limiter.reserve_attempt(ip, "bob")?.succeed();
         Ok(())
+    }
+
+    #[test]
+    fn successful_authentication_releases_its_reservation_without_spending_failure_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = super::AuthRateLimiter::new(2, 60_000);
+        let ip = "127.0.0.1".parse()?;
+        for _ in 0..20 {
+            limiter.reserve_attempt(ip, "alice")?.succeed();
+        }
+        assert_eq!(
+            limiter.state.lock().map_err(|_| "limiter poisoned")?.len(),
+            0
+        );
+        let first = limiter.reserve_attempt(ip, "alice")?;
+        let second = limiter.reserve_attempt(ip, "alice")?;
+        assert!(limiter.reserve_attempt(ip, "alice").is_err());
+        first.succeed();
+        let third = limiter.reserve_attempt(ip, "alice")?;
+        drop(second);
+        drop(third);
+        assert!(limiter.reserve_attempt(ip, "alice").is_err());
+        assert!(limiter.reserve_attempt(ip, &"u".repeat(257)).is_err());
+        Ok(())
+    }
+
+    async fn plain_client(
+        addr: std::net::SocketAddr,
+        password: &str,
+    ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let (client, connection) = tokio_postgres::Config::new()
+            .host("127.0.0.1")
+            .port(addr.port())
+            .user("alice")
+            .password(password)
+            .dbname("multidb")
+            .ssl_mode(SslMode::Disable)
+            .connect(tokio_postgres::NoTls)
+            .await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    async fn start_session_test_server(
+        config: NetworkConfig,
+    ) -> Result<TestServer, Box<dyn std::error::Error>> {
+        let database = Arc::new(shared_users_database()?);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown, receive) = oneshot::channel();
+        let handle = tokio::spawn(PgServer::serve_until_shutdown(
+            listener,
+            database,
+            config,
+            async {
+                let _ = receive.await;
+            },
+        ));
+        Ok(TestServer {
+            addr,
+            shutdown,
+            handle,
+        })
+    }
+
+    #[tokio::test]
+    async fn active_session_outlives_request_ceiling_but_idle_session_expires()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_connection_timeout_ms(250)
+            .with_handshake_timeout_ms(2_000)
+            .with_idle_timeout_ms(150);
+        let server = start_session_test_server(config).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        // Six individually short requests span more than the former total-session ceiling.
+        for _ in 0..6 {
+            assert_eq!(
+                client.simple_query("select name from users").await?.len(),
+                3
+            );
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(client.simple_query("select name from users").await.is_err());
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_budget_is_suspended_while_a_request_waits_for_database_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (stop, receive) = oneshot::channel();
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_connection_timeout_ms(2_000)
+            .with_handshake_timeout_ms(2_000)
+            .with_idle_timeout_ms(50);
+        let task = tokio::spawn(PgServer::serve_shared_until_shutdown(
+            listener,
+            Arc::clone(&database),
+            config,
+            async {
+                let _ = receive.await;
+            },
+        ));
+        let client = Arc::new(plain_client(addr, "secret").await?);
+        let writer = database.write().await;
+        let query = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.simple_query("select name from users").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(writer);
+        assert_eq!(query.await??.len(), 3);
+        assert_eq!(
+            client.simple_query("select name from users").await?.len(),
+            3
+        );
+        let _ = stop.send(());
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_processing_ceiling_closes_a_blocked_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (stop, receive) = oneshot::channel();
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_connection_timeout_ms(100)
+            .with_handshake_timeout_ms(2_000)
+            .with_idle_timeout_ms(2_000);
+        let task = tokio::spawn(PgServer::serve_shared_until_shutdown(
+            listener,
+            Arc::clone(&database),
+            config,
+            async {
+                let _ = receive.await;
+            },
+        ));
+        let client = plain_client(addr, "secret").await?;
+        let writer = database.write().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.simple_query("select name from users"),
+        )
+        .await?;
+        assert!(result.is_err());
+        // Timed-out socket work may already be running in spawn_blocking. Release
+        // its database lock before graceful shutdown drains the executor permits.
+        drop(writer);
+        let _ = stop.send(());
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_and_frontend_frame_cap_apply_to_real_sockets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncReadExt;
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_handshake_timeout_ms(100)
+            .with_max_frame_bytes(1024);
+        let server = start_session_test_server(config).await?;
+        let mut stalled = tokio::net::TcpStream::connect(server.addr).await?;
+        let mut byte = [0_u8];
+        let read = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte)).await??;
+        assert_eq!(read, 0);
+        let client = plain_client(server.addr, "secret").await?;
+        client.simple_query("select name from users").await?;
+        assert!(
+            client
+                .simple_query(&format!("SELECT '{}'", "x".repeat(2048)))
+                .await
+                .is_err()
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_pgwire_logins_do_not_trigger_failed_authentication_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_auth_failure_limit(2, 60_000);
+        let server = start_session_test_server(config).await?;
+        for _ in 0..12 {
+            plain_client(server.addr, "secret")
+                .await?
+                .simple_query("select name from users")
+                .await?;
+        }
+        assert!(plain_client(server.addr, "wrong").await.is_err());
+        // A valid login still fits the one remaining failure slot, and does not spend it.
+        plain_client(server.addr, "secret")
+            .await?
+            .simple_query("select name from users")
+            .await?;
+        assert!(plain_client(server.addr, "wrong").await.is_err());
+        let error = plain_client(server.addr, "secret")
+            .await
+            .err()
+            .ok_or("failed auth throttle was bypassed")?;
+        server.shutdown().await?;
+        let database_error = error
+            .as_db_error()
+            .ok_or_else(|| format!("expected a pgwire authentication rejection, got {error:?}"))?;
+        assert_eq!(database_error.code().code(), "28000");
+        assert!(
+            database_error
+                .message()
+                .contains("authentication rate limit exceeded"),
+            "unexpected authentication rejection: {database_error:?}"
+        );
+        Ok(())
+    }
+
+    async fn executor_uses_the_existing_runtime() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let executor = super::BlockingDbExecutor::new(super::DatabaseHandle::Shared(database), 2);
+        assert!(
+            executor
+                .describe_sql_as_user("alice".to_owned(), "select name from users".to_owned())
+                .await?
+                .is_some()
+        );
+        let output = executor
+            .execute_sql_as_user(
+                "alice".to_owned(),
+                "select name from users".to_owned(),
+                true,
+            )
+            .await?;
+        assert!(
+            matches!(output, crate::query::SqlOutput::Rows(rows) if rows.rows == vec![vec![Value::Str("Ada".to_owned())]])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_and_describe_work_on_an_existing_current_thread_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        executor_uses_the_existing_runtime().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_and_describe_work_on_an_existing_multi_thread_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        executor_uses_the_existing_runtime().await
     }
 
     #[tokio::test]
@@ -1575,6 +1791,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untyped_describe_requires_read_and_does_not_execute_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let TestTls {
+            server,
+            client_cert,
+        } = test_tls()?;
+        let mut database = shared_users_database()?;
+        database.create_table("secrets", Some(user_schema()), Vec::new())?;
+        let database = Arc::new(RwLock::new(database));
+        let server =
+            start_shared_test_server(TlsMode::Require(server), Arc::clone(&database)).await?;
+        let client = connect_client(server.addr, client_cert, "secret").await?;
+
+        // tokio-postgres prepare sends Parse with no parameter OIDs and Describe Statement.
+        // Previously the missing OIDs selected the schema fallback without checking RBAC.
+        let error = client
+            .prepare("select * from secrets where id = $1")
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("ungranted schema was disclosed"))?;
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        );
+        let statement = client
+            .prepare("select name, age from users where age = $1")
+            .await?;
+        assert_eq!(statement.columns()[0].name(), "name");
+        assert_eq!(
+            statement.columns()[1].type_(),
+            &tokio_postgres::types::Type::INT8
+        );
+
+        // There is a row with age=37. Preparing metadata must not evaluate its division by zero.
+        let statement = client
+            .prepare("select 10 / (age - 37) as quotient from users")
+            .await?;
+        assert_eq!(statement.columns()[0].name(), "quotient");
+        assert_eq!(
+            statement.columns()[0].type_(),
+            &tokio_postgres::types::Type::INT8
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn describe_executor_checks_current_grants() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let executor =
+            super::BlockingDbExecutor::new(super::DatabaseHandle::Shared(Arc::clone(&database)), 2);
+        let sql = "select name from users".to_owned();
+        assert!(
+            executor
+                .describe_sql_as_user("alice".to_owned(), sql.clone())
+                .await?
+                .is_some()
+        );
+        database
+            .write()
+            .await
+            .set_authz_policy(AuthzPolicy::new([]));
+        let error = executor
+            .describe_sql_as_user("alice".to_owned(), sql)
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("revoked schema was disclosed"))?;
+        let pgwire::error::PgWireError::UserError(info) = error else {
+            return Err(io::Error::other("expected authorization error").into());
+        };
+        assert_eq!(info.code, "42501");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn plaintext_is_rejected_when_tls_is_required() -> Result<(), Box<dyn std::error::Error>>
     {
         let TestTls { server, .. } = test_tls()?;
@@ -1658,6 +1949,20 @@ mod tests {
         assert_eq!(count, 1);
 
         server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_closes_idle_connections() -> Result<(), Box<dyn std::error::Error>> {
+        let TestTls {
+            server,
+            client_cert,
+        } = test_tls()?;
+        let server = start_test_server(TlsMode::Require(server)).await?;
+        let client = connect_client(server.addr, client_cert, "secret").await?;
+        client.simple_query("select name from users").await?;
+        tokio::time::timeout(Duration::from_secs(10), server.shutdown()).await??;
+        assert!(client.simple_query("select name from users").await.is_err());
         Ok(())
     }
 
