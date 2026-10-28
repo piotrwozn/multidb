@@ -71,8 +71,11 @@ The response includes typed sources, seed distances/depths, relationships and a
 `truncated` flag. Check that flag before passing context to your application or an
 LLM. Requests preserve the client's bearer token and optional principal header;
 authorization/validation failures return `ControlPlaneError` with server status,
-code and message. The default transport is blocking HTTP; custom transports can
-implement the existing `Transport` trait.
+code and message. The default transport supports HTTP and HTTPS with certificate verification, pooled
+connections, chunked responses, a 30-second total deadline and a 64 MiB response
+limit. Redirects are refused so bearer and principal headers cannot be replayed
+to another endpoint; configure the final API URL. Custom transports can implement
+the existing `Transport` trait.
 
 Run the deterministic transport tests without a server:
 

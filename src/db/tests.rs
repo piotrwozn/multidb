@@ -271,6 +271,18 @@ async fn rbac_enforces_analyze_and_explain_permissions() -> Result<(), Box<dyn s
         database.query_as(&reader, "ANALYZE users").await,
         Err(DbError::AuthzDenied(_))
     ));
+    // ANALYZE returns raw counts/distributions, so table administration alone
+    // cannot authorize reading them. Both independent permissions are required.
+    assert!(matches!(
+        database.query_as(&admin, "ANALYZE users").await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+        Role::new("table_admin")
+            .grant(Resource::Table("users".to_owned()), Permission::Admin)
+            .grant(Resource::Table("users".to_owned()), Permission::Read),
+    ]));
     assert!(matches!(
         database.query_as(&admin, "ANALYZE users").await?,
         SqlOutput::Rows(_)

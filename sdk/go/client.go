@@ -9,10 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const (
-	DefaultBaseURL          = "http://127.0.0.1:8080/api"
+	DefaultBaseURL         = "http://127.0.0.1:8080/api"
 	ControlPlaneAPIVersion = 1
 	MinMultiDBVersion      = "0.1.0"
 )
@@ -56,7 +57,10 @@ func WithHTTPClient(httpClient *http.Client) Option {
 }
 
 func NewClient(options ...Option) *Client {
-	client := &Client{baseURL: DefaultBaseURL, httpClient: http.DefaultClient}
+	client := &Client{baseURL: DefaultBaseURL, httpClient: &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 	for _, option := range options {
 		option(client)
 	}
@@ -355,6 +359,9 @@ func request[T any](client *Client, ctx context.Context, method, path string, bo
 	if !*envelope.OK {
 		return zero, &APIError{Status: status, Code: envelope.Error.Code, Message: envelope.Error.Message, Body: raw}
 	}
+	if (status < 200 || status >= 300) && !(status == 422 && (path == "/config/validate" || path == "/config/plan" || path == "/config/apply")) {
+		return zero, httpError(status, raw)
+	}
 	if len(envelope.Data) == 0 {
 		return zero, nil
 	}
@@ -370,6 +377,9 @@ func rawJSON[T any](client *Client, ctx context.Context, method, path string, bo
 	status, raw, err := client.send(ctx, method, path, body, auth)
 	if err != nil {
 		return zero, err
+	}
+	if (status < 200 || status >= 300) && !(path == "/ready" && status == 503) {
+		return zero, httpError(status, raw)
 	}
 	var data T
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -409,6 +419,9 @@ func (client *Client) send(ctx context.Context, method, path string, body any, a
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return resp.StatusCode, nil, err
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return resp.StatusCode, raw, httpError(resp.StatusCode, raw)
 	}
 	if resp.StatusCode >= 400 && len(raw) == 0 {
 		return resp.StatusCode, raw, httpError(resp.StatusCode, raw)

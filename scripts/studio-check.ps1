@@ -19,6 +19,7 @@ function Invoke-Npm {
 Push-Location $TypescriptSdkDir
 try {
     Invoke-Npm -Arguments @("ci")
+    Invoke-Npm -Arguments @("audit", "--audit-level=moderate")
     Invoke-Npm -Arguments @("run", "build")
 }
 finally {
@@ -28,6 +29,7 @@ finally {
 Push-Location $StudioDir
 try {
     Invoke-Npm -Arguments @("ci")
+    Invoke-Npm -Arguments @("audit", "--audit-level=moderate")
     Invoke-Npm -Arguments @("run", "lint")
     Invoke-Npm -Arguments @("run", "typecheck")
     Invoke-Npm -Arguments @("test")

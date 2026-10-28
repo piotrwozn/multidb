@@ -51,7 +51,10 @@ use crate::{
     query::{Row, SqlOutput, SqlRows},
 };
 
+mod frame;
+mod parameters;
 mod session;
+mod session_state;
 
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
 const DEFAULT_BLOCKING_TASKS: usize = 32;
@@ -161,6 +164,7 @@ struct DbStartupHandler {
     tls_required: bool,
     auth_limiter: AuthRateLimiter,
     pending_auth: StdMutex<Option<AuthAttempt>>,
+    sasl_started: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -805,6 +809,7 @@ impl DbStartupHandler {
             tls_required,
             auth_limiter,
             pending_auth: StdMutex::new(None),
+            sasl_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -859,6 +864,16 @@ impl StartupHandler for DbStartupHandler {
         let Some(inner) = &self.inner else {
             return Err(pg_error("FATAL", "08006", "startup handler is unavailable"));
         };
+
+        if let PgWireFrontendMessage::PasswordMessageFamily(
+            pgwire::messages::startup::PasswordMessageFamily::Raw(body),
+        ) = &message
+            && !self
+                .sasl_started
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            frame::validate_sasl_initial(body)?;
+        }
 
         let result = inner.on_startup(client, message).await;
         if result.is_err() || matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
@@ -966,10 +981,13 @@ impl ExtendedQueryHandler for DbPgHandler {
             .describe_sql_as_user(client_user(client), sql)
             .await?;
         match schema {
-            Some(schema) => Ok(DescribePortalResponse::new(fields_for_schema(
-                &schema,
-                Some(&target.result_column_format),
-            ))),
+            Some(schema) => {
+                validate_result_format(&target.result_column_format, schema.fields().len())?;
+                Ok(DescribePortalResponse::new(fields_for_schema(
+                    &schema,
+                    Some(&target.result_column_format),
+                )))
+            }
             None => Ok(DescribePortalResponse::no_data()),
         }
     }
@@ -978,7 +996,7 @@ impl ExtendedQueryHandler for DbPgHandler {
         &self,
         client: &mut C,
         portal: &Portal<Self::Statement>,
-        _max_rows: usize,
+        max_rows: usize,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -987,11 +1005,42 @@ impl ExtendedQueryHandler for DbPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = substitute_portal_params(portal)?;
+        if matches!(portal.result_column_format, Format::Individual(_)) {
+            let schema = self
+                .executor
+                .describe_sql_as_user(client_user(client), sql.clone())
+                .await?;
+            validate_result_format(
+                &portal.result_column_format,
+                schema.as_ref().map_or(0, |schema| schema.fields().len()),
+            )?;
+        }
         let output = self
             .executor
             .execute_sql_as_user(client_user(client), sql.clone(), true)
             .await
             .map_err(network_to_pg)?;
+        if let SqlOutput::Rows(rows) = &output {
+            validate_result_format(&portal.result_column_format, rows.columns.len())?;
+            if max_rows > 0 {
+                let available = client
+                    .metadata()
+                    .get(session_state::AVAILABLE_RESULT_BYTES)
+                    .and_then(|bytes| bytes.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let retained = session_state::result_bytes(rows, available).map_err(|_| {
+                    pg_error(
+                        "ERROR",
+                        "53200",
+                        "portal result exceeds retained session memory budget",
+                    )
+                })?;
+                client.metadata_mut().insert(
+                    session_state::NEW_RESULT_BYTES.to_owned(),
+                    retained.to_string(),
+                );
+            }
+        }
         Ok(sql_output_to_response(
             output,
             &sql,
@@ -1152,6 +1201,13 @@ fn fields_for_schema(schema: &SchemaRef, result_format: Option<&Format>) -> Vec<
 }
 
 fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
+    if parameters::count(&portal.statement.statement)? != portal.parameter_len() {
+        return Err(pg_error(
+            "ERROR",
+            "08P01",
+            "bind parameter count does not match statement",
+        ));
+    }
     let literals = (0..portal.parameter_len())
         .map(|index| portal_param_literal(portal, index))
         .collect::<PgWireResult<Vec<_>>>()?;
@@ -1160,7 +1216,7 @@ fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
 }
 
 fn describe_sql_for_statement(statement: &StoredStatement<String>) -> PgWireResult<Option<String>> {
-    if !contains_dollar_param(&statement.statement) {
+    if !parameters::contains(&statement.statement)? {
         return Ok(Some(statement.statement.clone()));
     }
 
@@ -1249,51 +1305,7 @@ fn float_literal(value: Option<impl Into<f64>>) -> PgWireResult<String> {
 }
 
 fn substitute_params(sql: &str, literals: &[String]) -> PgWireResult<String> {
-    let mut output = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            output.push(ch);
-            copy_quoted_string(&mut chars, &mut output);
-        } else if ch == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
-            let mut raw_index = String::new();
-            while let Some(next) = chars.peek() {
-                if next.is_ascii_digit() {
-                    raw_index.push(*next);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            let index = raw_index
-                .parse::<usize>()
-                .map_err(|error| pg_error("ERROR", "22023", error.to_string()))?;
-            let literal = literals
-                .get(index.saturating_sub(1))
-                .ok_or_else(|| PgWireError::ParameterIndexOutOfBound(index))?;
-            output.push_str(literal);
-        } else {
-            output.push(ch);
-        }
-    }
-
-    Ok(output)
-}
-
-fn copy_quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, output: &mut String) {
-    while let Some(ch) = chars.next() {
-        output.push(ch);
-        if ch == '\'' {
-            if chars.peek() == Some(&'\'') {
-                output.push('\'');
-                chars.next();
-            } else {
-                break;
-            }
-        }
-    }
+    parameters::substitute(sql, literals)
 }
 
 fn escape_sql_literal(value: &str) -> String {
@@ -1306,19 +1318,17 @@ fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
 }
 
-fn contains_dollar_param(sql: &str) -> bool {
-    let mut chars = sql.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            let mut sink = String::new();
-            copy_quoted_string(&mut chars, &mut sink);
-        } else if ch == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
-            return true;
-        }
+fn validate_result_format(format: &Format, columns: usize) -> PgWireResult<()> {
+    if let Format::Individual(codes) = format
+        && (codes.len() != columns || codes.iter().any(|code| !matches!(code, 0 | 1)))
+    {
+        return Err(pg_error(
+            "ERROR",
+            "08P01",
+            "result format count does not match output columns",
+        ));
     }
-
-    false
+    Ok(())
 }
 
 fn network_to_pg(error: NetworkError) -> PgWireError {
@@ -1411,6 +1421,23 @@ mod tests {
 
     #[test]
     fn database_errors_map_to_sqlstate() {
+        for error in [
+            crate::tensor::TensorError::Storage(StorageError::Conflict),
+            crate::tensor::TensorError::Repl(crate::repl::ReplError::Conflict),
+            crate::tensor::TensorError::Repl(crate::repl::ReplError::Storage(
+                StorageError::Conflict,
+            )),
+        ] {
+            let error = DbError::Tensor(error);
+            assert!(error.is_conflict());
+            assert_eq!(db_error_sqlstate(&error), "40001");
+        }
+        assert_eq!(
+            db_error_sqlstate(&DbError::Tensor(crate::tensor::TensorError::Timeout(
+                "budget".to_owned()
+            ))),
+            "57014"
+        );
         assert_eq!(
             db_error_sqlstate(&DbError::Query(QueryError::Parse("bad".to_owned()))),
             "42601"
@@ -1423,6 +1450,14 @@ mod tests {
             db_error_sqlstate(&DbError::Storage(StorageError::Conflict)),
             "40001"
         );
+    }
+
+    #[test]
+    fn invalid_individual_result_formats_are_errors_instead_of_indexing_panics() {
+        use pgwire::api::portal::Format;
+        assert!(super::validate_result_format(&Format::Individual(vec![0, 1]), 3).is_err());
+        assert!(super::validate_result_format(&Format::Individual(vec![0, 2]), 2).is_err());
+        assert!(super::validate_result_format(&Format::Individual(vec![0, 1]), 2).is_ok());
     }
 
     #[test]
@@ -1487,6 +1522,34 @@ mod tests {
             let _ = connection.await;
         });
         Ok(client)
+    }
+
+    #[tokio::test]
+    async fn named_prepared_statement_storm_is_bounded_per_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth());
+        let server = start_session_test_server(config).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        let mut retained = Vec::new();
+        for _ in 0..128 {
+            retained.push(
+                client
+                    .prepare("select name from users where age = 37")
+                    .await?,
+            );
+        }
+        assert!(
+            client
+                .prepare("select name from users where age = 37")
+                .await
+                .is_err()
+        );
+        // One over-budget session does not prevent another authenticated client.
+        let healthy = plain_client(server.addr, "secret").await?;
+        assert!(healthy.simple_query("select name from users").await.is_ok());
+        drop(retained);
+        server.shutdown().await?;
+        Ok(())
     }
 
     async fn start_session_test_server(

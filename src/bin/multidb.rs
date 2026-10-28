@@ -11,7 +11,7 @@ use serde_json::json;
 use multidb::{
     backup::{
         BackupConfig, BackupError, RestoreConfig, RestoreTarget, full_backup, incremental_backup,
-        list_backups, restore_backup_with_config, verify_backup,
+        list_backups, restore_backup_with_config, verify_backup_with_config,
     },
     cdc::{
         ChangefeedFilter, ChangefeedOptions, ChangefeedTarget, MaterializedViewSpec, ResumeToken,
@@ -3006,8 +3006,8 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
         parse_profile_selection(&required_value(args, "--profile")?)?
     else {
         return Err(CliError::Usage(
-            "restore does not accept --profile auto: the restore target must be absent or \
-             empty, so there is no database to inspect; pass the storage profile the backed-up \
+            "restore does not accept --profile auto: the restore target must be absent, \
+             so there is no database to inspect; pass the storage profile the backed-up \
              database was created with"
                 .to_owned(),
         ));
@@ -3026,7 +3026,7 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
         &backup,
         DbConfig::on_disk(profile, &dest_db),
         target,
-        &RestoreConfig::default().with_unmet_profile_floors_allowed(allow_unmet_floors),
+        &restore_options_from_args(args)?,
     )?;
     let mut lines = vec![format!(
         "restored timeline={} lsn={} applied_commits={}",
@@ -3048,7 +3048,7 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
 
 fn run_verify(args: &[String]) -> Result<String, CliError> {
     let backup = PathBuf::from(required_value(args, "--backup")?);
-    let report = verify_backup(backup)?;
+    let report = verify_backup_with_config(backup, &restore_options_from_args(args)?)?;
     Ok(format!(
         "verified backup {} lsn={} files={}",
         report.manifest.backup_id, report.restored_lsn, report.checked_files
@@ -3074,6 +3074,24 @@ fn run_list(args: &[String]) -> Result<String, CliError> {
     } else {
         Ok(lines.join("\n"))
     }
+}
+
+fn restore_options_from_args(args: &[String]) -> Result<RestoreConfig, CliError> {
+    let mut config = RestoreConfig::default()
+        .with_unmet_profile_floors_allowed(has_flag(args, "--allow-unmet-floors"));
+    if let Some(value) = optional_value(args, "--max-payload-bytes") {
+        let limit = value
+            .parse::<u64>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| {
+                CliError::Usage(
+                    "invalid --max-payload-bytes: expected a positive integer".to_owned(),
+                )
+            })?;
+        config.max_payload_bytes = limit;
+    }
+    Ok(config)
 }
 
 fn run_cdc(args: &[String]) -> Result<String, CliError> {
@@ -5524,8 +5542,8 @@ fn usage() -> CliError {
          multidb advice plan --db <path> --profile <profile> --advice-id <id> [--out <plan.json>] [--output text|json] [--json]\n\
          multidb advice reject --db <path> --profile <profile> --advice-id <id> --reason <reason> [--output text|json] [--json]\n\
          multidb backup incr --db <path> --profile <profile> --dest <dir> --parent <backup-dir>\n\
-         multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>] [--allow-unmet-floors]\n\
-         multidb verify --backup <backup-dir>\n\
+         multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>] [--allow-unmet-floors] [--max-payload-bytes <bytes>]\n\
+         multidb verify --backup <backup-dir> [--max-payload-bytes <bytes>]\n\
          multidb list --backup-root <dir>\n\
          multidb cdc poll --db <path> --profile <profile> [--lsn <lsn>] [--table <name>] [--include-system]\n\
          multidb cdc subscribe --db <path> --profile <profile> --name <name> [--table <name>]\n\
@@ -7478,6 +7496,89 @@ mod tests {
             cli_db_config(ProfileSelection::Auto, restored.clone())?,
             DbConfig::on_disk(Profile::Document, &restored)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_and_verify_cli_enforce_the_configured_payload_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database = create_database(DbConfig::on_disk(
+            Profile::Balanced,
+            temp.path().join("source.redb"),
+        ))?;
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default(),
+        )?;
+        let backup_path = path_arg(&backup.path);
+        let destination = temp.path().join("restore.redb");
+        let destination_arg = path_arg(&destination);
+        for invalid in ["0", "-1", "invalid"] {
+            let result = run(strings(&[
+                "verify",
+                "--backup",
+                &backup_path,
+                "--max-payload-bytes",
+                invalid,
+            ]));
+            assert!(
+                matches!(result, Err(CliError::Usage(message)) if message.contains("max-payload-bytes"))
+            );
+        }
+        for command in ["restore", "verify"] {
+            let mut args = strings(&[
+                command,
+                "--backup",
+                &backup_path,
+                "--max-payload-bytes",
+                "1",
+            ]);
+            if command == "restore" {
+                args.extend(strings(&[
+                    "--dest-db",
+                    &destination_arg,
+                    "--profile",
+                    "balanced",
+                ]));
+            }
+            assert!(matches!(
+                run(args),
+                Err(CliError::Backup(BackupError::Unsupported(_)))
+            ));
+            assert!(!destination.exists());
+        }
+        assert_eq!(
+            run(strings(&[
+                "verify",
+                "--backup",
+                &backup_path,
+                "--max-payload-bytes",
+                "8388608"
+            ]))?
+            .exit_code,
+            0
+        );
+        assert_eq!(
+            run(strings(&[
+                "restore",
+                "--backup",
+                &backup_path,
+                "--dest-db",
+                &destination_arg,
+                "--profile",
+                "balanced",
+                "--max-payload-bytes",
+                "8388608"
+            ]))?
+            .exit_code,
+            0
+        );
+        drop(open_database(DbConfig::on_disk(
+            Profile::Balanced,
+            &destination,
+        ))?);
         Ok(())
     }
 

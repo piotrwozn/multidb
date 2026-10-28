@@ -15,6 +15,41 @@ from multidb_client import (
 
 
 class ClientTests(unittest.TestCase):
+    def test_non_success_status_and_malformed_error_are_rejected(self) -> None:
+        for payload in ({"ok": True, "data": {}}, {"ok": False, "error": None}):
+            client = ControlPlaneClient(transport=lambda *_: (503, {}, json.dumps(payload).encode()))
+            with self.assertRaises(ControlPlaneError):
+                client.status()
+        client = ControlPlaneClient(transport=lambda *_: (200, {}, b"\xff"))
+        with self.assertRaises(ControlPlaneError) as error:
+            client.status()
+        self.assertEqual(error.exception.code, "invalid_json")
+
+    def test_default_transport_does_not_follow_redirects(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        visited = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                visited.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "/stolen")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                client = ControlPlaneClient(base_url=f"http://127.0.0.1:{server.server_port}", token="secret")
+                with self.assertRaises(ControlPlaneError):
+                    client.status()
+                self.assertEqual(visited, ["/status"])
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_default_base_url(self) -> None:
         self.assertEqual(DEFAULT_BASE_URL, "http://127.0.0.1:8080/api")
         self.assertEqual(CONTROL_PLANE_API_VERSION, 1)

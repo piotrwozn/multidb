@@ -1,6 +1,6 @@
 //! Native tensor dataset catalog, authorization and execution boundaries.
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
 use super::{
     CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, Profile, catalog_put_op,
@@ -14,8 +14,8 @@ use crate::{
     storage::Bytes,
     tensor::{
         TensorAppendResult, TensorBatch, TensorComputeRequest, TensorComputeResult, TensorDType,
-        TensorData, TensorDataset, TensorDatasetConfig, TensorDatasetInfo, TensorError,
-        TensorExecution, TensorGpuOperation, TensorReadBatch, TensorReadRequest,
+        TensorData, TensorDataset, TensorDatasetConfig, TensorDatasetInfo, TensorDeadline,
+        TensorError, TensorExecution, TensorGpuOperation, TensorReadBatch, TensorReadRequest,
         TensorSearchRequest, TensorSearchResult,
     },
     tensor_gpu::TensorGpuEngine,
@@ -84,7 +84,10 @@ impl Database {
             Some(CatalogEntry::TensorDataset { config }) => {
                 let repl: &dyn Replication = self;
                 Ok(TensorDataset::new(repl, config.clone())?
-                    .with_gpu_required(self.profile() == Profile::Tensor))
+                    .with_gpu_required(self.profile() == Profile::Tensor)
+                    .with_execution_timeout(Duration::from_millis(
+                        self.performance.query.timeout_ms,
+                    )))
             }
             Some(other) => Err(kind_mismatch(name, "tensor dataset", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -334,6 +337,7 @@ fn compute_tensor_rows(
     request: &TensorComputeRequest,
     gpu: bool,
 ) -> Result<TensorComputeResult, TensorError> {
+    let deadline = dataset.execution_deadline()?;
     request.validate()?;
     let column = dataset
         .config()
@@ -359,12 +363,16 @@ fn compute_tensor_rows(
     let mut rows = Vec::new();
     let mut floats = 0_usize;
     for index in request.start..end {
-        let mut batch = dataset.read(&TensorReadRequest {
-            start: index,
-            limit: 1,
-            columns: Some(vec![request.tensor.clone()]),
-            revision: Some(info.revision),
-        })?;
+        deadline.check()?;
+        let mut batch = dataset.read_with_deadline(
+            &TensorReadRequest {
+                start: index,
+                limit: 1,
+                columns: Some(vec![request.tensor.clone()]),
+                revision: Some(info.revision),
+            },
+            deadline,
+        )?;
         let tensor = batch
             .tensors
             .remove(&request.tensor)
@@ -389,14 +397,27 @@ fn compute_tensor_rows(
         if rows.len() >= MAX_GPU_BATCH_ROWS
             || floats.saturating_add(row.len()) > MAX_GPU_BATCH_FLOATS
         {
-            reduce_tensor_rows(&rows, request.operation, engine.as_deref(), &mut values)?;
+            reduce_tensor_rows(
+                &rows,
+                request.operation,
+                engine.as_deref(),
+                &mut values,
+                deadline,
+            )?;
             rows.clear();
             floats = 0;
         }
         floats += row.len();
         rows.push(row);
     }
-    reduce_tensor_rows(&rows, request.operation, engine.as_deref(), &mut values)?;
+    reduce_tensor_rows(
+        &rows,
+        request.operation,
+        engine.as_deref(),
+        &mut values,
+        deadline,
+    )?;
+    deadline.check()?;
     Ok(TensorComputeResult {
         start: request.start,
         end,
@@ -411,17 +432,35 @@ fn reduce_tensor_rows(
     operation: TensorGpuOperation,
     engine: Option<&TensorGpuEngine>,
     values: &mut Vec<f32>,
+    deadline: TensorDeadline,
 ) -> Result<(), TensorError> {
+    deadline.check()?;
     if rows.is_empty() {
         return Ok(());
     }
     if let Some(engine) = engine {
-        values.extend(engine.reduce_rows(rows, operation)?);
+        values.extend(engine.reduce_rows_until(rows, operation, deadline)?);
         return Ok(());
     }
     for row in rows {
+        deadline.check()?;
+        let mut total = 0.0;
+        for chunk in row.chunks(4096) {
+            deadline.check()?;
+            total += chunk
+                .iter()
+                .map(|value| {
+                    let value = f64::from(*value);
+                    if operation == TensorGpuOperation::L2Norm {
+                        value * value
+                    } else {
+                        value
+                    }
+                })
+                .sum::<f64>();
+        }
         let result = match operation {
-            TensorGpuOperation::Sum => row.iter().map(|value| f64::from(*value)).sum(),
+            TensorGpuOperation::Sum => total,
             TensorGpuOperation::Mean => {
                 if row.is_empty() {
                     return Err(TensorError::InvalidValue(
@@ -430,16 +469,13 @@ fn reduce_tensor_rows(
                 }
                 #[allow(clippy::cast_precision_loss)]
                 let length = row.len() as f64;
-                row.iter().map(|value| f64::from(*value)).sum::<f64>() / length
+                total / length
             }
-            TensorGpuOperation::L2Norm => row
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>()
-                .sqrt(),
+            TensorGpuOperation::L2Norm => total.sqrt(),
         };
         values.push(checked_f32(result)?);
     }
+    deadline.check()?;
     Ok(())
 }
 
@@ -580,6 +616,37 @@ mod tests {
             .append(&rows())?;
         database.set_authz_policy(authz());
         Ok(database)
+    }
+
+    #[test]
+    fn tensor_reads_searches_and_reductions_inherit_the_database_query_deadline() -> TestResult {
+        let mut database = fixture()?;
+        database.performance.query.timeout_ms = 0;
+        assert!(matches!(
+            database.read_tensors_as(&alice(), "samples", &TensorReadRequest::default()),
+            Err(DbError::Tensor(TensorError::Timeout(_)))
+        ));
+        assert!(matches!(
+            database.search_tensors_as(
+                &alice(),
+                "samples",
+                &TensorSearchRequest::new("embedding", vec![1.0, 0.0])
+            ),
+            Err(DbError::Tensor(TensorError::Timeout(_)))
+        ));
+        assert!(matches!(
+            database.compute_tensors_as(&alice(), "samples", &compute(TensorGpuOperation::Sum)),
+            Err(DbError::Tensor(TensorError::Timeout(_)))
+        ));
+        // Reusing the same dataset after a completed operation starts a fresh budget.
+        database.performance.query.timeout_ms = 1_000;
+        assert_eq!(
+            database
+                .read_tensors_as(&alice(), "samples", &TensorReadRequest::new(0, 1))?
+                .end,
+            1
+        );
+        Ok(())
     }
 
     #[test]

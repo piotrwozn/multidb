@@ -683,14 +683,7 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
             key,
             expected: old_bytes,
         };
-        match self
-            .repl
-            .propose_conditional_batch(ConditionalBatch::new(vec![condition], ops.clone()))
-        {
-            Ok(()) => {}
-            Err(ReplError::Unsupported(_)) => self.repl.propose_batch(ops)?,
-            Err(error) => return Err(error.into()),
-        }
+        self.commit_document_change(id, condition, ops)?;
         Ok(())
     }
 
@@ -712,16 +705,42 @@ impl<'repl, R: Replication + ?Sized> DocumentCollection<'repl, R> {
             key,
             expected: Some(old_bytes),
         };
-        match self
-            .repl
-            .propose_conditional_batch(ConditionalBatch::new(vec![condition], ops.clone()))
-        {
-            Ok(()) => {}
-            Err(ReplError::Unsupported(_)) => self.repl.propose_batch(ops)?,
-            Err(error) => return Err(error.into()),
-        }
+        self.commit_document_change(id, condition, ops)?;
 
         Ok(())
+    }
+
+    fn commit_document_change(
+        &self,
+        id: DocumentId,
+        condition: WriteCondition,
+        ops: Vec<Op>,
+    ) -> Result<(), ModelError> {
+        let plain = if self.indexes.is_empty()
+            && self.derived.full_text.is_empty()
+            && self.derived.geo.is_empty()
+            && let [op] = ops.as_slice()
+            && matches!(op, Op::Put { table, key, .. } | Op::Delete { table, key }
+                if table == DOCUMENT_TABLE && *key == self.document_key(id))
+        {
+            Some(op.clone())
+        } else {
+            None
+        };
+        match self
+            .repl
+            .propose_conditional_batch(ConditionalBatch::new(vec![condition], ops))
+        {
+            Ok(()) => Ok(()),
+            Err(ReplError::Unsupported(_)) if plain.is_some() => {
+                if let Some(op) = plain {
+                    self.repl
+                        .propose_plain_document_lww(self.collection_id.as_u32(), op)?;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Builds all operations needed to insert a document.
@@ -1207,6 +1226,9 @@ pub(crate) fn encode_index_value(value: &Value) -> Result<Bytes, ModelError> {
 
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod conditional_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
+use hnsw_rs::prelude::{Distance, Hnsw};
 
 use crate::{
     keyenc,
@@ -24,6 +24,9 @@ const HNSW_MAX_LAYER: usize = 16;
 const MIN_HNSW_M: usize = 1;
 const MAX_HNSW_M: usize = 255;
 const TOMBSTONE_COMPACT_PERCENT: usize = 20;
+const MAX_VECTOR_DIMENSION: usize = 16_384;
+const MAX_SEARCH_RESULTS: usize = 10_000;
+const MAX_HNSW_EF: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum VectorMetric {
@@ -332,9 +335,10 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         )
     }
 
-    /// HNSW-only candidates for bounded graph retrieval. Never scans the full vector map
-    /// as a fallback or expands the candidate set to include every tombstone. Deleted
-    /// candidates can therefore make this approximate search return fewer than requested.
+    /// Bounded candidates for graph retrieval. An index that fits entirely within
+    /// the explicit candidate budget is searched exactly in memory. Larger indexes
+    /// use HNSW without a full-map fallback or tombstone expansion; deleted candidates
+    /// can therefore make approximate search return fewer than requested.
     pub(crate) fn knn_bounded(
         &self,
         query: &[f32],
@@ -347,27 +351,15 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         }
         validate_query(&self.config, query)?;
         let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
+        if state.hnsw_to_doc.len() <= max_candidates {
+            return Ok(state.exact_hits(query));
+        }
         let requested = max_candidates.min(state.hnsw_to_doc.len());
         if requested == 0 {
             return Ok(Vec::new());
         }
-        // The dependency multiplies f32 cosine components before accumulating
-        // in f64. A finite but huge query can otherwise create inf/inf and panic.
-        // Normalization also prevents tiny nonzero queries underflowing to zero.
-        let normalized_query = (self.config.metric == VectorMetric::Cosine).then(|| {
-            let norm = query
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            query
-                .iter()
-                .map(|value| normalized_cosine_component(*value, norm))
-                .collect::<Vec<_>>()
-        });
-        let index_query = normalized_query.as_deref().unwrap_or(query);
         let mut hits = BTreeMap::new();
-        for (hnsw_id, _) in state.hnsw.search(index_query, requested, max_candidates) {
+        for (hnsw_id, _) in state.hnsw.search(query, requested, max_candidates) {
             let Some(id) = state.hnsw_to_doc.get(&hnsw_id) else {
                 continue;
             };
@@ -404,20 +396,27 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<VectorHit>, VectorError> {
+        validate_search_options(k, &options)?;
         if k == 0 {
             return Ok(Vec::new());
         }
 
         validate_query(&self.config, query)?;
         let ef_search = options.ef_search.unwrap_or(self.config.hnsw.ef_search);
-        if let Some(filter) = &options.filter {
-            return self.filtered_exact_knn(query, k, filter);
+        let hits = if let Some(filter) = &options.filter {
+            self.filtered_exact_knn(query, k, filter)?
+        } else if self.config.disk_ann.enabled {
+            self.disk_ann_style_knn(query, k, ef_search, options.rerank)?
+        } else {
+            let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
+            state.search(query, k, ef_search)
+        };
+        if hits.iter().any(|hit| !hit.distance.is_finite()) {
+            return Err(VectorError::InvalidIndexConfig(
+                "query produces a distance outside the finite f32 range".to_owned(),
+            ));
         }
-        if self.config.disk_ann.enabled {
-            return self.disk_ann_style_knn(query, k, ef_search, options.rerank);
-        }
-        let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
-        Ok(state.search(query, k, ef_search))
+        Ok(hits)
     }
 
     /// Deletes a vector and its metadata document atomically.
@@ -485,10 +484,9 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
             .range(VECTOR_TABLE, &start, &end, ReadConsistency::Strong)?
             .into_iter()
             .map(|(key, value)| {
-                Ok((
-                    document_id_from_vector_key(&key)?,
-                    decode_vector(&value, self.config.dim)?,
-                ))
+                let vector = decode_vector(&value, self.config.dim)?;
+                validate_vector(&self.config, &vector)?;
+                Ok((document_id_from_vector_key(&key)?, vector))
             })
             .collect()
     }
@@ -618,6 +616,11 @@ fn validate_config(config: &VectorCollectionConfig) -> Result<(), VectorError> {
     if config.dim == 0 {
         return Err(VectorError::EmptyDimension);
     }
+    if config.dim > MAX_VECTOR_DIMENSION {
+        return Err(VectorError::InvalidIndexConfig(
+            "vector dimension cannot exceed 16384".to_owned(),
+        ));
+    }
 
     if !(MIN_HNSW_M..=MAX_HNSW_M).contains(&config.hnsw.m) {
         return Err(VectorError::InvalidHnswParams(
@@ -625,15 +628,15 @@ fn validate_config(config: &VectorCollectionConfig) -> Result<(), VectorError> {
         ));
     }
 
-    if config.hnsw.ef_construction < config.hnsw.m {
+    if config.hnsw.ef_construction < config.hnsw.m || config.hnsw.ef_construction > MAX_HNSW_EF {
         return Err(VectorError::InvalidHnswParams(
-            "ef_construction must be at least m".to_owned(),
+            "ef_construction must be at least m and no greater than 10000".to_owned(),
         ));
     }
 
-    if config.hnsw.ef_search == 0 {
+    if config.hnsw.ef_search == 0 || config.hnsw.ef_search > MAX_HNSW_EF {
         return Err(VectorError::InvalidHnswParams(
-            "ef_search must be greater than zero".to_owned(),
+            "ef_search must be between 1 and 10000".to_owned(),
         ));
     }
 
@@ -666,6 +669,31 @@ fn validate_config(config: &VectorCollectionConfig) -> Result<(), VectorError> {
         ));
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_search_options(
+    k: usize,
+    options: &VectorSearchOptions,
+) -> Result<(), VectorError> {
+    if k > MAX_SEARCH_RESULTS {
+        return Err(VectorError::InvalidIndexConfig(
+            "k cannot exceed 10000".to_owned(),
+        ));
+    }
+    if options
+        .ef_search
+        .is_some_and(|ef| !(1..=MAX_HNSW_EF).contains(&ef))
+    {
+        return Err(VectorError::InvalidHnswParams(
+            "ef_search must be between 1 and 10000".to_owned(),
+        ));
+    }
+    if options.rerank > MAX_SEARCH_RESULTS {
+        return Err(VectorError::InvalidIndexConfig(
+            "rerank cannot exceed 10000".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -900,8 +928,8 @@ impl VectorIndexState {
 }
 
 enum HnswIndex {
-    Cosine(Hnsw<'static, f32, DistCosine>),
-    L2(Hnsw<'static, f32, DistL2>),
+    Cosine(Hnsw<'static, f32, StableCosine>),
+    L2(Hnsw<'static, f32, StableL2>),
 }
 
 impl HnswIndex {
@@ -912,14 +940,14 @@ impl HnswIndex {
                 capacity,
                 HNSW_MAX_LAYER,
                 params.ef_construction,
-                DistCosine,
+                StableCosine,
             )),
             VectorMetric::L2 => Self::L2(Hnsw::new(
                 params.m,
                 capacity,
                 HNSW_MAX_LAYER,
                 params.ef_construction,
-                DistL2,
+                StableL2,
             )),
         }
     }
@@ -947,6 +975,28 @@ impl HnswIndex {
     }
 }
 
+// The dependency's cosine metric multiplies f32 components before converting
+// to f64 and asserts on NaN. Valid finite inputs can therefore panic during
+// insertion, including after their durable commit. Use the same stable metric
+// for index construction, search, reranking and exact filtering.
+#[derive(Clone, Copy, Default)]
+struct StableCosine;
+
+impl Distance<f32> for StableCosine {
+    fn eval(&self, left: &[f32], right: &[f32]) -> f32 {
+        bounded_cosine_distance(left, right)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StableL2;
+
+impl Distance<f32> for StableL2 {
+    fn eval(&self, left: &[f32], right: &[f32]) -> f32 {
+        l2_distance(left, right)
+    }
+}
+
 fn hnsw_capacity(len: usize) -> usize {
     match len.max(1).checked_next_power_of_two() {
         Some(capacity) => capacity,
@@ -957,15 +1007,8 @@ fn hnsw_capacity(len: usize) -> usize {
 fn distance(metric: VectorMetric, left: &[f32], right: &[f32]) -> f32 {
     match metric {
         VectorMetric::Cosine => cosine_distance(left, right),
-        VectorMetric::L2 => squared_l2_distance(left, right).sqrt(),
+        VectorMetric::L2 => l2_distance(left, right),
     }
-}
-
-// Dividing by the positive f64 norm bounds each component to [-1, 1].
-// Rounding to f32 is intentional because the HNSW index stores f32 vectors.
-#[allow(clippy::cast_possible_truncation)]
-fn normalized_cosine_component(value: f32, norm: f64) -> f32 {
-    (f64::from(value) / norm) as f32
 }
 
 // The result is clamped to [0, 2], so narrowing only rounds its precision.
@@ -987,27 +1030,22 @@ fn bounded_cosine_distance(left: &[f32], right: &[f32]) -> f32 {
 }
 
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
-    let mut dot = 0.0;
-    let mut left_norm = 0.0;
-    let mut right_norm = 0.0;
-
-    for (left_value, right_value) in left.iter().zip(right) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
-    }
-
-    1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())
+    bounded_cosine_distance(left, right)
 }
 
-fn squared_l2_distance(left: &[f32], right: &[f32]) -> f32 {
+// A representable Euclidean distance can have an unrepresentable f32 square.
+// Accumulate and take the root in f64, narrowing only the final result. The
+// caller rejects genuinely unrepresentable distances before exposing any hits.
+#[allow(clippy::cast_possible_truncation)]
+fn l2_distance(left: &[f32], right: &[f32]) -> f32 {
     left.iter()
         .zip(right)
         .map(|(left_value, right_value)| {
-            let delta = left_value - right_value;
+            let delta = f64::from(*left_value) - f64::from(*right_value);
             delta * delta
         })
-        .sum()
+        .sum::<f64>()
+        .sqrt() as f32
 }
 
 fn sort_hits(hits: &mut [VectorHit]) {
@@ -1243,6 +1281,138 @@ mod tests {
             assert!(hits.iter().all(|hit| hit.distance.is_finite()));
             assert_eq!(hits.len(), 3);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cosine_insert_search_filter_and_reopen_handle_all_finite_magnitudes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("extreme-vectors.redb");
+        let config = VectorCollectionConfig::new(CollectionId::new(21), 2);
+        {
+            let database = create_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+            let vectors = VectorCollection::new(&database, config.clone())?;
+            for magnitude in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                vectors.insert_vector(&tagged_metadata("along", "keep"), vec![magnitude, 0.0])?;
+                vectors
+                    .insert_vector(&tagged_metadata("opposite", "omit"), vec![-magnitude, 0.0])?;
+            }
+            for magnitude in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                let hits = vectors.knn(&[magnitude, 0.0], 6)?;
+                assert_eq!(hits.len(), 6);
+                assert!(hits.iter().all(|hit| hit.distance.is_finite()));
+                assert_eq!(
+                    hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+                    vec![0.0, 0.0, 0.0, 2.0, 2.0, 2.0]
+                );
+                let filtered = vectors.knn_with_options(
+                    &[magnitude, 0.0],
+                    6,
+                    VectorSearchOptions::default().with_filter(VectorFilter::Eq {
+                        path: FieldPath::new(["tag"]),
+                        value: Value::Str("keep".to_owned()),
+                    }),
+                )?;
+                assert_eq!(filtered.len(), 3);
+                assert!(filtered.iter().all(|hit| hit.distance == 0.0));
+            }
+        }
+        let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+        let vectors = VectorCollection::new(&database, config)?;
+        assert_eq!(vectors.knn(&[f32::MAX, 0.0], 6)?.len(), 6);
+        assert!(
+            vectors
+                .knn_bounded(&[f32::from_bits(1), 0.0], 6)?
+                .iter()
+                .all(|hit| hit.distance.is_finite())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malicious_search_limits_and_config_fail_before_hnsw_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let config = VectorCollectionConfig::new(CollectionId::new(22), 2);
+        let vectors = VectorCollection::new(&database, config.clone())?;
+        assert!(matches!(
+            vectors.knn(&[1.0, 0.0], usize::MAX),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        for ef in [0, usize::MAX] {
+            assert!(matches!(
+                vectors.knn_with_ef(&[1.0, 0.0], 1, ef),
+                Err(VectorError::InvalidHnswParams(_))
+            ));
+        }
+        assert!(matches!(
+            vectors.knn_with_options(
+                &[1.0, 0.0],
+                1,
+                VectorSearchOptions::default().with_rerank(usize::MAX)
+            ),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        assert!(matches!(
+            VectorCollection::new(
+                &database,
+                config
+                    .clone()
+                    .with_hnsw(HnswParams::new(16, usize::MAX, 48))
+            ),
+            Err(VectorError::InvalidHnswParams(_))
+        ));
+        assert!(matches!(
+            VectorCollection::new(
+                &database,
+                config.with_hnsw(HnswParams::new(16, 200, usize::MAX))
+            ),
+            Err(VectorError::InvalidHnswParams(_))
+        ));
+        assert!(matches!(
+            VectorCollection::new(
+                &database,
+                VectorCollectionConfig::new(CollectionId::new(23), usize::MAX)
+            ),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn l2_keeps_large_representable_distances_and_rejects_true_f32_overflow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let vectors = VectorCollection::new(
+            &database,
+            VectorCollectionConfig::new(CollectionId::new(24), 2).with_metric(VectorMetric::L2),
+        )?;
+        let close = vectors.insert_vector(&metadata("close"), vec![1.0e20, 0.0])?;
+        vectors.insert_vector(&metadata("farther"), vec![3.0e20, 4.0e20])?;
+        let hits = vectors.knn(&[0.0, 0.0], 2)?;
+        assert_eq!(hits[0].id, close);
+        assert_eq!(hits[0].distance, 1.0e20);
+        assert_eq!(hits[1].distance, 5.0e20);
+        let extreme = VectorCollection::new(
+            &database,
+            VectorCollectionConfig::new(CollectionId::new(25), 2).with_metric(VectorMetric::L2),
+        )?;
+        extreme.insert_vector(&metadata("extreme"), vec![f32::MAX, f32::MAX])?;
+        assert!(
+            matches!(extreme.knn(&[0.0, 0.0], 1), Err(VectorError::InvalidIndexConfig(message)) if message.contains("finite f32 range"))
+        );
+        assert!(matches!(
+            extreme.knn_with_options(
+                &[0.0, 0.0],
+                1,
+                VectorSearchOptions::default().with_filter(VectorFilter::Eq {
+                    path: FieldPath::new(["label"]),
+                    value: Value::Str("extreme".to_owned())
+                })
+            ),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
         Ok(())
     }
 

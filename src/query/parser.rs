@@ -1,5 +1,7 @@
+use std::ops::ControlFlow;
+
 use sqlparser::{
-    ast::{Expr as SqlExpr, Query, SetExpr, Statement, Value as SqlValue},
+    ast::{Expr as SqlExpr, Query, SetExpr, Statement, Value as SqlValue, Visit, Visitor},
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
@@ -64,36 +66,29 @@ pub(crate) fn parse_with_limits(
 }
 
 fn count_statement_values_rows(statement: &Statement) -> usize {
-    match statement {
-        Statement::Query(query) => count_query_values_rows(query),
-        Statement::Insert(insert) => insert.source.as_deref().map_or(0, count_query_values_rows),
-        Statement::Explain { statement, .. } => count_statement_values_rows(statement),
-        _ => 0,
+    struct Counter(usize);
+    impl Visitor for Counter {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            self.0 = self
+                .0
+                .saturating_add(count_set_expr_values_rows(query.body.as_ref()));
+            ControlFlow::Continue(())
+        }
     }
-}
-
-fn count_query_values_rows(query: &Query) -> usize {
-    let with_rows = query.with.as_ref().map_or(0, |with| {
-        with.cte_tables
-            .iter()
-            .map(|cte| count_query_values_rows(&cte.query))
-            .sum()
-    });
-    with_rows + count_set_expr_values_rows(query.body.as_ref())
+    let mut counter = Counter(0);
+    let _ = statement.visit(&mut counter);
+    counter.0
 }
 
 fn count_set_expr_values_rows(expr: &SetExpr) -> usize {
     match expr {
-        SetExpr::Query(query) => count_query_values_rows(query),
         SetExpr::SetOperation { left, right, .. } => {
-            count_set_expr_values_rows(left) + count_set_expr_values_rows(right)
+            count_set_expr_values_rows(left).saturating_add(count_set_expr_values_rows(right))
         }
         SetExpr::Values(values) => values.rows.len(),
-        SetExpr::Insert(statement)
-        | SetExpr::Update(statement)
-        | SetExpr::Delete(statement)
-        | SetExpr::Merge(statement) => count_statement_values_rows(statement),
-        SetExpr::Select(_) | SetExpr::Table(_) => 0,
+        // The AST visitor finds nested queries/CTEs/subqueries independently.
+        _ => 0,
     }
 }
 
@@ -167,5 +162,32 @@ fn literal_usize(expr: &SqlExpr) -> Result<usize, QueryError> {
             other => Err(QueryError::Unsupported(other.to_string())),
         },
         other => Err(QueryError::Unsupported(other.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn values_row_limit_covers_nested_selects_and_all_statements() {
+        let limits = QueryExecutionConfig {
+            max_values_rows: 1,
+            ..QueryExecutionConfig::default()
+        };
+        for sql in [
+            "SELECT * FROM (VALUES (1), (2)) AS v(x)",
+            "SELECT (SELECT x FROM (VALUES (1), (2)) AS v(x) LIMIT 1)",
+            "WITH a AS (VALUES (1)) SELECT * FROM a, (VALUES (2)) AS b(x)",
+            "VALUES (1); SELECT * FROM (VALUES (2)) AS v(x)",
+            "EXPLAIN SELECT * FROM (VALUES (1), (2)) AS v(x)",
+        ] {
+            let result = parse_with_limits(sql, &limits);
+            assert!(
+                matches!(&result, Err(QueryError::InputLimit(_))),
+                "{sql}: {result:?}"
+            );
+        }
+        assert!(parse_with_limits("WITH a AS (VALUES (1)) SELECT * FROM a", &limits).is_ok());
     }
 }

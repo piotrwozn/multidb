@@ -390,7 +390,7 @@ pub(super) fn execute(engine: &SqlEngine, plan: &RowRangePlan) -> Result<SqlOutp
         table,
         plan.bounds,
         stop,
-        engine.performance.query.batch_rows,
+        1, // Check the output budget before the backend materializes another stored record.
         &cancelled,
         timeout_ms,
         &mut |row| {
@@ -458,7 +458,7 @@ fn checked_memory(current: usize, next: usize, limit: usize) -> Result<usize, Qu
 
 /// Conservative allocation accounting: Vec growth is charged at four times its live
 /// elements, which covers minimum capacity and collection into the final output Vec.
-fn value_heap_bytes(value: &Value, limit: usize) -> Result<usize, QueryError> {
+pub(super) fn value_heap_bytes(value: &Value, limit: usize) -> Result<usize, QueryError> {
     match value {
         Value::Str(value) => Ok(value.len()),
         Value::Bytes(value) => Ok(value.len()),
@@ -555,6 +555,7 @@ pub(super) fn batches(
     filters: &[DfExpr],
     limit: Option<usize>,
     batch_rows: usize,
+    budget: Option<&super::budget::Budget>,
 ) -> Result<Vec<RecordBatch>, QueryError> {
     let primary = table.schema.as_ref().and_then(primary_key);
     let bounds = primary.map_or_else(Bounds::default, |primary| {
@@ -590,16 +591,27 @@ pub(super) fn batches(
     // An inexact filter must run again outside the provider, so never apply a limit
     // before that residual. Strict fast SQL plans apply their own safe early limit.
     let limit = if filters.is_empty() { limit } else { None };
-    visit_rows(table, bounds, limit, batch_rows, &|| false, 0, &mut |row| {
-        rows.push(match projection {
-            Some(projection) => project_row(&row, projection),
-            None => row,
-        });
-        if rows.len() >= batch_rows.max(1) {
-            flush(&mut rows, &mut result)?;
-        }
-        Ok(())
-    })?;
+    visit_rows(
+        table,
+        bounds,
+        limit,
+        if budget.is_some() { 1 } else { batch_rows },
+        &|| budget.is_some_and(super::budget::Budget::expired),
+        budget.map_or(0, super::budget::Budget::timeout_ms),
+        &mut |row| {
+            if let Some(budget) = budget {
+                budget.charge_row(&row, projection)?;
+            }
+            rows.push(match projection {
+                Some(projection) => project_row(&row, projection),
+                None => row,
+            });
+            if rows.len() >= batch_rows.max(1) {
+                flush(&mut rows, &mut result)?;
+            }
+            Ok(())
+        },
+    )?;
     flush(&mut rows, &mut result)?;
     Ok(result)
 }

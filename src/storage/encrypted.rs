@@ -128,13 +128,26 @@ pub struct LocalFileKms {
     provider: FileKeyProvider,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VaultKekProvider {
     address: Arc<String>,
     token: Arc<String>,
     secret_path: Arc<String>,
     key_field: Arc<String>,
     timeout_ms: u64,
+}
+
+impl std::fmt::Debug for VaultKekProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VaultKekProvider")
+            .field("address", &self.address)
+            .field("token", &"<redacted>")
+            .field("secret_path", &self.secret_path)
+            .field("key_field", &self.key_field)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 /// Envelope keyring of KEK-wrapped DEKs persisted as JSON.
@@ -207,14 +220,14 @@ pub struct EncryptedWriteTxn<T, K> {
     key_provider: Arc<K>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct EnvelopeKeyring {
     format_version: u32,
     current_key_id: u64,
     keys: Vec<WrappedDataKey>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct WrappedDataKey {
     key_id: u64,
     algorithm: String,
@@ -435,7 +448,15 @@ where
             current_key_id: key.id(),
             keys: vec![wrapped],
         };
-        write_keyring(&keyring_path, &keyring)?;
+        let bytes = serde_json::to_vec_pretty(&keyring)
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        match fileio::atomic_create(&keyring_path, &bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Self::open(keyring_path, kek_provider);
+            }
+            Err(error) => return Err(error.into()),
+        }
         Self::from_keyring(keyring_path, kek_provider, keyring)
     }
 
@@ -486,7 +507,7 @@ where
             let key = unwrap_dek(&old_kek, wrapped)?;
             *wrapped = wrap_dek(&new_kek, &key)?;
         }
-        write_keyring(self.keyring_path.as_ref(), &next)?;
+        write_keyring_checked(self.keyring_path.as_ref(), &keyring, &next)?;
 
         let next_source: Arc<dyn KekSource> = Arc::new(new_kek_provider.clone());
         *keyring = next;
@@ -589,7 +610,7 @@ where
         let mut next = keyring.clone();
         next.current_key_id = next_id;
         next.keys.push(wrapped);
-        write_keyring(self.keyring_path.as_ref(), &next)?;
+        write_keyring_checked(self.keyring_path.as_ref(), &keyring, &next)?;
         *keyring = next;
         self.cache_key(key)?;
         drop(keyring);
@@ -634,7 +655,7 @@ where
             key.ciphertext.clear();
             key.nonce.clear();
         }
-        write_keyring(self.keyring_path.as_ref(), &next)?;
+        write_keyring_checked(self.keyring_path.as_ref(), &keyring, &next)?;
         *keyring = next;
         self.cache
             .lock()
@@ -1574,6 +1595,33 @@ fn write_keyring(path: &Path, keyring: &EnvelopeKeyring) -> Result<(), StorageEr
     fileio::atomic_write(path, &bytes).map_err(Into::into)
 }
 
+/// Independent providers/processes must never overwrite a newer keyring with a
+/// stale copy (which could reuse a DEK id or resurrect a destroyed key). The lock
+/// lives beside the atomically replaced file, so its inode remains stable.
+fn write_keyring_checked(
+    path: &Path,
+    expected: &EnvelopeKeyring,
+    next: &EnvelopeKeyring,
+) -> Result<(), StorageError> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(Path::new(&lock_path))?;
+    lock.lock()?;
+    if read_keyring(path)? != *expected {
+        return Err(StorageError::Backend(
+            "keyring changed through another provider; reopen it before key maintenance".to_owned(),
+        ));
+    }
+    write_keyring(path, next)
+}
+
 fn wrap_dek(kek: &ProtectedKey, dek: &ProtectedKey) -> Result<WrappedDataKey, StorageError> {
     let nonce = random_nonce_v3()?;
     let aad = envelope_aad(dek.id());
@@ -1710,6 +1758,73 @@ mod tests {
 
         let read = engine.begin_read()?;
         assert_eq!(read.get("t", b"k")?, Some(b"secret-value".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn vault_debug_redacts_the_access_token() {
+        let provider = VaultKekProvider::new(
+            "http://127.0.0.1:8200",
+            "very-sensitive-vault-token",
+            "secret/key",
+        );
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("very-sensitive-vault-token"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn stale_independent_keyring_provider_cannot_reuse_a_dek_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("keyring");
+        let kek = temp.path().join("kek");
+        std::fs::write(&kek, [7; 32])?;
+        let first = EnvelopeKeyProvider::open_or_create(&path, LocalFileKms::new(&kek))?;
+        let stale = EnvelopeKeyProvider::open(&path, LocalFileKms::new(&kek))?;
+        let next_id = first.rotate_dek()?;
+        let next_key = first.key_by_id(next_id)?;
+        assert!(
+            matches!(stale.rotate_dek(), Err(StorageError::Backend(message)) if message.contains("another provider"))
+        );
+        let reopened = EnvelopeKeyProvider::open(&path, LocalFileKms::new(&kek))?;
+        assert_eq!(reopened.current_key()?.id(), next_id);
+        assert_eq!(reopened.key_by_id(next_id)?.as_slice(), next_key.as_slice());
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct CreationBarrierKek(Arc<std::sync::Barrier>);
+
+    impl KekProvider for CreationBarrierKek {
+        fn kek(&self) -> Result<ProtectedKey, StorageError> {
+            self.0.wait();
+            Ok(ProtectedKey::new([3; 32]))
+        }
+    }
+
+    #[test]
+    fn concurrent_keyring_creation_never_replaces_another_initial_dek()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("keyring");
+        let gate = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    let provider =
+                        EnvelopeKeyProvider::open_or_create(path, CreationBarrierKek(gate))?;
+                    Ok::<_, StorageError>(provider.current_key()?.as_slice().to_vec())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        for handle in handles {
+            keys.push(handle.join().map_err(|_| "keyring creator panicked")??);
+        }
+        assert!(keys.iter().all(|key| key == &keys[0]));
         Ok(())
     }
 

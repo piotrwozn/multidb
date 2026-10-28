@@ -129,9 +129,11 @@ segments reject control characters. Unknown request fields are rejected.
 
 Vector candidate overfetch is bounded by `max_nodes`; candidates hidden by a
 policy or without usable text can leave fewer than `seed_k` seeds. GraphRAG uses
-bounded approximate HNSW retrieval and does not fall back to an exhaustive
-vector scan. Existing index loading/rebuilding and the index's internal search
-work are separate from the metadata/edge budgets.
+bounded approximate HNSW retrieval for indexes larger than the candidate budget
+and does not fall back to an exhaustive vector scan for those indexes. When the
+entire indexed set, including tombstones, fits within `max_nodes`, GraphRAG
+searches that bounded in-memory set exactly. Existing index loading/rebuilding
+and the index's internal search work are separate from the metadata/edge budgets.
 
 When a budget stops retrieval, `truncated` is true. Edge truncation is
 conservative when a scan exactly fills its budget. Context clipping preserves

@@ -85,6 +85,7 @@
         "operationId": "login",
         "tags": ["Auth"],
         "summary": "Create an admin session token.",
+        "description": "Password sessions are bound to the current durable admin credential. A concurrent password rotation rejects a login verified against the old credential. Sessions expire, are revoked at logout, and all password sessions are invalidated by password rotation, including a change made through another server state sharing that database.",
         "security": [],
         "x-multidb-stability": "stable",
         "requestBody": {
@@ -104,7 +105,7 @@
           "401": { "$ref": "#/components/responses/ErrorEnvelope" },
           "503": {
             "$ref": "#/components/responses/ErrorEnvelope",
-            "description": "Too many concurrent password checks (`auth_busy`). The response carries `Retry-After: 1` and the attempt is not counted as a failure."
+            "description": "Too many concurrent password checks (`auth_busy`, with `Retry-After: 1`, not counted as a failure), or the bounded session store is full (`session_error`; sign out or wait for session expiry)."
           }
         }
       }
@@ -127,6 +128,7 @@
         "operationId": "changePassword",
         "tags": ["Auth"],
         "summary": "Change the durable admin password.",
+        "description": "Verifies the current password and conditionally replaces the same credential. Success revokes every password-backed session, including the caller's token; sign in again with the new password. Static operator bearer tokens retain their separate configured lifetime. A concurrent credential change returns 409 and cannot be overwritten using a previously verified password.",
         "security": [{ "BearerAuth": [] }],
         "x-multidb-stability": "stable",
         "requestBody": {
@@ -144,6 +146,10 @@
             "description": "Invalid JSON (`invalid_json`), an empty new password, or a password over 1024 bytes (`invalid_value`)."
           },
           "401": { "$ref": "#/components/responses/ErrorEnvelope" },
+          "409": {
+            "$ref": "#/components/responses/ErrorEnvelope",
+            "description": "The credential changed concurrently (`conflict`). Sign in again with the current password before retrying."
+          },
           "503": {
             "$ref": "#/components/responses/ErrorEnvelope",
             "description": "Too many concurrent password checks (`auth_busy`). The response carries `Retry-After: 1`."
@@ -805,7 +811,7 @@
             ]
           }
         },
-        "description": "Reads a bounded sample range from the current immutable append snapshot or an explicit retained revision. Maximum decoded result: 64 MiB."
+        "description": "Reads a bounded sample range from the current immutable append snapshot or an explicit retained revision. Decoded chunk cache and returned tensor allocations share a 64 MiB budget, including vector/string capacities. The database query deadline applies across read steps."
       },
       "TensorSearchRequest": {
         "type": "object",
@@ -872,7 +878,7 @@
             ]
           }
         },
-        "description": "Exact bounded distance search over a fixed rank-one numeric tensor column. Query values must be finite and dimension-matched. Tensor-profile execution requires the real GPU backend; other profiles expose the CPU reference device explicitly."
+        "description": "Exact bounded distance search over a fixed rank-one numeric tensor column. Query values must be finite and dimension-matched. Tensor-profile execution requires the real GPU backend with zero or normal finite f32 inputs; subnormal values and L2 differences are unsupported. Other profiles expose the CPU reference device explicitly. The database query deadline applies across all batches and GPU queue wait; a timeout after submission stops the device until restart."
       },
       "TensorComputeRequest": {
         "type": "object",
@@ -2110,7 +2116,7 @@
             "$ref": "#/components/responses/ErrorEnvelope"
           },
           "422": {
-            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape, numeric range or GPU memory bounds are unsupported.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2122,6 +2128,7 @@
           "500": {
             "$ref": "#/components/responses/ErrorEnvelope"
           },
+          "504": { "description": "query_timeout: the configured query deadline expired.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "503": {
             "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
             "content": {
@@ -2183,7 +2190,7 @@
             "$ref": "#/components/responses/ErrorEnvelope"
           },
           "422": {
-            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape, numeric range or GPU memory bounds are unsupported.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2195,6 +2202,7 @@
           "500": {
             "$ref": "#/components/responses/ErrorEnvelope"
           },
+          "504": { "description": "query_timeout: the configured query deadline expired.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "503": {
             "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
             "content": {
@@ -2248,7 +2256,7 @@
             "$ref": "#/components/responses/ErrorEnvelope"
           },
           "422": {
-            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape, numeric range or GPU memory bounds are unsupported.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2260,6 +2268,7 @@
           "500": {
             "$ref": "#/components/responses/ErrorEnvelope"
           },
+          "504": { "description": "query_timeout: the configured query deadline expired.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "503": {
             "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
             "content": {
@@ -2313,7 +2322,7 @@
             "$ref": "#/components/responses/ErrorEnvelope"
           },
           "422": {
-            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape, numeric range or GPU memory bounds are unsupported.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2325,6 +2334,7 @@
           "500": {
             "$ref": "#/components/responses/ErrorEnvelope"
           },
+          "504": { "description": "query_timeout: the configured query deadline expired.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "503": {
             "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
             "content": {
@@ -2378,7 +2388,7 @@
             "$ref": "#/components/responses/ErrorEnvelope"
           },
           "422": {
-            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape, numeric range or GPU memory bounds are unsupported.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2390,6 +2400,7 @@
           "500": {
             "$ref": "#/components/responses/ErrorEnvelope"
           },
+          "504": { "description": "query_timeout: the configured query deadline expired.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "503": {
             "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
             "content": {
@@ -2443,7 +2454,7 @@
             "$ref": "#/components/responses/ErrorEnvelope"
           },
           "422": {
-            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape or GPU memory bounds are unsupported.",
+            "description": "tensor_unsupported: backend/profile is unsupported; tensor_gpu_unsupported: dtype, shape, numeric range or GPU memory bounds are unsupported.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2455,6 +2466,7 @@
           "500": {
             "$ref": "#/components/responses/ErrorEnvelope"
           },
+          "504": { "description": "query_timeout: the configured query deadline expired.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "503": {
             "description": "busy (query governor, Retry-After: 1) or tensor_gpu_unavailable (required adapter unavailable); GPU work is never silently run on the CPU.",
             "content": {

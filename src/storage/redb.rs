@@ -46,6 +46,7 @@ impl RedbEngine {
     /// # Errors
     /// Fails if redb cannot create or open the file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        create_private_file(path.as_ref())?;
         Ok(Self {
             db: Database::create(path).map_err(to_storage_err)?,
             two_phase_commit: false,
@@ -56,6 +57,7 @@ impl RedbEngine {
     /// # Errors
     /// Fails if redb cannot create or open the file.
     pub fn open_high_durability(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        create_private_file(path.as_ref())?;
         Ok(Self {
             db: Database::create(path).map_err(to_storage_err)?,
             two_phase_commit: true,
@@ -78,6 +80,27 @@ impl RedbEngine {
     pub(crate) fn recover_existing(path: impl AsRef<Path>) -> Result<(), StorageError> {
         drop(Database::open(path).map_err(to_storage_err)?);
         Ok(())
+    }
+}
+
+/// New database files can hold credentials and plaintext user data. Protect them
+/// from creation, independently of the caller's umask; leave existing modes alone.
+fn create_private_file(path: &Path) -> Result<(), StorageError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            file.sync_all()?;
+            crate::fileio::sync_parent(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 

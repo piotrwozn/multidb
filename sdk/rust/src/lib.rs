@@ -1,12 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    fmt,
-    io::{Read, Write},
-    net::TcpStream,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt, sync::Arc, time::Duration};
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -57,7 +51,7 @@ impl ControlPlaneClient {
             base_url: trim_trailing_slash(base_url.into()),
             token: String::new(),
             principal: None,
-            transport: Arc::new(HttpTransport),
+            transport: Arc::new(HttpTransport::default()),
         }
     }
 
@@ -582,6 +576,12 @@ impl ControlPlaneClient {
                 body: response.body,
             });
         }
+        if !(200..300).contains(&response.status)
+            && !(response.status == 422
+                && matches!(path, "/config/validate" | "/config/plan" | "/config/apply"))
+        {
+            return Err(http_status_error(response.status, response.body));
+        }
         let data = payload.get("data").cloned().unwrap_or(Value::Null);
         serde_json::from_value(data).map_err(|error| ControlPlaneError {
             status: response.status,
@@ -599,6 +599,9 @@ impl ControlPlaneClient {
         auth: bool,
     ) -> Result<T, ControlPlaneError> {
         let response = self.send(method, path, body, auth)?;
+        if !(200..300).contains(&response.status) && !(path == "/ready" && response.status == 503) {
+            return Err(http_status_error(response.status, response.body));
+        }
         serde_json::from_slice(&response.body).map_err(|_| ControlPlaneError {
             status: response.status,
             code: "invalid_json".to_owned(),
@@ -660,50 +663,52 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-struct HttpTransport;
+struct HttpTransport {
+    agent: ureq::Agent,
+}
+
+impl Default for HttpTransport {
+    fn default() -> Self {
+        Self {
+            agent: ureq::Agent::new_with_config(
+                ureq::Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(30)))
+                    // Never replay bearer/principal headers to a redirect destination.
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .build(),
+            ),
+        }
+    }
+}
 
 impl Transport for HttpTransport {
     fn send(&self, request: HttpRequest) -> Result<HttpResponse, ControlPlaneError> {
-        let parsed = ParsedHttpUrl::parse(&request.url)?;
-        let mut stream = TcpStream::connect(&parsed.host_port).map_err(io_error)?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-        write!(
-            stream,
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n",
-            request.method,
-            parsed.path,
-            parsed.host_port,
-            request.body.len()
-        )
-        .map_err(io_error)?;
+        let mut builder = ureq::http::Request::builder()
+            .method(request.method.as_str())
+            .uri(&request.url);
         for (name, value) in request.headers {
-            write!(stream, "{name}: {value}\r\n").map_err(io_error)?;
+            builder = builder.header(name, value);
         }
-        stream.write_all(b"\r\n").map_err(io_error)?;
-        stream.write_all(&request.body).map_err(io_error)?;
-
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).map_err(io_error)?;
-        let Some(split) = find_header_body_split(&raw) else {
+        let request = builder.body(request.body).map_err(transport_error)?;
+        let mut response = self.agent.run(request).map_err(transport_error)?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_vec()
+            .map_err(transport_error)?;
+        if (300..400).contains(&status) {
             return Err(ControlPlaneError {
-                status: 0,
-                code: "invalid_http".to_owned(),
-                message: "HTTP response did not contain a header/body split".to_owned(),
-                body: raw,
+                status,
+                code: "redirect_refused".to_owned(),
+                message: "Control Plane redirects are disabled; configure the final API URL"
+                    .to_owned(),
+                body,
             });
-        };
-        let header = String::from_utf8_lossy(&raw[..split]);
-        let status = header
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(0);
-        Ok(HttpResponse {
-            status,
-            body: raw[split + 4..].to_vec(),
-        })
+        }
+        Ok(HttpResponse { status, body })
     }
 }
 
@@ -757,31 +762,6 @@ pub struct AuthMeResponse {
     pub insecure_local_admin: bool,
 }
 
-struct ParsedHttpUrl {
-    host_port: String,
-    path: String,
-}
-
-impl ParsedHttpUrl {
-    fn parse(url: &str) -> Result<Self, ControlPlaneError> {
-        let Some(rest) = url.strip_prefix("http://") else {
-            return Err(ControlPlaneError {
-                status: 0,
-                code: "unsupported_url".to_owned(),
-                message: "only http:// URLs are supported by the default transport".to_owned(),
-                body: Vec::new(),
-            });
-        };
-        let (host_port, path) = rest
-            .split_once('/')
-            .map_or((rest, "/"), |(host, path)| (host, path));
-        Ok(Self {
-            host_port: host_port.to_owned(),
-            path: format!("/{path}"),
-        })
-    }
-}
-
 /// The body of a provisioning request: the spec and, when given, the options.
 fn provision_body(spec: Value, options: Option<Value>) -> Value {
     let mut body = json!({ "spec": spec });
@@ -795,17 +775,22 @@ fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_owned()
 }
 
-fn io_error(error: std::io::Error) -> ControlPlaneError {
+fn http_status_error(status: u16, body: Vec<u8>) -> ControlPlaneError {
+    ControlPlaneError {
+        status,
+        code: format!("http_{status}"),
+        message: format!("Control Plane returned HTTP {status}"),
+        body,
+    }
+}
+
+fn transport_error(error: impl fmt::Display) -> ControlPlaneError {
     ControlPlaneError {
         status: 0,
         code: "transport_error".to_owned(),
         message: error.to_string(),
         body: Vec::new(),
     }
-}
-
-fn find_header_body_split(raw: &[u8]) -> Option<usize> {
-    raw.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 fn path_escape(value: &str) -> String {

@@ -643,7 +643,9 @@ incremental payload in memory:
   (`schema_version`, the manifest) are copied verbatim, as before.
 - Restore refuses, with `BackupError::ProfileFloorsNotMet { floors }`, a
   backup whose restored database would not meet a manifest floor, and leaves
-  the target absent or empty. Like every restore target in this build, the
+  the target absent. Restore requires a new path; existing files (including
+  empty files) and symlinks are refused. See [restore safety and compatibility](backup-and-restore.md).
+  Like every restore target in this build, the
   target is not encrypted at rest, so `floors.encryption_at_rest` is never
   met; audit is restored as backed up, so `floors.audit` is missed when the
   audit flag of the restored state (the last write at or below the restore

@@ -1,6 +1,7 @@
 # Release Checklist
 
-Use this checklist for every release candidate.
+Use this checklist for every release candidate. Before a production 1.0.0
+announcement, complete the scoped [production acceptance gates](production-readiness.md).
 
 ## Before Tagging
 
@@ -11,7 +12,8 @@ Use this checklist for every release candidate.
 
 ## Release Workflow
 
-- Tag `vX.Y.Z`.
+- Update the server Cargo version, then tag the identical `vX.Y.Z`; the workflow rejects mismatches.
+- Build official artifacts with default secure features, excluding `insecure-transport`.
 - Verify the release workflow completes Linux, Windows and publish jobs.
 - Confirm the GitHub Release includes binaries, signatures, checksums, SBOM,
   image digest, image metadata and smoke/perf reports.

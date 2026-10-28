@@ -110,6 +110,7 @@ mod review_fixes;
 mod runtime;
 mod sql_cache;
 mod tensor;
+mod vector_search;
 
 pub(crate) use profile_binding::{
     MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
@@ -1011,6 +1012,13 @@ impl HealingBackend for DatabaseHealingBackend {
 }
 
 impl Replication for DatabaseRepl {
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        self.replication_ref()
+            .propose_plain_document_lww(collection_id, op)
+    }
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        self.replication_ref().registered_keyspaces()
+    }
     fn read_many(
         &self,
         table: &str,
@@ -1098,6 +1106,15 @@ impl Replication for DatabaseRepl {
             observability::record_replication_error(error.metric_kind());
         }
         result
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.replication_ref()
+            .propose_authorized_conditional_batch(batch, authorization)
     }
 
     fn read(
@@ -1500,6 +1517,48 @@ impl Database {
                 key: credential.username.as_bytes().to_vec(),
                 value,
             }],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces a credential only while the verified credential is still current.
+    /// `None` creates an account only if no other initializer has created it.
+    /// # Errors
+    /// Fails with a conflict on concurrent rotation, or on metadata/storage errors.
+    pub fn compare_and_set_admin_credential(
+        &self,
+        expected: Option<&AdminCredentialRecord>,
+        credential: &AdminCredentialRecord,
+    ) -> Result<(), DbError> {
+        let key = credential.username.as_bytes().to_vec();
+        let current_bytes =
+            self.replication_ref()
+                .read(ADMIN_AUTH_TABLE, &key, ReadConsistency::Strong)?;
+        let current: Option<AdminCredentialRecord> = current_bytes
+            .as_ref()
+            .map(|bytes| {
+                serde_json::from_slice(bytes).map_err(|error| DbError::Serde(error.to_string()))
+            })
+            .transpose()?;
+        if current.as_ref() != expected {
+            return Err(ReplError::Conflict.into());
+        }
+        let value =
+            serde_json::to_vec(credential).map_err(|error| DbError::Serde(error.to_string()))?;
+        crate::repl::propose_system_conditional_batch(
+            self.replication_ref(),
+            ConditionalBatch::new(
+                vec![WriteCondition::ValueEquals {
+                    table: ADMIN_AUTH_TABLE.to_owned(),
+                    key: key.clone(),
+                    expected: current_bytes,
+                }],
+                vec![Op::Put {
+                    table: ADMIN_AUTH_TABLE.to_owned(),
+                    key,
+                    value,
+                }],
+            ),
         )?;
         Ok(())
     }
@@ -3157,10 +3216,13 @@ impl Database {
         name: &str,
         token: ResumeToken,
     ) -> Result<SubscriptionState, DbError> {
-        let state = cdc::subscription_state(self.replication_ref(), name)?;
-        cdc::require_subscription_owner(&state, principal)?;
-        cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
-        Ok(cdc::ack_subscription(self.replication_ref(), name, token)?)
+        Ok(cdc::ack_subscription_as(
+            self.replication_ref(),
+            &self.authz,
+            principal,
+            name,
+            token,
+        )?)
     }
 
     /// Reads a named CDC subscription state.
@@ -3224,9 +3286,11 @@ impl Database {
         name: &str,
         token: ResumeToken,
     ) -> Result<ContinuousQueryState, DbError> {
-        let state = continuous::ack_continuous_query(self.replication_ref(), name, token.clone())?;
-        cdc::ack_subscription(self.replication_ref(), name, token)?;
-        Ok(state)
+        Ok(continuous::ack_continuous_query_and_subscription(
+            self.replication_ref(),
+            name,
+            token,
+        )?)
     }
 
     /// Acknowledges a continuous query after checking RBAC on its subscription filter.
@@ -3238,10 +3302,13 @@ impl Database {
         name: &str,
         token: ResumeToken,
     ) -> Result<ContinuousQueryState, DbError> {
-        let state = cdc::subscription_state(self.replication_ref(), name)?;
-        cdc::require_subscription_owner(&state, principal)?;
-        cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
-        self.ack_continuous_query(name, token)
+        Ok(continuous::ack_continuous_query_and_subscription_as(
+            self.replication_ref(),
+            &self.authz,
+            principal,
+            name,
+            token,
+        )?)
     }
 
     /// Registers an outbox connector in durable metadata.
@@ -3682,6 +3749,7 @@ impl Database {
         sql: &str,
         guard: Option<&mut dyn SqlReadGuard>,
     ) -> Result<SqlOutput, DbError> {
+        validate_sql_text_size(sql, &self.performance.query)?;
         let started = Instant::now();
         let _query_permit = self.acquire_query_permit().await.map_err(DbError::from)?;
         if let Some((rewritten, point)) = parse_as_of_query(sql)? {
@@ -3756,6 +3824,7 @@ impl Database {
         point: TemporalPoint,
         guard: Option<&mut dyn SqlReadGuard>,
     ) -> Result<SqlOutput, DbError> {
+        validate_sql_text_size(sql, &self.performance.query)?;
         if self.repl.is_ap() {
             return Err(TemporalError::Unsupported(
                 "AP replication does not support temporal AS OF".to_owned(),
@@ -4005,6 +4074,16 @@ impl Database {
         requirements: &[(Resource, Permission)],
     ) -> Result<SqlReadAuthorizer<'a>, DbError> {
         let policy = self.policy_config()?;
+        if requirements.iter().any(|(resource, permission)| {
+            *permission == Permission::Read
+                && matches!(resource, Resource::Graph(_))
+                && policy_has_row_or_masking(&policy, resource)
+        }) {
+            return Err(ExtensionError::PolicyDenied(
+                "graph traversals with row or masking policies are not supported".to_owned(),
+            )
+            .into());
+        }
         let searches_index = requirements.iter().any(|(resource, _)| {
             matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
         });
@@ -5484,6 +5563,43 @@ struct WritePipeline {
     sql_schema_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
+fn plain_document_catalog_allowed(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    collection_id: u32,
+) -> bool {
+    let mut source = false;
+    for entry in catalog.values() {
+        match entry {
+            CatalogEntry::Collection {
+                collection_id: id,
+                indexes,
+                ..
+            } if id.as_u32() == collection_id => {
+                if source || !indexes.is_empty() {
+                    return false;
+                }
+                source = true;
+            }
+            CatalogEntry::Vector {
+                collection_id: id, ..
+            } if id.as_u32() == collection_id => return false,
+            CatalogEntry::FullTextIndex { config } => {
+                let TextSource::Collection {
+                    collection_id: id, ..
+                } = &config.source;
+                if id.as_u32() == collection_id {
+                    return false;
+                }
+            }
+            CatalogEntry::GeoIndex { config } if config.collection_id.as_u32() == collection_id => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    source
+}
+
 /// Maps rejections raised before the commit into the caller's error type.
 trait PipelineError: From<ReplError> {
     fn trigger(error: DbError) -> Self;
@@ -6015,6 +6131,54 @@ impl WritePipeline {
 }
 
 impl Replication for WritePipeline {
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        let catalog = read_catalog_from_repl(self.backend.as_ref())
+            .map_err(|error| db_trigger_to_repl(&DbError::Config(error)))?;
+        if !plain_document_catalog_allowed(&catalog, collection_id) {
+            return Err(ReplError::Unsupported(
+                "plain AP document LWW requires a known collection without indexes".to_owned(),
+            ));
+        }
+        let source_key = match &op {
+            Op::Put { table, key, .. } | Op::Delete { table, key }
+                if table == DOCUMENT_TABLE
+                    && key.len() == 20
+                    && key.starts_with(&collection_id.to_be_bytes()) =>
+            {
+                key.clone()
+            }
+            _ => {
+                return Err(ReplError::Unsupported(
+                    "plain AP document LWW requires one source document".to_owned(),
+                ));
+            }
+        };
+        self.execute(
+            ConditionalBatch::new(Vec::new(), vec![op]),
+            None,
+            |mut batch| {
+                if !batch.conditions.is_empty() || batch.ops.len() != 1 {
+                    return Err(ReplError::Unsupported(
+                        "plain AP document LWW cannot include index or trigger deltas".to_owned(),
+                    ));
+                }
+                let op = batch.ops.pop().ok_or_else(|| {
+                    ReplError::Unsupported("missing plain document write".to_owned())
+                })?;
+                if !matches!(&op, Op::Put { table, key, .. } | Op::Delete { table, key }
+                if table == DOCUMENT_TABLE && *key == source_key)
+                {
+                    return Err(ReplError::Unsupported(
+                        "plain AP document LWW changed its source identity".to_owned(),
+                    ));
+                }
+                self.backend.propose_plain_document_lww(collection_id, op)
+            },
+        )
+    }
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        self.backend.registered_keyspaces()
+    }
     fn read_many(
         &self,
         table: &str,
@@ -6058,6 +6222,21 @@ impl Replication for WritePipeline {
     ) -> Result<(), ReplError> {
         let schema_changed = sql_cache::schema_changed(&ops);
         self.backend.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        let schema_changed = sql_cache::schema_changed(&batch.ops);
+        self.backend
+            .propose_authorized_conditional_batch(batch, authorization)?;
         if schema_changed {
             self.sql_schema_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -6358,6 +6537,13 @@ impl Drop for Database {
 }
 
 impl Replication for Database {
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        self.write_pipeline()
+            .propose_plain_document_lww(collection_id, op)
+    }
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        self.repl.registered_keyspaces()
+    }
     fn read_many(
         &self,
         table: &str,
@@ -6402,6 +6588,20 @@ impl Replication for Database {
     ) -> Result<(), ReplError> {
         let schema_changed = sql_cache::schema_changed(&ops);
         self.repl.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_catalog_cache.invalidate();
+        }
+        Ok(())
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        let schema_changed = sql_cache::schema_changed(&batch.ops);
+        self.repl
+            .propose_authorized_conditional_batch(batch, authorization)?;
         if schema_changed {
             self.sql_catalog_cache.invalidate();
         }
@@ -7578,6 +7778,7 @@ fn sql_requirements(
     catalog: &BTreeMap<String, CatalogEntry>,
     limits: &QueryExecutionConfig,
 ) -> Result<Vec<(Resource, Permission)>, DbError> {
+    validate_sql_text_size(sql, limits)?;
     if compat::compat_sql_requirements(sql, limits)? {
         return Ok(vec![(Resource::Database, Permission::Read)]);
     }
@@ -7659,6 +7860,17 @@ fn sql_requirements(
     requirements.sort();
     requirements.dedup();
     Ok(requirements)
+}
+
+fn validate_sql_text_size(sql: &str, limits: &QueryExecutionConfig) -> Result<(), QueryError> {
+    if sql.len() > limits.max_sql_bytes {
+        return Err(QueryError::InputLimit(format!(
+            "SQL text is {} bytes, limit is {} bytes",
+            sql.len(),
+            limits.max_sql_bytes
+        )));
+    }
+    Ok(())
 }
 
 fn phase19_requirements(

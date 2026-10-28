@@ -38,6 +38,9 @@ use crate::{
 const INTERNAL_ALPN: &[u8] = b"multidb-internal/1";
 const FRAME_LEN_BYTES: usize = 4;
 
+mod frame_budget;
+use frame_budget::{FrameWire, MAX_WIRE_BYTES};
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum InternalRequest {
     HealthPing {
@@ -771,22 +774,30 @@ async fn read_frame<S, T>(
 ) -> Result<T, InternalTransportError>
 where
     S: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: DeserializeOwned + FrameWire,
 {
     tokio::time::timeout(Duration::from_millis(idle_timeout_ms.max(1)), async {
         let len = stream.read_u32().await?;
         let len = usize::try_from(len).map_err(|error| {
             InternalTransportError::Codec(format!("invalid frame length: {error}"))
         })?;
-        if len > max_frame_bytes.max(FRAME_LEN_BYTES) {
+        let limit = max_frame_bytes.clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES);
+        if len > limit {
             return Err(InternalTransportError::Codec(format!(
-                "frame length {len} exceeds limit {max_frame_bytes}"
+                "frame length {len} exceeds limit {limit}"
             )));
         }
         let mut bytes = vec![0; len];
         stream.read_exact(&mut bytes).await?;
-        postcard::from_bytes(&bytes)
-            .map_err(|error| InternalTransportError::Codec(error.to_string()))
+        T::preflight(&bytes)?;
+        let (value, trailing) = postcard::take_from_bytes(&bytes)
+            .map_err(|error| InternalTransportError::Codec(error.to_string()))?;
+        if !trailing.is_empty() {
+            return Err(InternalTransportError::Codec(
+                "trailing bytes in internal frame".to_owned(),
+            ));
+        }
+        Ok(value)
     })
     .await
     .map_err(|_| {
@@ -828,11 +839,12 @@ where
 {
     let bytes = postcard::to_allocvec(value)
         .map_err(|error| InternalTransportError::Codec(error.to_string()))?;
-    if bytes.len() > max_frame_bytes.max(FRAME_LEN_BYTES) {
+    let limit = max_frame_bytes.clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES);
+    if bytes.len() > limit {
         return Err(InternalTransportError::Codec(format!(
             "encoded frame length {} exceeds limit {}",
             bytes.len(),
-            max_frame_bytes
+            limit
         )));
     }
     Ok(bytes)
@@ -1045,6 +1057,22 @@ mod tests {
         let decoded: InternalRequest = postcard::from_bytes(&bytes)?;
         assert_eq!(decoded, request);
         assert!(encode_frame(&request, 8).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_decoder_rejects_trailing_payload_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use tokio::io::AsyncWriteExt;
+        let (mut sender, mut receiver) = tokio::io::duplex(128);
+        let mut bytes = encode_frame(&InternalRequest::HealthPing { from: 1 }, 64)?;
+        bytes.push(0);
+        sender.write_u32(u32::try_from(bytes.len())?).await?;
+        sender.write_all(&bytes).await?;
+        assert!(matches!(
+            super::read_frame::<_, InternalRequest>(&mut receiver, 64, 1000).await,
+            Err(super::InternalTransportError::Codec(message)) if message.contains("trailing")
+        ));
         Ok(())
     }
 

@@ -30,18 +30,24 @@ jobs:
           cache-dependency-path: |
             studio/package-lock.json
             sdk/typescript/package-lock.json
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: sdk/go/go.mod
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
 
+      - name: Validate release version
+        run: python3 scripts/check-release-version.py "$GITHUB_REF_NAME"
+
+      - name: Test release configuration
+        run: cargo test --locked -- --test-threads=1
+
       - name: Build reproducible Linux artifact
         run: |
           repro_dir="$(mktemp -d)"
-          cargo build --locked --release --all-features
+          cargo build --locked --release
           cp target/release/multidb "$repro_dir/multidb.first"
           cargo clean -p multidb
-          cargo build --locked --release --all-features
+          cargo build --locked --release
           cmp "$repro_dir/multidb.first" target/release/multidb
           cp target/release/multidb target/release/multidb-linux-x86_64
 
@@ -135,7 +141,12 @@ jobs:
       - name: Build Windows artifact
         shell: pwsh
         run: |
-          cargo build --locked --release --all-features
+          python scripts/check-release-version.py "$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw "release version mismatch" }
+          cargo test --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "release configuration tests failed" }
+          cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { throw "release build failed" }
           Copy-Item target/release/multidb.exe target/release/multidb-windows-x86_64.exe
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -149,7 +160,7 @@ jobs:
       - linux-release
       - windows-release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: target/release
           merge-multiple: true

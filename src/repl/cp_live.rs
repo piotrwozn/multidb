@@ -33,7 +33,7 @@ use crate::{
     },
     repl::{
         ApTransport, CpClusterRole, CpClusterStatus, NodeId, ReplError, VersionedBytes,
-        VersionedRecord, VersionedWrite, ap::ApReplicaEndpoint, condition_matches, dist_txn,
+        VersionedRecord, VersionedWrite, ap::ApReplicaEndpoint, condition_matches,
     },
     storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
     txn::{self, TxnId, WriteSet},
@@ -43,7 +43,6 @@ use super::cp::{
     ClusterBootstrap, CpClusterConfig, CpOpenRaftTypeConfig, RAFT_LOG_TABLE, RAFT_SNAPSHOT_TABLE,
     RAFT_STATE_TABLE, RAFT_VOTE_TABLE, RaftNode, ReplApplyResponse, ReplCommand, command_write_set,
 };
-use super::{DIST_TXN_FINISHED_TABLE, DIST_TXN_PARTICIPANT_TABLE};
 
 const LAST_APPLIED_KEY: &[u8] = b"last_applied";
 const LAST_COMMITTED_KEY: &[u8] = b"last_committed";
@@ -899,28 +898,6 @@ impl<S: StorageEngine> CpStateMachine<S> {
         command: &ReplCommand,
     ) -> Result<ReplApplyResponse, StorageError> {
         let mut write = self.storage.begin_write()?;
-        if let ReplCommand::DistTxnPrepare { txn_id, ops, .. } = command {
-            let key = dist_txn::txn_key(*txn_id);
-            if write.get(DIST_TXN_FINISHED_TABLE, &key)?.is_some() {
-                let txn_id = txn::current_txn_id_from(&write)?;
-                write_apply_metadata(&mut write, log_id, None, txn_id)?;
-                write.commit()?;
-                return Ok(ReplApplyResponse {
-                    txn_id,
-                    conflict: false,
-                });
-            }
-            if let Some(existing) = write.get(DIST_TXN_PARTICIPANT_TABLE, &key)? {
-                let existing = dist_txn::decode_prepared(&existing)?;
-                let txn_id = txn::current_txn_id_from(&write)?;
-                write_apply_metadata(&mut write, log_id, None, txn_id)?;
-                write.commit()?;
-                return Ok(ReplApplyResponse {
-                    txn_id,
-                    conflict: existing.ops != *ops,
-                });
-            }
-        }
         if let ReplCommand::Conditional { conditions, .. } = command {
             for condition in conditions {
                 if !condition_matches(&write, condition)? {
@@ -935,7 +912,19 @@ impl<S: StorageEngine> CpStateMachine<S> {
             }
         }
 
-        let write_set = command_write_set(command, &write)?;
+        let write_set = match command_write_set(command, &write) {
+            Ok(writes) => writes,
+            Err(StorageError::Conflict) => {
+                let txn_id = txn::current_txn_id_from(&write)?;
+                write_apply_metadata(&mut write, log_id, None, txn_id)?;
+                write.commit()?;
+                return Ok(ReplApplyResponse {
+                    txn_id,
+                    conflict: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let snapshot_id = match command {
             ReplCommand::TxnCommit { snapshot_id, .. } => *snapshot_id,
             _ => txn::current_txn_id_from(&write)?,

@@ -6,8 +6,9 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
+    sync::Semaphore,
 };
 
 use crate::{
@@ -16,6 +17,9 @@ use crate::{
 };
 
 const DEFAULT_MAX_SERIES: usize = 4_096;
+const MAX_METRICS_CONNECTIONS: usize = 32;
+const MAX_METRICS_HEADER_BYTES: usize = 8_192;
+const METRICS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const HISTOGRAM_BUCKETS: [f64; 11] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0,
 ];
@@ -134,7 +138,8 @@ impl MetricsRegistry {
         if !inner.counters.contains_key(&key) && inner.series_count() >= self.max_series {
             return Err(ObservabilityError::SeriesLimit);
         }
-        *inner.counters.entry(key).or_default() += value;
+        let counter = inner.counters.entry(key).or_default();
+        *counter = counter.saturating_add(value);
         Ok(())
     }
 
@@ -239,47 +244,149 @@ impl MetricsServer {
         registry: MetricsRegistry,
         bearer_token: Option<String>,
     ) -> Result<(), ObservabilityError> {
-        loop {
-            let (mut socket, _) = listener.accept().await?;
-            let registry = registry.clone();
-            let bearer_token = bearer_token.clone();
-            tokio::spawn(async move {
-                let mut request = vec![0_u8; 2048];
-                let read = match socket.read(&mut request).await {
-                    Ok(read) => read,
-                    Err(error) => {
-                        tracing::debug!(?error, "metrics request read failed");
-                        return;
-                    }
-                };
-                let request = String::from_utf8_lossy(&request[..read]);
-                let response = if let Some(token) = bearer_token
-                    && !request
-                        .lines()
-                        .any(|line| line.trim() == format!("Authorization: Bearer {token}"))
-                {
-                    http_response("401 Unauthorized", "text/plain", "unauthorized")
-                } else {
-                    match registry.render() {
-                        Ok(body) => http_response("200 OK", "text/plain; version=0.0.4", &body),
-                        Err(error) => http_response(
-                            "500 Internal Server Error",
-                            "text/plain",
-                            &format!("metrics error: {error}"),
-                        ),
-                    }
-                };
-                if socket.write_all(response.as_bytes()).await.is_err() {
-                    tracing::debug!("metrics client disconnected before response");
-                }
-            });
+        serve_metrics_bounded(
+            listener,
+            registry,
+            bearer_token,
+            Arc::new(Semaphore::new(MAX_METRICS_CONNECTIONS)),
+            METRICS_CONNECTION_TIMEOUT,
+        )
+        .await
+    }
+}
+
+async fn serve_metrics_bounded(
+    listener: TcpListener,
+    registry: MetricsRegistry,
+    bearer_token: Option<String>,
+    connections: Arc<Semaphore>,
+    timeout: Duration,
+) -> Result<(), ObservabilityError> {
+    loop {
+        let (socket, _) = listener.accept().await?;
+        // Refuse excess sockets before spawning or waiting: a stalled client may
+        // consume only one of a fixed number of tasks and descriptors.
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let registry = registry.clone();
+        let bearer_token = bearer_token.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            metrics_connection(socket, &registry, bearer_token.as_deref(), deadline).await;
+        });
+    }
+}
+
+async fn metrics_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut socket: S,
+    registry: &MetricsRegistry,
+    bearer_token: Option<&str>,
+    deadline: tokio::time::Instant,
+) {
+    // One absolute deadline covers all header fragments and the complete response.
+    // A client cannot extend it by sending one byte or accepting one byte at a time.
+    let exchange = async {
+        let mut request = Vec::new();
+        let response = loop {
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break metrics_response(&request[..end], registry, bearer_token);
+            }
+            if request.len() == MAX_METRICS_HEADER_BYTES {
+                break http_response(
+                    "431 Request Header Fields Too Large",
+                    "text/plain",
+                    "request headers exceed 8192 bytes",
+                );
+            }
+            let mut buffer = [0_u8; 1024];
+            let remaining = buffer.len().min(MAX_METRICS_HEADER_BYTES - request.len());
+            let read = socket.read(&mut buffer[..remaining]).await?;
+            if read == 0 {
+                return Ok::<(), std::io::Error>(());
+            }
+            request.extend_from_slice(&buffer[..read]);
+        };
+        socket.write_all(response.as_bytes()).await?;
+        socket.shutdown().await
+    };
+    match tokio::time::timeout_at(deadline, exchange).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::debug!(?error, "metrics client I/O failed"),
+        Err(_) => tracing::debug!("metrics connection deadline exceeded"),
+    }
+}
+
+fn metrics_response(
+    request: &[u8],
+    registry: &MetricsRegistry,
+    bearer_token: Option<&str>,
+) -> String {
+    let Ok(request) = std::str::from_utf8(request) else {
+        return http_response("400 Bad Request", "text/plain", "invalid HTTP request");
+    };
+    let mut lines = request.split("\r\n");
+    let parts = lines
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if parts.len() != 3 || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1") {
+        return http_response("400 Bad Request", "text/plain", "invalid HTTP request");
+    }
+    let mut authorization = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return http_response("400 Bad Request", "text/plain", "invalid HTTP header");
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return http_response("400 Bad Request", "text/plain", "invalid HTTP header");
         }
+        if name.eq_ignore_ascii_case("authorization")
+            && authorization.replace(value.trim()).is_some()
+        {
+            return http_response(
+                "400 Bad Request",
+                "text/plain",
+                "duplicate authorization header",
+            );
+        }
+    }
+    if let Some(token) = bearer_token {
+        let valid = authorization
+            .and_then(|value| value.split_once(' '))
+            .is_some_and(|(scheme, supplied)| {
+                scheme.eq_ignore_ascii_case("bearer") && supplied == token
+            });
+        if !valid {
+            return http_response("401 Unauthorized", "text/plain", "unauthorized");
+        }
+    }
+    if parts[0] != "GET" {
+        return http_response("405 Method Not Allowed", "text/plain", "GET required");
+    }
+    if parts[1] != "/metrics" {
+        return http_response("404 Not Found", "text/plain", "not found");
+    }
+    match registry.render() {
+        Ok(body) => http_response("200 OK", "text/plain; version=0.0.4", &body),
+        Err(error) => http_response(
+            "500 Internal Server Error",
+            "text/plain",
+            &format!("metrics error: {error}"),
+        ),
     }
 }
 
 fn http_response(status: &str, content_type: &str, body: &str) -> String {
     format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -1014,6 +1121,10 @@ fn sanitize_with(value: &str, fallback: char) -> String {
 }
 
 #[cfg(test)]
+#[path = "observability_http_tests.rs"]
+mod http_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Instant;
 
@@ -1080,6 +1191,21 @@ mod tests {
         registry
             .increment_counter("bounded_metric", &[("value", "one")], 1)
             .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn counter_overflow_saturates_without_panicking_or_wrapping()
+    -> Result<(), super::ObservabilityError> {
+        let registry = MetricsRegistry::new();
+        registry.increment_counter("bounded_total", &[], u64::MAX - 1)?;
+        registry.increment_counter("bounded_total", &[], 10)?;
+        registry.increment_counter("bounded_total", &[], 1)?;
+        assert!(
+            registry
+                .render()?
+                .contains(&format!("bounded_total {}\n", u64::MAX))
+        );
+        Ok(())
     }
 
     #[test]

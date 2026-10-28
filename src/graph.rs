@@ -335,14 +335,12 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
             if depth >= options.max_depth {
                 continue;
             }
-            for edge in self.neighbors(&node, label)? {
-                expanded += 1;
-                if expanded > options.max_expansion {
-                    return Err(GraphError::TraversalLimit);
-                }
-                if visited.insert(edge.dst.clone()) {
-                    result.push(edge.dst.clone());
-                    queue.push_back((edge.dst, depth + 1));
+            let page = self.traversal_neighbors(&node, label, options.max_expansion - expanded)?;
+            expanded += page.scanned_count;
+            for dst in page.neighbors {
+                if visited.insert(dst.clone()) {
+                    result.push(dst.clone());
+                    queue.push_back((dst, depth + 1));
                 }
             }
         }
@@ -375,19 +373,33 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
             if path.len().saturating_sub(1) >= options.max_depth {
                 continue;
             }
-            for edge in self.neighbors(node, label)? {
-                expanded += 1;
-                if expanded > options.max_expansion {
-                    return Err(GraphError::TraversalLimit);
-                }
-                if visited.insert(edge.dst.clone()) {
+            let page = self.traversal_neighbors(node, label, options.max_expansion - expanded)?;
+            expanded += page.scanned_count;
+            for dst in page.neighbors {
+                if visited.insert(dst.clone()) {
                     let mut next = path.clone();
-                    next.push(edge.dst);
+                    next.push(dst);
                     queue.push_back(next);
                 }
             }
         }
         Ok(None)
+    }
+
+    // One lookahead record distinguishes an exhausted budget from a node with no
+    // outgoing edges. Count physical records, including malformed keys, and never
+    // fetch or decode properties for a traversal that only needs destinations.
+    fn traversal_neighbors(
+        &self,
+        node: &GraphNodeId,
+        label: &str,
+        remaining: usize,
+    ) -> Result<BoundedNeighborIds, GraphError> {
+        let page = self.neighbor_ids_bounded(node, label, remaining.saturating_add(1))?;
+        if page.scanned_count > remaining {
+            return Err(GraphError::TraversalLimit);
+        }
+        Ok(page)
     }
 }
 
@@ -709,6 +721,83 @@ mod tests {
             graph.neighbor_ids_bounded(&source, "related", 0)?.neighbors,
             Vec::new()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn traversals_bound_high_degree_scans_before_materializing_neighbors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repl = ScanOnlyRepl {
+            inner: Arc::new(create_database(DbConfig::new(Profile::InMemory))?),
+            scanned: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        };
+        let graph = Graph::new(&repl, GraphId::new(1));
+        let root = GraphNodeId::from_str_id("root");
+        for id in 0..100 {
+            graph.add_edge(
+                root.clone(),
+                "related",
+                GraphNodeId::from_str_id(&format!("n{id:03}")),
+                &Value::Null,
+            )?;
+        }
+        let options = TraversalOptions {
+            max_depth: 2,
+            max_expansion: 3,
+        };
+        assert!(matches!(
+            graph.k_hop(&root, "related", options),
+            Err(super::GraphError::TraversalLimit)
+        ));
+        assert_eq!(repl.scanned.load(Ordering::SeqCst), 4);
+        repl.scanned.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            graph.shortest_path(
+                &root,
+                &GraphNodeId::from_str_id("missing"),
+                "related",
+                options
+            ),
+            Err(super::GraphError::TraversalLimit)
+        ));
+        assert_eq!(repl.scanned.load(Ordering::SeqCst), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn traversals_accept_exact_budget_and_count_malformed_edges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repl = ScanOnlyRepl {
+            inner: Arc::new(create_database(DbConfig::new(Profile::InMemory))?),
+            scanned: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        };
+        let id = GraphId::new(1);
+        let graph = Graph::new(&repl, id);
+        let root = GraphNodeId::from_str_id("root");
+        let child = GraphNodeId::from_str_id("child");
+        graph.add_edge(root.clone(), "related", child.clone(), &Value::Null)?;
+        let options = TraversalOptions {
+            max_depth: 2,
+            max_expansion: 1,
+        };
+        assert_eq!(graph.k_hop(&root, "related", options)?, vec![child.clone()]);
+        assert_eq!(
+            graph.shortest_path(&root, &child, "related", options)?,
+            Some(vec![root.clone(), child])
+        );
+        let mut malformed = super::out_prefix(id, &root, "related");
+        malformed.push(0);
+        repl.propose(Op::Put {
+            table: super::GRAPH_OUT_EDGES_TABLE.to_owned(),
+            key: malformed,
+            value: Vec::new(),
+        })?;
+        assert!(matches!(
+            graph.k_hop(&root, "related", options),
+            Err(super::GraphError::TraversalLimit)
+        ));
         Ok(())
     }
 

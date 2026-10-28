@@ -10,12 +10,15 @@ use crate::{
     txn,
 };
 
-use super::{NodeId, Op, ReadConsistency, ReplError, Replication};
+use super::{ConditionalBatch, NodeId, Op, ReadConsistency, ReplError, Replication};
+
+mod conditional;
 
 pub const AP_VERSIONS_TABLE: &str = "__ap_versions";
 pub const AP_HINTS_TABLE: &str = "__ap_hints";
 pub const AP_MERKLE_TABLE: &str = "__ap_merkle";
 pub const AP_HINT_SEQ_TABLE: &str = "__ap_hint_seq";
+pub const AP_NODE_CLOCK_TABLE: &str = "__ap_node_clock";
 
 const DEFAULT_HINT_TTL_MS: u64 = 60 * 60 * 1_000;
 const MAX_HINT_WRITES: usize = 1_024;
@@ -281,7 +284,8 @@ impl VectorClock {
     }
 
     pub fn increment(&mut self, node_id: NodeId) {
-        *self.0.entry(node_id).or_insert(0) += 1;
+        let value = self.0.entry(node_id).or_insert(0);
+        *value = value.saturating_add(1);
     }
 
     pub fn merge_from(&mut self, other: &Self) {
@@ -478,8 +482,7 @@ impl<S: StorageEngine> ApDynamo<S> {
         for parent in parents {
             clock.merge_from(&parent);
         }
-        clock.increment(self.cluster.node_id);
-        let write = VersionedWrite {
+        let mut writes = [VersionedWrite {
             table: table.to_owned(),
             key: key.to_vec(),
             version: VersionedBytes {
@@ -487,8 +490,17 @@ impl<S: StorageEngine> ApDynamo<S> {
                 clock,
                 origin: self.cluster.node_id,
             },
-        };
-        self.write_versioned_batch(&[write], self.cluster.default_write)
+        }];
+        {
+            let _guard = self
+                .commit_lock
+                .lock()
+                .map_err(|_| StorageError::Backend("AP commit lock poisoned".to_owned()))?;
+            let mut txn = self.storage.begin_write()?;
+            self.reserve_write_clocks(&mut txn, &mut writes)?;
+            txn.commit()?;
+        }
+        self.write_versioned_batch(&writes, self.cluster.default_write)
     }
 
     /// Attempts to deliver all currently stored hinted handoff records.
@@ -624,6 +636,24 @@ impl<S: StorageEngine> ApDynamo<S> {
     }
 
     fn build_writes(&self, ops: Vec<Op>) -> Result<Vec<VersionedWrite>, StorageError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| StorageError::Backend("AP commit lock poisoned".to_owned()))?;
+        let mut txn = self.storage.begin_write()?;
+        let writes = self.build_writes_in_txn(&mut txn, ops)?;
+        txn.commit()?;
+        Ok(writes)
+    }
+
+    fn build_writes_in_txn<T: WriteTransaction>(
+        &self,
+        txn: &mut T,
+        ops: Vec<Op>,
+    ) -> Result<Vec<VersionedWrite>, StorageError> {
         let mut collapsed = BTreeMap::new();
         for op in ops {
             match op {
@@ -636,12 +666,11 @@ impl<S: StorageEngine> ApDynamo<S> {
             }
         }
 
-        collapsed
+        let mut writes = collapsed
             .into_iter()
             .map(|((table, key), value)| {
-                let existing = self.local_versions(&table, &key)?;
-                let mut clock = VectorClock::merged(existing.iter().map(|version| &version.clock));
-                clock.increment(self.cluster.node_id);
+                let existing = read_versions_from_txn(txn, &version_key(&table, &key)?)?;
+                let clock = VectorClock::merged(existing.iter().map(|version| &version.clock));
                 Ok(VersionedWrite {
                     table,
                     key,
@@ -652,7 +681,45 @@ impl<S: StorageEngine> ApDynamo<S> {
                     },
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        if !writes.is_empty() {
+            self.reserve_write_clocks(txn, &mut writes)?;
+        }
+        Ok(writes)
+    }
+
+    fn reserve_write_clocks<T: WriteTransaction>(
+        &self,
+        txn: &mut T,
+        writes: &mut [VersionedWrite],
+    ) -> Result<(), StorageError> {
+        let key = self.cluster.node_id.to_be_bytes();
+        let stored = txn
+            .get(AP_NODE_CLOCK_TABLE, &key)?
+            .as_deref()
+            .map(decode_u64)
+            .transpose()?
+            .unwrap_or(0);
+        let maximum = writes
+            .iter()
+            .filter_map(|write| write.version.clock.0.get(&self.cluster.node_id).copied())
+            .fold(stored, u64::max);
+        let next = maximum
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Corruption("AP vector clock exhausted".to_owned()))?;
+        // The coordinator need not itself be a replica for these keys. Persist
+        // its counter before publication so later writes cannot reuse a clock,
+        // even after a failed send, restart, or reordered replica delivery.
+        txn.put(AP_NODE_CLOCK_TABLE, &key, &next.to_be_bytes())?;
+        txn.put(
+            txn::KEYSPACE_REGISTRY_TABLE,
+            AP_NODE_CLOCK_TABLE.as_bytes(),
+            b"1",
+        )?;
+        for write in writes {
+            write.version.clock.0.insert(self.cluster.node_id, next);
+        }
+        Ok(())
     }
 
     fn write_versioned_batch(
@@ -1034,6 +1101,22 @@ impl<S: StorageEngine> ApDynamo<S> {
 }
 
 impl<S: StorageEngine> Replication for ApDynamo<S> {
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        let (table, key) = match &op {
+            Op::Put { table, key, .. } | Op::Delete { table, key } => (table, key),
+        };
+        if table != crate::model::DOCUMENT_TABLE
+            || key.len() != 20
+            || !key.starts_with(&collection_id.to_be_bytes())
+        {
+            return Err(ReplError::Rejected(
+                "AP plain document write must target exactly its collection document key"
+                    .to_owned(),
+            ));
+        }
+        self.propose_batch(vec![op])
+    }
+
     fn supports_commit_log(&self) -> bool {
         false
     }
@@ -1044,6 +1127,9 @@ impl<S: StorageEngine> Replication for ApDynamo<S> {
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
         txn::validate_public_ops(&ops)?;
+        if self.is_single_local_node() {
+            return self.commit_local_conditional(ConditionalBatch::new(Vec::new(), ops));
+        }
         let writes = self.build_writes(ops)?;
         self.write_versioned_batch(&writes, self.cluster.default_write)
     }
@@ -1053,8 +1139,31 @@ impl<S: StorageEngine> Replication for ApDynamo<S> {
         ops: Vec<Op>,
         _authorization: txn::WriteAuthorization,
     ) -> Result<(), ReplError> {
+        if self.is_single_local_node() {
+            return self.commit_local_conditional(ConditionalBatch::new(Vec::new(), ops));
+        }
         let writes = self.build_writes(ops)?;
         self.write_versioned_batch(&writes, self.cluster.default_write)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        txn::validate_public_conditions(&batch.conditions)?;
+        txn::validate_public_ops(&batch.ops)?;
+        if batch.conditions.is_empty() {
+            return self.propose_batch(batch.ops);
+        }
+        self.commit_local_conditional(batch)
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        if batch.conditions.is_empty() {
+            return self.propose_authorized_batch(batch.ops, authorization);
+        }
+        self.commit_local_conditional(batch)
     }
 
     fn read(

@@ -155,6 +155,203 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn sql_graph_neighbors_fail_closed_for_graph_row_and_masking_policies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_graph("social", crate::graph::GraphId::new(1))?;
+        database.graph("social")?.add_edge(
+            crate::graph::GraphNodeId::from_str_id("alice"),
+            "knows",
+            crate::graph::GraphNodeId::from_str_id("private-neighbor"),
+            &Value::Null,
+        )?;
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("reader").grant(Resource::Graph("social".to_owned()), Permission::Read)
+        ]));
+        let reader = Principal::new("alice").with_role("reader");
+        let sql = "SELECT graph_neighbors('social', 'alice', 'knows', 1)";
+        assert!(
+            matches!(database.query_as(&reader, sql).await?, SqlOutput::Rows(rows) if !rows.rows.is_empty())
+        );
+        for policy in [
+            PolicyConfig {
+                row_policies: vec![RowPolicy {
+                    resource: Resource::Graph("social".to_owned()),
+                    path: FieldPath::new(["owner"]),
+                    equals: Value::Str("public".to_owned()),
+                }],
+                ..PolicyConfig::default()
+            },
+            PolicyConfig {
+                masking: vec![MaskingPolicy {
+                    resource: Resource::Graph("social".to_owned()),
+                    paths: vec![FieldPath::new(["dst"])],
+                    replacement: Value::Str("***".to_owned()),
+                }],
+                ..PolicyConfig::default()
+            },
+        ] {
+            database.set_policy_config(&policy)?;
+            assert!(matches!(
+                database.query_as(&reader, sql).await,
+                Err(DbError::Extension(ExtensionError::PolicyDenied(_)))
+            ));
+            assert!(matches!(
+                database.describe_query_as(&reader, sql).await,
+                Err(DbError::Extension(ExtensionError::PolicyDenied(_)))
+            ));
+        }
+        database.set_policy_config(&PolicyConfig::default())?;
+        assert!(
+            matches!(database.query_as(&reader, sql).await?, SqlOutput::Rows(rows) if !rows.rows.is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plain_document_lww_catalog_guard_rejects_unknown_and_derived_collections() {
+        use crate::model::{CollectionId, IndexId, IndexSpec};
+        let id = CollectionId::new(1);
+        let entry = |indexes| CatalogEntry::Collection {
+            collection_id: id,
+            fields: Vec::new(),
+            indexes,
+        };
+        let mut catalog = BTreeMap::new();
+        assert!(!super::super::plain_document_catalog_allowed(&catalog, 1));
+        catalog.insert("docs".to_owned(), entry(Vec::new()));
+        assert!(super::super::plain_document_catalog_allowed(&catalog, 1));
+        catalog.insert(
+            "docs".to_owned(),
+            entry(vec![IndexSpec::new(
+                IndexId::new(1),
+                FieldPath::new(["text"]),
+            )]),
+        );
+        assert!(!super::super::plain_document_catalog_allowed(&catalog, 1));
+        catalog.insert("docs".to_owned(), entry(Vec::new()));
+        catalog.insert(
+            "fts".to_owned(),
+            CatalogEntry::FullTextIndex {
+                config: crate::text::FullTextIndexConfig::collection(
+                    "fts",
+                    id,
+                    FieldPath::new(["text"]),
+                ),
+            },
+        );
+        assert!(!super::super::plain_document_catalog_allowed(&catalog, 1));
+        catalog.remove("fts");
+        catalog.insert(
+            "geo".to_owned(),
+            CatalogEntry::GeoIndex {
+                config: crate::geo::GeoIndexConfig::new("geo", id, FieldPath::new(["point"])),
+            },
+        );
+        assert!(!super::super::plain_document_catalog_allowed(&catalog, 1));
+    }
+
+    #[tokio::test]
+    async fn custom_sql_dispatchers_cannot_bypass_text_size_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut performance = crate::performance::PerformanceConfig::for_profile(Profile::InMemory);
+        performance.query.max_sql_bytes = 64;
+        let mut database = crate::db::create_database_with_ops(
+            DbConfig::new(Profile::InMemory),
+            crate::db::OperationalConfig::new().with_performance(performance),
+        )?;
+        database.create_table(
+            "users",
+            Some(TableSchema::new(
+                vec![ColumnDef::new("id", ColumnType::Int, false)],
+                0,
+            )),
+            Vec::new(),
+        )?;
+        database.set_authz_policy(AuthzPolicy::new([Role::new("admin")
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Database, Permission::Admin)
+            .grant(Resource::Database, Permission::Write)]));
+        let principal = Principal::new("root").with_role("admin");
+        for prefix in [
+            "ANALYZE FULL users",
+            "CALL absent()",
+            "SELECT time_bucket(1, 1)",
+        ] {
+            let sql = format!("{prefix}{}", " ".repeat(100));
+            for result in [
+                database.query(&sql).await,
+                database.query_as(&principal, &sql).await,
+                database
+                    .query_as_of(&sql, crate::temporal::TemporalPoint::Lsn(0))
+                    .await,
+                database
+                    .describe_query_as(&principal, &sql)
+                    .await
+                    .map(|_| SqlOutput::AffectedRows(0)),
+            ] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DbError::Query(crate::query::QueryError::InputLimit(_)))
+                    ),
+                    "{result:?}"
+                );
+            }
+        }
+        assert!(
+            crate::query::StatsCatalog::read_table(database.replication_ref(), "users")?.is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_credential_compare_and_set_has_exactly_one_concurrent_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(create_database(DbConfig::new(Profile::InMemory))?);
+        let original = super::super::AdminCredentialRecord {
+            username: "admin".to_owned(),
+            password_hash: "old-hash".to_owned(),
+            updated_at_millis: 1,
+        };
+        database.compare_and_set_admin_credential(None, &original)?;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = std::thread::scope(|scope| {
+            (0..2)
+                .map(|index| {
+                    let database = Arc::clone(&database);
+                    let barrier = Arc::clone(&barrier);
+                    let original = original.clone();
+                    scope.spawn(move || {
+                        let replacement = super::super::AdminCredentialRecord {
+                            username: "admin".to_owned(),
+                            password_hash: format!("new-hash-{index}"),
+                            updated_at_millis: 2,
+                        };
+                        barrier.wait();
+                        database.compare_and_set_admin_credential(Some(&original), &replacement)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(std::thread::ScopedJoinHandle::join)
+                .collect::<Vec<_>>()
+        });
+        let mut winners = 0;
+        let mut conflicts = 0;
+        for attempt in attempts {
+            match attempt.map_err(|_| "credential worker panicked")? {
+                Ok(()) => winners += 1,
+                Err(error) if error.is_conflict() => conflicts += 1,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        assert_eq!((winners, conflicts), (1, 1));
+        assert_ne!(database.admin_credential("admin")?, Some(original));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn workload_and_tuning_metadata_require_system_admin()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut database = create_database(DbConfig::new(Profile::InMemory))?;

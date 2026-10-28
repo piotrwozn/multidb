@@ -5,7 +5,10 @@ use std::{io, sync::Arc, time::Duration};
 use bytes::BytesMut;
 use futures::StreamExt;
 use pgwire::{
-    api::{ClientInfo, ErrorHandler, PgWireConnectionState, PgWireServerHandlers},
+    api::{
+        ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers,
+        portal::PortalExecutionState, store::PortalStore,
+    },
     error::{PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage},
     tokio::server::{PgWireMessageServerCodec, negotiate_tls, process_error, process_message},
@@ -65,7 +68,28 @@ impl Decoder for BoundedCodec {
         if length > self.frame_bytes {
             return Err(PgWireError::MessageTooLarge(length, self.frame_bytes));
         }
-        self.inner.decode(bytes)
+        if self.startup && length > 10_000 {
+            return Err(PgWireError::MessageTooLarge(length, 10_000));
+        }
+        let total = length.checked_add(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid pgwire frame length")
+        })?;
+        if bytes.len() < total {
+            return Ok(None);
+        }
+        super::frame::validate(&bytes[offset + 4..total], self.startup, bytes[0])?;
+        // The upstream decoder receives exactly one declared frame. It cannot
+        // satisfy a malformed field by consuming bytes from the next request.
+        let mut packet = bytes.split_to(total);
+        let decoded = self.inner.decode(&mut packet)?;
+        if decoded.is_none() || !packet.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pgwire frame was not consumed exactly",
+            )
+            .into());
+        }
+        Ok(decoded)
     }
 }
 
@@ -85,6 +109,74 @@ fn deadline(duration: Duration) -> io::Result<tokio::time::Instant> {
     tokio::time::Instant::now()
         .checked_add(duration)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pgwire timeout is too large"))
+}
+
+fn prepare_state_budget<C: ClientInfo + ClientPortalStore>(
+    socket: &mut C,
+    budget: &super::session_state::Budget,
+    message: &PgWireFrontendMessage,
+    ready: bool,
+) -> io::Result<(Option<super::session_state::Update>, Option<String>)>
+where
+    C::PortalStore: PortalStore<Statement = String>,
+{
+    let execution = match message {
+        PgWireFrontendMessage::Execute(execute) if ready => Some(
+            execute
+                .name
+                .as_deref()
+                .unwrap_or(pgwire::api::DEFAULT_NAME)
+                .to_owned(),
+        ),
+        _ => None,
+    };
+    // Server-owned fields override any untrusted startup metadata.
+    socket
+        .metadata_mut()
+        .remove(super::session_state::NEW_RESULT_BYTES);
+    if execution.is_some() {
+        socket.metadata_mut().insert(
+            super::session_state::AVAILABLE_RESULT_BYTES.to_owned(),
+            budget.available_result_bytes().to_string(),
+        );
+    }
+    let update = if ready {
+        budget.prepare(message, socket.portal_store())?
+    } else {
+        None
+    };
+    Ok((update, execution))
+}
+
+async fn finish_state_budget<C: ClientInfo + ClientPortalStore + Sync>(
+    socket: &C,
+    budget: &mut super::session_state::Budget,
+    execution: Option<&str>,
+) -> io::Result<()>
+where
+    C::PortalStore: PortalStore<Statement = String>,
+{
+    if let Some(name) = execution {
+        let retained = if let Some(portal) = socket.portal_store().get_portal(name) {
+            let state = portal.state();
+            let suspended = matches!(*state.lock().await, PortalExecutionState::Suspended(_));
+            suspended
+        } else {
+            false
+        };
+        if retained {
+            if let Some(bytes) = socket
+                .metadata()
+                .get(super::session_state::NEW_RESULT_BYTES)
+                .and_then(|bytes| bytes.parse::<usize>().ok())
+            {
+                budget.record_result(name, Some(bytes))?;
+            }
+        } else {
+            budget.record_result(name, None)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn process_socket(
@@ -108,6 +200,7 @@ pub(super) async fn process_socket(
     let copy = factory.copy_handler();
     let cancel = factory.cancel_handler();
     let errors = factory.error_handler();
+    let mut state_budget = super::session_state::Budget::default();
     loop {
         let state = socket.state();
         let authenticating = matches!(
@@ -136,6 +229,12 @@ pub(super) async fn process_socket(
             return Ok(());
         };
         let message = message.map_err(io::Error::from)?;
+        let (state_update, execution) = prepare_state_budget(
+            &mut socket,
+            &state_budget,
+            &message,
+            matches!(state, PgWireConnectionState::ReadyForQuery),
+        )?;
         let is_extended = match state {
             PgWireConnectionState::CopyInProgress(is_extended) => is_extended,
             _ => message.is_extended_query(),
@@ -160,12 +259,15 @@ pub(super) async fn process_socket(
             {
                 errors.on_error(&socket, &mut error);
                 process_error(&mut socket, error, is_extended).await?;
+            } else if let Some(update) = state_update {
+                state_budget.commit(update);
             }
             Ok::<(), io::Error>(())
         };
         tokio::time::timeout_at(request_deadline, processing)
             .await
             .map_err(|_| timed_out("protocol request"))??;
+        finish_state_budget(&socket, &mut state_budget, execution.as_deref()).await?;
     }
 }
 
@@ -180,13 +282,24 @@ mod tests {
 
     fn make_codec(startup: bool, frame_bytes: usize) -> BoundedCodec {
         let mut client = DefaultClient::<String>::new(([127, 0, 0, 1], 5432).into(), false);
-        client.set_state(if startup {
-            PgWireConnectionState::AwaitingStartup
-        } else {
-            PgWireConnectionState::ReadyForQuery
-        });
+        client.set_state(PgWireConnectionState::AwaitingStartup);
+        let mut inner = PgWireMessageServerCodec::new(client);
+        if !startup {
+            // The codec's private decode context is initialized by startup in
+            // production; setting only client_info.state leaves it awaiting TLS.
+            let mut message = BytesMut::from(&b"\0\0\0\x10\0\x03\0\0user\0a\0\0"[..]);
+            assert!(inner.decode(&mut message).is_ok_and(|message| {
+                matches!(
+                    message,
+                    Some(pgwire::messages::PgWireFrontendMessage::Startup(_))
+                )
+            }));
+            inner
+                .client_info
+                .set_state(PgWireConnectionState::ReadyForQuery);
+        }
         BoundedCodec {
-            inner: PgWireMessageServerCodec::new(client),
+            inner,
             startup,
             frame_bytes,
         }
@@ -233,5 +346,33 @@ mod tests {
             codec.decode(&mut bytes),
             Err(PgWireError::MessageTooLarge(20_000, 10_000))
         ));
+    }
+
+    #[test]
+    fn malformed_packet_cannot_consume_a_pipelined_next_request() {
+        let mut codec = make_codec(false, 1_024);
+        let mut bytes = BytesMut::from(&b"Q\0\0\0\x05xQ\0\0\0\x0dselect 1\0"[..]);
+        assert!(codec.decode(&mut bytes).is_err());
+        let mut codec = make_codec(false, 1_024);
+        let mut bytes = BytesMut::from(&b"P\0\0\0\x06\0\0"[..]);
+        assert!(codec.decode(&mut bytes).is_err());
+        let mut codec = make_codec(false, 1_024);
+        let mut bytes = BytesMut::from(&b"B\0\0\0\x0c\0\0\0\0\0\0\xff\xff"[..]);
+        assert!(codec.decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn valid_pipelined_requests_preserve_frame_boundaries() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut codec = make_codec(false, 1_024);
+        let mut bytes = BytesMut::from(&b"Q\0\0\0\x0dselect 1\0Q\0\0\0\x0dselect 2\0"[..]);
+        assert!(
+            matches!(codec.decode(&mut bytes)?, Some(pgwire::messages::PgWireFrontendMessage::Query(query)) if query.query == "select 1")
+        );
+        assert!(
+            matches!(codec.decode(&mut bytes)?, Some(pgwire::messages::PgWireFrontendMessage::Query(query)) if query.query == "select 2")
+        );
+        assert!(bytes.is_empty());
+        Ok(())
     }
 }

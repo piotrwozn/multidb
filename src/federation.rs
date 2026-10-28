@@ -221,6 +221,17 @@ pub async fn scan_remote_postgres(
             ));
         }
     };
+    validate_scan_request(schema, request)?;
+    validate_remote_identifier_path(table)?;
+    if request.limit == Some(0) {
+        return Ok(ForeignScanResult {
+            rows: Vec::new(),
+            stats: ForeignTableStats {
+                row_count: Some(0),
+                ..ForeignTableStats::default()
+            },
+        });
+    }
     let connection = resolve_secret(connection)?;
     let (client, connection_task) = tokio_postgres::connect(&connection, tokio_postgres::NoTls)
         .await
@@ -380,6 +391,10 @@ pub fn apply_filters_and_projection(
     rows: Vec<Row>,
     request: &ForeignScanRequest,
 ) -> Result<Vec<Row>, FederationError> {
+    validate_scan_request(schema, request)?;
+    if request.limit == Some(0) {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for row in rows {
         if request
@@ -408,6 +423,26 @@ pub fn apply_filters_and_projection(
         }
     }
     Ok(out)
+}
+
+fn validate_scan_request(
+    schema: &TableSchema,
+    request: &ForeignScanRequest,
+) -> Result<(), FederationError> {
+    for index in request
+        .projection
+        .iter()
+        .flatten()
+        .copied()
+        .chain(request.filters.iter().map(|filter| filter.column))
+    {
+        if index >= schema.columns.len() {
+            return Err(FederationError::InvalidSource(format!(
+                "scan column {index} is out of range"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn foreign_filter_matches(row: &[Value], filter: &ForeignFilter) -> bool {
@@ -453,28 +488,14 @@ fn remote_select_sql(
     request: &ForeignScanRequest,
 ) -> Result<String, FederationError> {
     validate_remote_identifier_path(table)?;
-    let columns: Vec<String> = if let Some(projection) = request.projection.as_ref() {
-        projection
-            .iter()
-            .map(|index| {
-                schema
-                    .columns
-                    .get(*index)
-                    .map(|column| quote_ident(&column.name))
-                    .ok_or_else(|| {
-                        FederationError::InvalidSource(format!(
-                            "projection column {index} is out of range"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        schema
-            .columns
-            .iter()
-            .map(|column| quote_ident(&column.name))
-            .collect::<Vec<_>>()
-    };
+    validate_scan_request(schema, request)?;
+    // The decoder and residual filters use original schema positions. Fetch
+    // that shape, then apply the requested projection exactly once locally.
+    let columns: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|column| quote_ident(&column.name))
+        .collect();
     let mut sql = format!("SELECT {} FROM {}", columns.join(", "), quote_path(table));
     let predicates = request
         .filters
@@ -486,12 +507,12 @@ fn remote_select_sql(
         sql.push_str(&predicates.join(" AND "));
     }
     let limit = request.limit.unwrap_or(options.remote_scan_limit);
-    if limit == 0 && !options.allow_remote_without_limit {
+    if request.limit.is_none() && limit == 0 && !options.allow_remote_without_limit {
         return Err(FederationError::InvalidSource(
             "remote foreign scan requires a non-zero limit".to_owned(),
         ));
     }
-    if limit > 0 {
+    if request.limit.is_some() || limit > 0 {
         sql.push_str(" LIMIT ");
         sql.push_str(&limit.to_string());
     }
@@ -681,3 +702,6 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::GeoPoint { lon, lat } => serde_json::json!({ "lon": lon, "lat": lat }),
     }
 }
+
+#[cfg(test)]
+mod tests;

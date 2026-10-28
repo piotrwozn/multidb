@@ -223,6 +223,7 @@ pub fn sqlstate_for_db_error(error: &DbError) -> &'static str {
         DbError::Hook(HookError::Rejected(_) | HookError::Timeout(_)) => "P0001",
         DbError::Hook(HookError::InvalidTarget(_)) => "42704",
         DbError::Query(error) => sqlstate_for_query(error),
+        DbError::Tensor(crate::tensor::TensorError::Timeout(_)) => "57014",
         DbError::Config(_) => "08004",
         _ => "XX000",
     }

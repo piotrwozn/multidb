@@ -22,6 +22,35 @@ struct CountReads {
 }
 
 impl Replication for CountReads {
+    fn supports_bounded_scans(&self) -> bool {
+        self.inner.supports_bounded_scans()
+    }
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn scan_range_batches(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        batch_rows: usize,
+        cancelled: &dyn Fn() -> bool,
+        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        self.inner.scan_range_batches(
+            table,
+            start,
+            end,
+            consistency,
+            batch_rows,
+            cancelled,
+            &mut |batch| {
+                if table == REL_ROWS_TABLE {
+                    self.reads.fetch_add(batch.len(), Ordering::SeqCst);
+                }
+                on_batch(batch)
+            },
+        )
+    }
     fn propose(&self, op: Op) -> Result<(), ReplError> {
         self.inner.propose(op)
     }

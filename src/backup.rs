@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Cursor,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime},
@@ -33,7 +33,7 @@ use crate::{
     },
     repl::{
         AP_HINTS_TABLE, AP_MERKLE_TABLE, AP_VERSIONS_TABLE, HEALING_EVENTS_TABLE,
-        HEALING_STATE_TABLE, ReadConsistency, ReplError, Replication, SHARD_MIGRATIONS_TABLE,
+        HEALING_STATE_TABLE, ReplError, SHARD_MIGRATIONS_TABLE,
     },
     security::AUDIT_TABLE,
     storage::{
@@ -60,6 +60,11 @@ const KEY_PROFILE_MANIFEST: &[u8] = b"profile_manifest";
 const KEY_TIMELINE_ID: &[u8] = b"timeline_id";
 const KEY_RECOVERY_LSN: &[u8] = b"recovery_lsn";
 const KEYSPACE_PRESENT_VALUE: &[u8] = b"1";
+const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 1_073_741_824;
+const MAX_MANIFEST_BYTES: u64 = 1_048_576;
+
+#[cfg(test)]
+mod audit_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum BackupKind {
@@ -81,7 +86,7 @@ pub struct BackupConfig {
     pub encryption: Option<EncryptionConfig>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreConfig {
     /// Decrypts the backup files, which are encrypted when the backup had backup encryption
     /// (`BackupConfig.encryption`, or by default the encryption config of the database backed
@@ -92,6 +97,19 @@ pub struct RestoreConfig {
     /// or `floors.audit` when audit is off in the backup. Off by default, and then such a
     /// restore fails with `BackupError::ProfileFloorsNotMet` before it creates anything.
     pub allow_unmet_profile_floors: bool,
+    /// Maximum stored and decompressed bytes per payload file. Defaults to 1 GiB.
+    /// Increase explicitly for larger trusted backups; zero is rejected.
+    pub max_payload_bytes: u64,
+}
+
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        Self {
+            encryption: None,
+            allow_unmet_profile_floors: false,
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -108,6 +126,9 @@ pub struct BackupManifest {
     pub engine_version: String,
     pub files: Vec<BackupFileEntry>,
     pub keyspace_counts: BTreeMap<String, u64>,
+    /// Canonical last-commit hash used to refuse divergent incremental parents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_commit_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<BackupEncryptionMetadata>,
 }
@@ -216,6 +237,11 @@ impl BackupConfig {
 
 impl RestoreConfig {
     #[must_use]
+    pub fn with_max_payload_bytes(mut self, max_payload_bytes: u64) -> Self {
+        self.max_payload_bytes = max_payload_bytes;
+        self
+    }
+    #[must_use]
     pub fn with_encryption(mut self, encryption: EncryptionConfig) -> Self {
         self.encryption = Some(encryption);
         self
@@ -278,8 +304,7 @@ pub fn full_backup(
     let started = Instant::now();
     let backup_id = new_id();
     let timeline_id = current_or_new_timeline(database)?;
-    let backup_path = backup_dir(dest_root.as_ref(), &backup_id);
-    fs::create_dir_all(&backup_path)?;
+    let backup_path = create_backup_directory(dest_root.as_ref(), &backup_id)?;
 
     let storage = database.local_storage().ok_or_else(|| {
         BackupError::Unsupported("sharded backup must be taken per shard".to_owned())
@@ -311,6 +336,7 @@ pub fn full_backup(
         engine_version: env!("CARGO_PKG_VERSION").to_owned(),
         files: vec![data_entry],
         keyspace_counts,
+        end_commit_hash: commit_hash_at(&read, end_lsn)?,
         encryption: backup_keys.as_ref().map(|_| BackupEncryptionMetadata {
             algorithm: "XChaCha20Poly1305".to_owned(),
         }),
@@ -355,6 +381,15 @@ pub fn incremental_backup(
         BackupError::Unsupported("sharded backup must be taken per shard".to_owned())
     })?;
     let read = storage.begin_read()?;
+    let timeline_id = read.get(BACKUP_META_TABLE, KEY_TIMELINE_ID)?.ok_or_else(|| {
+        BackupError::Unsupported("incremental backup requires a full backup made by this database; take a new full backup".to_owned())
+    })?;
+    if timeline_id != parent.timeline_id.as_bytes() {
+        return Err(BackupError::Unsupported(
+            "incremental parent belongs to another database timeline; take a new full backup"
+                .to_owned(),
+        ));
+    }
     let end_lsn = txn::current_txn_id_from(&read)?;
     if end_lsn < parent.end_lsn {
         return Err(BackupError::Corruption(format!(
@@ -372,10 +407,18 @@ pub fn incremental_backup(
         });
     }
 
+    if parent.end_lsn > 0
+        && (parent.end_commit_hash.is_none()
+            || commit_hash_at(&read, parent.end_lsn)? != parent.end_commit_hash)
+    {
+        return Err(BackupError::Unsupported(
+            "incremental parent commit is absent or belongs to a divergent branch; take a new full backup".to_owned(),
+        ));
+    }
+
     let records = read_commit_logs_from(&read, parent.end_lsn, end_lsn)?;
     let backup_id = new_id();
-    let backup_path = backup_dir(dest_root.as_ref(), &backup_id);
-    fs::create_dir_all(&backup_path)?;
+    let backup_path = create_backup_directory(dest_root.as_ref(), &backup_id)?;
     let payload = CommitLogPayload { records };
     let backup_keys = backup_key_provider(database, config)?;
     let wal_entry = write_compressed_json(
@@ -399,6 +442,7 @@ pub fn incremental_backup(
         engine_version: env!("CARGO_PKG_VERSION").to_owned(),
         files: vec![wal_entry],
         keyspace_counts: BTreeMap::new(),
+        end_commit_hash: commit_hash_at(&read, end_lsn)?,
         encryption: backup_keys.as_ref().map(|_| BackupEncryptionMetadata {
             algorithm: "XChaCha20Poly1305".to_owned(),
         }),
@@ -420,7 +464,7 @@ pub fn incremental_backup(
 /// database gets the source's `__txn_mvcc` history, key versions, commit log and HLC.
 ///
 /// # Errors
-/// Fails as described for [`restore_backup_with_config`]: when the target is not empty, the
+/// Fails as described for [`restore_backup_with_config`]: when the target already exists, the
 /// backup chain is broken or corrupt, the restore target is earlier than the full backup, a
 /// backup file is encrypted (the default config has no restore key), the backed-up profile
 /// manifest is corrupt, newer than this build or for another storage profile, the restored
@@ -451,11 +495,14 @@ pub fn restore_backup(
 /// to the target LSN through the same routine as live commits, which rebuilds the source's
 /// `__txn_mvcc` history, key versions, commit log and HLC. So restore holds the full payload and
 /// at most one incremental payload in memory. The restored records and the restore metadata are
-/// committed in one write transaction.
+/// committed in one write transaction inside a private staging directory. The closed, synced
+/// database is then published without replacing an existing path. A failed replay never
+/// exposes a partially initialized target.
 ///
 /// # Errors
 /// Before anything is created, restore fails with:
-/// - `BackupError::Unsupported` when the target path is not empty, a backup file is encrypted
+/// - `BackupError::Unsupported` when the target path already exists (even as an empty file or
+///   symlink), the target is in memory, a backup file is encrypted
 ///   and `restore_config` has no key, or a `RestoreTarget::Lsn` or `RestoreTarget::Time` is
 ///   earlier than the full backup;
 /// - `BackupError::Corruption` when the backup chain is corrupt: it does not start with a full
@@ -479,20 +526,20 @@ pub fn restore_backup(
 /// - `BackupError::ProfileFloorsNotMet` when the restored database would not meet a floor of the
 ///   backed-up profile manifest and `allow_unmet_profile_floors` is not set.
 ///
-/// Creating the target can fail with `BackupError::Config`, for example when its storage cannot
-/// be opened. Once the target exists, restore fails, leaving the initialised target file behind
-/// without any restored records, when the target has no local storage
-/// (`BackupError::Unsupported`), when the full payload's LSN differs from its manifest's
-/// `end_lsn` (`BackupError::Corruption`), or when storage rejects restored records
-/// (`BackupError::Storage`).
+/// Creating the private staging database can fail with `BackupError::Config`. Replay or
+/// validation failures remove the staging directory and leave the target absent. A target
+/// created concurrently is preserved and publication fails. A directory-sync error after
+/// publication is reported as I/O failure; the published file already contains the complete
+/// restore, but its directory entry may not be durable.
 pub fn restore_backup_with_config(
     backup_dir: impl AsRef<Path>,
-    config: DbConfig,
+    mut config: DbConfig,
     target: RestoreTarget,
     restore_config: &RestoreConfig,
 ) -> Result<RestoreReport, BackupError> {
     let started = Instant::now();
     ensure_restore_target_empty(&config)?;
+    ensure_payload_limit(restore_config.max_payload_bytes)?;
     let chain = load_chain(backup_dir.as_ref())?;
     let first = chain
         .first()
@@ -504,21 +551,41 @@ pub fn restore_backup_with_config(
     }
 
     let backup_keys = restore_key_provider(restore_config)?;
-    let full_payload = read_backup_payload::<BackupDataPayload>(
+    let full_payload = read_backup_payload_bounded::<BackupDataPayload>(
         &chain[0].path,
         required_file(&chain[0].manifest, FULL_DATA_FILE)?,
         backup_keys.as_ref(),
+        restore_config.max_payload_bytes,
     )?;
+    let mut seen_records = BTreeSet::new();
+    for record in &full_payload.records {
+        if !seen_records.insert((&record.table, &record.key)) {
+            return Err(BackupError::Corruption(
+                "full backup contains a duplicate table/key record".to_owned(),
+            ));
+        }
+    }
     ensure_tensor_restore_profile(&chain, &config, &full_payload)?;
     ensure_restore_replication_supported(&chain, &full_payload, &target)?;
-    let target_lsn = resolve_target_lsn(&chain, &target, backup_keys.as_ref())?;
-    let audit_flag =
-        check_incremental_payloads(&chain, backup_keys.as_ref(), &full_payload, target_lsn)?;
+    let target_lsn = resolve_target_lsn(
+        &chain,
+        &target,
+        backup_keys.as_ref(),
+        restore_config.max_payload_bytes,
+    )?;
+    let audit_flag = check_incremental_payloads(
+        &chain,
+        backup_keys.as_ref(),
+        &full_payload,
+        target_lsn,
+        restore_config.max_payload_bytes,
+    )?;
     let manifest = restore_target_manifest(&config, &full_payload)?;
     if let Some(manifest) = &manifest {
         check_restore_floors(manifest, audit_flag.as_deref(), restore_config)?;
     }
 
+    let staging = RestoreStaging::new(&mut config)?;
     let database = create_restore_target(config, manifest.as_ref())?;
     let storage = database.local_storage().ok_or_else(|| {
         BackupError::Unsupported("restore target must have local storage".to_owned())
@@ -533,10 +600,18 @@ pub fn restore_backup_with_config(
         )));
     }
 
-    let applied = replay_incrementals(&mut write, &chain, target_lsn, backup_keys.as_ref())?;
+    let applied = replay_incrementals(
+        &mut write,
+        &chain,
+        target_lsn,
+        backup_keys.as_ref(),
+        restore_config.max_payload_bytes,
+    )?;
 
     write_restore_metadata(&mut write, &chain[0].manifest.timeline_id, target_lsn)?;
     write.commit()?;
+    drop(database);
+    staging.publish()?;
     observability::record_restore("ok", started.elapsed());
 
     Ok(RestoreReport {
@@ -561,7 +636,7 @@ pub fn verify_backup(backup_dir: impl AsRef<Path>) -> Result<VerifyReport, Backu
 ///
 /// The drill restores without checking profile floors, as if
 /// `allow_unmet_profile_floors` were set: its target is a temporary redb file under
-/// [`std::env::temp_dir`] that only this verification reads and that is removed when the drill
+/// [`std::env::temp_dir`] inside an exclusive private directory, removed when the drill
 /// ends, also when it fails, so no restored database keeps running below a floor. Like every
 /// restore target, that file is not encrypted at rest: while the drill runs it holds the
 /// restored values in plaintext, also when the backup files are encrypted.
@@ -576,6 +651,7 @@ pub fn verify_backup_with_config(
     restore_config: &RestoreConfig,
 ) -> Result<VerifyReport, BackupError> {
     let started = Instant::now();
+    ensure_payload_limit(restore_config.max_payload_bytes)?;
     let chain = load_chain(backup_dir.as_ref())?;
     let selected = chain
         .last()
@@ -584,14 +660,20 @@ pub fn verify_backup_with_config(
     let mut checked_files = 0_usize;
     for item in &chain {
         for file in &item.manifest.files {
-            verify_file(&item.path, file, backup_keys.as_ref())?;
+            verify_file(
+                &item.path,
+                file,
+                backup_keys.as_ref(),
+                restore_config.max_payload_bytes,
+            )?;
             checked_files = checked_files.saturating_add(1);
         }
     }
 
-    let restore_path = std::env::temp_dir().join(format!("multidb-verify-{}.redb", new_id()));
-    // The drill database holds decrypted data, so it is removed on every path.
-    let drill = RemoveOnDrop(restore_path.clone());
+    // The drill can contain decrypted secrets. Keep the complete lifetime inside
+    // an exclusive directory, not a world-searchable shared temporary directory.
+    let drill = fileio::PrivateDirectory::create_in(&std::env::temp_dir(), "multidb-verify")?;
+    let restore_path = drill.path().join("database.redb");
     let config = DbConfig::on_disk(selected.manifest.profile, &restore_path);
     let drill_config = RestoreConfig {
         allow_unmet_profile_floors: true,
@@ -633,17 +715,6 @@ pub fn list_backups(root: impl AsRef<Path>) -> Result<Vec<BackupManifest>, Backu
     Ok(manifests)
 }
 
-/// Removes a temporary file when dropped, including on early error returns.
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        if self.0.exists() && fs::remove_file(&self.0).is_err() {
-            tracing::debug!("temporary verify database could not be removed");
-        }
-    }
-}
-
 #[derive(Clone)]
 struct ChainItem {
     path: PathBuf,
@@ -651,11 +722,24 @@ struct ChainItem {
 }
 
 fn current_or_new_timeline(database: &Database) -> Result<TimelineId, BackupError> {
-    match database.read(BACKUP_META_TABLE, KEY_TIMELINE_ID, ReadConsistency::Strong)? {
-        Some(bytes) => {
-            String::from_utf8(bytes).map_err(|error| BackupError::Serde(error.to_string()))
-        }
-        None => Ok(new_id()),
+    let storage = database.local_storage().ok_or_else(|| {
+        BackupError::Unsupported("sharded backup must be taken per shard".to_owned())
+    })?;
+    // Storage writers serialize this initial-if-missing maintenance metadata.
+    // Every full backup of the same source must retain the same identity.
+    let mut write = storage.begin_write()?;
+    if let Some(bytes) = write.get(BACKUP_META_TABLE, KEY_TIMELINE_ID)? {
+        String::from_utf8(bytes).map_err(|error| BackupError::Serde(error.to_string()))
+    } else {
+        let timeline = new_id();
+        write.put(BACKUP_META_TABLE, KEY_TIMELINE_ID, timeline.as_bytes())?;
+        write.put(
+            txn::KEYSPACE_REGISTRY_TABLE,
+            BACKUP_META_TABLE.as_bytes(),
+            KEYSPACE_PRESENT_VALUE,
+        )?;
+        write.commit()?;
+        Ok(timeline)
     }
 }
 
@@ -663,12 +747,40 @@ fn new_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+fn commit_hash_at(read: &impl ReadTransaction, lsn: Lsn) -> Result<Option<String>, BackupError> {
+    read.get(txn::COMMIT_LOG_TABLE, &txn::commit_log_key(lsn))?
+        .map(|bytes| {
+            let record = txn::decode_commit_log_record(&bytes)?;
+            let canonical = txn::encode_commit_log_record(&record)?;
+            Ok(blake3::hash(&canonical).to_hex().to_string())
+        })
+        .transpose()
+}
+
 fn backup_dir(root: &Path, backup_id: &str) -> PathBuf {
     root.join(backup_id)
 }
 
+fn create_backup_directory(root: &Path, backup_id: &str) -> Result<PathBuf, BackupError> {
+    fs::create_dir_all(root)?;
+    let path = backup_dir(root, backup_id);
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path)?;
+    fileio::sync_parent(&path)?;
+    Ok(path)
+}
+
 fn read_manifest(dir: &Path) -> Result<BackupManifest, BackupError> {
-    let bytes = fs::read(dir.join(MANIFEST_FILE))?;
+    let bytes = read_bounded(
+        fs::File::open(checked_backup_file(dir, MANIFEST_FILE)?)?,
+        MAX_MANIFEST_BYTES,
+        "backup manifest",
+    )?;
     let manifest = serde_json::from_slice::<BackupManifest>(&bytes)
         .map_err(|error| BackupError::Serde(error.to_string()))?;
     if manifest.format_version != FORMAT_VERSION {
@@ -880,12 +992,65 @@ fn write_compressed_json<T: Serialize>(
     })
 }
 
+#[cfg(test)]
 fn read_backup_payload<T: DeserializeOwned>(
     base: &Path,
     entry: &BackupFileEntry,
     encryption: Option<&ConfiguredKeyProvider>,
 ) -> Result<T, BackupError> {
-    let stored = fs::read(base.join(&entry.path))?;
+    read_backup_payload_bounded(base, entry, encryption, DEFAULT_MAX_PAYLOAD_BYTES)
+}
+
+fn ensure_payload_limit(limit: u64) -> Result<(), BackupError> {
+    if limit == 0 {
+        return Err(BackupError::Unsupported(
+            "restore max_payload_bytes must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded(
+    reader: impl Read,
+    max_bytes: u64,
+    description: &str,
+) -> Result<Bytes, BackupError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(BackupError::Unsupported(format!(
+            "{description} exceeds byte limit {max_bytes}"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_backup_payload_bounded<T: DeserializeOwned>(
+    base: &Path,
+    entry: &BackupFileEntry,
+    encryption: Option<&ConfiguredKeyProvider>,
+    max_payload_bytes: u64,
+) -> Result<T, BackupError> {
+    ensure_payload_limit(max_payload_bytes)?;
+    if entry.bytes > max_payload_bytes {
+        return Err(BackupError::Unsupported(
+            "stored backup payload exceeds max_payload_bytes".to_owned(),
+        ));
+    }
+    let path = checked_backup_file(base, &entry.path)?;
+    let stored = read_bounded(
+        fs::File::open(path)?,
+        max_payload_bytes,
+        "stored backup payload",
+    )?;
+    if stored.len() as u64 != entry.bytes {
+        return Err(BackupError::Corruption(format!(
+            "stored length mismatch for {}",
+            entry.path
+        )));
+    }
     if crc32fast::hash(&stored) != entry.checksum {
         return Err(BackupError::Corruption(format!(
             "compressed checksum mismatch for {}",
@@ -903,7 +1068,11 @@ fn read_backup_payload<T: DeserializeOwned>(
     } else {
         stored
     };
-    let json = zstd::stream::decode_all(Cursor::new(compressed))?;
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))?;
+    // Writer level 3 uses a much smaller window. Bound decoder allocations too,
+    // not just output bytes, so a forged frame cannot request a huge window.
+    decoder.window_log_max(27)?;
+    let json = read_bounded(decoder, max_payload_bytes, "decompressed backup payload")?;
     if crc32fast::hash(&json) != entry.logical_checksum {
         return Err(BackupError::Corruption(format!(
             "logical checksum mismatch for {}",
@@ -917,8 +1086,10 @@ fn verify_file(
     base: &Path,
     entry: &BackupFileEntry,
     encryption: Option<&ConfiguredKeyProvider>,
+    max_payload_bytes: u64,
 ) -> Result<(), BackupError> {
-    let _: serde_json::Value = read_backup_payload(base, entry, encryption)?;
+    let _: serde_json::Value =
+        read_backup_payload_bounded(base, entry, encryption, max_payload_bytes)?;
     Ok(())
 }
 
@@ -940,7 +1111,16 @@ fn restore_key_provider(
     config
         .encryption
         .as_ref()
-        .map(configured_key_provider)
+        .map(|encryption| match &encryption.mode {
+            EncryptionMode::LegacyFile => {
+                Ok(ConfiguredKeyProvider::file_key(encryption.key_path.clone()))
+            }
+            EncryptionMode::LocalEnvelope {
+                keyring_path,
+                kek_path,
+            } => ConfiguredKeyProvider::open_local_envelope(keyring_path.clone(), kek_path.clone())
+                .map_err(Into::into),
+        })
         .transpose()
 }
 
@@ -1095,6 +1275,12 @@ fn load_chain(selected_dir: &Path) -> Result<Vec<ChainItem>, BackupError> {
         if !parent_path.exists() {
             return Err(BackupError::MissingParent(parent_id));
         }
+        let metadata = fs::symlink_metadata(&parent_path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(BackupError::Corruption(
+                "backup parent must be a directory, not a symlink".to_owned(),
+            ));
+        }
         let parent = read_manifest(&parent_path)?;
         validate_chain_link(&manifest, &parent_id, &parent)?;
         seen.insert(parent_id);
@@ -1156,11 +1342,12 @@ fn replay_incrementals(
     chain: &[ChainItem],
     target_lsn: Lsn,
     encryption: Option<&ConfiguredKeyProvider>,
+    max_payload_bytes: u64,
 ) -> Result<usize, BackupError> {
     let mut applied = 0_usize;
     let mut last_lsn = full_backup_end_lsn(chain)?;
     for item in chain.iter().skip(1) {
-        let payload = read_incremental_payload(item, encryption)?;
+        let payload = read_incremental_payload(item, encryption, max_payload_bytes)?;
         last_lsn = check_commit_log(item, &payload, last_lsn)?;
         for record in payload
             .records
@@ -1215,6 +1402,7 @@ fn resolve_target_lsn(
     chain: &[ChainItem],
     target: &RestoreTarget,
     encryption: Option<&ConfiguredKeyProvider>,
+    max_payload_bytes: u64,
 ) -> Result<Lsn, BackupError> {
     let first = chain
         .first()
@@ -1239,7 +1427,9 @@ fn resolve_target_lsn(
             }
             Ok(*lsn)
         }
-        RestoreTarget::Time(time) => target_lsn_for_time(chain, *time, encryption),
+        RestoreTarget::Time(time) => {
+            target_lsn_for_time(chain, *time, encryption, max_payload_bytes)
+        }
     }
 }
 
@@ -1343,6 +1533,7 @@ fn target_lsn_for_time(
     chain: &[ChainItem],
     time: SystemTime,
     encryption: Option<&ConfiguredKeyProvider>,
+    max_payload_bytes: u64,
 ) -> Result<Lsn, BackupError> {
     let first = chain
         .first()
@@ -1356,10 +1547,11 @@ fn target_lsn_for_time(
     let mut selected = first.manifest.end_lsn;
 
     for item in chain.iter().skip(1) {
-        let payload = read_backup_payload::<CommitLogPayload>(
+        let payload = read_backup_payload_bounded::<CommitLogPayload>(
             &item.path,
             required_file(&item.manifest, WAL_DATA_FILE)?,
             encryption,
+            max_payload_bytes,
         )?;
         for record in payload.records {
             if record.committed_at <= time {
@@ -1371,19 +1563,86 @@ fn target_lsn_for_time(
 }
 
 fn ensure_restore_target_empty(config: &DbConfig) -> Result<(), BackupError> {
-    let Some(path) = &config.path else {
-        return Ok(());
+    let Some(path) = config
+        .path
+        .as_ref()
+        .filter(|_| !config.profile.is_in_memory())
+    else {
+        return Err(BackupError::Unsupported(
+            "restore requires a persistent on-disk target".to_owned(),
+        ));
     };
-    if !path.exists() {
-        return Ok(());
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(BackupError::Unsupported(
+            "restore target path must be absent, including symlinks and empty files".to_owned(),
+        )),
     }
-    let metadata = fs::metadata(path)?;
-    if metadata.len() == 0 {
-        return Ok(());
+}
+
+struct RestoreStaging {
+    directory: fileio::PrivateDirectory,
+    destination: PathBuf,
+}
+
+impl RestoreStaging {
+    fn new(config: &mut DbConfig) -> Result<Self, BackupError> {
+        let destination = config.path.clone().ok_or_else(|| {
+            BackupError::Unsupported("restore requires a persistent target".to_owned())
+        })?;
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let directory = fileio::PrivateDirectory::create_in(parent, "multidb-restore")?;
+        config.path = Some(directory.path().join("database.redb"));
+        Ok(Self {
+            directory,
+            destination,
+        })
     }
-    Err(BackupError::Unsupported(
-        "restore target path must be empty or absent".to_owned(),
-    ))
+
+    fn publish(self) -> Result<(), BackupError> {
+        let path = self.directory.path().join("database.redb");
+        fs::File::open(&path)?.sync_all()?;
+        // Never overwrite a destination created while validation/replay ran.
+        fs::hard_link(&path, &self.destination)?;
+        fileio::sync_parent(&self.destination)?;
+        Ok(())
+    }
+}
+
+/// Manifest file paths are relative regular files contained by the backup directory.
+/// Refuse links/devices before opening them, including links in intermediate directories.
+fn checked_backup_file(base: &Path, relative: &str) -> Result<PathBuf, BackupError> {
+    let mut path = base.to_path_buf();
+    if relative.is_empty() || relative.contains('\\') || relative.contains(':') {
+        return Err(BackupError::Corruption(
+            "invalid backup file path".to_owned(),
+        ));
+    }
+    for part in Path::new(relative).components() {
+        let std::path::Component::Normal(part) = part else {
+            return Err(BackupError::Corruption(
+                "backup file path escapes its directory".to_owned(),
+            ));
+        };
+        path.push(part);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(BackupError::Corruption(
+                "backup file path contains a symlink".to_owned(),
+            ));
+        }
+    }
+    if !fs::symlink_metadata(&path)?.is_file() {
+        return Err(BackupError::Corruption(
+            "backup payload is not a regular file".to_owned(),
+        ));
+    }
+    Ok(path)
 }
 
 /// The profile manifest in the full backup payload, which `create_restore_target` builds the
@@ -1412,11 +1671,13 @@ fn restore_target_manifest(
 fn read_incremental_payload(
     item: &ChainItem,
     encryption: Option<&ConfiguredKeyProvider>,
+    max_payload_bytes: u64,
 ) -> Result<CommitLogPayload, BackupError> {
-    read_backup_payload(
+    read_backup_payload_bounded(
         &item.path,
         required_file(&item.manifest, WAL_DATA_FILE)?,
         encryption,
+        max_payload_bytes,
     )
 }
 
@@ -1432,6 +1693,7 @@ fn check_incremental_payloads(
     encryption: Option<&ConfiguredKeyProvider>,
     full_payload: &BackupDataPayload,
     target_lsn: Lsn,
+    max_payload_bytes: u64,
 ) -> Result<Option<Bytes>, BackupError> {
     let source_profile = chain
         .first()
@@ -1446,7 +1708,7 @@ fn check_incremental_payloads(
         .map(|record| record.value.clone());
     let mut last_lsn = full_backup_end_lsn(chain)?;
     for item in chain.iter().skip(1) {
-        let payload = read_incremental_payload(item, encryption)?;
+        let payload = read_incremental_payload(item, encryption, max_payload_bytes)?;
         last_lsn = check_commit_log(item, &payload, last_lsn)?;
         for write in payload
             .records

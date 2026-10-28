@@ -9,7 +9,7 @@ pub(crate) use dataset::search_dataset;
 use std::sync::{Arc, OnceLock};
 
 use crate::{
-    tensor::{TensorDevice, TensorError, TensorExecution, TensorGpuOperation},
+    tensor::{TensorDeadline, TensorDevice, TensorError, TensorExecution, TensorGpuOperation},
     vector::VectorMetric,
 };
 
@@ -99,6 +99,17 @@ impl TensorGpuEngine {
         query: &[f32],
         metric: VectorMetric,
     ) -> Result<Vec<f32>, TensorError> {
+        self.compute_distances_until(rows, query, metric, TensorDeadline::default())
+    }
+
+    pub(crate) fn compute_distances_until(
+        &self,
+        rows: &[Vec<f32>],
+        query: &[f32],
+        metric: VectorMetric,
+        deadline: TensorDeadline,
+    ) -> Result<Vec<f32>, TensorError> {
+        deadline.check()?;
         validate_rows(rows)?;
         if query.is_empty()
             || query.len() > MAX_QUERY_DIMENSION
@@ -109,13 +120,26 @@ impl TensorGpuEngine {
         if rows.iter().any(|row| row.len() != query.len()) {
             return invalid("every GPU search row must match the query dimension");
         }
+        if query.iter().any(|value| value.is_subnormal())
+            || metric == VectorMetric::L2
+                && rows.iter().any(|row| {
+                    row.iter()
+                        .zip(query)
+                        .any(|(left, right)| (left - right).is_subnormal())
+                })
+        {
+            return Err(TensorError::GpuUnsupported(
+                "subnormal GPU inputs or L2 differences are not portable across native adapters"
+                    .to_owned(),
+            ));
+        }
         if metric == VectorMetric::Cosine
             && (query.iter().all(|value| *value == 0.0)
                 || rows.iter().any(|row| row.iter().all(|value| *value == 0.0)))
         {
             return invalid("cosine GPU search requires nonzero query and sample vectors");
         }
-        self.dispatch(rows, query, u32::from(metric != VectorMetric::L2))
+        self.dispatch(rows, query, u32::from(metric != VectorMetric::L2), deadline)
     }
 
     /// Reduces each possibly ragged row on the GPU.
@@ -126,6 +150,16 @@ impl TensorGpuEngine {
         rows: &[Vec<f32>],
         operation: TensorGpuOperation,
     ) -> Result<Vec<f32>, TensorError> {
+        self.reduce_rows_until(rows, operation, TensorDeadline::default())
+    }
+
+    pub(crate) fn reduce_rows_until(
+        &self,
+        rows: &[Vec<f32>],
+        operation: TensorGpuOperation,
+        deadline: TensorDeadline,
+    ) -> Result<Vec<f32>, TensorError> {
+        deadline.check()?;
         validate_rows(rows)?;
         let mode = match operation {
             TensorGpuOperation::Sum => 2,
@@ -137,7 +171,7 @@ impl TensorGpuEngine {
             }
             TensorGpuOperation::L2Norm => 4,
         };
-        self.dispatch(rows, &[], mode)
+        self.dispatch(rows, &[], mode, deadline)
     }
 
     fn dispatch(
@@ -145,14 +179,15 @@ impl TensorGpuEngine {
         rows: &[Vec<f32>],
         query: &[f32],
         mode: u32,
+        deadline: TensorDeadline,
     ) -> Result<Vec<f32>, TensorError> {
         #[cfg(feature = "tensor-gpu")]
         {
-            self.inner.dispatch(rows, query, mode)
+            self.inner.dispatch(rows, query, mode, deadline)
         }
         #[cfg(not(feature = "tensor-gpu"))]
         {
-            let _ = (rows, query, mode);
+            let _ = (rows, query, mode, deadline);
             Err(TensorError::GpuUnavailable(
                 "this build has no tensor-gpu feature".to_owned(),
             ))
@@ -175,6 +210,11 @@ fn validate_rows(rows: &[Vec<f32>]) -> Result<(), TensorError> {
         if row.iter().any(|value| !value.is_finite()) {
             return invalid("GPU tensor inputs must be finite f32 values");
         }
+        if row.iter().any(|value| value.is_subnormal()) {
+            return Err(TensorError::GpuUnsupported(
+                "subnormal GPU inputs are not portable across native adapters".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -187,11 +227,15 @@ fn invalid<T>(message: &str) -> Result<T, TensorError> {
 mod native {
     use std::{
         borrow::Cow,
-        sync::{Mutex, mpsc},
+        sync::{
+            Mutex, TryLockError,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         time::{Duration, Instant},
     };
 
-    use super::{TensorDevice, TensorError, TensorExecution, invalid};
+    use super::{TensorDeadline, TensorDevice, TensorError, TensorExecution, invalid};
 
     pub(super) struct GpuState {
         device: wgpu::Device,
@@ -200,6 +244,7 @@ mod native {
         pub(super) execution: TensorExecution,
         // Error scopes are device-wide. Keep dispatch, mapping and scope draining together.
         serial: Mutex<()>,
+        failed: AtomicBool,
     }
 
     pub(super) fn hardware_type(kind: wgpu::DeviceType) -> bool {
@@ -277,6 +322,7 @@ mod native {
                 queue,
                 pipeline,
                 serial: Mutex::new(()),
+                failed: AtomicBool::new(false),
                 execution: TensorExecution {
                     device: TensorDevice::Gpu,
                     adapter: Some(info.name),
@@ -290,18 +336,31 @@ mod native {
             rows: &[Vec<f32>],
             query: &[f32],
             mode: u32,
+            deadline: TensorDeadline,
         ) -> Result<Vec<f32>, TensorError> {
+            deadline.check()?;
+            self.ensure_available()?;
             if rows.is_empty() {
                 return Ok(Vec::new());
             }
-            let _serial = self
-                .serial
-                .lock()
-                .map_err(|_| TensorError::Gpu("GPU dispatch lock poisoned".to_owned()))?;
+            let _serial = loop {
+                deadline.check()?;
+                match self.serial.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err(TensorError::Gpu("GPU dispatch lock poisoned".to_owned()));
+                    }
+                    Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+                }
+            };
+            self.ensure_available()?;
             push_scopes(&self.device);
-            let result = self.dispatch_scoped(rows, query, mode);
+            let result = self.dispatch_scoped(rows, query, mode, deadline);
             let errors = check_scopes(&self.device);
-            errors.and(result)
+            match result {
+                Err(error @ TensorError::Timeout(_)) => Err(error),
+                other => errors.and(other),
+            }
         }
 
         // Keep buffer lifetimes, GPU submission and readback in one error-scoped operation.
@@ -311,12 +370,14 @@ mod native {
             rows: &[Vec<f32>],
             query: &[f32],
             mode: u32,
+            query_deadline: TensorDeadline,
         ) -> Result<Vec<f32>, TensorError> {
             let mut values = Vec::new();
             let mut offsets = Vec::with_capacity((rows.len() + 1) * 4);
             offsets.extend_from_slice(&0_u32.to_le_bytes());
             let mut total = 0_u32;
             for row in rows {
+                query_deadline.check()?;
                 for value in row {
                     values.extend_from_slice(&value.to_le_bytes());
                 }
@@ -324,6 +385,7 @@ mod native {
                     .map_err(|_| TensorError::InvalidValue("row length exceeds u32".to_owned()))?;
                 offsets.extend_from_slice(&total.to_le_bytes());
             }
+            query_deadline.check()?;
             if values.is_empty() {
                 values.extend_from_slice(&0_f32.to_le_bytes());
             }
@@ -399,6 +461,7 @@ mod native {
                 pass.dispatch_workgroups(row_count.div_ceil(64), 1, 1);
             }
             encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_size);
+            query_deadline.check()?;
             self.queue.submit([encoder.finish()]);
             let (sender, receiver) = mpsc::sync_channel(1);
             readback
@@ -408,6 +471,11 @@ mod native {
                 });
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
+                if let Err(error) = query_deadline.check() {
+                    self.failed.store(true, Ordering::Release);
+                    self.device.destroy();
+                    return Err(error);
+                }
                 self.device
                     .poll(wgpu::PollType::Poll)
                     .map_err(|error| TensorError::Gpu(format!("GPU polling failed: {error}")))?;
@@ -426,6 +494,7 @@ mod native {
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
                 if Instant::now() >= deadline {
+                    self.failed.store(true, Ordering::Release);
                     self.device.destroy();
                     return Err(TensorError::Gpu(
                         "GPU dispatch timed out after 30 seconds; device destroyed".to_owned(),
@@ -446,6 +515,13 @@ mod native {
                 return invalid("GPU result exceeds the finite f32 range");
             }
             Ok(result)
+        }
+
+        fn ensure_available(&self) -> Result<(), TensorError> {
+            if self.failed.load(Ordering::Acquire) {
+                return Err(TensorError::GpuUnavailable("tensor GPU device stopped after a timeout; restart the server to reinitialize it".to_owned()));
+            }
+            Ok(())
         }
 
         fn input(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -490,6 +566,10 @@ mod tests {
         assert!(validate_rows(&[vec![0.0; MAX_ELEMENTS + 1]]).is_err());
         assert!(validate_rows(&[vec![f32::NAN]]).is_err());
         assert!(validate_rows(&[vec![f32::INFINITY]]).is_err());
+        assert!(matches!(
+            validate_rows(&[vec![f32::from_bits(1)]]),
+            Err(TensorError::GpuUnsupported(_))
+        ));
         assert!(validate_rows(&[vec![1.0, 2.0], vec![]]).is_ok());
     }
 
@@ -535,6 +615,10 @@ mod tests {
             VectorMetric::L2,
         )?;
         near(&distances, &[5.0, 0.0]);
+        near(
+            &engine.compute_distances(&[vec![1.0e20, 1.0]], &[1.0e20, 0.0], VectorMetric::L2)?,
+            &[1.0],
+        );
         let huge = f32::MAX / 4.0;
         let cosine = engine.compute_distances(
             &[vec![huge, huge], vec![-huge, -huge]],
@@ -583,6 +667,10 @@ mod tests {
             VectorMetric::L2,
         )?;
         near(&distances, &[5.0, 0.0]);
+        near(
+            &engine.compute_distances(&[vec![1.0e20, 1.0]], &[1.0e20, 0.0], VectorMetric::L2)?,
+            &[1.0],
+        );
         near(
             &engine.compute_distances(
                 &[vec![f32::MAX, f32::MAX], vec![-f32::MAX, -f32::MAX]],

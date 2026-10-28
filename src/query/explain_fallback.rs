@@ -82,6 +82,7 @@ impl SqlEngine {
                 ctx,
                 plan,
                 planning,
+                budget,
             } => {
                 let started = std::time::Instant::now();
                 let optimized = ctx
@@ -96,7 +97,9 @@ impl SqlEngine {
                 let planning = planning.saturating_add(started.elapsed());
                 let (actual_rows, actual_ms) = if options.analyze {
                     let started = std::time::Instant::now();
-                    let output = self.run_datafusion_select(&ctx, *plan, planning).await?;
+                    let output = self
+                        .run_datafusion_select(&ctx, *plan, planning, &budget)
+                        .await?;
                     let SqlOutput::Rows(rows) = output else {
                         return Err(QueryError::Unsupported(
                             "EXPLAIN requires a read query".to_owned(),

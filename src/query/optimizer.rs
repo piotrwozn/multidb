@@ -745,6 +745,28 @@ fn eligible_indexes<'a>(
         .collect()
 }
 
+/// Normalized fingerprints share plans across literals. Recheck partial-index
+/// eligibility against the current predicate before reusing any indexed path.
+pub(super) fn cached_path_applies(
+    path: &AccessPath,
+    indexes: &[RelIndexSpec],
+    filter: &RelPredicate,
+    projection: &[usize],
+) -> bool {
+    let eligible = eligible_indexes(indexes, filter);
+    let eligible_index = |id| eligible.iter().find(|index| index.id == id).copied();
+    match path {
+        AccessPath::BTreeIndex { index_id, .. } => eligible_index(*index_id).is_some(),
+        AccessPath::IndexOnly { index_id, .. } => {
+            eligible_index(*index_id).is_some_and(|index| index.covers_projection(projection))
+        }
+        AccessPath::BitmapIndex { index_ids, .. } => {
+            index_ids.iter().all(|id| eligible_index(*id).is_some())
+        }
+        _ => true,
+    }
+}
+
 fn bitmap_path_for_filter(
     filter: &RelPredicate,
     eligible: &[&RelIndexSpec],

@@ -26,16 +26,14 @@ use datafusion::{
         source_as_provider,
     },
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{
-        disk_manager::DiskManagerBuilder, memory_pool::GreedyMemoryPool,
-        runtime_env::RuntimeEnvBuilder,
-    },
+    execution::{disk_manager::DiskManagerBuilder, runtime_env::RuntimeEnvBuilder},
     logical_expr::{
         Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, lit,
     },
-    physical_plan::{ExecutionPlan, collect},
+    physical_plan::ExecutionPlan,
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
+use futures::StreamExt;
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use rayon::prelude::*;
 use sqlparser::ast::{
@@ -65,10 +63,12 @@ use crate::{
 };
 
 mod batch_cache;
+mod budget;
 mod explain_fallback;
 mod optimizer;
 mod parser;
 mod row_scan;
+mod simple_grammar;
 mod write_batch;
 
 pub use optimizer::{
@@ -348,6 +348,7 @@ enum PreparedSelect {
         plan: Box<LogicalPlan>,
         /// Time already spent planning; execution gets the rest of the query timeout.
         planning: std::time::Duration,
+        budget: Arc<budget::Budget>,
     },
 }
 
@@ -385,6 +386,7 @@ struct StorageTableProvider {
     performance: PerformanceConfig,
     snapshot_lsn: Option<u64>,
     batch_cache: Arc<batch_cache::BatchCache>,
+    budget: Arc<budget::Budget>,
 }
 
 #[derive(Clone)]
@@ -2155,6 +2157,30 @@ impl SqlEngine {
         Ok(AnalyzeReport { mode, analyzed })
     }
 
+    /// Statistics expose raw row counts and value distributions, so they cannot
+    /// be computed under a caller's row or masking policies.
+    fn analyze_read_targets(
+        &self,
+        target: &AnalyzeTarget,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
+    ) -> Result<BTreeSet<SqlReadTarget>, QueryError> {
+        let names: BTreeSet<String> = match target {
+            AnalyzeTarget::All => self
+                .tables
+                .keys()
+                .chain(self.collections.keys())
+                .cloned()
+                .collect(),
+            AnalyzeTarget::Named(name) => BTreeSet::from([name.clone()]),
+        };
+        if let Some(name) = names.iter().find(|name| policies.contains_key(*name)) {
+            return Err(QueryError::Unsupported(format!(
+                "ANALYZE over {name} is unsupported while it has row or masking policies"
+            )));
+        }
+        Ok(names.into_iter().map(SqlReadTarget::Catalog).collect())
+    }
+
     /// Builds an optimizer explanation without necessarily executing the query.
     /// # Errors
     /// Fails when SQL is unsupported or execution fails under `ANALYZE`.
@@ -2194,15 +2220,13 @@ impl SqlEngine {
 
         let (actual_rows, actual_ms) = if options.analyze {
             let started = std::time::Instant::now();
-            let result = table.query_filter_with_access_path(
-                &simple.filter,
-                &simple.projection,
-                &plan.access_path,
-            )?;
+            let SqlOutput::Rows(result) = self.run_simple_select(sql, simple)? else {
+                return Err(QueryError::Unsupported(
+                    "EXPLAIN requires a read query".to_owned(),
+                ));
+            };
             (
-                Some(usize_to_u64(
-                    result.rows.len().min(simple.limit.unwrap_or(usize::MAX)),
-                )),
+                Some(usize_to_u64(result.rows.len())),
                 Some(optimizer::elapsed_ms(started)),
             )
         } else {
@@ -2260,6 +2284,16 @@ impl SqlEngine {
         }
 
         if let Some((target, mode)) = parse_analyze_command(sql)? {
+            let policies = guard
+                .as_deref()
+                .map(SqlReadGuard::relation_policies)
+                .unwrap_or_default();
+            let reads = self.analyze_read_targets(&target, &policies)?;
+            if let Some(guard) = guard.as_deref_mut() {
+                guard
+                    .authorize_reads(&reads)
+                    .map_err(QueryError::AuthzDenied)?;
+            }
             return Ok(self.analyze(target, mode)?.to_sql_output());
         }
 
@@ -2348,7 +2382,7 @@ impl SqlEngine {
             Statement::Analyze(_) => return Ok(None),
             other => return Err(QueryError::Unsupported(other.to_string())),
         };
-        let (ctx, providers) = self.datafusion_catalog_context(&policies)?;
+        let (ctx, providers, _) = self.datafusion_catalog_context(&policies)?;
         let plan = self.plan_datafusion_select(&ctx, &select_sql).await?;
         guard
             .authorize_reads(&planned_read_targets(&plan, &providers)?)
@@ -2378,7 +2412,8 @@ impl SqlEngine {
                     .map_or(Ok(AnalyzeTarget::All), |name| {
                         object_name_to_string(name).map(AnalyzeTarget::Named)
                     })?;
-                Ok((PreparedStatement::Analyze(target), None))
+                let reads = self.analyze_read_targets(&target, policies)?;
+                Ok((PreparedStatement::Analyze(target), Some(reads)))
             }
             Statement::Explain {
                 analyze, statement, ..
@@ -2423,7 +2458,11 @@ impl SqlEngine {
                 ctx,
                 plan,
                 planning,
-            }) => self.run_datafusion_select(&ctx, *plan, planning).await,
+                budget,
+            }) => {
+                self.run_datafusion_select(&ctx, *plan, planning, &budget)
+                    .await
+            }
             PreparedStatement::Analyze(target) => Ok(self
                 .analyze(target, AnalyzeMode::default())?
                 .to_sql_output()),
@@ -2464,7 +2503,7 @@ impl SqlEngine {
             ));
         }
 
-        let (ctx, providers) = self.datafusion_catalog_context(policies)?;
+        let (ctx, providers, budget) = self.datafusion_catalog_context(policies)?;
         let started = std::time::Instant::now();
         let plan = self.plan_datafusion_select(&ctx, sql).await?;
         let planning = started.elapsed();
@@ -2474,6 +2513,7 @@ impl SqlEngine {
                 ctx,
                 plan: Box::new(plan),
                 planning,
+                budget,
             },
             reads,
         ))
@@ -2486,24 +2526,34 @@ impl SqlEngine {
     fn datafusion_catalog_context(
         &self,
         policies: &BTreeMap<String, SqlRelationPolicy>,
-    ) -> Result<(SessionContext, RegisteredProviders), QueryError> {
-        let ctx = self.datafusion_context()?;
+    ) -> Result<(SessionContext, RegisteredProviders, Arc<budget::Budget>), QueryError> {
+        let budget = budget::Budget::new(&self.performance.query);
+        let ctx = self.datafusion_context(&budget)?;
         let mut providers: RegisteredProviders = Vec::new();
 
         for (name, table) in &self.tables {
             providers.push((
                 name.clone(),
                 Arc::new(StorageTableProvider::new(
-                    table.clone(),
+                    {
+                        let mut table = table.clone();
+                        if self.snapshot_lsn.is_some() || table.layout == TableLayout::Columnar {
+                            table.repl = budget::replication(Arc::clone(&table.repl), &budget);
+                        }
+                        table
+                    },
                     self.performance.clone(),
                     self.snapshot_lsn,
                     Arc::clone(&self.batch_cache),
+                    Arc::clone(&budget),
                 )),
             ));
         }
 
         for (name, provider) in &self.collections {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.repl = budget::replication(Arc::clone(&provider.repl), &budget);
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &self.foreign_tables {
@@ -2511,11 +2561,15 @@ impl SqlEngine {
         }
 
         for (name, provider) in &self.materialized_views {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.repl = budget::replication(Arc::clone(&provider.repl), &budget);
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &self.temporal_tables {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.repl = budget::replication(Arc::clone(&provider.repl), &budget);
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &mut providers {
@@ -2525,6 +2579,7 @@ impl SqlEngine {
                     Arc::clone(provider),
                     self.collections.get(name),
                     policy,
+                    Arc::clone(&budget),
                 )?;
             }
         }
@@ -2534,7 +2589,7 @@ impl SqlEngine {
                 .map_err(|error| QueryError::DataFusion(error.to_string()))?;
         }
 
-        Ok((ctx, providers))
+        Ok((ctx, providers, budget))
     }
 
     async fn plan_datafusion_select(
@@ -2565,7 +2620,9 @@ impl SqlEngine {
         ctx: &SessionContext,
         plan: LogicalPlan,
         planning: std::time::Duration,
+        budget: &Arc<budget::Budget>,
     ) -> Result<SqlOutput, QueryError> {
+        let _cancel_on_drop = budget.start(planning)?;
         // Planning and execution share one `timeout_ms` budget per statement.
         let timeout = std::time::Duration::from_millis(self.performance.query.timeout_ms)
             .saturating_sub(planning);
@@ -2580,18 +2637,28 @@ impl SqlEngine {
                 .iter()
                 .map(|field| field.name().clone())
                 .collect::<Vec<_>>();
-            let batches = dataframe
-                .collect()
+            let mut stream = dataframe
+                .execute_stream()
                 .await
                 .map_err(|error| datafusion_to_query_error(&error))?;
-            Ok::<_, QueryError>((columns, batches))
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(|error| datafusion_to_query_error(&error))?;
+                budget.charge_batch(&batch)?;
+                batches.push(batch);
+            }
+            let mut rows = Vec::new();
+            for batch in batches {
+                budget.check()?;
+                rows.extend(record_batches_to_rows(&[batch], Vec::new())?.rows);
+            }
+            budget.check()?;
+            Ok::<_, QueryError>(SqlOutput::Rows(SqlRows { columns, rows }))
         };
 
-        let (columns, batches) = tokio::time::timeout(timeout, execution)
+        tokio::time::timeout(timeout, execution)
             .await
-            .map_err(|_| self.timeout_error())??;
-
-        Ok(SqlOutput::Rows(record_batches_to_rows(&batches, columns)?))
+            .map_err(|_| self.timeout_error())?
     }
 
     fn timeout_error(&self) -> QueryError {
@@ -2601,11 +2668,9 @@ impl SqlEngine {
         ))
     }
 
-    fn datafusion_context(&self) -> Result<SessionContext, QueryError> {
+    fn datafusion_context(&self, budget: &budget::Budget) -> Result<SessionContext, QueryError> {
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(
-                self.performance.query.memory_limit_bytes,
-            )))
+            .with_memory_pool(Arc::clone(&budget.pool))
             .with_disk_manager_builder(
                 DiskManagerBuilder::default()
                     .with_max_temp_directory_size(self.performance.query.spill_limit_bytes),
@@ -2651,11 +2716,15 @@ impl SqlEngine {
             .tables
             .get(&simple.table)
             .ok_or_else(|| QueryError::MissingTable(simple.table.clone()))?;
+        let budget = budget::Budget::new(&self.performance.query);
+        let _cancel_on_drop = budget.start(std::time::Duration::ZERO)?;
+        let mut table = table.clone();
+        table.repl = budget::replication(Arc::clone(&table.repl), &budget);
         let stats = StatsCatalog::read_table(self.repl.as_ref(), &simple.table)?;
         let fingerprint = QueryFingerprint::new(sql);
         let plan = self.choose_eq_plan(
             &fingerprint,
-            table,
+            &table,
             &simple.filter,
             &simple.projection,
             stats.as_ref(),
@@ -2665,7 +2734,12 @@ impl SqlEngine {
             &simple.filter,
             &simple.projection,
             &plan.access_path,
-        )?;
+        );
+        budget.check()?;
+        let result = result?;
+        for row in &result.rows {
+            budget.charge_row(row, Some(&simple.projection))?;
+        }
         let mut rows = result
             .rows
             .into_iter()
@@ -2686,6 +2760,9 @@ impl SqlEngine {
         let [Statement::Query(query)] = statements.as_slice() else {
             return Ok(None);
         };
+        if !simple_grammar::supported(query) {
+            return Ok(None);
+        }
 
         if query.with.is_some()
             || query.order_by.is_some()
@@ -2790,6 +2867,12 @@ impl SqlEngine {
                 QueryError::Storage(StorageError::Backend("plan cache lock poisoned".to_owned()))
             })?
             .get(fingerprint, stats_version)
+            && optimizer::cached_path_applies(
+                &cached.access_path,
+                &table.indexes,
+                filter,
+                projection,
+            )
         {
             return Ok(EqPlan {
                 access_path: cached.access_path,
@@ -2848,6 +2931,7 @@ impl StorageTableProvider {
         performance: PerformanceConfig,
         snapshot_lsn: Option<u64>,
         batch_cache: Arc<batch_cache::BatchCache>,
+        budget: Arc<budget::Budget>,
     ) -> Self {
         Self {
             arrow_schema: schema_to_arrow(table.schema.as_ref()),
@@ -2855,6 +2939,7 @@ impl StorageTableProvider {
             performance,
             snapshot_lsn,
             batch_cache,
+            budget,
         }
     }
 }
@@ -3137,12 +3222,16 @@ impl TableProvider for StorageTableProvider {
         let snapshot_lsn = self.snapshot_lsn;
         let row_filters = filters.to_vec();
         let batch_cache = Arc::clone(&self.batch_cache);
+        let budget = Arc::clone(&self.budget);
 
         let batches = tokio::task::spawn_blocking(move || {
+            budget.check()?;
             if let Some(snapshot_lsn) = snapshot_lsn {
                 table.scan_record_batches_as_of_lsn(&schema, limit, batch_rows, snapshot_lsn)
             } else if table.layout == TableLayout::Row {
+                let filled = std::cell::Cell::new(false);
                 let scan = || {
+                    filled.set(true);
                     row_scan::batches(
                         &table,
                         &schema,
@@ -3150,16 +3239,24 @@ impl TableProvider for StorageTableProvider {
                         &row_filters,
                         limit,
                         batch_rows,
+                        Some(&budget),
                     )
                 };
                 if row_filters.is_empty() && limit.is_none() {
-                    batch_cache.batches(
+                    let batches = batch_cache.batches(
                         &table,
                         &schema,
                         projection_for_scan.as_deref(),
                         batch_rows,
                         scan,
-                    )
+                    )?;
+                    if !filled.get() {
+                        for batch in &batches {
+                            budget.charge_cached_source(batch)?;
+                        }
+                    }
+                    budget.check()?;
+                    Ok(batches)
                 } else {
                     scan()
                 }
@@ -5184,6 +5281,7 @@ struct PolicyTableProvider {
     plan: Result<LogicalPlan, String>,
     schema: SchemaRef,
     table_type: TableType,
+    budget: Arc<budget::Budget>,
 }
 
 #[async_trait]
@@ -5209,7 +5307,15 @@ impl TableProvider for PolicyTableProvider {
                 return Err(query_to_datafusion(QueryError::Unsupported(reason.clone())));
             }
         };
-        let batches = collect(plan, state.task_ctx()).await?;
+        let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            self.budget
+                .charge_batch(&batch)
+                .map_err(query_to_datafusion)?;
+            batches.push(batch);
+        }
         let mem = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         mem.scan(state, projection, &[], limit).await
     }
@@ -5225,6 +5331,7 @@ fn policy_table_provider(
     provider: Arc<dyn TableProvider>,
     collection: Option<&DocCollectionProvider>,
     policy: &SqlRelationPolicy,
+    budget: Arc<budget::Budget>,
 ) -> Result<Arc<dyn TableProvider>, QueryError> {
     // A collection column reads NULL where a document lacks its path or holds
     // a value of another type, so SQL predicates cannot decide its row policies.
@@ -5306,6 +5413,7 @@ fn policy_table_provider(
                                 )),
                                 schema: Arc::clone(&schema),
                                 table_type,
+                                budget,
                             }));
                         }
                     };
@@ -5326,6 +5434,7 @@ fn policy_table_provider(
         plan: Ok(plan),
         schema,
         table_type,
+        budget,
     }))
 }
 
@@ -5352,6 +5461,8 @@ fn datafusion_to_query_error(error: &DataFusionError) -> QueryError {
     // included, are client errors like the engine's parse errors.
     if matches!(error.find_root(), DataFusionError::SQL(..)) {
         QueryError::Parse(message)
+    } else if lower.contains("query timeout") || lower.contains("query exceeded") {
+        QueryError::Timeout(message)
     } else if lower.contains("cancel") {
         QueryError::Cancelled(message)
     } else if lower.contains("memory")
@@ -5369,6 +5480,10 @@ fn query_to_datafusion(error: QueryError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
+#[cfg(test)]
+mod analyze_guard_tests;
+#[cfg(test)]
+mod audit_tests;
 #[cfg(test)]
 mod index_read_tests;
 #[cfg(test)]

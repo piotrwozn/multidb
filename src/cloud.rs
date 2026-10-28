@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -725,14 +725,10 @@ impl CloudLease {
         let path = format!("leases/{}.lease", sanitize_object_component(&name.into()));
         let lease_id = Uuid::now_v7().to_string();
         let owner = options.owner.unwrap_or_else(|| lease_id.clone());
-        let expires_at = SystemTime::now()
-            .checked_add(options.ttl.max(Duration::from_millis(1)))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         let root = uri.local_root()?;
         let full_path = root.join(&path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let _guard = lock_lease_file(&full_path)?;
+        let expires_at = lease_expiration(options.ttl)?;
         if let Some(existing) = read_lease_file(&full_path)?
             && existing.expires_at > SystemTime::now()
         {
@@ -786,18 +782,20 @@ impl CloudLease {
     /// # Errors
     /// Fails when the backing object cannot be read/written or ownership changed.
     pub fn heartbeat(&mut self, ttl: Duration) -> Result<(), CloudError> {
+        let full_path = self.uri.local_root()?.join(&self.path);
+        let _guard = lock_lease_file(&full_path)?;
         self.ensure_owner()?;
-        self.expires_at = SystemTime::now()
-            .checked_add(ttl.max(Duration::from_millis(1)))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let expires_at = lease_expiration(ttl)?;
         write_lease_file(
-            &self.uri.local_root()?.join(&self.path),
+            &full_path,
             &CloudLeaseFile {
                 lease_id: self.lease_id.clone(),
                 owner: self.owner.clone(),
-                expires_at: self.expires_at,
+                expires_at,
             },
-        )
+        )?;
+        self.expires_at = expires_at;
+        Ok(())
     }
 
     /// Validates that a fencing token still owns the named lease.
@@ -810,6 +808,7 @@ impl CloudLease {
     ) -> Result<(), CloudError> {
         let path = format!("leases/{}.lease", sanitize_object_component(&name.into()));
         let full_path = uri.local_root()?.join(&path);
+        let _guard = lock_lease_file(&full_path)?;
         let Some(record) = read_lease_file(&full_path)? else {
             return Err(CloudError::LeaseOwnerMismatch(path));
         };
@@ -825,6 +824,7 @@ impl CloudLease {
     pub fn break_lease(uri: &ObjectStoreUri, name: impl Into<String>) -> Result<(), CloudError> {
         let path = format!("leases/{}.lease", sanitize_object_component(&name.into()));
         let full_path = uri.local_root()?.join(path);
+        let _guard = lock_lease_file(&full_path)?;
         if full_path.exists() {
             fs::remove_file(full_path)?;
         }
@@ -836,8 +836,11 @@ impl CloudLease {
     /// Fails when the object store URI is unsupported, ownership changed, or the lease file cannot be removed.
     pub fn release(&self) -> Result<(), CloudError> {
         let path = self.uri.local_root()?.join(&self.path);
-        self.ensure_owner()?;
-        if path.exists() {
+        let _guard = lock_lease_file(&path)?;
+        if let Some(record) = read_lease_file(&path)? {
+            if record.lease_id != self.lease_id || record.owner != self.owner {
+                return Err(CloudError::LeaseOwnerMismatch(self.path.clone()));
+            }
             fs::remove_file(path)?;
         }
         Ok(())
@@ -846,13 +849,41 @@ impl CloudLease {
     fn ensure_owner(&self) -> Result<(), CloudError> {
         let path = self.uri.local_root()?.join(&self.path);
         let Some(record) = read_lease_file(&path)? else {
-            return Ok(());
+            return Err(CloudError::LeaseOwnerMismatch(self.path.clone()));
         };
-        if record.lease_id != self.lease_id || record.owner != self.owner {
+        if record.lease_id != self.lease_id
+            || record.owner != self.owner
+            || record.expires_at <= SystemTime::now()
+        {
             return Err(CloudError::LeaseOwnerMismatch(self.path.clone()));
         }
         Ok(())
     }
+}
+
+fn lease_expiration(ttl: Duration) -> Result<SystemTime, CloudError> {
+    SystemTime::now()
+        .checked_add(ttl.max(Duration::from_millis(1)))
+        .ok_or_else(|| {
+            CloudError::Unsupported("lease TTL exceeds the system clock range".to_owned())
+        })
+}
+
+/// The sibling lock inode is never removed: locking the replaceable lease file
+/// itself would let a successor open another inode and bypass the old owner.
+fn lock_lease_file(path: &Path) -> Result<File, CloudError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lease.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 impl GuardedResumeSession {
@@ -1793,6 +1824,9 @@ fn throttle(limit: Option<u64>, bytes: u64, started: Instant) {
         std::thread::sleep(delay);
     }
 }
+
+#[cfg(test)]
+mod lease_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2963,6 +2997,7 @@ mod tests {
             engine_version: "test".to_owned(),
             files: Vec::new(),
             keyspace_counts: BTreeMap::new(),
+            end_commit_hash: None,
             encryption: None,
         }
     }

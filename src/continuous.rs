@@ -6,7 +6,10 @@ use crate::{
     extension::{AbiVersion, UdfBudget},
     model::Value,
     query::{Row, TableSchema},
-    repl::{Op, ReadConsistency, ReplError, Replication, propose_system, propose_system_batch},
+    repl::{
+        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition,
+        propose_system, propose_system_batch, propose_system_conditional_batch,
+    },
     security::{AuthzError, AuthzPolicy, Principal},
     storage::{Bytes, StorageError},
 };
@@ -222,28 +225,20 @@ pub fn create_continuous_query_as(
             "continuous query SQL is required".to_owned(),
         ));
     }
-    let previous_query = match read_continuous_query_state(repl, &spec.name) {
-        Ok(state) => Some(state),
-        Err(ContinuousError::MissingContinuousQuery(_)) => None,
-        Err(error) => return Err(error),
-    };
-    let previous_subscription = match cdc::subscription_state(repl, &spec.name) {
-        Ok(state) => {
-            cdc::require_subscription_owner(&state, principal)?;
-            Some(state)
-        }
-        Err(cdc::SubscriptionError::MissingSubscription(_)) => None,
-        Err(error) => return Err(error.into()),
-    };
+    let previous_query = query_state_snapshot(repl, &spec.name)?;
+    let previous_subscription = cdc::subscription_snapshot(repl, &spec.name)?;
+    if let Some((state, _)) = &previous_subscription {
+        cdc::require_subscription_owner(state, principal)?;
+    }
     let now = SystemTime::now();
     let state = ContinuousQueryState {
         name: spec.name.clone(),
         last_ack: previous_query
             .as_ref()
-            .map_or_else(|| spec.start.clone(), |state| state.last_ack.clone()),
+            .map_or_else(|| spec.start.clone(), |(state, _)| state.last_ack.clone()),
         created_at: previous_query
             .as_ref()
-            .map_or(now, |state| state.created_at),
+            .map_or(now, |(state, _)| state.created_at),
         updated_at: now,
     };
     let subscription = SubscriptionState {
@@ -252,23 +247,37 @@ pub fn create_continuous_query_as(
         config: spec.subscription_config(),
         last_ack: previous_subscription
             .as_ref()
-            .map_or_else(|| spec.start.clone(), |state| state.last_ack.clone()),
+            .map_or_else(|| spec.start.clone(), |(state, _)| state.last_ack.clone()),
         created_at: previous_subscription
             .as_ref()
-            .map_or(now, |state| state.created_at),
+            .map_or(now, |(state, _)| state.created_at),
         updated_at: now,
     };
-    propose_system_batch(
+    propose_system_conditional_batch(
         repl,
-        vec![
-            put_json(CONTINUOUS_QUERIES_TABLE, spec.name.as_bytes(), spec)?,
-            put_json(CONTINUOUS_QUERY_STATE_TABLE, spec.name.as_bytes(), &state)?,
-            put_json(
-                cdc::CDC_SUBSCRIPTIONS_TABLE,
-                spec.name.as_bytes(),
-                &subscription,
-            )?,
-        ],
+        ConditionalBatch::new(
+            vec![
+                WriteCondition::ValueEquals {
+                    table: CONTINUOUS_QUERY_STATE_TABLE.to_owned(),
+                    key: spec.name.as_bytes().to_vec(),
+                    expected: previous_query.map(|(_, bytes)| bytes),
+                },
+                WriteCondition::ValueEquals {
+                    table: cdc::CDC_SUBSCRIPTIONS_TABLE.to_owned(),
+                    key: spec.name.as_bytes().to_vec(),
+                    expected: previous_subscription.map(|(_, bytes)| bytes),
+                },
+            ],
+            vec![
+                put_json(CONTINUOUS_QUERIES_TABLE, spec.name.as_bytes(), spec)?,
+                put_json(CONTINUOUS_QUERY_STATE_TABLE, spec.name.as_bytes(), &state)?,
+                put_json(
+                    cdc::CDC_SUBSCRIPTIONS_TABLE,
+                    spec.name.as_bytes(),
+                    &subscription,
+                )?,
+            ],
+        ),
     )?;
     Ok(state)
 }
@@ -292,14 +301,117 @@ pub fn ack_continuous_query(
     token: ResumeToken,
 ) -> Result<ContinuousQueryState, ContinuousError> {
     ensure_commit_log(repl, "continuous queries")?;
-    let mut state = read_continuous_query_state(repl, name)?;
+    let (mut state, expected) = query_state_snapshot(repl, name)?
+        .ok_or_else(|| ContinuousError::MissingContinuousQuery(name.to_owned()))?;
+    cdc::validate_ack_advance(&state.last_ack, &token)?;
+    if state.last_ack == token {
+        return Ok(state);
+    }
     state.last_ack = token;
     state.updated_at = SystemTime::now();
-    propose_system(
+    propose_system_conditional_batch(
         repl,
-        put_json(CONTINUOUS_QUERY_STATE_TABLE, name.as_bytes(), &state)?,
+        ConditionalBatch::new(
+            vec![WriteCondition::ValueEquals {
+                table: CONTINUOUS_QUERY_STATE_TABLE.to_owned(),
+                key: name.as_bytes().to_vec(),
+                expected: Some(expected),
+            }],
+            vec![put_json(
+                CONTINUOUS_QUERY_STATE_TABLE,
+                name.as_bytes(),
+                &state,
+            )?],
+        ),
     )?;
     Ok(state)
+}
+
+/// Advances the query offset and its subscription cursor in one conditional commit.
+pub(crate) fn ack_continuous_query_and_subscription(
+    repl: &dyn Replication,
+    name: &str,
+    token: ResumeToken,
+) -> Result<ContinuousQueryState, ContinuousError> {
+    ack_query_and_subscription(repl, name, token, |_| Ok(()))
+}
+
+/// Authorizes the exact owner/filter snapshot updated by the conditional commit.
+pub(crate) fn ack_continuous_query_and_subscription_as(
+    repl: &dyn Replication,
+    authz: &AuthzPolicy,
+    principal: &Principal,
+    name: &str,
+    token: ResumeToken,
+) -> Result<ContinuousQueryState, ContinuousError> {
+    ack_query_and_subscription(repl, name, token, |state| {
+        cdc::require_subscription_owner(state, principal)?;
+        cdc::authorize_filter_access(authz, principal, &state.config.filter)?;
+        Ok(())
+    })
+}
+
+fn ack_query_and_subscription(
+    repl: &dyn Replication,
+    name: &str,
+    token: ResumeToken,
+    authorize: impl FnOnce(&SubscriptionState) -> Result<(), ContinuousError>,
+) -> Result<ContinuousQueryState, ContinuousError> {
+    ensure_commit_log(repl, "continuous queries")?;
+    let (mut state, query_bytes) = query_state_snapshot(repl, name)?
+        .ok_or_else(|| ContinuousError::MissingContinuousQuery(name.to_owned()))?;
+    let (mut subscription, subscription_bytes) = cdc::subscription_snapshot(repl, name)?
+        .ok_or_else(|| cdc::SubscriptionError::MissingSubscription(name.to_owned()))?;
+    authorize(&subscription)?;
+    cdc::validate_ack_advance(&state.last_ack, &token)?;
+    cdc::validate_ack_advance(&subscription.last_ack, &token)?;
+    if state.last_ack == token && subscription.last_ack == token {
+        return Ok(state);
+    }
+    state.last_ack = token.clone();
+    subscription.last_ack = token;
+    let now = SystemTime::now();
+    state.updated_at = now;
+    subscription.updated_at = now;
+    propose_system_conditional_batch(
+        repl,
+        ConditionalBatch::new(
+            vec![
+                WriteCondition::ValueEquals {
+                    table: CONTINUOUS_QUERY_STATE_TABLE.to_owned(),
+                    key: name.as_bytes().to_vec(),
+                    expected: Some(query_bytes),
+                },
+                WriteCondition::ValueEquals {
+                    table: cdc::CDC_SUBSCRIPTIONS_TABLE.to_owned(),
+                    key: name.as_bytes().to_vec(),
+                    expected: Some(subscription_bytes),
+                },
+            ],
+            vec![
+                put_json(CONTINUOUS_QUERY_STATE_TABLE, name.as_bytes(), &state)?,
+                put_json(cdc::CDC_SUBSCRIPTIONS_TABLE, name.as_bytes(), &subscription)?,
+            ],
+        ),
+    )?;
+    Ok(state)
+}
+
+fn query_state_snapshot(
+    repl: &dyn Replication,
+    name: &str,
+) -> Result<Option<(ContinuousQueryState, Bytes)>, ContinuousError> {
+    let Some(bytes) = repl.read(
+        CONTINUOUS_QUERY_STATE_TABLE,
+        name.as_bytes(),
+        ReadConsistency::Strong,
+    )?
+    else {
+        return Ok(None);
+    };
+    let state = serde_json::from_slice(&bytes)
+        .map_err(|error| ContinuousError::Serde(error.to_string()))?;
+    Ok(Some((state, bytes)))
 }
 
 /// Reads durable continuous-query state.

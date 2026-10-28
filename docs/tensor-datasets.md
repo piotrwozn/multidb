@@ -176,6 +176,12 @@ query representable as `f32`. `Cosine` is the default metric; `L2` means Euclide
 distance. Metric strings are case sensitive. Cosine rejects a zero query and
 skips zero-valued sample vectors, recording `skipped_samples`.
 
+GPU inputs must be zero or normal finite `f32` values. Subnormal inputs and
+subnormal L2 component differences return `tensor_gpu_unsupported`, because
+native adapters can flush them to zero. A query that underflows to zero or
+overflows when converted from `f64` is invalid. Tensor storage and CPU reference
+calculations retain their wider numeric range.
+
 This is bounded exact distance search over the requested sample range, not an
 ANN index. Results contain `hits` (`index`, `distance`), `scanned_samples`,
 `skipped_samples`, `total_samples`, `revision`, `next_start` and `execution`.
@@ -188,7 +194,10 @@ its own scanned range. Equal distances are ordered by sample index.
 report `device: "gpu"` with the selected adapter. Explicit reference datasets
 under other profiles report `device: "cpu"`; CPU reference search supports
 fixed rank-one `f32` and `f64`. The SDK forwards the server's metadata unchanged.
-GPU floating-point results can differ slightly from reference calculations.
+GPU calculations use `f32`; CPU reference calculations accumulate in `f64`.
+Rounding and cancellation can produce different results, especially for sums
+with widely different magnitudes. Search computes every requested distance;
+it does not use an approximate nearest-neighbor index.
 
 ## Reduce F32 and U8 tensors
 
@@ -218,10 +227,11 @@ request API with CPU calculations and labels its results accordingly.
 | Tensor elements | At most 4,000,000 per sample; each dimension is 0–4,000,000. |
 | Append | 1–1024 aligned samples per request. |
 | Physical chunks | 1–1024 samples; 1024–16777216 encoded bytes per column chunk. Defaults: 64 samples and 4194304 bytes. |
-| Decoded payload | 64 MiB logical-data budget for an append/read; allocator capacity and separate cache/output buffers add overhead, so this is not a process RSS cap. |
+| Decoded payload | 64 MiB tensor-allocation budget for an append/read, including vector/string capacities. A read's decoded chunk cache and returned tensors share this budget. Encoded frames, HTTP serialization and allocator bookkeeping are additional, so this is not a process RSS cap. |
 | Read/compute | 1–1024 samples; default 100. Read starts at 0 by default. |
 | Search | k 1–100, default 10; max_samples 1–100000, default 10000. |
 | GPU search | Fixed rank-one F32, dimension 1–16384. GPU dispatches are internally batched. |
+| Execution deadline | Database reads, searches and reductions share the configured `query.timeout_ms` budget across their batches and GPU queue wait. Default: 30000 ms. GPU dispatch also has a 30-second device deadline. |
 | HTTP request body | 1 MiB, including JSON overhead. Smaller than the native binary chunk maximum. Split large HTTP appends accordingly. |
 
 The shared query governor also limits tensor read/search/compute concurrency.
@@ -234,8 +244,17 @@ Relevant HTTP errors include:
   invalid limits. Invalid JSON/body-limit failures also use the existing 400 path.
 - `404 not_found`: missing dataset or revision.
 - `422 tensor_unsupported`: an unsupported native storage backend.
-- `422 tensor_gpu_unsupported`: an unsupported GPU tensor dtype/shape/operation.
+- `409 conflict`: concurrent appends exhausted the bounded retry budget.
+- `422 tensor_gpu_unsupported`: an unsupported GPU tensor dtype, shape, numeric
+  range or operation.
 - `503 tensor_gpu_unavailable`: the required native GPU cannot be initialized.
+- `504 query_timeout`: the configured query execution deadline expired.
+
+Execution checks are cooperative between bounded processing steps; an individual
+blocking storage call finishes before its result is checked. A timeout while
+waiting for the GPU dispatch lock leaves the running dispatch alone. A timeout
+after submission stops the GPU device to cancel outstanding work; subsequent
+GPU operations return `tensor_gpu_unavailable` until the server restarts.
 
 Authentication, authorization, query-governor and storage failures retain their
 normal Control Plane error handling. Dataset creation uses the existing catalog

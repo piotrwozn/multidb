@@ -533,27 +533,31 @@ class ControlPlaneClient:
         status, _, raw = self._send(method, path, body, auth=auth)
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ControlPlaneError("Control Plane did not return JSON", status=status, code="invalid_json") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
             raise ControlPlaneError("Control Plane returned an invalid envelope", status=status, code="invalid_envelope", body=payload)
         if not payload["ok"]:
             error = payload.get("error", {})
+            if not isinstance(error, dict):
+                error = {}
             raise ControlPlaneError(
                 str(error.get("message", "Control Plane request failed")),
                 status=status,
                 code=str(error.get("code", "unknown_error")),
                 body=payload,
             )
+        if not 200 <= status < 300 and not (status == 422 and path in ("/config/validate", "/config/plan", "/config/apply")):
+            self._raise_http(status, raw)
         return payload.get("data")
 
     def _raw_json(self, method: str, path: str, body: Any = None, *, auth: bool = True) -> JsonObject:
         status, _, raw = self._send(method, path, body, auth=auth)
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ControlPlaneError("Control Plane did not return JSON", status=status, code="invalid_json") from exc
-        if status >= 400 and not (isinstance(payload, dict) and "ok" in payload):
+        if not 200 <= status < 300 and not (path == "/ready" and status == 503):
             self._raise_http(status, raw)
         return payload
 
@@ -567,17 +571,25 @@ class ControlPlaneClient:
             if self.principal:
                 headers["x-multidb-principal"] = self.principal
         transport = self.transport or _urllib_transport
-        return transport(method, f"{self.base_url}{path}", headers, encoded)
+        result = transport(method, f"{self.base_url}{path}", headers, encoded)
+        if 300 <= result[0] < 400:
+            self._raise_http(result[0], result[2])
+        return result
 
     @staticmethod
     def _raise_http(status: int, body: bytes) -> None:
         raise ControlPlaneError(body.decode("utf-8", errors="replace"), status=status, code=f"http_{status}", body=body)
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _urllib_transport(method: str, url: str, headers: Mapping[str, str], body: Optional[bytes]) -> Tuple[int, Mapping[str, str], bytes]:
     request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.build_opener(_RefuseRedirect).open(request, timeout=30) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read()

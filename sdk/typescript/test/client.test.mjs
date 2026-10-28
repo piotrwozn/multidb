@@ -277,3 +277,17 @@ test("tensor provisioning preserves the version 2 physical schema fields", async
   assert.deepEqual(calls, [{ spec }]);
   assert.deepEqual(calls[0].spec.collections[0].physical, physical);
 });
+
+test("refuses redirects, unsuccessful raw responses and malformed error bodies", async () => {
+  const calls = [];
+  const client = new ControlPlaneClient({ fetchImpl: async (_, init) => {
+    calls.push(init);
+    return jsonResponse(503, { ok: true, data: {} });
+  }});
+  await assert.rejects(() => client.health(), { code: "http_503" });
+  await assert.rejects(() => client.status(), { code: "http_503" });
+  await assert.rejects(() => client.metrics(), { code: "http_503" });
+  for (const init of calls) assert.equal(init.redirect, "error");
+  const malformed = new ControlPlaneClient({ fetchImpl: async () => jsonResponse(403, { ok: false, error: null }) });
+  await assert.rejects(() => malformed.status(), { code: "unknown_error" });
+});

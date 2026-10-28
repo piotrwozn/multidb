@@ -16,14 +16,18 @@ Download the release binary for your platform, `SHA256SUMS`,
 Release. Tagged releases also include the signed GHCR image digest and build
 metadata when a Docker image is published.
 
+Set the tag to the exact release you downloaded. Verification must match this
+repository and that tag, rather than accept an arbitrary GitHub workflow signer.
+
 On Linux/macOS:
 
 ```bash
+release_tag='vX.Y.Z' # replace with the exact downloaded tag
 sha256sum --check SHA256SUMS
 cosign verify-blob multidb-linux-x86_64 \
   --certificate multidb-linux-x86_64.pem \
   --signature multidb-linux-x86_64.sig \
-  --certificate-identity-regexp 'https://github.com/.*/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-identity "https://github.com/piotrwozn/multidb/.github/workflows/release.yml@refs/tags/$release_tag" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 chmod +x multidb-linux-x86_64
 ./multidb-linux-x86_64 template list
@@ -32,12 +36,13 @@ chmod +x multidb-linux-x86_64
 On Windows PowerShell:
 
 ```powershell
+$ReleaseTag = "vX.Y.Z" # replace with the exact downloaded tag
 Get-FileHash .\multidb-windows-x86_64.exe -Algorithm SHA256
 Get-Content .\SHA256SUMS
 cosign verify-blob .\multidb-windows-x86_64.exe `
   --certificate .\multidb-windows-x86_64.exe.pem `
   --signature .\multidb-windows-x86_64.exe.sig `
-  --certificate-identity-regexp 'https://github.com/.*/.github/workflows/release.yml@refs/tags/v.*' `
+  --certificate-identity "https://github.com/piotrwozn/multidb/.github/workflows/release.yml@refs/tags/$ReleaseTag" `
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 .\multidb-windows-x86_64.exe template list
 ```

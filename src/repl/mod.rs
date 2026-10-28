@@ -134,6 +134,14 @@ impl ReplError {
 }
 
 pub trait Replication: Send + Sync {
+    /// Lists tracked public physical keyspaces for complete native migrations.
+    /// # Errors
+    /// Fails when inventory is unsupported or its metadata is corrupt.
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        Err(ReplError::Unsupported(
+            "registered keyspace inventory is not supported".to_owned(),
+        ))
+    }
     /// Returns an atomic data-version token for one public physical table, when
     /// this backend maintains one. A legacy native table has token zero until
     /// its next write. Unsupported backends and internal tables return `None`.
@@ -187,6 +195,31 @@ pub trait Replication: Send + Sync {
                 "conditional batches are not supported".to_owned(),
             ))
         }
+    }
+
+    /// Explicit native AP last-writer-wins support for one index-free source
+    /// document. This is not compare-and-swap; unknown backends fail closed.
+    /// # Errors
+    /// Fails unless the backend supports this narrowly scoped operation.
+    fn propose_plain_document_lww(&self, _collection_id: u32, _op: Op) -> Result<(), ReplError> {
+        Err(ReplError::Unsupported(
+            "plain document LWW is not supported".to_owned(),
+        ))
+    }
+
+    /// Internal conditional metadata writes. Unsupported backends fail closed;
+    /// implementations must evaluate conditions in the atomic write transaction.
+    /// # Errors
+    /// Fails on a condition mismatch, backend error, or unsupported operation.
+    #[doc(hidden)]
+    fn propose_authorized_conditional_batch(
+        &self,
+        _batch: ConditionalBatch,
+        _authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        Err(ReplError::Unsupported(
+            "authorized conditional batches are not supported".to_owned(),
+        ))
     }
 
     /// Commits a validated typed tensor append through the ordinary user write path.
@@ -300,6 +333,23 @@ pub(crate) fn propose_system_batch<R: Replication + ?Sized>(
     ops: Vec<Op>,
 ) -> Result<(), ReplError> {
     repl.propose_authorized_batch(ops, txn::system_write_authorization())
+}
+
+pub(crate) fn propose_system_conditional_batch<R: Replication + ?Sized>(
+    repl: &R,
+    batch: ConditionalBatch,
+) -> Result<(), ReplError> {
+    repl.propose_authorized_conditional_batch(batch, txn::system_write_authorization())
+}
+
+pub(crate) fn registered_public_keyspaces<R: Replication + ?Sized>(
+    repl: &R,
+) -> Result<Vec<String>, ReplError> {
+    repl.range(txn::KEYSPACE_REGISTRY_TABLE, &[], &[], ReadConsistency::Strong)?
+        .into_iter()
+        .map(|(key, _)| String::from_utf8(key).map_err(|error| StorageError::Corruption(format!("invalid keyspace inventory name: {error}")).into()))
+        .filter(|name: &Result<String, ReplError>| !matches!(name, Ok(name) if txn::table_is_reserved(name)))
+        .collect()
 }
 
 pub struct SingleNode<S: StorageEngine> {
@@ -462,16 +512,6 @@ impl<S: StorageEngine> SingleNode<S> {
         commit_conditional_batch(&self.storage, &self.commit_lock, batch)
     }
 
-    fn load_prepared_dist_txn(
-        &self,
-        txn_id: DistTxnId,
-    ) -> Result<Option<PreparedTxnRecord>, StorageError> {
-        let read = self.storage.begin_read()?;
-        read.get(DIST_TXN_PARTICIPANT_TABLE, &dist_txn::txn_key(txn_id))?
-            .map(|bytes| dist_txn::decode_prepared(&bytes))
-            .transpose()
-    }
-
     fn load_dist_txn_decision(&self, txn_id: DistTxnId) -> Result<Option<Decision>, StorageError> {
         let read = self.storage.begin_read()?;
         read.get(DIST_TXN_COORDINATOR_TABLE, &dist_txn::txn_key(txn_id))?
@@ -487,26 +527,6 @@ impl<S: StorageEngine> SingleNode<S> {
                 dist_txn::decode_prepared(&bytes)
             })
             .collect()
-    }
-
-    fn mark_dist_txn_finished(
-        &self,
-        txn_id: DistTxnId,
-        decision: Decision,
-    ) -> Result<(), StorageError> {
-        let _guard = self
-            .commit_lock
-            .lock()
-            .map_err(|_| StorageError::Backend("commit lock poisoned".to_owned()))?;
-        let mut write = self.storage.begin_write()?;
-        let key = dist_txn::txn_key(txn_id);
-        write.put(
-            DIST_TXN_FINISHED_TABLE,
-            &key,
-            &dist_txn::encode_finished(&FinishedTxnRecord::new(txn_id, decision))?,
-        )?;
-        write.delete(DIST_TXN_PARTICIPANT_TABLE, &key)?;
-        write.commit()
     }
 }
 
@@ -630,20 +650,44 @@ fn commit_conditional_batch<S: StorageEngine>(
 ) -> Result<TxnId, StorageError> {
     txn::validate_public_conditions(&batch.conditions)?;
     txn::validate_public_ops(&batch.ops)?;
+    commit_conditional_batch_authorized(
+        storage,
+        commit_lock,
+        batch,
+        txn::system_write_authorization(),
+    )
+}
+
+fn commit_conditional_batch_authorized<S: StorageEngine>(
+    storage: &S,
+    commit_lock: &Mutex<()>,
+    batch: ConditionalBatch,
+    authorization: txn::WriteAuthorization,
+) -> Result<TxnId, StorageError> {
     let _guard = commit_lock
         .lock()
         .map_err(|_| StorageError::Backend("commit lock poisoned".to_owned()))?;
 
-    {
-        let read = storage.begin_read()?;
-        for condition in &batch.conditions {
-            if !condition_matches(&read, condition)? {
-                return Err(StorageError::Conflict);
-            }
+    let write = storage.begin_write()?;
+    for condition in &batch.conditions {
+        if !condition_matches(&write, condition)? {
+            write.rollback();
+            return Err(StorageError::Conflict);
         }
     }
-
-    txn::commit_write_set_at_current(storage, txn::ops_to_write_set(batch.ops))
+    let snapshot = txn::current_txn_id_from(&write)?;
+    if batch.ops.is_empty() {
+        write.rollback();
+        return Ok(snapshot);
+    }
+    txn::commit_write_set_in_txn_with_extra_authorized(
+        write,
+        snapshot,
+        txn::ops_to_write_set(batch.ops),
+        |_| Ok(()),
+        |_, _| Ok(()),
+        authorization,
+    )
 }
 
 pub(crate) fn condition_matches<T: ReadTransaction>(
@@ -692,8 +736,29 @@ fn clone_storage_error(error: &StorageError) -> StorageError {
 }
 
 impl<S: StorageEngine> Replication for SingleNode<S> {
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        registered_public_keyspaces(self)
+    }
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        match commit_conditional_batch_authorized(
+            &self.storage,
+            &self.commit_lock,
+            batch,
+            authorization,
+        ) {
+            Ok(_) => Ok(()),
+            Err(StorageError::Conflict) => Err(ReplError::Conflict),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
-        txn::read_table_data_version(self, table)
+        let read = self.storage.begin_read()?;
+        txn::read_table_data_version_from(&read, table).map_err(Into::into)
     }
 
     fn supports_bounded_scans(&self) -> bool {
@@ -732,57 +797,73 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
             .commit_lock
             .lock()
             .map_err(|_| StorageError::Backend("commit lock poisoned".to_owned()))?;
-        let mut write = self.storage.begin_write()?;
-        let key = dist_txn::txn_key(txn_id);
-
-        if write.get(DIST_TXN_FINISHED_TABLE, &key)?.is_some() {
-            write.commit()?;
+        let write = self.storage.begin_write()?;
+        let writes = match dist_txn::locks::prepare_write_set(
+            &write,
+            txn_id,
+            &ops,
+            DEFAULT_DIST_TXN_DEADLINE_MS,
+            dist_txn::now_ms(),
+        ) {
+            Ok(writes) => writes,
+            Err(StorageError::Conflict) => {
+                write.rollback();
+                return Ok(Vote::No);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if writes.is_empty() {
+            write.rollback();
             return Ok(Vote::Yes);
         }
-
-        if let Some(existing) = write.get(DIST_TXN_PARTICIPANT_TABLE, &key)? {
-            let existing = dist_txn::decode_prepared(&existing)?;
-            write.commit()?;
-            return Ok(if existing.ops == ops {
-                Vote::Yes
-            } else {
-                Vote::No
-            });
-        }
-
-        let record = PreparedTxnRecord::new(txn_id, ops, DEFAULT_DIST_TXN_DEADLINE_MS);
-        write.put(
-            DIST_TXN_PARTICIPANT_TABLE,
-            &key,
-            &dist_txn::encode_prepared(&record)?,
+        let snapshot = txn::current_txn_id_from(&write)?;
+        txn::commit_write_set_in_txn_with_extra_authorized(
+            write,
+            snapshot,
+            writes,
+            |_| Ok(()),
+            |_, _| Ok(()),
+            txn::system_write_authorization(),
         )?;
-        write.commit()?;
         Ok(Vote::Yes)
     }
 
     fn finish_dist_txn(&self, txn_id: DistTxnId, decision: Decision) -> Result<(), ReplError> {
-        let key = dist_txn::txn_key(txn_id);
-        {
-            let read = self.storage.begin_read()?;
-            if read.get(DIST_TXN_FINISHED_TABLE, &key)?.is_some() {
-                return Ok(());
-            }
+        let _guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| StorageError::Backend("commit lock poisoned".to_owned()))?;
+        let write = self.storage.begin_write()?;
+        let writes =
+            match dist_txn::locks::finish_write_set(&write, txn_id, decision, dist_txn::now_ms()) {
+                Ok(writes) => writes,
+                Err(StorageError::Conflict) => {
+                    write.rollback();
+                    return Err(ReplError::Conflict);
+                }
+                Err(error) => return Err(error.into()),
+            };
+        if writes.is_empty() {
+            write.rollback();
+            return Ok(());
         }
-
-        let prepared = self.load_prepared_dist_txn(txn_id)?;
-        if let (Decision::Commit, Some(record)) = (decision, prepared) {
-            self.commit_ops_at_current_authorized(record.ops, txn::system_write_authorization())?;
-        }
-        self.mark_dist_txn_finished(txn_id, decision)?;
+        let snapshot = txn::current_txn_id_from(&write)?;
+        txn::commit_write_set_in_txn_with_extra_authorized(
+            write,
+            snapshot,
+            writes,
+            |_| Ok(()),
+            |_, _| Ok(()),
+            txn::system_write_authorization(),
+        )?;
         Ok(())
     }
 
     fn recover_dist_txns(&self) -> Result<(), ReplError> {
         for record in self.local_prepared_dist_txns()? {
-            let decision = self
-                .load_dist_txn_decision(record.txn_id)?
-                .unwrap_or(Decision::Abort);
-            self.finish_dist_txn(record.txn_id, decision)?;
+            if let Some(decision) = self.load_dist_txn_decision(record.txn_id)? {
+                self.finish_dist_txn(record.txn_id, decision)?;
+            }
         }
         Ok(())
     }
@@ -794,6 +875,7 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
         _consistency: ReadConsistency,
     ) -> Result<Option<Bytes>, ReplError> {
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_key(&txn, table, key)?;
         Ok(txn.get(table, key)?)
     }
 
@@ -807,6 +889,7 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
             return Ok(Vec::new());
         }
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_keys(&txn, table, keys)?;
         keys.iter()
             .map(|key| txn.get(table, key).map_err(Into::into))
             .collect()
@@ -820,6 +903,7 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
         _consistency: ReadConsistency,
     ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_range(&txn, table, start, end)?;
         txn.range(table, start, end)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -836,6 +920,7 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
         on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
     ) -> Result<(), ReplError> {
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_range(&txn, table, start, end)?;
         let mut batch = Vec::with_capacity(batch_rows.max(1));
         for entry in txn.range(table, start, end)? {
             if cancelled() {

@@ -107,12 +107,44 @@ function Test-LatencyRegression {
     return [double]$CandidateValue -gt $allowed
 }
 
+function Assert-ValidReport($Report) {
+    $items = @(Convert-ToArray $Report.benchmarks)
+    if ($items.Count -eq 0) { throw "empty benchmark report: $($Report.path)" }
+    $seen = @{}
+    foreach ($item in $items) {
+        if ([string]::IsNullOrWhiteSpace($item.name) -or $seen.ContainsKey($item.name)) {
+            throw "missing or duplicate benchmark name in $($Report.path)"
+        }
+        $seen[$item.name] = $true
+        foreach ($field in @("throughput_ops_per_sec", "p50_ms", "p95_ms", "p99_ms")) {
+            $value = $item.$field
+            $number = 0.0
+            if ($null -eq $value -or $value -is [bool] -or
+                -not [double]::TryParse([string]$value, [System.Globalization.NumberStyles]::Float,
+                    [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number) -or
+                [double]::IsNaN($number) -or [double]::IsInfinity($number) -or $number -lt 0 -or
+                ($field -eq "throughput_ops_per_sec" -and $number -eq 0)) {
+                throw "invalid $field for $($item.name) in $($Report.path)"
+            }
+        }
+        if ([double]$item.p50_ms -gt [double]$item.p95_ms -or [double]$item.p95_ms -gt [double]$item.p99_ms) {
+            throw "unordered percentiles for $($item.name) in $($Report.path)"
+        }
+    }
+}
+
 function Compare-Reports($BaselineReport, $CandidateReport) {
+    Assert-ValidReport $BaselineReport
+    Assert-ValidReport $CandidateReport
     if (!$AllowProfileMismatch -and $BaselineReport.profile -and $CandidateReport.profile -and $BaselineReport.profile -ne $CandidateReport.profile) {
         throw "performance profile mismatch: baseline=$($BaselineReport.profile), candidate=$($CandidateReport.profile)"
     }
 
     $thresholds = Get-EffectiveThresholds $BaselineReport
+    foreach ($field in @("throughput_regression_percent", "latency_regression_percent")) {
+        if ($null -eq $thresholds.$field -or [double]$thresholds.$field -lt 0 -or [double]$thresholds.$field -gt 100 -or
+            [double]::IsNaN([double]$thresholds.$field)) { throw "invalid threshold $field" }
+    }
     $candidateByName = @{}
     foreach ($item in $CandidateReport.benchmarks) {
         $candidateByName[$item.name] = $item
@@ -123,7 +155,7 @@ function Compare-Reports($BaselineReport, $CandidateReport) {
 
     foreach ($base in $BaselineReport.benchmarks) {
         if (!$candidateByName.ContainsKey($base.name)) {
-            $failures.Add("missing benchmark $($base.name)")
+            $failures += "missing benchmark $($base.name)"
             continue
         }
 
@@ -219,6 +251,21 @@ if ($SelfTest) {
     $result = Compare-Reports $baselineReport $candidateReport
     if ($result.failures.Count -lt 4) {
         throw "performance gate self-test failed to catch synthetic 20% regression"
+    }
+    # Missing data and malformed metrics must never yield a successful gate.
+    foreach ($badItems in @(
+        @(),
+        @([pscustomobject]@{ name = "other"; throughput_ops_per_sec = 1; p50_ms = 1; p95_ms = 1; p99_ms = 1 }),
+        @([pscustomobject]@{ name = "synthetic_regression"; throughput_ops_per_sec = 1; p50_ms = 1; p95_ms = 1 }),
+        @([pscustomobject]@{ name = "synthetic_regression"; throughput_ops_per_sec = "NaN"; p50_ms = 1; p95_ms = 1; p99_ms = 1 }),
+        @([pscustomobject]@{ name = "synthetic_regression"; throughput_ops_per_sec = 1; p50_ms = 3; p95_ms = 2; p99_ms = 1 }),
+        @($baselineItems[0], $baselineItems[0])
+    )) {
+        $badReport = [pscustomobject]@{ path = "self-test-invalid"; profile = "ci-gate"; benchmarks = $badItems }
+        $rejected = $false
+        try { $badResult = Compare-Reports $baselineReport $badReport; $rejected = $badResult.failures.Count -gt 0 }
+        catch { $rejected = $true }
+        if (-not $rejected) { throw "performance gate accepted malformed or missing benchmark data" }
     }
     Write-Host "Performance gate self-test passed"
     exit 0

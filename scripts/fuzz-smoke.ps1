@@ -1,8 +1,15 @@
+param([switch] $Required)
+
 $ErrorActionPreference = "Stop"
 
-if (-not (Get-Command cargo-fuzz -ErrorAction SilentlyContinue)) {
-    Write-Host "cargo-fuzz is not installed; install with: cargo install cargo-fuzz"
+function Skip-Or-Fail([string] $Reason) {
+    if ($Required) { throw $Reason }
+    Write-Host $Reason
     exit 0
+}
+
+if (-not (Get-Command cargo-fuzz -ErrorAction SilentlyContinue)) {
+    Skip-Or-Fail "cargo-fuzz is not installed; install with: cargo install cargo-fuzz"
 }
 
 $cargoFuzzArgs = @("fuzz", "run")
@@ -10,8 +17,7 @@ $rustcVersion = rustc --version
 if ($rustcVersion -notmatch "nightly") {
     cargo +nightly --version *> $null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "nightly toolchain is not available; skipping cargo-fuzz smoke on stable rustc"
-        exit 0
+        Skip-Or-Fail "nightly toolchain is not available; skipping cargo-fuzz smoke on stable rustc"
     }
     $cargoFuzzArgs = @("+nightly", "fuzz", "run")
 }
@@ -28,8 +34,7 @@ if ($isWindows) {
         Select-Object -First 1
 
     if ($null -eq $asanRuntime) {
-        Write-Host "Windows ASan runtime is not available; skipping cargo-fuzz smoke"
-        exit 0
+        Skip-Or-Fail "Windows ASan runtime is not available; skipping cargo-fuzz smoke"
     }
 
     $env:PATH = "$($asanRuntime.DirectoryName);$env:PATH"

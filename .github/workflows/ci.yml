@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_DENY_VERSION: "0.19.9"
@@ -23,7 +26,7 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: studio/package-lock.json
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: sdk/go/go.mod
       - name: cargo-deny
@@ -36,6 +39,9 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --lib phase33 -- --nocapture
       - run: cargo test --locked --all-features -- --test-threads=1
+      - run: cargo test --locked --no-default-features -- --test-threads=1
+      - name: Release and benchmark tooling tests
+        run: python3 -m unittest discover -s scripts/benchmarks -p 'test_*.py'
       - name: Template smoke
         shell: pwsh
         run: ./scripts/templates-smoke.ps1
@@ -57,9 +63,6 @@ jobs:
       - name: SDK examples smoke
         shell: pwsh
         run: ./scripts/sdk-examples-smoke.ps1 -RequireGo -ImageTag multidb:docker-smoke
-      - name: Fuzz smoke
-        shell: pwsh
-        run: ./scripts/fuzz-smoke.ps1
       - name: Performance gate self-test
         shell: pwsh
         run: ./scripts/perf_gate.ps1 -SelfTest
@@ -72,6 +75,19 @@ jobs:
         with:
           name: multidb-ci-performance
           path: target/perf/*.json
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - run: cargo install cargo-fuzz --locked
+      - name: Required fuzz smoke
+        shell: pwsh
+        run: ./scripts/fuzz-smoke.ps1 -Required
 
   msrv:
     runs-on: ubuntu-latest

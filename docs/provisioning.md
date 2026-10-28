@@ -983,6 +983,18 @@ principal needs the permissions: `serve` grants them only to the `admin` of
 the admin password bootstrap, or a spec grants them to a principal of its
 own.
 
+Password sessions are tied to the current durable admin credential. A successful
+`POST /auth/change-password` revokes all password sessions, including the token
+that made the request; sign in again with the new password. The same check rejects
+old sessions after another server state or a trusted embedded caller changes the
+credential. A password verified before a concurrent rotation cannot overwrite
+the newer credential; a conflicting change returns HTTP 409.
+
+Static operator bearer tokens (`MULTIDB_ADMIN_TOKEN`) keep their separate
+configured lifetime when the password changes. Password login also bounds the
+number of active sessions; HTTP 503 `session_error` means capacity is exhausted,
+so sign out an existing session or wait for expiry.
+
 **The flow** is plan, review, confirm:
 
 1. `POST /provision/plan` returns the plan with 200 when it is `ready`, a
