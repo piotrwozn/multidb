@@ -6,8 +6,8 @@ use crate::{repl::VersionedBytes, storage::StorageError};
 
 /// Workspace of the slice decoder, distinct from the owned sibling allocations.
 /// Unescaped strings are borrowed; numeric byte-array length does not determine
-/// scratch capacity. Also cover IgnoredAny's container stack and optional
-/// serde_json number-parser features without depending on feature unification.
+/// scratch capacity. Also cover `IgnoredAny`'s container stack and optional
+/// `serde_json` number-parser features without depending on feature unification.
 pub(super) fn working_bytes(bytes: &[u8]) -> usize {
     let mut start = None;
     let mut escaped = false;

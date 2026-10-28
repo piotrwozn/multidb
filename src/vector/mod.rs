@@ -1696,7 +1696,7 @@ mod tests {
             .state
             .write()
             .map_err(|_| VectorError::LockPoisoned)?
-            .source_version = database.table_data_version(VECTOR_TABLE)?;
+            .source_version = crate::repl::Replication::table_data_version(&database, super::VECTOR_TABLE)?;
         assert_eq!(vectors.knn_bounded(&[0.0, 0.0], 1)?, Vec::new());
         assert_eq!(vectors.knn(&[0.0, 0.0], 1)?[0].id, ids[1]);
         assert!(matches!(
