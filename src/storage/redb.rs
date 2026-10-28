@@ -6,7 +6,7 @@ use redb::{
 };
 
 use crate::storage::{
-    Bytes, RangeIter, ReadTransaction, StorageEngine, StorageError, WriteTransaction,
+    Bytes, RangeIter, ReadBudget, ReadTransaction, StorageEngine, StorageError, WriteTransaction,
 };
 
 type RawTableDefinition<'name> = TableDefinition<'name, &'static [u8], &'static [u8]>;
@@ -133,6 +133,10 @@ impl RedbReadOnly {
 }
 
 impl StorageEngine for RedbEngine {
+    fn supports_guarded_reads(&self) -> bool {
+        true
+    }
+
     type ReadTxn<'a> = RedbReadTxn;
     type WriteTxn<'a> = RedbWriteTxn;
 
@@ -159,6 +163,61 @@ impl StorageEngine for RedbEngine {
 }
 
 impl ReadTransaction for RedbReadTxn {
+    fn supports_guarded_reads(&self) -> bool {
+        true
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        budget.check()?;
+        let Some(data) = self.open_existing_table(table)? else {
+            let _ = visitor(None)?;
+            return budget.check();
+        };
+        let value = data.get(key).map_err(to_storage_err)?;
+        let _ = visitor(value.as_ref().map(redb::AccessGuard::value))?;
+        budget.check()
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        budget.check()?;
+        if !end.is_empty() && start >= end {
+            return Ok(());
+        }
+        let Some(data) = self.open_existing_table(table)? else {
+            return Ok(());
+        };
+        let mut entries = if end.is_empty() {
+            data.range(start..)
+        } else {
+            data.range(start..end)
+        }
+        .map_err(to_storage_err)?;
+        loop {
+            budget.check()?;
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let (key, value) = entry.map_err(to_storage_err)?;
+            if !visitor(key.value(), value.value())? {
+                break;
+            }
+        }
+        budget.check()
+    }
+
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
         let Some(data) = self.open_existing_table(table)? else {
             return Ok(None);
@@ -183,25 +242,18 @@ impl ReadTransaction for RedbReadTxn {
             return Ok(Box::new(std::iter::empty()));
         };
 
+        // ReadOnlyTable's inherent range owns an Arc transaction guard, so it
+        // outlives this local table handle without collecting owned row values.
         let rows = if end.is_empty() {
             data.range(start..)
-                .map_err(to_storage_err)?
-                .map(|item| {
-                    item.map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
-                        .map_err(to_storage_err)
-                })
-                .collect::<Result<Vec<_>, _>>()?
         } else {
             data.range(start..end)
-                .map_err(to_storage_err)?
-                .map(|item| {
-                    item.map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
-                        .map_err(to_storage_err)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
-
-        Ok(Box::new(rows.into_iter().map(Ok)))
+        }
+        .map_err(to_storage_err)?;
+        Ok(Box::new(rows.map(|item| {
+            item.map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+                .map_err(to_storage_err)
+        })))
     }
 }
 
@@ -327,6 +379,40 @@ mod catalog_tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn read_range_keeps_its_snapshot_after_table_handle_drops_and_writer_commits() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let engine = RedbEngine::open(directory.path().join("iterator.redb"))?;
+        let mut write = engine.begin_write()?;
+        write.put("items", b"a", b"first")?;
+        write.put("items", b"b", b"old second")?;
+        write.commit()?;
+
+        let read = engine.begin_read()?;
+        let mut rows = read.range("items", &[], &[])?;
+        assert_eq!(
+            rows.next().transpose()?,
+            Some((b"a".to_vec(), b"first".to_vec()))
+        );
+        let mut write = engine.begin_write()?;
+        write.put("items", b"b", b"new second")?;
+        write.put("items", b"c", b"new third")?;
+        write.commit()?;
+        assert_eq!(
+            rows.next().transpose()?,
+            Some((b"b".to_vec(), b"old second".to_vec()))
+        );
+        assert!(rows.next().is_none());
+        assert_eq!(
+            engine.begin_read()?.get("items", b"b")?,
+            Some(b"new second".to_vec())
+        );
+        // A consumer may stop at its limit without retaining/cloning later values.
+        let read = engine.begin_read()?;
+        assert_eq!(read.range("items", b"b", b"d")?.take(1).count(), 1);
+        Ok(())
+    }
 
     #[test]
     fn absent_write_snapshot_reads_and_deletes_do_not_create_tables() -> TestResult {

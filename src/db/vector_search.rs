@@ -1,13 +1,17 @@
 //! Fresh vector authorization and shared query-governor boundaries.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{Database, DbError};
 use crate::{
-    model::{Value, encode_value},
+    model::Value,
     query::QueryError,
     security::{AuditEvent, AuditOutcome, Permission, Principal, Resource},
-    vector::{VectorHit, VectorSearchOptions, validate_search_options},
+    vector::{
+        VectorError, VectorHit, VectorSearchOptions,
+        execution::{ExecutionLimits, retained_value_bytes},
+        validate_search_options,
+    },
 };
 
 type VisibleHits = Vec<(VectorHit, Value)>;
@@ -34,32 +38,28 @@ impl Database {
             .map_err(|_| {
                 QueryError::Busy("vector search concurrent query limit reached".to_owned())
             })?;
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(self.performance.query.timeout_ms))
-            .ok_or_else(|| {
-                QueryError::ResourceLimit("vector timeout exceeds monotonic clock range".to_owned())
-            })?;
-        let check = || {
-            if Instant::now() >= deadline {
-                Err(QueryError::Timeout(
-                    "vector search execution deadline exceeded".to_owned(),
-                ))
-            } else {
-                Ok(())
-            }
-        };
+        let limits = ExecutionLimits::new(
+            Duration::from_millis(self.performance.query.timeout_ms),
+            self.performance.query.memory_limit_bytes,
+        )?;
+        let check = || limits.check();
         let result = (|| -> Result<VisibleHits, DbError> {
             check()?;
             let policy = self.policy_config()?;
-            let vectors = self.vector_collection(name)?;
+            let vectors = self.vector_collection(name)?.with_execution_limits(limits);
             check()?;
-            let hits = vectors.knn(query, k)?;
+            let hits = vectors.knn(query, k).map_err(vector_execution_error)?;
             check()?;
             let mut visible = Vec::new();
             let mut retained = 0_usize;
             for hit in hits {
                 check()?;
-                let Some(metadata) = vectors.get_metadata(hit.id)? else {
+                let Some(metadata) = vectors
+                    .with_reserved_memory(retained)
+                    .map_err(vector_execution_error)?
+                    .get_metadata(hit.id)
+                    .map_err(vector_execution_error)?
+                else {
                     continue;
                 };
                 if !policy.row_visible(principal, &resource, &metadata) {
@@ -67,14 +67,11 @@ impl Database {
                 }
                 let metadata = policy.mask_value(&resource, &metadata);
                 retained = retained
-                    .saturating_add(encode_value(&metadata)?.len().saturating_mul(4))
+                    .saturating_add(retained_value_bytes(&metadata))
                     .saturating_add(256);
-                if retained > self.performance.query.memory_limit_bytes {
-                    return Err(QueryError::ResourceLimit(
-                        "vector metadata result exceeds query memory limit".to_owned(),
-                    )
-                    .into());
-                }
+                vectors
+                    .check_temporary_memory(retained)
+                    .map_err(vector_execution_error)?;
                 visible.push((hit, metadata));
             }
             check()?;
@@ -95,6 +92,13 @@ impl Database {
     }
 }
 
+pub(super) fn vector_execution_error(error: VectorError) -> DbError {
+    match error {
+        VectorError::Execution(error) => DbError::Query(error),
+        other => DbError::Vector(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +108,40 @@ mod tests {
         security::{AuthzPolicy, Role},
         vector::{VectorCollectionConfig, VectorMetric},
     };
+
+    #[tokio::test]
+    async fn graph_sql_special_route_preserves_governor_limits_and_releases_its_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::graph::{GraphId, GraphNodeId};
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        database.create_graph("bounded", GraphId::new(17))?;
+        database.graph("bounded")?.add_edge(
+            GraphNodeId::from_str_id("root"),
+            "next",
+            GraphNodeId::from_str_id(&"x".repeat(64 * 1024)),
+            &Value::Null,
+        )?;
+        let sql = "SELECT graph_neighbors('bounded', 'root', 'next', 1)";
+        database.query_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        database.performance.query.timeout_ms = 0;
+        assert!(matches!(
+            database.query(sql).await,
+            Err(DbError::Query(QueryError::Timeout(_)))
+        ));
+        assert_eq!(database.query_permits.available_permits(), 1);
+        database.performance.query.timeout_ms = 5_000;
+        database.performance.query.memory_limit_bytes = 16 * 1024;
+        assert!(matches!(
+            database.query(sql).await,
+            Err(DbError::Query(QueryError::ResourceLimit(_)))
+        ));
+        assert_eq!(database.query_permits.available_permits(), 1);
+        database.performance.query.memory_limit_bytes = 2 * 1024 * 1024;
+        assert!(
+            matches!(database.query(sql).await?, crate::query::SqlOutput::Rows(rows) if rows.rows.len() == 1)
+        );
+        Ok(())
+    }
 
     #[test]
     fn vector_search_shares_governor_and_zero_deadline_fails_before_lookup()

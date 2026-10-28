@@ -704,11 +704,17 @@ fn template_provisioning_section(template: &TemplateSpec, spec: &DatabaseSpec) -
         String::new(),
         "Guarantee statuses a CLI plan reports for this spec:".to_owned(),
         String::new(),
-        "- `guarantees.audit.enabled`: `enforced_with_development_key`. Audit is on, but the"
+        "- `guarantees.audit.enabled`: `enforced` with `MULTIDB_AUDIT_KEY_PATH`; without it,"
             .to_owned(),
-        "  CLI, `multidb serve` and the Control Plane chain audit events with the built-in"
+        "  local CLI usage reports `enforced_with_development_key` (`AUDIT_DEVELOPMENT_KEY`)."
             .to_owned(),
-        "  development key (`AUDIT_DEVELOPMENT_KEY`); only the Rust API takes an audit key."
+        "  Production `multidb serve` requires an existing private audit key and, for durable"
+            .to_owned(),
+        "  profiles, `MULTIDB_AUDIT_ANCHOR_PATH`. The Control Plane inherits these runtime"
+            .to_owned(),
+        "  settings. Existing audit history requires its original signing key; changing the"
+            .to_owned(),
+        "  path does not re-sign it. Follow the repository's `docs/docker.md` audit setup."
             .to_owned(),
     ]);
     if spec.guarantees.backup.enabled || spec.guarantees.backup.pitr {

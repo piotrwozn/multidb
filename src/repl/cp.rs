@@ -10,7 +10,7 @@ use crate::{
         DistTxnConfig, FlowControlConfig, HlcConfig, HlcTimestamp, InternalTransportConfig,
         RaftRuntimeConfig, RegionConfig,
     },
-    storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
+    storage::{Bytes, ReadBudget, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
     txn::{self, TxnId, WriteSet},
 };
 
@@ -1006,6 +1006,95 @@ impl<S: StorageEngine> CpRaft<S> {
 }
 
 impl<S: StorageEngine> Replication for CpRaft<S> {
+    fn supports_guarded_reads(&self) -> bool {
+        self.storage.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        budget.check()?;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_key_guarded(&txn, table, key, budget)?;
+        let mut callback_error = None;
+        txn.visit_get(table, key, budget, &mut |value| {
+            Ok(super::visit_keep_going(visitor(value), &mut callback_error))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        budget.check()?;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_keys_guarded(&txn, table, keys, budget)?;
+        let mut callback_error = None;
+        txn.visit_many(table, keys, budget, &mut |index, value| {
+            Ok(super::visit_keep_going(
+                visitor(index, value),
+                &mut callback_error,
+            ))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        budget.check()?;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_range_guarded(&txn, table, start, end, budget)?;
+        let mut callback_error = None;
+        txn.visit_range(table, start, end, budget, &mut |key, value| {
+            Ok(super::visit_keep_going(
+                visitor(key, value),
+                &mut callback_error,
+            ))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
     fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
         super::registered_public_keyspaces(self)
     }
@@ -1226,6 +1315,9 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
         cancelled: &dyn Fn() -> bool,
         on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
     ) -> Result<(), ReplError> {
+        if cancelled() {
+            return Ok(());
+        }
         if consistency == ReadConsistency::Strong {
             if let Some(live) = &self.live {
                 live.strong_read_barrier()?;
@@ -1234,15 +1326,20 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
             }
         }
 
+        if cancelled() {
+            return Ok(());
+        }
         let txn = self.storage.begin_read()?;
         dist_txn::locks::validate_read_range(&txn, table, start, end)?;
-        let mut batch = Vec::with_capacity(batch_rows.max(1));
-        for entry in txn.range(table, start, end)? {
-            if cancelled() {
+        let batch_rows = batch_rows.clamp(1, 1_024);
+        let mut batch = Vec::new();
+        let mut entries = txn.range(table, start, end)?;
+        while !cancelled() {
+            let Some(entry) = entries.next() else {
                 break;
-            }
+            };
             batch.push(entry?);
-            if batch.len() >= batch_rows.max(1) {
+            if batch.len() >= batch_rows {
                 if !on_batch(&batch)? {
                     return Ok(());
                 }

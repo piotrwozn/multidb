@@ -6,16 +6,20 @@ use super::{InternalRequest, InternalResponse, InternalTransportError};
 use crate::repl::{CpClusterNodeStatus, RaftNode, VersionedBytes, VersionedRecord, VersionedWrite};
 
 pub(super) const MAX_WIRE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) trait FrameWire {
-    fn preflight(bytes: &[u8]) -> Result<(), InternalTransportError>;
+    fn decoded_size(bytes: &[u8], limit: usize) -> Result<usize, InternalTransportError>;
+    fn preflight(bytes: &[u8]) -> Result<(), InternalTransportError> {
+        Self::decoded_size(bytes, MAX_DECODED_BYTES).map(|_| ())
+    }
 }
 
 struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
     allocated: usize,
+    limit: usize,
 }
 
 impl Cursor<'_> {
@@ -75,7 +79,7 @@ impl Cursor<'_> {
         self.allocated = self
             .allocated
             .checked_add(bytes)
-            .filter(|total| *total <= MAX_DECODED_BYTES)
+            .filter(|total| *total <= self.limit)
             .ok_or_else(|| Self::invalid("internal frame decoded allocation budget exceeded"))?;
         Ok(())
     }
@@ -169,7 +173,7 @@ impl Cursor<'_> {
     }
 
     fn ap_request(&mut self) -> Result<(), InternalTransportError> {
-        match self.variant(5)? {
+        match self.variant(7)? {
             0 => {
                 for _ in 0..self.count(std::mem::size_of::<VersionedWrite>())? {
                     self.string()?;
@@ -187,9 +191,19 @@ impl Cursor<'_> {
                 }
             }
             3 => {}
-            _ => {
+            4 => {
                 self.bytes()?;
                 self.integer()?;
+            }
+            variant => {
+                self.string()?;
+                self.bytes()?;
+                self.bytes()?;
+                self.integer()?;
+                if variant == 6 {
+                    self.integer()?;
+                    self.integer()?;
+                }
             }
         }
         Ok(())
@@ -254,7 +268,7 @@ impl Cursor<'_> {
     }
 
     fn response(&mut self) -> Result<(), InternalTransportError> {
-        match self.variant(6)? {
+        match self.variant(7)? {
             0 => {
                 self.integer()?;
             }
@@ -279,20 +293,26 @@ impl Cursor<'_> {
         Ok(())
     }
 
-    fn finish(self) -> Result<(), InternalTransportError> {
+    fn finish(self) -> Result<usize, InternalTransportError> {
         if self.position != self.bytes.len() {
             return Err(Self::invalid("trailing bytes in internal frame"));
         }
-        Ok(())
+        if self.allocated > self.limit {
+            return Err(Self::invalid(
+                "internal frame decoded allocation budget exceeded",
+            ));
+        }
+        Ok(self.allocated)
     }
 }
 
 impl FrameWire for InternalRequest {
-    fn preflight(bytes: &[u8]) -> Result<(), InternalTransportError> {
+    fn decoded_size(bytes: &[u8], limit: usize) -> Result<usize, InternalTransportError> {
         let mut cursor = Cursor {
             bytes,
             position: 0,
             allocated: std::mem::size_of::<Self>() * 2,
+            limit: limit.min(MAX_DECODED_BYTES),
         };
         cursor.request()?;
         cursor.finish()
@@ -300,11 +320,12 @@ impl FrameWire for InternalRequest {
 }
 
 impl FrameWire for InternalResponse {
-    fn preflight(bytes: &[u8]) -> Result<(), InternalTransportError> {
+    fn decoded_size(bytes: &[u8], limit: usize) -> Result<usize, InternalTransportError> {
         let mut cursor = Cursor {
             bytes,
             position: 0,
             allocated: std::mem::size_of::<Self>() * 2,
+            limit: limit.min(MAX_DECODED_BYTES),
         };
         cursor.response()?;
         cursor.finish()

@@ -10,6 +10,10 @@ use crate::{
     text::{FullTextIndexConfig, TextSource},
 };
 
+mod memory;
+pub(crate) use memory::ValueMemoryCounter;
+pub use memory::value_decode_memory_bound;
+
 pub const DOCUMENT_TABLE: &str = "documents";
 pub const INDEX_TABLE: &str = "document_indexes";
 const EMPTY_INDEX_VALUE: &[u8] = b"";

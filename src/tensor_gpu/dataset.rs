@@ -68,7 +68,26 @@ fn search_dataset_until<R: Replication + ?Sized>(
     let mut hits = Vec::new();
     let mut position = request.start;
     let mut skipped_samples = 0;
-    let batch_size = MAX_GPU_BATCH_ROWS.min(MAX_GPU_BATCH_FLOATS / dim).max(1);
+    let working_bytes = query
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_add(
+            request
+                .k
+                .saturating_mul(std::mem::size_of::<TensorSearchHit>()),
+        )
+        .saturating_add(4_096);
+    let available_floats = dataset
+        .memory_limit()
+        .checked_sub(working_bytes)
+        .map_or(0, |bytes| bytes / 16)
+        .min(MAX_GPU_BATCH_FLOATS);
+    if available_floats < dim {
+        return Err(TensorError::InvalidValue(
+            "GPU search input exceeds the configured memory budget".to_owned(),
+        ));
+    }
+    let batch_size = MAX_GPU_BATCH_ROWS.min(available_floats / dim);
     while position < end {
         deadline.check()?;
         let limit = batch_size.min(

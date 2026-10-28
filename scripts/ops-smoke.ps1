@@ -1,64 +1,40 @@
-$ErrorActionPreference = "Stop"
-
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Required = @(
-    "ops/kind/multidb-kind.yaml",
-    "ops/helm/multidb/Chart.yaml",
-    "ops/helm/multidb/values.yaml",
-    "ops/helm/multidb/templates/deployment.yaml",
-    "ops/helm/multidb/templates/service.yaml",
-    "ops/helm/multidb/templates/pvc.yaml",
-    "ops/helm/multidb/templates/configmap.yaml",
-    "ops/vault/dev-policy.hcl",
-    "ops/minio/backup-target.env.example"
+param(
+    [string] $Output = "",
+    [string] $Helm = "helm",
+    [string] $Kubeconform = "kubeconform",
+    [string] $KubernetesVersion = "1.31.0"
 )
 
-foreach ($Relative in $Required) {
-    $Path = Join-Path $Root $Relative
-    if (-not (Test-Path $Path)) {
+$ErrorActionPreference = "Stop"
+$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+foreach ($Relative in @(
+    "ops/kind/multidb-kind.yaml", "ops/helm/multidb/Chart.yaml",
+    "ops/helm/multidb/values.yaml", "ops/helm/multidb/values.schema.json",
+    "ops/helm/multidb/values-production-large.yaml", "ops/helm/multidb/values-local.yaml",
+    "ops/vault/dev-policy.hcl", "ops/minio/backup-target.env.example"
+)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $Relative))) {
         throw "missing operator artifact: $Relative"
     }
 }
 
-$Deployment = Get-Content (Join-Path $Root "ops/helm/multidb/templates/deployment.yaml") -Raw
-foreach ($Token in @("readinessProbe:", "livenessProbe:", "RollingUpdate", "downgrade-policy", "secretKeyRef:", "persistentVolumeClaim:", "MULTIDB_ADMIN_PASSWORD", "MULTIDB_ADMIN_TOKEN", "MULTIDB_PG_PASSWORD", "MULTIDB_PG_TLS_CERT", "configMap:", ".Values.spec.enabled")) {
-    if (-not $Deployment.Contains($Token)) {
-        throw "deployment template missing required token: $Token"
-    }
+if (-not (Get-Command $Helm -ErrorAction SilentlyContinue)) {
+    throw "Helm is required: static template text does not validate a deployment"
 }
+if (-not (Get-Command $Kubeconform -ErrorAction SilentlyContinue)) {
+    throw "kubeconform is required for rendered Kubernetes schema validation"
+}
+$Python = Get-Command python3 -ErrorAction SilentlyContinue
+if ($null -eq $Python) { $Python = Get-Command python -ErrorAction SilentlyContinue }
+if ($null -eq $Python) { throw "Python3 and qualification requirements are required" }
 
-$Values = Get-Content (Join-Path $Root "ops/helm/multidb/values.yaml") -Raw
-foreach ($Token in @("vaultAddress", "minioEndpoint", "auditJsonlPath", "backupTarget", "runtime:", "persistence:", "adminPassword:", "adminToken:", "pgPassword:", "pgTls:", "spec:", "configMap:", "apply: verify")) {
-    if (-not $Values.Contains($Token)) {
-        throw "values.yaml missing required token: $Token"
-    }
+if (-not $Output) {
+    $RunSuffix = [Guid]::NewGuid().ToString("N")
+    $Output = Join-Path $Root "target/qualification/kubernetes-ops-$RunSuffix"
 }
-
-$ConfigMap = Get-Content (Join-Path $Root "ops/helm/multidb/templates/configmap.yaml") -Raw
-foreach ($Token in @("MULTIDB_RUNTIME_MODE", "MULTIDB_DB_PATH", "MULTIDB_BIND", "MULTIDB_PG_BIND", "MULTIDB_STUDIO_DIR", "MULTIDB_SPEC_PATH", "MULTIDB_SPEC_APPLY")) {
-    if (-not $ConfigMap.Contains($Token)) {
-        throw "configmap template missing required token: $Token"
-    }
-}
-# Spec mode blanks the image's MULTIDB_PROFILE default instead of leaving it out.
-foreach ($Token in @('MULTIDB_PROFILE: ""', 'MULTIDB_REPLICATION: ""')) {
-    if (-not $ConfigMap.Contains($Token)) {
-        throw "configmap template missing spec-mode token: $Token"
-    }
-}
-
-$Pvc = Get-Content (Join-Path $Root "ops/helm/multidb/templates/pvc.yaml") -Raw
-foreach ($Token in @("PersistentVolumeClaim", "storageClassName", "accessModes")) {
-    if (-not $Pvc.Contains($Token)) {
-        throw "pvc template missing required token: $Token"
-    }
-}
-
-$Vault = Get-Content (Join-Path $Root "ops/vault/dev-policy.hcl") -Raw
-foreach ($Token in @("transit/encrypt", "transit/decrypt", "transit/rewrap", "secret/data/multidb/kek")) {
-    if (-not $Vault.Contains($Token)) {
-        throw "vault dev policy missing required token: $Token"
-    }
-}
-
-Write-Host "operator artifact smoke passed"
+$Validator = Join-Path $Root "scripts/qualification/kubernetes.py"
+if (-not (Test-Path -LiteralPath $Validator)) { throw "missing Kubernetes qualification runner" }
+& $Python.Source $Validator --chart (Join-Path $Root "ops/helm/multidb") --output $Output --helm $Helm --kubeconform $Kubeconform --kubernetes-version $KubernetesVersion
+if ($LASTEXITCODE -ne 0) { throw "rendered operator qualification failed; inspect $Output" }
+Write-Host "rendered operator/schema qualification accepted; live storage/CNI/HA acceptance is separate"

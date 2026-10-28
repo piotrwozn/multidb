@@ -121,6 +121,20 @@ fn preflight_matches_every_request_variant_and_rejects_truncation() -> TestResul
             prefix: vec![9],
             limit: 1024,
         }),
+        InternalRequest::Ap(ApRequest::ReadRangePage {
+            table: "t".to_owned(),
+            start: vec![1],
+            end: vec![9],
+            limit: 256,
+        }),
+        InternalRequest::Ap(ApRequest::ReadRangePageGuarded {
+            table: "t".to_owned(),
+            start: vec![1],
+            end: vec![9],
+            limit: 1,
+            max_wire_bytes: 4096,
+            max_decoded_bytes: 8192,
+        }),
     ];
     for value in requests {
         check(&value)?;
@@ -159,6 +173,7 @@ fn preflight_matches_every_response_variant_and_rejects_truncation() -> TestResu
         }])),
         InternalResponse::Ap(ApResponse::Merkle(vec![(vec![4], vec![5])])),
         InternalResponse::Error("failure".to_owned()),
+        InternalResponse::ResourceLimit("read budget exhausted".to_owned()),
     ];
     for value in responses {
         check(&value)?;

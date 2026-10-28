@@ -1,0 +1,10 @@
+# Existing ConfigMap contains an approved DURABLE DatabaseSpec; create applies
+# only an absent database, verify is appropriate after initialization.
+spec:
+  enabled: true
+  configMap: multidb-spec
+  apply: create
+encryption:
+  enabled: true
+  secretName: multidb-encryption
+  key: key

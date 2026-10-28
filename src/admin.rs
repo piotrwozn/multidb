@@ -5,12 +5,18 @@ use std::{
     fs,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
+mod catalog_security_tests;
+mod http_guard;
+#[cfg(test)]
+mod readiness_tests;
+#[cfg(test)]
 mod static_asset_tests;
+mod time_series_policy;
 
 use argon2::{
     Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
@@ -1373,11 +1379,13 @@ pub struct AdminState {
     started_at_millis: u64,
     status: AdminStatus,
     readiness_probe: Arc<dyn Fn() -> bool + Send + Sync>,
+    runtime_health: Arc<OnceLock<crate::db::RuntimeHealth>>,
     admin_token: Option<String>,
     admin_sessions: Arc<AdminSessionStore>,
     admin_session_ttl_seconds: u64,
     admin_login_rate_limiter: Arc<AdminLoginRateLimiter>,
     admin_password_verifier: Arc<Semaphore>,
+    http_guard: Arc<http_guard::Guard>,
     insecure_local_admin: bool,
     studio_assets_dir: Option<Arc<PathBuf>>,
     spec_mode: Option<ServeSpecMode>,
@@ -1388,11 +1396,13 @@ impl AdminState {
     pub fn from_database(database: Database) -> Self {
         let started_at_millis = now_millis();
         let status = status_from_database(&database, started_at_millis);
+        let runtime_health = Arc::new(OnceLock::from(database.runtime_health()));
         Self {
             database: Arc::new(RwLock::new(database)),
             started_at_millis,
             status,
             readiness_probe: Arc::new(|| true),
+            runtime_health,
             admin_token: None,
             admin_sessions: Arc::new(AdminSessionStore::default()),
             admin_session_ttl_seconds: DEFAULT_ADMIN_SESSION_TTL_SECONDS,
@@ -1400,6 +1410,7 @@ impl AdminState {
                 AdminLoginRateLimitConfig::default(),
             )),
             admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
+            http_guard: Arc::new(http_guard::Guard::default()),
             insecure_local_admin: false,
             studio_assets_dir: None,
             spec_mode: None,
@@ -1409,6 +1420,10 @@ impl AdminState {
     #[must_use]
     pub fn from_database_handle(database: Arc<RwLock<Database>>) -> Self {
         let started_at_millis = now_millis();
+        let runtime_health = Arc::new(OnceLock::new());
+        if let Ok(database) = database.try_read() {
+            let _ = runtime_health.set(database.runtime_health());
+        }
         let status = database.try_read().map_or_else(
             |_| empty_status(started_at_millis),
             |database| status_from_database(&database, started_at_millis),
@@ -1418,6 +1433,7 @@ impl AdminState {
             started_at_millis,
             status,
             readiness_probe: Arc::new(|| true),
+            runtime_health,
             admin_token: None,
             admin_sessions: Arc::new(AdminSessionStore::default()),
             admin_session_ttl_seconds: DEFAULT_ADMIN_SESSION_TTL_SECONDS,
@@ -1425,6 +1441,7 @@ impl AdminState {
                 AdminLoginRateLimitConfig::default(),
             )),
             admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
+            http_guard: Arc::new(http_guard::Guard::default()),
             insecure_local_admin: false,
             studio_assets_dir: None,
             spec_mode: None,
@@ -1438,11 +1455,13 @@ impl AdminState {
     ) -> Self {
         let started_at_millis = now_millis();
         let status = status_from_database(&database, started_at_millis);
+        let runtime_health = Arc::new(OnceLock::from(database.runtime_health()));
         Self {
             database: Arc::new(RwLock::new(database)),
             started_at_millis,
             status,
             readiness_probe: Arc::new(readiness_probe),
+            runtime_health,
             admin_token: None,
             admin_sessions: Arc::new(AdminSessionStore::default()),
             admin_session_ttl_seconds: DEFAULT_ADMIN_SESSION_TTL_SECONDS,
@@ -1450,6 +1469,7 @@ impl AdminState {
                 AdminLoginRateLimitConfig::default(),
             )),
             admin_password_verifier: Arc::new(Semaphore::new(ADMIN_PASSWORD_VERIFY_PERMITS)),
+            http_guard: Arc::new(http_guard::Guard::default()),
             insecure_local_admin: false,
             studio_assets_dir: None,
             spec_mode: None,
@@ -1588,7 +1608,21 @@ impl AdminState {
 
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        (self.readiness_probe)()
+        self.runtime_health_condition() == Some(crate::db::RuntimeHealthCondition::Ready)
+            && (self.readiness_probe)()
+    }
+
+    fn runtime_health_condition(&self) -> Option<crate::db::RuntimeHealthCondition> {
+        // Constructors normally capture the handle. If an embedded caller
+        // handed us an already-locked database, retry once without ever waiting.
+        if self.runtime_health.get().is_none()
+            && let Ok(database) = self.database.try_read()
+        {
+            let _ = self.runtime_health.set(database.runtime_health());
+        }
+        self.runtime_health
+            .get()
+            .map(crate::db::RuntimeHealth::condition)
     }
 
     fn bootstrap_insecure_local_admin(&self) {
@@ -1611,6 +1645,9 @@ impl AdminState {
         }
         if bearer_token(headers).is_some_and(|token| token.starts_with(SESSION_TOKEN_PREFIX)) {
             return Principal::new("__invalid_admin_session__");
+        }
+        if headers.get_all(HEADER_PRINCIPAL).iter().count() > 1 {
+            return Principal::new("__ambiguous_admin_principal__");
         }
         headers
             .get(HEADER_PRINCIPAL)
@@ -1699,7 +1736,7 @@ impl AdminState {
 /// login lockout is tracked per client address; without connection info all
 /// clients share a single lockout.
 pub fn router(state: AdminState) -> Router {
-    api_router().with_state(state)
+    api_router(state.clone()).with_state(state)
 }
 
 /// Builds the Control Plane API router, also mounted under `/api`.
@@ -1708,8 +1745,8 @@ pub fn router(state: AdminState) -> Router {
 /// login lockout is tracked per client address.
 pub fn router_with_api_prefix(state: AdminState) -> Router {
     Router::new()
-        .merge(api_router())
-        .nest("/api", api_router())
+        .merge(api_router(state.clone()))
+        .nest("/api", api_router(state.clone()))
         .with_state(state)
 }
 
@@ -1720,13 +1757,13 @@ pub fn router_with_api_prefix(state: AdminState) -> Router {
 /// login lockout is tracked per client address.
 pub fn router_with_studio(state: AdminState) -> Router {
     Router::new()
-        .merge(api_router())
-        .nest("/api", api_router())
+        .merge(api_router(state.clone()))
+        .nest("/api", api_router(state.clone()))
         .fallback(studio_static_handler)
         .with_state(state)
 }
 
-fn api_router() -> Router<AdminState> {
+fn api_router(state: AdminState) -> Router<AdminState> {
     Router::new()
         .route("/openapi.json", get(openapi_handler))
         .route("/health", get(health_handler))
@@ -1816,6 +1853,10 @@ fn api_router() -> Router<AdminState> {
         .route("/advice/decision", post(advice_decision_handler))
         .route("/studio", get(studio_handler))
         .layer(DefaultBodyLimit::max(MAX_CONTROL_PLANE_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            http_guard::protect,
+        ))
 }
 
 #[must_use]
@@ -1823,11 +1864,15 @@ pub fn local_insecure_admin_allowed(bind: SocketAddr) -> bool {
     bind.ip().is_loopback()
 }
 
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(state): State<AdminState>) -> Response {
+    if state.runtime_health_condition() == Some(crate::db::RuntimeHealthCondition::GpuStopped) {
+        return failed_probe("gpu_stopped", "restart_required");
+    }
     Json(HealthResponse {
         ok: true,
         status: "alive",
     })
+    .into_response()
 }
 
 async fn openapi_handler() -> impl IntoResponse {
@@ -1858,15 +1903,30 @@ async fn studio_static_handler(
     run_blocking(move || studio_static_response(&root, &path, &method)).await
 }
 
-async fn ready_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    if !state.is_ready() {
+async fn ready_handler(State(state): State<AdminState>) -> Response {
+    use crate::db::RuntimeHealthCondition;
+    match state.runtime_health_condition() {
+        Some(RuntimeHealthCondition::AuditFailed) => {
+            return failed_probe("audit_failed", "operator_required");
+        }
+        Some(RuntimeHealthCondition::GpuUnavailable) => {
+            return failed_probe("gpu_unavailable", "operator_required");
+        }
+        Some(RuntimeHealthCondition::GpuStopped) => {
+            return failed_probe("gpu_stopped", "restart_required");
+        }
+        None => return failed_probe("initializing", "wait"),
+        Some(RuntimeHealthCondition::Ready) => {}
+    }
+    if !(state.readiness_probe)() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HealthResponse {
                 ok: false,
                 status: "not_ready",
             }),
-        );
+        )
+            .into_response();
     }
     (
         StatusCode::OK,
@@ -1875,6 +1935,17 @@ async fn ready_handler(State(state): State<AdminState>) -> impl IntoResponse {
             status: "ready",
         }),
     )
+        .into_response()
+}
+
+fn failed_probe(reason: &'static str, recovery: &'static str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "ok": false, "status": "not_ready", "reason": reason, "recovery": recovery,
+        })),
+    )
+        .into_response()
 }
 
 async fn auth_login_handler(
@@ -2245,7 +2316,8 @@ async fn catalog_handler(State(state): State<AdminState>, headers: HeaderMap) ->
         return response;
     }
     let database = Arc::clone(&state.database).read_owned().await;
-    run_blocking(move || match catalog_response(&database) {
+    let principal = state.principal_from_headers(&database, &headers);
+    run_blocking(move || match catalog_response(&database, &principal) {
         Ok(catalog) => api_ok(StatusCode::OK, catalog),
         Err(error) => db_error(&error),
     })
@@ -3031,10 +3103,16 @@ async fn time_series_range_handler(
         ) {
             return db_error(&DbError::from(error));
         }
+        let policy = match database.policy_config() {
+            Ok(policy) => policy,
+            Err(error) => return db_error(&error),
+        };
         match database
             .time_series(&name)
             .and_then(|series| Ok(series.range(&query.series, query.start, query.end)?))
-        {
+            .and_then(|points| {
+                time_series_policy::apply(&policy, &principal, &name, &query.series, points)
+            }) {
             Ok(points) => api_ok(StatusCode::OK, json!({ "points": points })),
             Err(error) => db_error(&error),
         }
@@ -3951,20 +4029,56 @@ fn insert_time_series_point(
     }
 }
 
-fn catalog_response(database: &Database) -> Result<CatalogResponse, DbError> {
+fn catalog_response(
+    database: &Database,
+    principal: &Principal,
+) -> Result<CatalogResponse, DbError> {
+    let policy = database.policy_config()?;
     let mut objects = Vec::new();
     for (name, entry) in database.catalog() {
+        let resource = catalog_resource(name, entry);
+        if database
+            .authz_policy()
+            .authorize(principal, &resource, Permission::Read)
+            .is_err()
+        {
+            continue;
+        }
+        // Counts expose rows hidden by policies, even though the catalog carries no
+        // row payloads. Keep schema browsing without revealing raw cardinality.
+        let protected = policy
+            .row_policies
+            .iter()
+            .any(|policy| policy.resource == resource)
+            || policy
+                .masking
+                .iter()
+                .any(|policy| policy.resource == resource);
         let (schema, row_count) = match entry {
             CatalogEntry::Table { .. } => {
                 let table = database.table(name)?;
-                (table.schema().cloned(), Some(table.row_count()?))
+                (
+                    table.schema().cloned(),
+                    if protected {
+                        None
+                    } else {
+                        Some(table.row_count()?)
+                    },
+                )
             }
             CatalogEntry::Collection { .. } => {
                 let collection = database.collection(name)?;
-                (None, Some(collection.scan()?.len()))
+                (
+                    None,
+                    if protected {
+                        None
+                    } else {
+                        Some(collection.scan()?.len())
+                    },
+                )
             }
-            CatalogEntry::TensorDataset { .. } => {
-                let info = database.tensor_dataset(name)?.info(None)?;
+            CatalogEntry::TensorDataset { .. } if !protected => {
+                let info = database.tensor_dataset_info_as(principal, name, None)?;
                 (
                     None,
                     Some(usize::try_from(info.samples).unwrap_or(usize::MAX)),
@@ -3981,6 +4095,20 @@ fn catalog_response(database: &Database) -> Result<CatalogResponse, DbError> {
         });
     }
     Ok(CatalogResponse { objects })
+}
+
+fn catalog_resource(name: &str, entry: &CatalogEntry) -> Resource {
+    match entry {
+        CatalogEntry::Collection { .. } | CatalogEntry::TensorDataset { .. } => {
+            Resource::Collection(name.to_owned())
+        }
+        CatalogEntry::Vector { .. } => Resource::VectorCollection(name.to_owned()),
+        CatalogEntry::FullTextIndex { .. } => Resource::FullTextIndex(name.to_owned()),
+        CatalogEntry::TimeSeries { .. } => Resource::TimeSeries(name.to_owned()),
+        CatalogEntry::Graph { .. } => Resource::Graph(name.to_owned()),
+        CatalogEntry::GeoIndex { .. } => Resource::GeoIndex(name.to_owned()),
+        _ => Resource::Table(name.to_owned()),
+    }
 }
 
 fn catalog_kind(entry: &CatalogEntry) -> &'static str {
@@ -4342,6 +4470,11 @@ async fn require_admin_token(state: &AdminState, headers: &HeaderMap) -> Option<
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    // Proxy layers differ in first/last-header handling. Authentication must not
+    // interpret an ambiguous credential list as one valid bearer credential.
+    if headers.get_all(AUTHORIZATION).iter().count() != 1 {
+        return None;
+    }
     headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -4407,7 +4540,9 @@ async fn audit_auth_event(
     let action = action.to_owned();
     let detail = detail.map(str::to_owned);
     let database = Arc::clone(&state.database).read_owned().await;
+    let http_permit = http_guard::processing_permit();
     let result = tokio::task::spawn_blocking(move || {
+        let _http_permit = http_permit;
         database.record_admin_auth_event(principal.as_ref(), &action, outcome, detail.as_deref())
     })
     .await;
@@ -4419,7 +4554,9 @@ async fn audit_auth_event(
 }
 
 async fn hash_admin_password(password: String) -> Result<String, String> {
+    let http_permit = http_guard::processing_permit();
     tokio::task::spawn_blocking(move || {
+        let _http_permit = http_permit;
         let mut salt_bytes = [0_u8; 16];
         getrandom::fill(&mut salt_bytes).map_err(|error| error.to_string())?;
         let salt = SaltString::encode_b64(&salt_bytes).map_err(|error| error.to_string())?;
@@ -4439,7 +4576,9 @@ async fn verify_admin_password(
     password_hash: String,
     password: String,
 ) -> Result<bool, String> {
+    let http_permit = http_guard::processing_permit();
     tokio::task::spawn_blocking(move || {
+        let _http_permit = http_permit;
         // The permit lives in the blocking task, not in the request future: a
         // client that disconnects drops the handler, but hashing keeps running
         // and its Argon2 memory must stay counted until it finishes.
@@ -4795,8 +4934,9 @@ fn invalid_json_value(message: impl Into<String>) -> Response {
 /// Query governor saturation is `503 busy` with `Retry-After`, and an optimistic
 /// write conflict that outlasted the internal retries is `409 conflict`; both
 /// can be retried as is. Authorization failures are `403 forbidden`, an invalid
-/// time-series config or point is `400 invalid_value`, and everything else is
-/// `500 internal_error`.
+/// time-series config or point is `400 invalid_value`. Read memory exhaustion is
+/// `503 resource_limit`, deadline expiry is `504 query_timeout`, and cancellation
+/// is `408 query_cancelled`. Other failures remain `500 internal_error`.
 fn db_error(error: &DbError) -> Response {
     if matches!(
         error,
@@ -4807,7 +4947,12 @@ fn db_error(error: &DbError) -> Response {
     if matches!(error, DbError::Extension(ExtensionError::PolicyDenied(_))) {
         return api_error(StatusCode::FORBIDDEN, "forbidden", error.to_string());
     }
-    if matches!(error, DbError::Config(ConfigError::Unsupported(_))) {
+    if matches!(
+        error,
+        DbError::Config(ConfigError::Unsupported(_))
+            | DbError::Query(QueryError::Unsupported(_))
+            | DbError::Federation(crate::federation::FederationError::Unsupported(_))
+    ) {
         return api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported",
@@ -4842,12 +4987,21 @@ fn db_error(error: &DbError) -> Response {
         );
         return response;
     }
-    if matches!(error, DbError::Query(QueryError::Timeout(_))) {
-        return api_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "query_timeout",
-            error.to_string(),
-        );
+    if let Some(failure) = crate::compat::read_budget_failure(error) {
+        let (status, code) = match failure {
+            crate::compat::ReadBudgetFailure::ResourceLimit => {
+                (StatusCode::SERVICE_UNAVAILABLE, "resource_limit")
+            }
+            crate::compat::ReadBudgetFailure::Timeout => {
+                (StatusCode::GATEWAY_TIMEOUT, "query_timeout")
+            }
+            crate::compat::ReadBudgetFailure::Cancelled => {
+                (StatusCode::REQUEST_TIMEOUT, "query_cancelled")
+            }
+        };
+        // An oversized statement needs a smaller request or a larger budget;
+        // unlike queue saturation, retrying it unchanged has no promised delay.
+        return api_error(status, code, error.to_string());
     }
     if error.is_conflict() {
         return api_error(StatusCode::CONFLICT, "conflict", error.to_string());
@@ -4883,7 +5037,13 @@ fn invalid_vector_input(error: &VectorError) -> bool {
 /// and group-commit waits off the async workers. Callers move an owned database
 /// guard into `work`, so the guard is released when the work finishes.
 async fn run_blocking(work: impl FnOnce() -> Response + Send + 'static) -> Response {
-    match tokio::task::spawn_blocking(work).await {
+    let http_permit = http_guard::processing_permit();
+    match tokio::task::spawn_blocking(move || {
+        let _http_permit = http_permit;
+        work()
+    })
+    .await
+    {
         Ok(response) => response,
         Err(error) => blocking_task_failed(&error),
     }
@@ -4934,7 +5094,13 @@ async fn with_bootstrap_admin_principal(
 async fn run_blocking_opt(
     work: impl FnOnce() -> Option<Response> + Send + 'static,
 ) -> Option<Response> {
-    match tokio::task::spawn_blocking(work).await {
+    let http_permit = http_guard::processing_permit();
+    match tokio::task::spawn_blocking(move || {
+        let _http_permit = http_permit;
+        work()
+    })
+    .await
+    {
         Ok(response) => response,
         Err(error) => Some(blocking_task_failed(&error)),
     }
@@ -5037,6 +5203,19 @@ fn studio_static_response(root: &Path, uri_path: &str, method: &Method) -> Respo
         body.len() as u64
     };
     let mut response = ([(CONTENT_TYPE, content_type_for_path(&file_path))], body).into_response();
+    response.headers_mut().insert("content-security-policy", HeaderValue::from_static(
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http: https:; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    ));
+    response
+        .headers_mut()
+        .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     if let Ok(length) = HeaderValue::from_str(&length.to_string()) {
         response.headers_mut().insert(CONTENT_LENGTH, length);
     }
@@ -5736,6 +5915,7 @@ mod tests {
                 .is_err()
         );
         let app = super::router(state);
+        let token = login_token(&app, "correct").await?;
 
         for request in [
             serde_json::json!({
@@ -5747,14 +5927,11 @@ mod tests {
                 "new_password": "new-secret"
             }),
         ] {
-            let response = app
-                .clone()
-                .oneshot(json_request(
-                    Method::POST,
-                    "/auth/change-password",
-                    &request,
-                )?)
-                .await?;
+            let mut authenticated = json_request(Method::POST, "/auth/change-password", &request)?;
+            authenticated
+                .headers_mut()
+                .insert(AUTHORIZATION, format!("Bearer {token}").parse()?);
+            let response = app.clone().oneshot(authenticated).await?;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let body = json_body(response).await?;
             assert_eq!(body["error"]["code"], "invalid_value");
@@ -10677,10 +10854,8 @@ mod tests {
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
         assert_eq!(json_body(forbidden).await?["error"]["code"], "forbidden");
 
-        // Other resource limits, such as a statement over its memory limit, would
-        // fail again on retry.
+        // These failures still represent internal errors, not read budgets.
         for other in [
-            DbError::Query(QueryError::ResourceLimit("memory".to_owned())),
             DbError::Query(QueryError::DuplicatePrimaryKey),
             DbError::Storage(StorageError::Corruption("bad page".to_owned())),
         ] {
@@ -10696,6 +10871,60 @@ mod tests {
                 "internal_error"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guarded_storage_failures_preserve_http_status_through_wrappers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = super::db_error(&DbError::Federation(
+            crate::federation::FederationError::Unsupported(
+                "verified TLS requires a CA bundle".to_owned(),
+            ),
+        ));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(response).await?["error"]["code"], "unsupported");
+        for (storage, status, code) in [
+            (
+                StorageError::ResourceLimit("memory".to_owned()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "resource_limit",
+            ),
+            (
+                StorageError::Timeout("deadline".to_owned()),
+                StatusCode::GATEWAY_TIMEOUT,
+                "query_timeout",
+            ),
+            (
+                StorageError::Cancelled("cancelled".to_owned()),
+                StatusCode::REQUEST_TIMEOUT,
+                "query_cancelled",
+            ),
+        ] {
+            let error = DbError::TimeSeries(TimeSeriesError::Repl(ReplError::Storage(storage)));
+            let response = super::db_error(&error);
+            assert_eq!(response.status(), status, "{error}");
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+            assert_eq!(json_body(response).await?["error"]["code"], code);
+        }
+        for error in [
+            DbError::Query(QueryError::ResourceLimit("memory".to_owned())),
+            DbError::Federation(crate::federation::FederationError::Query(
+                QueryError::ResourceLimit("decoder".to_owned()),
+            )),
+        ] {
+            let response = super::db_error(&error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                json_body(response).await?["error"]["code"],
+                "resource_limit"
+            );
+        }
+        // Error text alone must never cause a resource/policy classification.
+        let response = super::db_error(&DbError::Storage(StorageError::Backend(
+            "read timeout: memory authorization denied".to_owned(),
+        )));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         Ok(())
     }
 

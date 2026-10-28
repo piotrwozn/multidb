@@ -1,0 +1,20 @@
+MultiDB is deployed as ONE writer with Recreate replacement and maintenance downtime.
+Replica count1 is intentional: adding pods does not create live Raft/AP or database HA.
+{{- if .Values.runtime.allowVolatile }}
+This is explicitly VOLATILE InMemory: database state is lost on process/pod restart.
+{{- else if .Values.persistence.devEmptyDir }}
+This is disposable emptyDir storage: state is lost on pod replacement.
+{{- else }}
+The PVC is retained by default. Never mount it into a second active writer/release.
+{{- end }}
+The PodDisruptionBudget blocks healthy voluntary drains; plan downtime explicitly.
+
+Production requires a real verified image digest, existing credential/TLS Secrets,
+an enforcing NetworkPolicy CNI and explicit client/proxy/monitoring peer selectors.
+Ingress additionally requires an authenticated TLS-only gateway that strips or
+replaces untrusted X-MultiDB-Principal headers. The acknowledgment is not a proxy.
+
+Legacy config.replication/backupTarget/minio/vault values do not create clustering,
+backup scheduling or a live Vault integration in flat serve. Check docs/kubernetes.md.
+Tensor deployments require real vendor device plugins/drivers/CDI/Vulkan access;
+rendering a GPU request does not qualify physical execution or GPU throughput.

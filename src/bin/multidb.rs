@@ -35,8 +35,8 @@ use multidb::{
         suggest_profile_name,
     },
     db::{
-        Database, DbConfig, DbError, EncryptionConfig, MetadataProbe, OperationalConfig,
-        PersistedProfileManifest, ProbedMetadata, Profile, ReplicationKind,
+        AuditConfig, Database, DbConfig, DbError, EncryptionConfig, MetadataProbe,
+        OperationalConfig, PersistedProfileManifest, ProbedMetadata, Profile, ReplicationKind,
         create_database_with_ops, inspect_database_metadata,
         inspect_database_metadata_with_encryption, open_database_with_ops, recover_database_file,
     },
@@ -114,6 +114,8 @@ enum ServePgTls {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServeConfig {
+    runtime_mode: ServeRuntimeMode,
+    audit: AuditConfig,
     admin_bind: SocketAddr,
     pg_bind: SocketAddr,
     db_path: PathBuf,
@@ -905,9 +907,22 @@ fn encryption_from_sources(get_env: &impl Fn(&str) -> Option<String>) -> Option<
 }
 
 fn cli_operational_config() -> OperationalConfig {
-    OperationalConfig {
+    let mut config = OperationalConfig {
         encryption: encryption_from_sources(&|name| env::var(name).ok()),
         ..OperationalConfig::default()
+    };
+    config.security.audit = audit_from_sources(&|name| env::var(name).ok());
+    config
+}
+
+fn audit_from_sources(get_env: &impl Fn(&str) -> Option<String>) -> AuditConfig {
+    AuditConfig {
+        key_path: get_env("MULTIDB_AUDIT_KEY_PATH")
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from),
+        anchor_path: get_env("MULTIDB_AUDIT_ANCHOR_PATH")
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from),
     }
 }
 
@@ -923,8 +938,11 @@ fn inspect_cli_database_metadata(path: &Path) -> MetadataProbe {
 }
 
 fn cli_environment() -> ProvisionEnvironment {
+    let operational = cli_operational_config();
+    let audit = operational.security.audit;
     ProvisionEnvironment {
-        encryption: cli_operational_config().encryption,
+        encryption: operational.encryption,
+        audit: (audit.key_path.is_some() || audit.anchor_path.is_some()).then_some(audit),
         ..ProvisionEnvironment::new(ProvisionSurface::Cli)
     }
 }
@@ -3022,11 +3040,12 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
     };
     let allow_unmet_floors = has_flag(args, "--allow-unmet-floors");
 
+    let restore_config = restore_options_from_args(args)?;
     let report = restore_backup_with_config(
         &backup,
         DbConfig::on_disk(profile, &dest_db),
         target,
-        &restore_options_from_args(args)?,
+        &restore_config,
     )?;
     let mut lines = vec![format!(
         "restored timeline={} lsn={} applied_commits={}",
@@ -3034,7 +3053,8 @@ fn run_restore(args: &[String]) -> Result<String, CliError> {
     )];
     // Without the flag, a restore that would miss a floor is refused.
     if allow_unmet_floors
-        && let MetadataProbe::Initialized(metadata) = inspect_database_metadata(&dest_db)
+        && let MetadataProbe::Initialized(metadata) =
+            inspect_with_encryption(&dest_db, restore_config.target_encryption.as_ref())
     {
         lines.extend(
             metadata
@@ -3079,6 +3099,22 @@ fn run_list(args: &[String]) -> Result<String, CliError> {
 fn restore_options_from_args(args: &[String]) -> Result<RestoreConfig, CliError> {
     let mut config = RestoreConfig::default()
         .with_unmet_profile_floors_allowed(has_flag(args, "--allow-unmet-floors"));
+    config.encryption = restore_encryption_from_args(args, "source")?;
+    config.target_encryption = restore_encryption_from_args(args, "target")?;
+    config.create_target_keyring = has_flag(args, "--create-target-keyring");
+    if config.create_target_keyring
+        && !config.target_encryption.as_ref().is_some_and(|encryption| {
+            matches!(
+                encryption.mode,
+                multidb::db::EncryptionMode::LocalEnvelope { .. }
+            )
+        })
+    {
+        return Err(CliError::Usage(
+            "--create-target-keyring requires --target-keyring-file and --target-kek-file"
+                .to_owned(),
+        ));
+    }
     if let Some(value) = optional_value(args, "--max-payload-bytes") {
         let limit = value
             .parse::<u64>()
@@ -3092,6 +3128,28 @@ fn restore_options_from_args(args: &[String]) -> Result<RestoreConfig, CliError>
         config.max_payload_bytes = limit;
     }
     Ok(config)
+}
+
+fn restore_encryption_from_args(
+    args: &[String],
+    scope: &str,
+) -> Result<Option<EncryptionConfig>, CliError> {
+    let key_flag = format!("--{scope}-key-file");
+    let keyring_flag = format!("--{scope}-keyring-file");
+    let kek_flag = format!("--{scope}-kek-file");
+    let key = flag_value(args, &key_flag)?;
+    let keyring = flag_value(args, &keyring_flag)?;
+    let kek = flag_value(args, &kek_flag)?;
+    match (key, keyring, kek) {
+        (None, None, None) => Ok(None),
+        (Some(key), None, None) => Ok(Some(EncryptionConfig::file_key(key))),
+        (None, Some(keyring), Some(kek)) => {
+            Ok(Some(EncryptionConfig::local_envelope(keyring, kek)))
+        }
+        _ => Err(CliError::Usage(format!(
+            "use either {key_flag}, or {keyring_flag} together with {kek_flag}"
+        ))),
+    }
 }
 
 fn run_cdc(args: &[String]) -> Result<String, CliError> {
@@ -3571,23 +3629,45 @@ fn serve_database_with_spec_mode(
         .encryption_key_path
         .as_ref()
         .map(EncryptionConfig::file_key);
-    let db_config =
-        cli_db_config_with_encryption(config.profile, config.db_path.clone(), encryption.as_ref())?;
-    if let Some(parent) = config.db_path.parent()
+    let durable =
+        !matches!(config.profile, ProfileSelection::Fixed(profile) if profile.is_in_memory());
+    config.audit.validate_startup(
+        durable.then_some(config.db_path.as_path()),
+        encryption.as_ref(),
+        config.runtime_mode == ServeRuntimeMode::Production,
+        durable,
+    )?;
+    let db_config = if let ProfileSelection::Fixed(profile) = config.profile
+        && profile.is_in_memory()
+    {
+        DbConfig::new(profile)
+    } else {
+        cli_db_config_with_encryption(config.profile, config.db_path.clone(), encryption.as_ref())?
+    };
+    if durable
+        && let Some(parent) = config.db_path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    Ok((
-        create_database_with_ops(
-            db_config,
-            OperationalConfig {
-                encryption,
-                ..OperationalConfig::default()
-            },
-        )?,
-        None,
-    ))
+    let mut operational = OperationalConfig {
+        encryption,
+        ..OperationalConfig::default()
+    };
+    operational.security.audit.clone_from(&config.audit);
+    let initialized =
+        durable && std::fs::metadata(&config.db_path).is_ok_and(|metadata| metadata.len() > 0);
+    let database = if initialized {
+        // Open performs physical crash repair when needed, while preserving logical
+        // metadata/RBAC. Validate the signed history before bootstrap can write.
+        open_database_with_ops(db_config, &operational)?
+    } else {
+        create_database_with_ops(db_config, operational)?
+    };
+    if config.audit.key_path.is_none() && config.audit.anchor_path.is_none() {
+        database.verify_audit_startup()?;
+    }
+    Ok((database, None))
 }
 
 /// `serve` in spec mode (`MULTIDB_SPEC_PATH`). The spec is read through `spec_io`, validated
@@ -3638,6 +3718,16 @@ fn serve_spec_database(
         return Err(serve_refusal(serve_spec, &reason));
     }
     let (db_path, notes) = serve_spec_db_path(config, serve_spec, &spec);
+    config.audit.validate_startup(
+        Some(&db_path),
+        config
+            .encryption_key_path
+            .as_ref()
+            .map(EncryptionConfig::file_key)
+            .as_ref(),
+        config.runtime_mode == ServeRuntimeMode::Production,
+        true,
+    )?;
     if let Some(parent) = db_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -3649,6 +3739,7 @@ fn serve_spec_database(
         serve_spec.mode,
         &ProvisionOptions::default(),
         &ProvisionEnvironment {
+            audit: Some(config.audit.clone()),
             encryption: config
                 .encryption_key_path
                 .as_ref()
@@ -4946,7 +5037,7 @@ where
         "MULTIDB_STUDIO_DIR",
         "/usr/share/multidb/studio",
     ));
-    let pg_tls = pg_tls_from_sources(&get_env, runtime_mode)?;
+    let pg_tls = pg_tls_from_sources(&get_env, runtime_mode.clone())?;
     let pg_limits = serve_pg_limits_from_sources(&get_env)?;
     let spec = serve_spec_from_sources(&get_env)?;
     let query_governor = ServeQueryGovernor {
@@ -4966,6 +5057,8 @@ where
         bounded_positive_from_sources(&get_env, "MULTIDB_HISTORY_RETAIN_LSNS", u64::MAX)?;
 
     Ok(ServeConfig {
+        runtime_mode,
+        audit: audit_from_sources(&get_env),
         admin_bind,
         pg_bind,
         db_path,
@@ -5543,7 +5636,8 @@ fn usage() -> CliError {
          multidb advice reject --db <path> --profile <profile> --advice-id <id> --reason <reason> [--output text|json] [--json]\n\
          multidb backup incr --db <path> --profile <profile> --dest <dir> --parent <backup-dir>\n\
          multidb restore --backup <backup-dir> --dest-db <path> --profile <profile> [--to-lsn <lsn>] [--allow-unmet-floors] [--max-payload-bytes <bytes>]\n\
-         multidb verify --backup <backup-dir> [--max-payload-bytes <bytes>]\n\
+         multidb verify --backup <backup-dir> [--max-payload-bytes <bytes>] [restore encryption flags]\n\
+         restore/verify encryption flags: [--source-key-file <path> | --source-keyring-file <path> --source-kek-file <path>] [--target-key-file <path> | --target-keyring-file <path> --target-kek-file <path>] [--create-target-keyring]\n\
          multidb list --backup-root <dir>\n\
          multidb cdc poll --db <path> --profile <profile> [--lsn <lsn>] [--table <name>] [--include-system]\n\
          multidb cdc subscribe --db <path> --profile <profile> --name <name> [--table <name>]\n\
@@ -5564,6 +5658,10 @@ fn usage() -> CliError {
             .to_owned(),
     )
 }
+
+#[cfg(test)]
+#[path = "multidb/serve_audit_tests.rs"]
+mod serve_audit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7500,6 +7598,110 @@ mod tests {
     }
 
     #[test]
+    fn restore_cli_separates_source_keys_and_explicit_new_target_keyring()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let database = create_database(DbConfig::on_disk(
+            Profile::Balanced,
+            temp.path().join("source"),
+        ))?;
+        let source_key = temp.path().join("source-key");
+        let target_kek = temp.path().join("target-kek");
+        let target_keyring = temp.path().join("target-keyring");
+        std::fs::write(&source_key, [17; 32])?;
+        std::fs::write(&target_kek, [29; 32])?;
+        let backup = full_backup(
+            &database,
+            temp.path().join("backups"),
+            &BackupConfig::default().with_encryption(EncryptionConfig::file_key(&source_key)),
+        )?;
+        let destination = temp.path().join("encrypted-target");
+        let args = strings(&[
+            "restore",
+            "--backup",
+            &path_arg(&backup.path),
+            "--dest-db",
+            &path_arg(&destination),
+            "--profile",
+            "balanced",
+            "--source-key-file",
+            &path_arg(&source_key),
+            "--target-keyring-file",
+            &path_arg(&target_keyring),
+            "--target-kek-file",
+            &path_arg(&target_kek),
+        ]);
+        assert!(run(args.clone()).is_err());
+        assert!(!destination.exists());
+        assert!(!target_keyring.exists());
+        let mut create_args = args;
+        create_args.push("--create-target-keyring".to_owned());
+        assert_eq!(run(create_args)?.exit_code, 0);
+        let ops = OperationalConfig::new().with_encryption(EncryptionConfig::local_envelope(
+            &target_keyring,
+            &target_kek,
+        ));
+        drop(open_database_with_ops(
+            DbConfig::on_disk(Profile::Balanced, &destination),
+            &ops,
+        )?);
+        assert_eq!(
+            run(strings(&[
+                "verify",
+                "--backup",
+                &path_arg(&backup.path),
+                "--source-key-file",
+                &path_arg(&source_key),
+                "--target-keyring-file",
+                &path_arg(&target_keyring),
+                "--target-kek-file",
+                &path_arg(&target_kek),
+            ]))?
+            .exit_code,
+            0
+        );
+        let plaintext = temp.path().join("plaintext-target");
+        assert_eq!(
+            run(strings(&[
+                "restore",
+                "--backup",
+                &path_arg(&backup.path),
+                "--dest-db",
+                &path_arg(&plaintext),
+                "--profile",
+                "balanced",
+                "--source-key-file",
+                &path_arg(&source_key),
+            ]))?
+            .exit_code,
+            0
+        );
+        drop(open_database(DbConfig::on_disk(
+            Profile::Balanced,
+            plaintext,
+        ))?);
+        for invalid in [
+            vec!["--create-target-keyring"],
+            vec!["--source-keyring-file", "keyring"],
+            vec!["--source-key-file"],
+            vec![
+                "--target-key-file",
+                "key",
+                "--target-keyring-file",
+                "ring",
+                "--target-kek-file",
+                "kek",
+            ],
+        ] {
+            assert!(matches!(
+                super::restore_options_from_args(&strings(&invalid)),
+                Err(CliError::Usage(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn restore_and_verify_cli_enforce_the_configured_payload_budget()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -7582,7 +7784,7 @@ mod tests {
         Ok(())
     }
 
-    /// A restore target is never encrypted, so `restore` refuses a backup whose manifest sets
+    /// A default restore target is not encrypted, so `restore` refuses a backup whose manifest sets
     /// `floors.encryption_at_rest` unless `--allow-unmet-floors` is given, and then warns.
     #[test]
     fn restore_refuses_unmet_profile_floors_without_allow_unmet_floors()

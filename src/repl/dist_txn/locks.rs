@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     repl::Op,
-    storage::{ReadTransaction, StorageError},
+    storage::{ReadBudget, ReadTransaction, StorageError},
     txn::{self, WriteSet},
 };
 
@@ -195,6 +195,130 @@ pub(crate) fn validate_write_locks(
         }
     }
     Ok(())
+}
+
+fn reject_legacy_prepares_guarded(
+    read: &impl ReadTransaction,
+    budget: &dyn ReadBudget,
+) -> Result<(), StorageError> {
+    let mut supported = false;
+    read.visit_get(txn::TXN_META_TABLE, LOCK_FORMAT_KEY, budget, &mut |value| {
+        supported = match value {
+            None => false,
+            Some(LOCK_FORMAT) => true,
+            Some(_) => {
+                return Err(StorageError::Corruption(
+                    "unsupported distributed transaction lock format".to_owned(),
+                ));
+            }
+        };
+        Ok(false)
+    })?;
+    if !supported {
+        let mut found = false;
+        read.visit_range(DIST_TXN_PARTICIPANT_TABLE, &[], &[], budget, &mut |_, _| {
+            found = true;
+            Ok(false)
+        })?;
+        if found {
+            return Err(StorageError::Conflict);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_read_keys_guarded(
+    read: &impl ReadTransaction,
+    table: &str,
+    keys: &[crate::storage::Bytes],
+    budget: &dyn ReadBudget,
+) -> Result<(), StorageError> {
+    if txn::table_is_reserved(table) {
+        return budget.check();
+    }
+    reject_legacy_prepares_guarded(read, budget)?;
+    for key in keys {
+        let _key = budget.reserve(
+            8_usize
+                .saturating_add(table.len())
+                .saturating_add(key.len())
+                .saturating_add(std::mem::size_of::<crate::storage::Bytes>()),
+        )?;
+        let lock_key = txn::version_key(table, key)?;
+        let mut found = false;
+        read.visit_get(LOCKS_TABLE, &lock_key, budget, &mut |value| {
+            found = value.is_some();
+            Ok(false)
+        })?;
+        if found {
+            return Err(StorageError::Conflict);
+        }
+    }
+    budget.check()
+}
+
+pub(crate) fn validate_read_key_guarded(
+    read: &impl ReadTransaction,
+    table: &str,
+    key: &[u8],
+    budget: &dyn ReadBudget,
+) -> Result<(), StorageError> {
+    if txn::table_is_reserved(table) {
+        return budget.check();
+    }
+    reject_legacy_prepares_guarded(read, budget)?;
+    let _key = budget.reserve(
+        8_usize
+            .saturating_add(table.len())
+            .saturating_add(key.len())
+            .saturating_add(std::mem::size_of::<crate::storage::Bytes>()),
+    )?;
+    let lock_key = txn::version_key(table, key)?;
+    let mut found = false;
+    read.visit_get(LOCKS_TABLE, &lock_key, budget, &mut |value| {
+        found = value.is_some();
+        Ok(false)
+    })?;
+    if found {
+        return Err(StorageError::Conflict);
+    }
+    budget.check()
+}
+
+pub(crate) fn validate_read_range_guarded(
+    read: &impl ReadTransaction,
+    table: &str,
+    start: &[u8],
+    end: &[u8],
+    budget: &dyn ReadBudget,
+) -> Result<(), StorageError> {
+    if txn::table_is_reserved(table) {
+        return budget.check();
+    }
+    reject_legacy_prepares_guarded(read, budget)?;
+    let key_bytes = 8_usize
+        .saturating_add(table.len())
+        .saturating_mul(3)
+        .saturating_add(start.len())
+        .saturating_add(end.len())
+        .saturating_add(4 * std::mem::size_of::<crate::storage::Bytes>());
+    let _keys = budget.reserve(key_bytes)?;
+    let prefix = txn::version_key(table, &[])?;
+    let first = txn::version_key(table, start)?;
+    let last = if end.is_empty() {
+        crate::keyenc::range_end(&prefix)
+    } else {
+        txn::version_key(table, end)?
+    };
+    let mut found = false;
+    read.visit_range(LOCKS_TABLE, &first, &last, budget, &mut |_, _| {
+        found = true;
+        Ok(false)
+    })?;
+    if found {
+        return Err(StorageError::Conflict);
+    }
+    budget.check()
 }
 
 pub(crate) fn validate_read_keys(

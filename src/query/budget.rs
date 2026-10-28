@@ -76,6 +76,14 @@ impl Budget {
         }
     }
 
+    pub(super) fn remaining_bytes(&self) -> usize {
+        self.limit.saturating_sub(self.pool.reserved())
+    }
+
+    pub(super) fn scratch(&self) -> MemoryReservation {
+        MemoryConsumer::new("multidb decoder scratch").register(&self.pool)
+    }
+
     pub(super) fn timeout_ms(&self) -> u64 {
         self.timeout_ms
     }
@@ -114,6 +122,36 @@ impl Budget {
         self.charge(bytes)
     }
 
+    pub(super) fn charge_arrow_build(
+        &self,
+        schema: &super::SchemaRef,
+        rows: &[Row],
+    ) -> Result<(), QueryError> {
+        if rows.is_empty() {
+            return self.check();
+        }
+        // Array metadata, null/offset buffers and builder growth coexist with
+        // retained Rust rows. Charge their full working set before Arrow allocates.
+        let mut bytes = 1_024_usize.saturating_add(schema.fields().len().saturating_mul(512));
+        for row in rows {
+            self.check()?;
+            for (value, field) in row.iter().zip(schema.fields()) {
+                let heap = super::row_scan::value_heap_bytes(value, self.limit)?;
+                let copies = if field.data_type() == &datafusion::arrow::datatypes::DataType::Utf8
+                    && !matches!(value, super::Value::Str(_) | super::Value::Null)
+                {
+                    32
+                } else {
+                    2
+                };
+                bytes = bytes
+                    .saturating_add(32)
+                    .saturating_add(heap.saturating_mul(copies));
+            }
+        }
+        self.charge(bytes)
+    }
+
     pub(super) fn charge_batch(&self, batch: &RecordBatch) -> Result<(), QueryError> {
         // Include Rust result values as well as Arrow buffers, even for zero-column batches.
         let row_bytes = batch
@@ -138,6 +176,69 @@ impl Budget {
                 .get_array_memory_size()
                 .saturating_add(std::mem::size_of::<RecordBatch>()),
         )
+    }
+}
+
+fn storage_budget_error(error: QueryError) -> crate::storage::StorageError {
+    match error {
+        QueryError::ResourceLimit(reason) => crate::storage::StorageError::ResourceLimit(reason),
+        QueryError::Timeout(reason) => crate::storage::StorageError::Timeout(reason),
+        QueryError::Cancelled(reason) => crate::storage::StorageError::Cancelled(reason),
+        other => crate::storage::StorageError::Backend(other.to_string()),
+    }
+}
+
+impl crate::storage::ReadBudget for Budget {
+    fn check(&self) -> Result<(), crate::storage::StorageError> {
+        Self::check(self).map_err(storage_budget_error)
+    }
+
+    fn reserve(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn crate::storage::ReadReservation>, crate::storage::StorageError> {
+        self.check().map_err(storage_budget_error)?;
+        let reservation = self.scratch();
+        reservation.try_grow(bytes).map_err(|error| {
+            self.resource_failed.store(true, Ordering::Release);
+            crate::storage::StorageError::ResourceLimit(error.to_string())
+        })?;
+        Ok(Box::new(reservation))
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        Self::remaining_bytes(self)
+    }
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline.get().copied()
+    }
+}
+
+impl crate::federation::ForeignScanGuard for Budget {
+    fn check(&self) -> Result<(), QueryError> {
+        Self::check(self)
+    }
+
+    fn charge(&self, retained_bytes: usize) -> Result<(), QueryError> {
+        Self::charge(self, retained_bytes)
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        Self::remaining_bytes(self)
+    }
+
+    fn reserve(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn crate::federation::ForeignScanReservation>, QueryError> {
+        self.check()?;
+        let reservation =
+            MemoryConsumer::new("multidb foreign decoder scratch").register(&self.pool);
+        reservation.try_grow(bytes).map_err(|error| {
+            self.resource_failed.store(true, Ordering::Release);
+            QueryError::ResourceLimit(error.to_string())
+        })?;
+        Ok(Box::new(reservation))
     }
 }
 
@@ -167,14 +268,24 @@ struct BudgetReplication {
 }
 
 impl BudgetReplication {
-    fn charge(&self, key_bytes: usize, value_bytes: usize) -> Result<(), super::ReplError> {
+    fn charge(&self, table: &str, key_bytes: usize, value: &[u8]) -> Result<(), super::ReplError> {
         let bytes = key_bytes
-            .saturating_add(value_bytes)
+            .saturating_add(value.len())
             .saturating_mul(4)
             .saturating_add(512);
         self.budget
             .charge(bytes)
-            .map_err(|error| super::ReplError::Rejected(error.to_string()))
+            .map_err(|error| super::ReplError::Storage(storage_budget_error(error)))?;
+        if matches!(table, super::REL_ROWS_TABLE | crate::model::DOCUMENT_TABLE) {
+            let decoded =
+                crate::model::value_decode_memory_bound(value, self.budget.remaining_bytes())?;
+            // Legacy collectors retain encoded records and decoded Values together.
+            // Bound Value nodes as well as wire bytes before constructing them.
+            self.budget
+                .charge(decoded.saturating_mul(2))
+                .map_err(|error| super::ReplError::Storage(storage_budget_error(error)))?;
+        }
+        Ok(())
     }
 }
 
@@ -215,14 +326,21 @@ impl super::Replication for BudgetReplication {
         key: &[u8],
         consistency: super::ReadConsistency,
     ) -> Result<Option<super::Bytes>, super::ReplError> {
-        self.budget
-            .check()
-            .map_err(|error| super::ReplError::Rejected(error.to_string()))?;
-        let value = self.inner.read(table, key, consistency)?;
-        if let Some(value) = &value {
-            self.charge(key.len(), value.len())?;
-        }
-        Ok(value)
+        let mut out = None;
+        self.inner.visit_get(
+            table,
+            key,
+            consistency,
+            self.budget.as_ref(),
+            &mut |value| {
+                if let Some(value) = value {
+                    self.charge(table, key.len(), value)?;
+                    out = Some(value.to_vec());
+                }
+                Ok(false)
+            },
+        )?;
+        Ok(out)
     }
 
     fn read_many(
@@ -231,14 +349,34 @@ impl super::Replication for BudgetReplication {
         keys: &[super::Bytes],
         consistency: super::ReadConsistency,
     ) -> Result<Vec<Option<super::Bytes>>, super::ReplError> {
-        self.budget
-            .check()
-            .map_err(|error| super::ReplError::Rejected(error.to_string()))?;
-        let values = self.inner.read_many(table, keys, consistency)?;
-        for (index, value) in values.iter().enumerate() {
-            if let Some(value) = value {
-                self.charge(keys.get(index).map_or(0, Vec::len), value.len())?;
-            }
+        let mut values = Vec::new();
+        self.inner.visit_many(
+            table,
+            keys,
+            consistency,
+            self.budget.as_ref(),
+            &mut |index, value| {
+                if index != values.len() || index >= keys.len() {
+                    return Err(crate::storage::StorageError::Corruption(
+                        "multi-key visitor index mismatch".to_owned(),
+                    )
+                    .into());
+                }
+                self.budget
+                    .charge(4 * std::mem::size_of::<Option<super::Bytes>>())
+                    .map_err(|error| super::ReplError::Storage(storage_budget_error(error)))?;
+                if let Some(value) = value {
+                    self.charge(table, keys[index].len(), value)?;
+                }
+                values.push(value.map(<[u8]>::to_vec));
+                Ok(true)
+            },
+        )?;
+        if values.len() != keys.len() {
+            return Err(crate::storage::StorageError::Corruption(
+                "multi-key visitor result length mismatch".to_owned(),
+            )
+            .into());
         }
         Ok(values)
     }
@@ -251,11 +389,60 @@ impl super::Replication for BudgetReplication {
         consistency: super::ReadConsistency,
     ) -> Result<Vec<(super::Bytes, super::Bytes)>, super::ReplError> {
         let mut entries = Vec::new();
-        self.scan_range_batches(table, start, end, consistency, 1, &|| false, &mut |batch| {
-            entries.extend_from_slice(batch);
-            Ok(true)
-        })?;
+        self.inner.visit_range(
+            table,
+            start,
+            end,
+            consistency,
+            self.budget.as_ref(),
+            &mut |key, value| {
+                self.charge(table, key.len(), value)?;
+                entries.push((key.to_vec(), value.to_vec()));
+                Ok(true)
+            },
+        )?;
         Ok(entries)
+    }
+
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: super::ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, super::ReplError>,
+    ) -> Result<(), super::ReplError> {
+        self.inner
+            .visit_get(table, key, consistency, budget, visitor)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[super::Bytes],
+        consistency: super::ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, super::ReplError>,
+    ) -> Result<(), super::ReplError> {
+        self.inner
+            .visit_many(table, keys, consistency, budget, visitor)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: super::ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, super::ReplError>,
+    ) -> Result<(), super::ReplError> {
+        self.inner
+            .visit_range(table, start, end, consistency, budget, visitor)
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -269,26 +456,22 @@ impl super::Replication for BudgetReplication {
         cancelled: &dyn Fn() -> bool,
         on_batch: &mut dyn FnMut(&[(super::Bytes, super::Bytes)]) -> Result<bool, super::ReplError>,
     ) -> Result<(), super::ReplError> {
-        // Preserve AP/custom-backend query support. Their compatibility scanner may
-        // materialize a range internally before the first callback: retained SQL
-        // buffers are charged here, but only native bounded backends can also bound
-        // that backend's temporary allocation and stop its storage work promptly.
-        self.inner.scan_range_batches(
+        if cancelled() {
+            return Ok(());
+        }
+        self.inner.visit_range(
             table,
             start,
             end,
             consistency,
-            1,
-            &|| cancelled() || self.budget.expired(),
-            &mut |batch| {
-                for (key, value) in batch {
-                    self.charge(key.len(), value.len())?;
+            self.budget.as_ref(),
+            &mut |key, value| {
+                if cancelled() {
+                    return Ok(false);
                 }
-                on_batch(batch)
+                self.charge(table, key.len(), value)?;
+                on_batch(&[(key.to_vec(), value.to_vec())])
             },
-        )?;
-        self.budget
-            .check()
-            .map_err(|error| super::ReplError::Rejected(error.to_string()))
+        )
     }
 }

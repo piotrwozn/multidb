@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "smoke": {
+      "scope": "Short HTTP functional/load smoke; not production soak acceptance",
+      "duration_seconds": 20,
+      "concurrency": 2,
+      "requests_per_second_per_worker": 20,
+      "rows": 1000,
+      "payload_bytes": 256,
+      "slow_clients": 2,
+      "large_result_rows": 128,
+      "history_retain_lsns": 128,
+      "request_timeout_seconds": 5,
+      "minimum_successful_requests": 100,
+      "maximum_unexpected_errors": 0,
+      "latency_ms": {
+        "point_read": {"p95": 500, "p99": 2000},
+        "upsert": {"p95": 1000, "p99": 3000},
+        "large_result": {"p95": 1000, "p99": 3000},
+        "denied_policy": {"p95": 500, "p99": 2000}
+      },
+      "maximum_rss_bytes": 2147483648,
+      "maximum_file_descriptors": 256,
+      "maximum_directory_bytes": 1073741824,
+      "minimum_free_disk_bytes": 536870912,
+      "minimum_effective_cpus": 1,
+      "minimum_memory_bytes": 1073741824,
+      "cold_start": false,
+      "larger_than_ram": false,
+      "minimum_read_io_fraction_of_ram": 0
+    },
+    "local-15m": {
+      "scope": "Declared local 4-CPU/16-GiB single-node HTTP soak; not hardware or distributed qualification",
+      "duration_seconds": 900,
+      "concurrency": 8,
+      "requests_per_second_per_worker": 20,
+      "rows": 100000,
+      "payload_bytes": 256,
+      "slow_clients": 16,
+      "large_result_rows": 1024,
+      "history_retain_lsns": 128,
+      "request_timeout_seconds": 5,
+      "minimum_successful_requests": 72000,
+      "maximum_unexpected_errors": 0,
+      "latency_ms": {
+        "point_read": {"p95": 250, "p99": 1000},
+        "upsert": {"p95": 1000, "p99": 2000},
+        "large_result": {"p95": 1000, "p99": 2000},
+        "denied_policy": {"p95": 250, "p99": 1000}
+      },
+      "maximum_rss_bytes": 2147483648,
+      "maximum_file_descriptors": 256,
+      "maximum_directory_bytes": 1073741824,
+      "minimum_free_disk_bytes": 536870912,
+      "minimum_effective_cpus": 4,
+      "minimum_memory_bytes": 8589934592,
+      "cold_start": false,
+      "larger_than_ram": false,
+      "minimum_read_io_fraction_of_ram": 0
+    },
+    "cold": {
+      "extends": "local-15m",
+      "scope": "Verified eviction of this fixture's Linux page-cache pages before restart; first-request samples then warm naturally",
+      "cold_start": true,
+      "maximum_resident_fraction_after_eviction": 0.05
+    },
+    "larger-than-ram": {
+      "extends": "local-15m",
+      "scope": "Logical fixture payload must exceed observed effective host/cgroup memory; requires operator-sized rows/payload and disk",
+      "larger_than_ram": true,
+      "duration_seconds": 3600,
+      "minimum_successful_requests": 288000,
+      "minimum_read_io_fraction_of_ram": 1
+    }
+  }
+}

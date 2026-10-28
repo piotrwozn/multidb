@@ -1,0 +1,15 @@
+# Requires NVIDIA device plugin, host Vulkan driver and NVIDIA Container Toolkit.
+# Configure a real RuntimeClass if the cluster requires one; no privileged pod.
+config:
+  profile: tensor
+gpu:
+  enabled: true
+  vendor: nvidia
+resources:
+  requests:
+    nvidia.com/gpu: 1
+  limits:
+    nvidia.com/gpu: 1
+nodeSelector:
+  kubernetes.io/os: linux
+  multidb.io/gpu-vendor: nvidia

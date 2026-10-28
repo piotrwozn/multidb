@@ -76,6 +76,8 @@ Environment:
 | `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` | no | `100` | How long a statement waits for a free governor slot before it fails as busy, `1` to `60000`. |
 | `MULTIDB_HISTORY_RETAIN_LSNS` | no | unset | Opt in to online MVCC history GC, retaining this positive number of recent LSNs (plus active snapshots and temporal retention). One bounded batch runs every 10 seconds. Never truncates the commit log. |
 | `MULTIDB_ENCRYPTION_KEY_PATH` | no | unset | Path to an existing 32-byte encryption key file (raw bytes or 64 hexadecimal characters). Used by `serve` and CLI database/provisioning commands; mount it read-only. |
+| `MULTIDB_AUDIT_KEY_PATH` | production | unset | Existing private audit signing key: 32 raw bytes or 64 hex characters (optional final newline). Mount read-only; never put key bytes in environment variables or specs. |
+| `MULTIDB_AUDIT_ANCHOR_PATH` | durable production | unset | Separate JSONL anchor on durable storage; its parent directory must exist. The anchor file may initially be absent. |
 
 `MULTIDB_MAX_CONCURRENT_QUERIES` and `MULTIDB_QUERY_QUEUE_TIMEOUT_MS` must be
 whole numbers in their range; any other non-empty value stops `multidb serve`
@@ -103,7 +105,8 @@ stored roles, mappings or the audit flag.
 
 Production mode fails closed unless a stored admin credential, admin password,
 or legacy admin token is available. It also requires PG password and PG TLS
-certificate/key paths.
+certificate/key paths, a private audit signing key and, for durable profiles,
+a persistent audit anchor.
 
 ## Spec Mode
 
@@ -170,8 +173,70 @@ Roles and principals that provisioning applied are stored in the database
 file like any other RBAC state, so they survive a restart with or without spec
 mode (see the RBAC note above).
 
-Known limit in this build: audit is chained with the development key
-(`enforced_with_development_key`); `serve` has no audit key setting.
+## Audit Signing And Restart
+
+`serve` reads `MULTIDB_AUDIT_KEY_PATH` and `MULTIDB_AUDIT_ANCHOR_PATH` in both
+flat and spec mode, before admin bootstrap or provisioning can append events.
+The same variables reach other CLI database/provisioning commands; keep them
+set when operating on the database offline. The settings belong to the
+process and are not stored in the spec or persisted RBAC policy. Reopening
+preserves stored roles, principals and the audit on/off flag.
+
+Production requires an existing signing key. It never creates one and refuses
+the public development key even when that value is placed in a private file.
+Key reads are bounded to 66 bytes: 32 raw bytes or 64 hexadecimal characters
+with at most two trailing whitespace bytes. On Unix, startup refuses world
+access and group/other write permissions. Owner-only `0400`/`0600`, or
+read-only trusted-group `0440`/`0640`, are accepted; protect corresponding ACLs
+on other systems. Kubernetes projected Secret symlinks are supported: the
+regular target's permissions are checked. Use a dedicated signing key,
+separate from encryption credentials.
+
+For durable profiles, set an anchor path on the persistent volume, separate
+from the database and all key files. Its parent must already exist and be
+writable and, on Unix, must not be world-writable; an existing anchor must be
+a regular appendable file, not a symlink.
+Existing anchor records are verified before new events are written. A clean
+short prefix can be recovered from the verified database chain without
+re-signing historical records. Preserve incomplete, altered or mismatched
+anchors for investigation instead of deleting them to make startup succeed.
+
+```text
+MULTIDB_RUNTIME_MODE=production
+MULTIDB_AUDIT_KEY_PATH=/run/secrets/multidb-audit.key
+MULTIDB_AUDIT_ANCHOR_PATH=/var/lib/multidb/audit.anchor
+```
+
+The explicitly selected flat `InMemory` profile still needs a real signing
+key in production, while the anchor may be omitted. Its history is volatile
+and starts empty on every process start. An optional anchor for this profile
+must be new/empty for that lifetime; reusing an old nonempty anchor fails
+instead of silently accepting a history reset. `local-dev` retains the public
+development key when no signing key is configured, for evaluation only.
+
+Startup verifies the complete signed database history and its anchor before
+admitting writes. Verification streams ordinary ordered history; older
+histories with clock regressions use bounded sequence windows and may take
+longer to check. A restart after SIGKILL can run redb's physical crash repair
+first. This repair may change database file bytes, but a wrong signing key
+cannot authorize new logical data, RBAC, provisioning or audit writes.
+
+Changing a projected Secret's key bytes is **not** audit-key rotation.
+Visible changes are rejected before operation admission, and a change during
+an operation can fail its later append and seal further mutations. That
+operation may already have committed its data: an error is an uncertain
+outcome, not a rollback guarantee. Stop writes, preserve the database, anchor
+and original key, reconcile the outcome, then restart with the original key.
+There is no automatic audit-chain rekey.
+
+To move an old development-key database to production, first archive its
+database, audit anchor and verification evidence. Create a fresh production
+database with a separately generated private signing key and new anchor,
+then import reviewed user data/schema and restore reviewed RBAC through the
+audited production APIs. Retain the original database for its historical
+timeline. Restoring a full backup preserves its old audit history; supplying
+a different key does not migrate or re-sign that history. A database already
+signed with a private key can keep using that same key across restarts.
 
 ## Encryption At Rest
 

@@ -1,0 +1,15 @@
+# Requires Intel GPU device plugin i915 resource and host Vulkan render-nodeaccess.
+# If a platform advertises another resource, qualify its explicit configuration.
+config:
+  profile: tensor
+gpu:
+  enabled: true
+  vendor: intel
+resources:
+  requests:
+    gpu.intel.com/i915: 1
+  limits:
+    gpu.intel.com/i915: 1
+nodeSelector:
+  kubernetes.io/os: linux
+  multidb.io/gpu-vendor: intel

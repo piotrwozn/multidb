@@ -4,6 +4,8 @@
 
 use std::time::{Duration, Instant};
 
+use datafusion::execution::memory_pool::MemoryReservation;
+
 use super::{
     ColumnType, DfExpr, QueryError, REL_ROWS_TABLE, RecordBatch, RelTable, Row, ScalarValue,
     SchemaRef, SqlEngine, SqlExpr, SqlOutput, SqlRows, Statement, TableLayout, TableSchema, Value,
@@ -355,11 +357,9 @@ pub(super) fn execute(engine: &SqlEngine, plan: &RowRangePlan) -> Result<SqlOutp
         .get(&plan.table)
         .ok_or_else(|| QueryError::MissingTable(plan.table.clone()))?;
     let timeout_ms = engine.performance.query.timeout_ms;
-    let remaining = Duration::from_millis(timeout_ms).saturating_sub(plan.planning);
-    let deadline = Instant::now().checked_add(remaining).ok_or_else(|| {
-        QueryError::ResourceLimit("query timeout exceeds the monotonic clock range".to_owned())
-    })?;
-    let cancelled = || Instant::now() >= deadline;
+    let budget = super::budget::Budget::new(&engine.performance.query);
+    let _cancel_on_drop = budget.start(plan.planning)?;
+    let cancelled = || budget.expired();
     if cancelled() {
         return Err(timeout(timeout_ms));
     }
@@ -370,7 +370,7 @@ pub(super) fn execute(engine: &SqlEngine, plan: &RowRangePlan) -> Result<SqlOutp
         }));
     }
     let memory_limit = engine.performance.query.memory_limit_bytes;
-    let mut retained = plan.names.iter().try_fold(0_usize, |bytes, name| {
+    let names_bytes = plan.names.iter().try_fold(0_usize, |bytes, name| {
         checked_memory(
             bytes,
             std::mem::size_of::<String>()
@@ -379,6 +379,7 @@ pub(super) fn execute(engine: &SqlEngine, plan: &RowRangePlan) -> Result<SqlOutp
             memory_limit,
         )
     })?;
+    budget.charge(names_bytes)?;
     let stop = if plan.descending {
         None
     } else {
@@ -391,8 +392,7 @@ pub(super) fn execute(engine: &SqlEngine, plan: &RowRangePlan) -> Result<SqlOutp
         plan.bounds,
         stop,
         1, // Check the output budget before the backend materializes another stored record.
-        &cancelled,
-        timeout_ms,
+        &ReadControl::new(&cancelled, timeout_ms, Some(&budget)),
         &mut |row| {
             // Ascending OFFSET rows never become output and need not be retained.
             if !plan.descending && skipped < plan.offset {
@@ -400,25 +400,7 @@ pub(super) fn execute(engine: &SqlEngine, plan: &RowRangePlan) -> Result<SqlOutp
                 return Ok(());
             }
             // Charge before cloning/projecting, including every duplicated output column.
-            let row_bytes = plan.projection.iter().try_fold(
-                4 * std::mem::size_of::<Row>(),
-                |bytes, index| {
-                    let value = row.get(*index).ok_or_else(|| {
-                        QueryError::InvalidRow("projection column is missing".to_owned())
-                    })?;
-                    let fixed = 4 * std::mem::size_of::<Value>();
-                    checked_memory(
-                        bytes,
-                        checked_memory(
-                            fixed,
-                            value_heap_bytes(value, memory_limit)?,
-                            memory_limit,
-                        )?,
-                        memory_limit,
-                    )
-                },
-            )?;
-            retained = checked_memory(retained, row_bytes, memory_limit)?;
+            budget.charge_row(&row, Some(&plan.projection))?;
             rows.push(project_row(&row, &plan.projection));
             Ok(())
         },
@@ -574,6 +556,9 @@ pub(super) fn batches(
         if rows.is_empty() {
             return Ok(());
         }
+        if let Some(budget) = budget {
+            budget.charge_arrow_build(&schema, rows)?;
+        }
         let batch = if schema.fields().is_empty() {
             RecordBatch::try_new_with_options(
                 schema.clone(),
@@ -596,8 +581,11 @@ pub(super) fn batches(
         bounds,
         limit,
         if budget.is_some() { 1 } else { batch_rows },
-        &|| budget.is_some_and(super::budget::Budget::expired),
-        budget.map_or(0, super::budget::Budget::timeout_ms),
+        &ReadControl::new(
+            &|| budget.is_some_and(super::budget::Budget::expired),
+            budget.map_or(0, super::budget::Budget::timeout_ms),
+            budget,
+        ),
         &mut |row| {
             if let Some(budget) = budget {
                 budget.charge_row(&row, projection)?;
@@ -616,77 +604,159 @@ pub(super) fn batches(
     Ok(result)
 }
 
+struct ReadControl<'a> {
+    cancelled: &'a dyn Fn() -> bool,
+    timeout_ms: u64,
+    budget: Option<&'a super::budget::Budget>,
+    scratch: Option<MemoryReservation>,
+}
+
+impl<'a> ReadControl<'a> {
+    fn new(
+        cancelled: &'a dyn Fn() -> bool,
+        timeout_ms: u64,
+        budget: Option<&'a super::budget::Budget>,
+    ) -> Self {
+        Self {
+            cancelled,
+            timeout_ms,
+            budget,
+            scratch: budget.map(super::budget::Budget::scratch),
+        }
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<Option<Row>, QueryError> {
+        if (self.cancelled)() {
+            return Err(timeout(self.timeout_ms));
+        }
+        if let (Some(budget), Some(scratch)) = (self.budget, &self.scratch) {
+            budget.check()?;
+            // Native input is borrowed under its storage/codec lease. JSON may
+            // allocate unescape scratch during preflight; canonical binary does
+            // not. Reserve decoded Value nodes before constructing them.
+            let input = if crate::model::value_is_binary_encoded(bytes) {
+                0
+            } else {
+                bytes.len()
+            };
+            scratch
+                .try_resize(input)
+                .map_err(|error| QueryError::ResourceLimit(error.to_string()))?;
+            let decoded = crate::model::value_decode_memory_bound(bytes, budget.remaining_bytes())?;
+            scratch
+                .try_resize(input.saturating_add(decoded))
+                .map_err(|error| QueryError::ResourceLimit(error.to_string()))?;
+            budget.check()?;
+        }
+        decode_row(bytes)
+    }
+
+    fn release(&self) {
+        if let Some(scratch) = &self.scratch {
+            scratch.free();
+        }
+    }
+}
+
 fn visit_rows(
     table: &RelTable,
     bounds: Bounds,
     limit: Option<usize>,
     batch_rows: usize,
-    cancelled: &dyn Fn() -> bool,
-    timeout_ms: u64,
+    control: &ReadControl<'_>,
     visitor: &mut dyn FnMut(Row) -> Result<(), QueryError>,
 ) -> Result<(), QueryError> {
+    let cancelled = control.cancelled;
+    let timeout_ms = control.timeout_ms;
     if cancelled() {
         return Err(timeout(timeout_ms));
     }
     if bounds.empty || limit == Some(0) {
         return Ok(());
     }
-    if !bounds.all_keys && bounds.lower == bounds.upper {
-        if let Some(row) = table.get(&Value::Int(bounds.lower))? {
-            if cancelled() {
-                return Err(timeout(timeout_ms));
-            }
-            visitor(row)?;
-        }
-        return if cancelled() {
-            Err(timeout(timeout_ms))
-        } else {
-            Ok(())
-        };
-    }
-    let (start, end) = if bounds.all_keys {
-        super::table_range_bounds(&table.name)
-    } else {
-        (
-            make_row_key(&table.name, &Value::Int(bounds.lower))?,
-            keyenc::range_end(&make_row_key(&table.name, &Value::Int(bounds.upper))?),
-        )
-    };
     let mut read = 0_usize;
     let mut error = None;
-    table.repl.scan_range_batches(
-        REL_ROWS_TABLE,
-        &start,
-        &end,
-        ReadConsistency::Strong,
-        if limit.is_some() {
-            1
+    let mut process = |bytes: &[u8]| -> Result<bool, super::ReplError> {
+        if cancelled() {
+            return Ok(false);
+        }
+        let result = control
+            .decode(bytes)
+            .and_then(|row| {
+                row.ok_or_else(|| QueryError::InvalidRow("missing stored row".to_owned()))
+            })
+            .and_then(&mut *visitor);
+        control.release();
+        if let Err(cause) = result {
+            error = Some(cause);
+            return Ok(false);
+        }
+        read += 1;
+        Ok(limit.is_none_or(|limit| read < limit))
+    };
+    if !bounds.all_keys && bounds.lower == bounds.upper {
+        let key = make_row_key(&table.name, &Value::Int(bounds.lower))?;
+        if let Some(budget) = control.budget {
+            table.repl.visit_get(
+                REL_ROWS_TABLE,
+                &key,
+                ReadConsistency::Strong,
+                budget,
+                &mut |value| {
+                    if let Some(value) = value {
+                        process(value)?;
+                    }
+                    Ok(false)
+                },
+            )?;
+        } else if let Some(bytes) =
+            table
+                .repl
+                .read(REL_ROWS_TABLE, &key, ReadConsistency::Strong)?
+        {
+            process(&bytes)?;
+        }
+    } else {
+        let (start, end) = if bounds.all_keys {
+            super::table_range_bounds(&table.name)
         } else {
-            batch_rows.max(1)
-        },
-        cancelled,
-        &mut |batch| {
-            for (_, bytes) in batch {
-                if cancelled() {
-                    return Ok(false);
-                }
-                let result = decode_row(bytes)
-                    .and_then(|row| {
-                        row.ok_or_else(|| QueryError::InvalidRow("missing stored row".to_owned()))
-                    })
-                    .and_then(&mut *visitor);
-                if let Err(cause) = result {
-                    error = Some(cause);
-                    return Ok(false);
-                }
-                read += 1;
-                if limit.is_some_and(|limit| read >= limit) {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        },
-    )?;
+            (
+                make_row_key(&table.name, &Value::Int(bounds.lower))?,
+                keyenc::range_end(&make_row_key(&table.name, &Value::Int(bounds.upper))?),
+            )
+        };
+        if let Some(budget) = control.budget {
+            table.repl.visit_range(
+                REL_ROWS_TABLE,
+                &start,
+                &end,
+                ReadConsistency::Strong,
+                budget,
+                &mut |_, bytes| process(bytes),
+            )?;
+        } else {
+            table.repl.scan_range_batches(
+                REL_ROWS_TABLE,
+                &start,
+                &end,
+                ReadConsistency::Strong,
+                if limit.is_some() {
+                    1
+                } else {
+                    batch_rows.max(1)
+                },
+                cancelled,
+                &mut |batch| {
+                    for (_, bytes) in batch {
+                        if !process(bytes)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                },
+            )?;
+        }
+    }
     match error {
         Some(error) => Err(error),
         None if cancelled() => Err(timeout(timeout_ms)),

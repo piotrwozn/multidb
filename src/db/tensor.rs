@@ -87,7 +87,8 @@ impl Database {
                     .with_gpu_required(self.profile() == Profile::Tensor)
                     .with_execution_timeout(Duration::from_millis(
                         self.performance.query.timeout_ms,
-                    )))
+                    ))
+                    .with_memory_limit(self.performance.query.memory_limit_bytes))
             }
             Some(other) => Err(kind_mismatch(name, "tensor dataset", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -332,6 +333,10 @@ impl Replication for TensorPolicyReplication<'_> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the bounded read, flush and reduction transaction together so all retained buffers share one budget."
+)]
 fn compute_tensor_rows(
     dataset: &TensorDataset<'_, dyn Replication + '_>,
     request: &TensorComputeRequest,
@@ -362,17 +367,47 @@ fn compute_tensor_rows(
     // reductions whose aggregate GPU input stays inside the storage-buffer budget.
     let mut rows = Vec::new();
     let mut floats = 0_usize;
+    let max_floats = (dataset.memory_limit() / if gpu { 16 } else { 8 }).min(MAX_GPU_BATCH_FLOATS);
     for index in request.start..end {
         deadline.check()?;
-        let mut batch = dataset.read_with_deadline(
-            &TensorReadRequest {
-                start: index,
-                limit: 1,
-                columns: Some(vec![request.tensor.clone()]),
-                revision: Some(info.revision),
-            },
-            deadline,
-        )?;
+        let read = TensorReadRequest {
+            start: index,
+            limit: 1,
+            columns: Some(vec![request.tensor.clone()]),
+            revision: Some(info.revision),
+        };
+        let retained = floats
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(
+                rows.capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<f32>>()),
+            )
+            .saturating_add(values.capacity().saturating_mul(std::mem::size_of::<f32>()));
+        let available = dataset.memory_limit().saturating_sub(retained);
+        let read_result = dataset.read_with_budget(&read, deadline, available);
+        let mut batch = match read_result {
+            Err(TensorError::InvalidValue(_)) if !rows.is_empty() => {
+                // A large ragged successor may fit by itself. Flush the
+                // previous GPU/CPU reduction batch and retry the bounded read.
+                reduce_tensor_rows(
+                    &rows,
+                    request.operation,
+                    engine.as_deref(),
+                    &mut values,
+                    deadline,
+                )?;
+                rows = Vec::new();
+                floats = 0;
+                dataset.read_with_budget(
+                    &read,
+                    deadline,
+                    dataset.memory_limit().saturating_sub(
+                        values.capacity().saturating_mul(std::mem::size_of::<f32>()),
+                    ),
+                )?
+            }
+            result => result?,
+        };
         let tensor = batch
             .tensors
             .remove(&request.tensor)
@@ -380,23 +415,21 @@ fn compute_tensor_rows(
             .ok_or_else(|| {
                 TensorError::Corruption("compute tensor missing from selected row".to_owned())
             })?;
-        let row = match tensor.data {
-            TensorData::F32(values) => values,
-            TensorData::U8(values) => values.into_iter().map(f32::from).collect(),
+        let row_elements = match &tensor.data {
+            TensorData::F32(values) => values.len(),
+            TensorData::U8(values) => values.len(),
             _ => {
                 return Err(TensorError::Corruption(
                     "compute tensor has another dtype".to_owned(),
                 ));
             }
         };
-        if row.len() > MAX_GPU_BATCH_FLOATS {
+        if row_elements > max_floats {
             return Err(TensorError::GpuUnsupported(
-                "one tensor exceeds the reduction buffer budget".to_owned(),
+                "one tensor exceeds the configured reduction buffer budget".to_owned(),
             ));
         }
-        if rows.len() >= MAX_GPU_BATCH_ROWS
-            || floats.saturating_add(row.len()) > MAX_GPU_BATCH_FLOATS
-        {
+        if rows.len() >= MAX_GPU_BATCH_ROWS || floats.saturating_add(row_elements) > max_floats {
             reduce_tensor_rows(
                 &rows,
                 request.operation,
@@ -407,6 +440,15 @@ fn compute_tensor_rows(
             rows.clear();
             floats = 0;
         }
+        let row = match tensor.data {
+            TensorData::F32(values) => values,
+            TensorData::U8(values) => values.into_iter().map(f32::from).collect(),
+            _ => {
+                return Err(TensorError::Corruption(
+                    "compute tensor has another dtype".to_owned(),
+                ));
+            }
+        };
         floats += row.len();
         rows.push(row);
     }

@@ -1,7 +1,10 @@
 use crate::{
     observability,
     performance::{CompressionAlgorithm, CompressionConfig},
-    storage::{Bytes, RangeIter, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
+    storage::{
+        Bytes, RangeIter, ReadBudget, ReadTransaction, StorageEngine, StorageError,
+        WriteTransaction,
+    },
 };
 
 const MAGIC: &[u8; 5] = b"MDBC1";
@@ -46,6 +49,10 @@ impl<S> StorageEngine for CompressedEngine<S>
 where
     S: StorageEngine,
 {
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
     type ReadTxn<'a>
         = CompressedReadTxn<S::ReadTxn<'a>>
     where
@@ -74,6 +81,56 @@ impl<T> ReadTransaction for CompressedReadTxn<T>
 where
     T: ReadTransaction,
 {
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_get(table, key, budget, &mut |value| match value {
+                Some(value) => {
+                    visit_decoded_value(value, budget, &mut |value| visitor(Some(value)))
+                }
+                None => visitor(None),
+            })
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_many(table, keys, budget, &mut |index, value| match value {
+                Some(value) => {
+                    visit_decoded_value(value, budget, &mut |value| visitor(index, Some(value)))
+                }
+                None => visitor(index, None),
+            })
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_range(table, start, end, budget, &mut |key, value| {
+                visit_decoded_value(value, budget, &mut |value| visitor(key, value))
+            })
+    }
+
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
         self.inner
             .get(table, key)?
@@ -87,15 +144,10 @@ where
         start: &[u8],
         end: &[u8],
     ) -> Result<RangeIter<'txn>, StorageError> {
-        let rows = self
-            .inner
-            .range(table, start, end)?
-            .map(|item| {
-                let (key, value) = item?;
-                Ok((key, decode_stored_value(&value)?))
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        Ok(Box::new(rows.into_iter().map(Ok)))
+        Ok(Box::new(self.inner.range(table, start, end)?.map(|item| {
+            let (key, value) = item?;
+            Ok((key, decode_stored_value(&value)?))
+        })))
     }
 }
 
@@ -103,6 +155,56 @@ impl<T> ReadTransaction for CompressedWriteTxn<T>
 where
     T: WriteTransaction,
 {
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_get(table, key, budget, &mut |value| match value {
+                Some(value) => {
+                    visit_decoded_value(value, budget, &mut |value| visitor(Some(value)))
+                }
+                None => visitor(None),
+            })
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_many(table, keys, budget, &mut |index, value| match value {
+                Some(value) => {
+                    visit_decoded_value(value, budget, &mut |value| visitor(index, Some(value)))
+                }
+                None => visitor(index, None),
+            })
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_range(table, start, end, budget, &mut |key, value| {
+                visit_decoded_value(value, budget, &mut |value| visitor(key, value))
+            })
+    }
+
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
         self.inner
             .get(table, key)?
@@ -116,15 +218,10 @@ where
         start: &[u8],
         end: &[u8],
     ) -> Result<RangeIter<'txn>, StorageError> {
-        let rows = self
-            .inner
-            .range(table, start, end)?
-            .map(|item| {
-                let (key, value) = item?;
-                Ok((key, decode_stored_value(&value)?))
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        Ok(Box::new(rows.into_iter().map(Ok)))
+        Ok(Box::new(self.inner.range(table, start, end)?.map(|item| {
+            let (key, value) = item?;
+            Ok((key, decode_stored_value(&value)?))
+        })))
     }
 }
 
@@ -147,6 +244,52 @@ where
 
     fn rollback(self) {
         self.inner.rollback();
+    }
+}
+
+fn visit_decoded_value(
+    value: &[u8],
+    budget: &dyn ReadBudget,
+    visitor: &mut dyn FnMut(&[u8]) -> Result<bool, StorageError>,
+) -> Result<bool, StorageError> {
+    budget.check()?;
+    let _reservation = budget.reserve(decode_working_bytes(value)?)?;
+    let decoded = zeroize::Zeroizing::new(decode_stored_value(value)?);
+    budget.check()?;
+    visitor(&decoded)
+}
+
+fn decode_working_bytes(value: &[u8]) -> Result<usize, StorageError> {
+    if !value.starts_with(MAGIC) {
+        return Ok(value.len());
+    }
+    if value.len() < HEADER_LEN {
+        return Err(StorageError::Corruption(
+            "compressed value has truncated header".to_owned(),
+        ));
+    }
+    let original_len =
+        u64::from_be_bytes(read_array::<8>(&value[MAGIC.len() + 1..MAGIC.len() + 9])?);
+    if original_len > MAX_DECODED_VALUE_BYTES {
+        return Err(StorageError::Corruption(
+            "compressed value exceeds decode limit".to_owned(),
+        ));
+    }
+    let original_len = usize::try_from(original_len)
+        .map_err(|error| StorageError::Corruption(error.to_string()))?;
+    match value[MAGIC.len()] {
+        // A corrupt RAW frame can lie about its original length. The decoder copies
+        // the actual payload before checking length, so budget that payload too.
+        ALGO_RAW => Ok(original_len.max(value.len() - HEADER_LEN)),
+        ALGO_LZ4 => Ok(original_len),
+        // Bulk zstd decoding owns a context as well as the output buffer. Reserve
+        // conservative workspace before constructing it; it uses no dictionary.
+        ALGO_ZSTD => original_len
+            .checked_add(256 * 1024)
+            .ok_or_else(|| StorageError::ResourceLimit("zstd read size overflow".to_owned())),
+        _ => Err(StorageError::Corruption(
+            "compressed value has unknown algorithm".to_owned(),
+        )),
     }
 }
 
@@ -305,6 +448,9 @@ const fn algorithm_label(algorithm: u8) -> &'static str {
 }
 
 #[cfg(test)]
+mod guarded_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         ALGO_LZ4, HEADER_LEN, MAGIC, MAX_DECODED_VALUE_BYTES, decode_stored_value,
@@ -362,6 +508,46 @@ mod tests {
             decode_stored_value(&encoded),
             Err(crate::storage::StorageError::Corruption(_))
         ));
+    }
+
+    #[test]
+    fn range_decompresses_only_consumed_records() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = CompressedEngine::new(
+            MemEngine::new(),
+            CompressionConfig {
+                algorithm: CompressionAlgorithm::Lz4,
+                min_bytes: 1,
+                zstd_level: 0,
+            },
+        );
+        let mut write = engine.begin_write()?;
+        write.put("t", b"a", b"valid first value")?;
+        write.commit()?;
+        let mut raw = engine.inner().begin_write()?;
+        raw.put("t", b"b", MAGIC)?;
+        raw.commit()?;
+        let read = engine.begin_read()?;
+        let mut rows = read.range("t", &[], &[])?;
+        assert_eq!(
+            rows.next().transpose()?,
+            Some((b"a".to_vec(), b"valid first value".to_vec()))
+        );
+        assert!(matches!(
+            rows.next(),
+            Some(Err(crate::storage::StorageError::Corruption(_)))
+        ));
+        drop(rows);
+        let write = engine.begin_write()?;
+        let mut rows = write.range("t", &[], &[])?;
+        assert_eq!(
+            rows.next().transpose()?,
+            Some((b"a".to_vec(), b"valid first value".to_vec()))
+        );
+        assert!(matches!(
+            rows.next(),
+            Some(Err(crate::storage::StorageError::Corruption(_)))
+        ));
+        Ok(())
     }
 
     #[test]

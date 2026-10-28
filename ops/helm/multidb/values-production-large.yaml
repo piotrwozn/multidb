@@ -1,0 +1,45 @@
+# Capacity starting point for a large application's single-writer database.
+# This is not a measured SLO, HA topology, or a replacement for qualification.
+# Provide a real signed image.digest and peer selectors separately.
+resources:
+  requests:
+    cpu: "8"
+    memory: 16Gi
+    ephemeral-storage: 4Gi
+  limits:
+    cpu: "16"
+    memory: 32Gi
+    ephemeral-storage: 16Gi
+config:
+  maxConcurrentQueries: 16
+  queryQueueTimeoutMs: 2000
+  # Configure query.memory_limit_bytes through a supported DatabaseSpec/profile,
+  # not an invented environment variable; budget concurrency and indexes together.
+persistence:
+  size: 500Gi
+  # Requires a CSI driver supporting RWOP. Keep legacy existingClaim access mode
+  # unchanged when migrating; never recreate an existing data volume to change it.
+  accessModes: [ReadWriteOncePod]
+runtime:
+  terminationGracePeriodSeconds: 120
+  preStopDelaySeconds: 10
+probes:
+  startupFailureThreshold: 360
+nodeSelector:
+  kubernetes.io/os: linux
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: multidb.io/node-pool
+              operator: In
+              values: [database]
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: multidb

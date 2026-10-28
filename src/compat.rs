@@ -212,6 +212,9 @@ pub fn sqlstate_for_db_error(error: &DbError) -> &'static str {
     if error.is_conflict() {
         return "40001";
     }
+    if let Some(failure) = read_budget_failure(error) {
+        return failure.sqlstate();
+    }
 
     match error {
         DbError::AuthzDenied(_) => "42501",
@@ -224,6 +227,10 @@ pub fn sqlstate_for_db_error(error: &DbError) -> &'static str {
         DbError::Hook(HookError::InvalidTarget(_)) => "42704",
         DbError::Query(error) => sqlstate_for_query(error),
         DbError::Tensor(crate::tensor::TensorError::Timeout(_)) => "57014",
+        DbError::Federation(crate::federation::FederationError::Unsupported(_)) => "0A000",
+        DbError::Federation(crate::federation::FederationError::Query(error)) => {
+            sqlstate_for_query(error)
+        }
         DbError::Config(_) => "08004",
         _ => "XX000",
     }
@@ -269,7 +276,57 @@ pub fn sqlstate_for_storage(error: &StorageError) -> &'static str {
         StorageError::NotFound => "02000",
         StorageError::Io(_) => "58030",
         StorageError::Backend(_) => "XX000",
+        StorageError::ResourceLimit(_) => "53200",
+        StorageError::Timeout(_) | StorageError::Cancelled(_) => "57014",
     }
+}
+
+/// Keeps statement budget failures typed across model, replication and foreign
+/// source wrappers, rather than classifying their formatted error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadBudgetFailure {
+    ResourceLimit,
+    Timeout,
+    Cancelled,
+}
+
+impl ReadBudgetFailure {
+    fn sqlstate(self) -> &'static str {
+        match self {
+            Self::ResourceLimit => "53200",
+            Self::Timeout | Self::Cancelled => "57014",
+        }
+    }
+}
+
+pub(crate) fn read_budget_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<ReadBudgetFailure> {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        let failure = if let Some(error) = error.downcast_ref::<StorageError>() {
+            match error {
+                StorageError::ResourceLimit(_) => Some(ReadBudgetFailure::ResourceLimit),
+                StorageError::Timeout(_) => Some(ReadBudgetFailure::Timeout),
+                StorageError::Cancelled(_) => Some(ReadBudgetFailure::Cancelled),
+                _ => None,
+            }
+        } else if let Some(error) = error.downcast_ref::<QueryError>() {
+            match error {
+                QueryError::ResourceLimit(_) => Some(ReadBudgetFailure::ResourceLimit),
+                QueryError::Timeout(_) => Some(ReadBudgetFailure::Timeout),
+                QueryError::Cancelled(_) => Some(ReadBudgetFailure::Cancelled),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if failure.is_some() {
+            return failure;
+        }
+        cause = error.source();
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -588,7 +645,7 @@ mod tests {
     use super::{
         CatalogObject, CatalogObjectKind, PgCatalogSnapshot, SERVER_VERSION,
         compat_sql_requirements, execute_compat_sql, sqlstate_for_db_error, sqlstate_for_query,
-        sqlstate_for_repl,
+        sqlstate_for_repl, sqlstate_for_storage,
     };
     use crate::{
         cdc::HookError,
@@ -598,6 +655,7 @@ mod tests {
         query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
         repl::ReplError,
         security::{AuthzError, Permission, Resource},
+        storage::StorageError,
     };
 
     #[test]
@@ -691,6 +749,37 @@ mod tests {
             "P0001"
         );
         assert_eq!(sqlstate_for_repl(&ReplError::NoQuorum), "08006");
+    }
+
+    #[test]
+    fn guarded_storage_failures_keep_sqlstates_through_wrappers() {
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Federation(
+                crate::federation::FederationError::Unsupported(
+                    "verified TLS requires a CA bundle".to_owned(),
+                )
+            )),
+            "0A000"
+        );
+        for (storage, expected) in [
+            (StorageError::ResourceLimit("memory".to_owned()), "53200"),
+            (StorageError::Timeout("deadline".to_owned()), "57014"),
+            (StorageError::Cancelled("cancelled".to_owned()), "57014"),
+        ] {
+            assert_eq!(sqlstate_for_storage(&storage), expected);
+            let nested = DbError::TimeSeries(crate::timeseries::TimeSeriesError::Repl(
+                ReplError::Storage(storage),
+            ));
+            assert_eq!(sqlstate_for_db_error(&nested), expected);
+        }
+        assert_eq!(
+            sqlstate_for_db_error(&DbError::Federation(
+                crate::federation::FederationError::Query(QueryError::ResourceLimit(
+                    "decoder".to_owned()
+                ),)
+            )),
+            "53200"
+        );
     }
 
     #[test]

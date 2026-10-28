@@ -106,7 +106,7 @@ pub struct AuthConfig {
     users: Arc<BTreeMap<String, ScramCredential>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScramCredential {
     salt: Vec<u8>,
     salted_password: Vec<u8>,
@@ -159,6 +159,7 @@ struct DbPgFactory {
 }
 
 struct DbStartupHandler {
+    auth: AuthConfig,
     inner: Option<SASLAuthStartupHandler<DefaultServerParameterProvider>>,
     startup_error: Option<String>,
     tls_required: bool,
@@ -403,6 +404,16 @@ impl AuthConfig {
 
     fn credential(&self, user: &str) -> Option<&ScramCredential> {
         self.users.get(user)
+    }
+}
+
+impl Debug for ScramCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScramCredential")
+            .field("salt", &self.salt)
+            .field("salted_password", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -779,6 +790,24 @@ impl PgWireServerHandlers for DbPgFactory {
 }
 
 impl DbStartupHandler {
+    fn reserve_auth_attempt(
+        &self,
+        ip: std::net::IpAddr,
+        user: &str,
+    ) -> Result<Option<AuthAttempt>, NetworkError> {
+        if user.len() > MAX_AUTH_USERNAME_BYTES {
+            return Err(NetworkError::Auth(
+                "authentication username is too long".to_owned(),
+            ));
+        }
+        // Unknown names cannot authenticate. Let SCRAM return its ordinary failure,
+        // without allowing random names to exhaust the shared known-user limiter.
+        self.auth
+            .contains_user(user)
+            .then(|| self.auth_limiter.reserve_attempt(ip, user))
+            .transpose()
+    }
+
     fn new(
         auth: &AuthConfig,
         certificate_pem: Option<&[u8]>,
@@ -804,6 +833,7 @@ impl DbStartupHandler {
         );
 
         Self {
+            auth: auth.clone(),
             inner,
             startup_error,
             tls_required,
@@ -844,8 +874,7 @@ impl StartupHandler for DbStartupHandler {
                 .get("user")
                 .map_or("unknown", String::as_str);
             let attempt = self
-                .auth_limiter
-                .reserve_attempt(client.socket_addr().ip(), user)
+                .reserve_auth_attempt(client.socket_addr().ip(), user)
                 .map_err(|error| pg_error("FATAL", "28000", error.to_string()))?;
             let mut pending = self
                 .pending_auth
@@ -858,7 +887,7 @@ impl StartupHandler for DbStartupHandler {
                     "authentication is already in progress",
                 ));
             }
-            *pending = Some(attempt);
+            *pending = attempt;
         }
 
         let Some(inner) = &self.inner else {
@@ -1238,6 +1267,7 @@ fn dummy_literal_for_type(ty: Option<&Type>) -> PgWireResult<String> {
         Some(&Type::INT2 | &Type::INT4 | &Type::INT8) => Ok("0".to_owned()),
         Some(&Type::FLOAT4 | &Type::FLOAT8) => Ok("0.0".to_owned()),
         Some(&Type::BOOL) => Ok("false".to_owned()),
+        Some(&Type::BYTEA) => Ok("X''".to_owned()),
         Some(&Type::TEXT | &Type::VARCHAR | &Type::BPCHAR | &Type::NAME | &Type::UNKNOWN) => {
             Ok("''".to_owned())
         }
@@ -1281,6 +1311,9 @@ fn portal_param_literal(portal: &Portal<String>, index: usize) -> PgWireResult<S
         Type::BOOL => Ok(portal
             .parameter::<bool>(index, &Type::BOOL)?
             .map_or_else(|| "NULL".to_owned(), |value| value.to_string())),
+        Type::BYTEA => Ok(portal
+            .parameter::<Vec<u8>>(index, &Type::BYTEA)?
+            .map_or_else(|| "NULL".to_owned(), |value| binary_sql_literal(&value))),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => Ok(portal
             .parameter::<String>(index, &ty)?
             .map_or_else(|| "NULL".to_owned(), |value| escape_sql_literal(&value))),
@@ -1310,6 +1343,18 @@ fn substitute_params(sql: &str, literals: &[String]) -> PgWireResult<String> {
 
 fn escape_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn binary_sql_literal(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut literal = String::with_capacity(value.len().saturating_mul(2).saturating_add(3));
+    literal.push_str("X'");
+    for &byte in value {
+        literal.push(char::from(HEX[usize::from(byte >> 4)]));
+        literal.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    literal.push('\'');
+    literal
 }
 
 fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
@@ -1417,6 +1462,32 @@ mod tests {
         assert!(auth.contains_user("alice"));
         assert_ne!(credential.salted_password(), b"secret");
         assert_eq!(credential.salt(), b"fixed-test-salt");
+        let verifier = format!("{:?}", credential.salted_password());
+        assert!(!format!("{credential:?}").contains(&verifier));
+        assert!(!format!("{auth:?}").contains(&verifier));
+        assert!(format!("{auth:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn unknown_startup_names_cannot_fill_known_user_authentication_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = super::AuthRateLimiter::new(2, 60_000);
+        let handler = super::DbStartupHandler::new(&test_auth(), None, false, limiter.clone());
+        let ip = "127.0.0.1".parse()?;
+        for index in 0..=super::MAX_AUTH_RATE_KEYS {
+            assert!(
+                handler
+                    .reserve_auth_attempt(ip, &format!("unknown-{index}"))?
+                    .is_none()
+            );
+        }
+        assert_eq!(limiter.state.lock().map_err(|_| "limiter lock")?.len(), 0);
+        let known = handler
+            .reserve_auth_attempt(ip, "alice")?
+            .ok_or("known user was not reserved")?;
+        known.succeed();
+        assert_eq!(limiter.state.lock().map_err(|_| "limiter lock")?.len(), 0);
+        Ok(())
     }
 
     #[test]
@@ -1849,6 +1920,41 @@ mod tests {
             Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
         );
 
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_bytea_bind_matches_binary_data_without_text_coercion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = shared_users_database()?;
+        {
+            let blobs = database.create_table(
+                "blobs",
+                Some(TableSchema::new(
+                    vec![
+                        ColumnDef::new("id", ColumnType::Int, false),
+                        ColumnDef::new("payload", ColumnType::Bytes, true),
+                    ],
+                    0,
+                )),
+                Vec::new(),
+            )?;
+            blobs.insert(vec![Value::Int(1), Value::Bytes(vec![0, 255, 39, 92])])?;
+            blobs.insert(vec![Value::Int(2), Value::Bytes(b"00ff275c".to_vec())])?;
+        }
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("user").grant(Resource::Table("blobs".to_owned()), Permission::Read)
+        ]));
+        let database = Arc::new(RwLock::new(database));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        let statement = client
+            .prepare_typed("SELECT id FROM blobs WHERE payload = $1", &[Type::BYTEA])
+            .await?;
+        let rows = client.query(&statement, &[&vec![0u8, 255, 39, 92]]).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<_, i64>(0)?, 1);
         server.shutdown().await?;
         Ok(())
     }

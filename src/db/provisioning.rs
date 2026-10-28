@@ -10,8 +10,8 @@ use super::{
     AuditConfig, CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, KEY_PROFILE_MANIFEST,
     KEY_SCHEMA_VERSION, PROVISION_TABLE, PersistedProfileManifest, ProbedMetadata,
     QueryGovernorOverrides, SCHEMA_VERSION, SCHEMA_VERSION_FRAMED, SecurityConfig, catalog_put_op,
-    current_lsn_from_repl, meta_put_op, parse_audit_key_file, read_metadata_from_repl,
-    read_security_from_repl, unmet_profile_floors, validate_manifest,
+    current_lsn_from_repl, meta_put_op, read_metadata_from_repl, read_security_from_repl,
+    unmet_profile_floors, validate_manifest,
 };
 use crate::graph::GraphId;
 use crate::model::{
@@ -27,7 +27,6 @@ use crate::security::{
     AUDIT_TABLE, AuditEvent, AuditOutcome, AuthzPolicy, Permission, Principal, PrincipalRegistry,
     Resource,
 };
-use crate::storage::StorageError;
 use crate::txn::TxnId;
 use crate::vector::{HnswParams, VectorCollectionConfig, VectorMetric};
 
@@ -110,20 +109,18 @@ impl Database {
     }
 
     /// Makes this handle chain audit events with the key and anchor of `audit`. The audit
-    /// config is not persisted, and `open_database_with_ops` does not apply
-    /// `OperationalConfig.security.audit`, so `provision::open_from_spec` re-applies the
-    /// caller's config to the handle it opened; without it the handle falls back to the
-    /// development key, and the chain no longer verifies. The key file is read and parsed first,
-    /// so an unusable key fails here rather than at the next audit event.
+    /// config is not persisted. Operational open paths verify the existing signed chain and
+    /// anchor with the caller's key before any new event. A different key fails instead of
+    /// re-signing old evidence. Key reads are bounded.
     /// # Errors
     /// Fails with `Storage` when the key file cannot be read and with `AuditIntegrity` when it
     /// holds neither 32 raw bytes nor 64 hex characters.
     pub(crate) fn apply_audit_config(&mut self, audit: AuditConfig) -> Result<(), DbError> {
-        if let Some(path) = &audit.key_path {
-            let bytes = std::fs::read(path).map_err(StorageError::Io)?;
-            parse_audit_key_file(&bytes).map_err(DbError::AuditIntegrity)?;
+        let previous = std::mem::replace(&mut self.audit_config, audit);
+        if let Err(error) = self.verify_audit_startup() {
+            self.audit_config = previous;
+            return Err(error);
         }
-        self.audit_config = audit;
         Ok(())
     }
 

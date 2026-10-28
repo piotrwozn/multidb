@@ -57,6 +57,7 @@ impl BatchCache {
         schema: &SchemaRef,
         projection: Option<&[usize]>,
         batch_rows: usize,
+        budget: &super::budget::Budget,
         fill: impl FnOnce() -> Result<Vec<RecordBatch>, QueryError>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         if self.max_bytes == 0 || self.max_entries == 0 {
@@ -72,7 +73,7 @@ impl BatchCache {
             batch_rows,
             version,
         };
-        if let Some(batches) = self.get(&key) {
+        if let Some(batches) = self.get(&key, Some(budget))? {
             return Ok(batches);
         }
         let batches = fill()?;
@@ -82,14 +83,29 @@ impl BatchCache {
         Ok(batches)
     }
 
-    fn get(&self, key: &Key) -> Option<Vec<RecordBatch>> {
-        // A poisoned optimization cache is safely bypassed; no authorization lives here.
-        let mut entries = self.entries.lock().ok()?;
+    fn get(
+        &self,
+        key: &Key,
+        budget: Option<&super::budget::Budget>,
+    ) -> Result<Option<Vec<RecordBatch>>, QueryError> {
+        // Charge before cloning all per-batch Vec/Arc metadata. The data buffers
+        // themselves remain shared, but a tiny-budget hit must not first clone
+        // an entire large entry and only then discover that it cannot be admitted.
+        let Ok(mut entries) = self.entries.lock() else {
+            return Ok(None);
+        };
         entries.clock = entries.clock.saturating_add(1);
         let clock = entries.clock;
-        let entry = entries.values.get_mut(key)?;
+        let Some(entry) = entries.values.get_mut(key) else {
+            return Ok(None);
+        };
+        if let Some(budget) = budget {
+            for batch in &entry.batches {
+                budget.charge_cached_source(batch)?;
+            }
+        }
         entry.last_used = clock;
-        Some(entry.batches.clone())
+        Ok(Some(entry.batches.clone()))
     }
 
     fn insert(&self, key: Key, batches: &[RecordBatch]) {
@@ -214,11 +230,11 @@ mod limits_tests {
         };
         cache.insert(first.clone(), &batches);
         cache.insert(second.clone(), &batches);
-        assert!(cache.get(&first).is_some());
+        assert!(cache.get(&first, None)?.is_some());
         cache.insert(third.clone(), &batches);
-        assert!(cache.get(&second).is_none());
-        assert!(cache.get(&first).is_some());
-        assert!(cache.get(&third).is_some());
+        assert!(cache.get(&second, None)?.is_none());
+        assert!(cache.get(&first, None)?.is_some());
+        assert!(cache.get(&third, None)?.is_some());
         let entries = cache.entries.lock().map_err(|_| "cache poisoned")?;
         assert_eq!(entries.values.len(), 2);
         assert!(entries.bytes <= max_bytes);
@@ -235,22 +251,22 @@ mod limits_tests {
             entries: Mutex::new(Entries::default()),
         };
         cache.insert(key.clone(), &batches);
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get(&key, None)?.is_none());
         let cache = BatchCache::new(&PerformanceConfig::default());
         cache.insert(key.clone(), &batches);
         let mut projected = key.clone();
         projected.projection = Some(Vec::new());
-        assert!(cache.get(&projected).is_none());
+        assert!(cache.get(&projected, None)?.is_none());
         projected = key;
         projected.batch_rows += 1;
-        assert!(cache.get(&projected).is_none());
+        assert!(cache.get(&projected, None)?.is_none());
         projected.batch_rows -= 1;
         projected.schema = Arc::new(Schema::new(vec![Field::new(
             "renamed",
             DataType::Int64,
             false,
         )]));
-        assert!(cache.get(&projected).is_none());
+        assert!(cache.get(&projected, None)?.is_none());
         Ok(())
     }
 
@@ -265,8 +281,8 @@ mod limits_tests {
         };
         cache.insert(first.clone(), &batches);
         cache.insert(second.clone(), &batches);
-        assert!(cache.get(&first).is_none());
-        assert!(cache.get(&second).is_some());
+        assert!(cache.get(&first, None)?.is_none());
+        assert!(cache.get(&second, None)?.is_some());
         Ok(())
     }
 

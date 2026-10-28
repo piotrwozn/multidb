@@ -462,6 +462,7 @@ pub struct TensorDataset<'a, R: Replication + ?Sized> {
     config: TensorDatasetConfig,
     require_gpu: bool,
     execution_timeout: Option<Duration>,
+    execution_memory_bytes: usize,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -498,6 +499,7 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             config,
             require_gpu: false,
             execution_timeout: None,
+            execution_memory_bytes: MAX_DECODED_BYTES,
         })
     }
 
@@ -512,6 +514,27 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
     pub(crate) const fn with_execution_timeout(mut self, timeout: Duration) -> Self {
         self.execution_timeout = Some(timeout);
         self
+    }
+
+    pub(crate) const fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.execution_memory_bytes = if bytes < MAX_DECODED_BYTES {
+            bytes
+        } else {
+            MAX_DECODED_BYTES
+        };
+        self
+    }
+
+    pub(crate) const fn memory_limit(&self) -> usize {
+        self.execution_memory_bytes
+    }
+
+    fn checked_read_bytes(&self, total: usize, next: usize) -> Result<usize, TensorError> {
+        let total = checked_bytes(total, next)?;
+        if total > self.execution_memory_bytes {
+            return invalid("decoded tensor data exceeds the configured query memory budget");
+        }
+        Ok(total)
     }
 
     pub(crate) fn execution_deadline(&self) -> Result<TensorDeadline, TensorError> {
@@ -662,6 +685,23 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
         request: &TensorReadRequest,
         deadline: TensorDeadline,
     ) -> Result<TensorReadBatch, TensorError> {
+        self.read_with_budget(request, deadline, self.execution_memory_bytes)
+    }
+
+    pub(crate) fn read_with_budget(
+        &self,
+        request: &TensorReadRequest,
+        deadline: TensorDeadline,
+        memory_bytes: usize,
+    ) -> Result<TensorReadBatch, TensorError> {
+        let memory_bytes = memory_bytes.min(self.execution_memory_bytes);
+        let checked = |current, extra| {
+            let total = checked_bytes(current, extra)?;
+            if total > memory_bytes {
+                return invalid("decoded tensor data exceeds the configured query memory budget");
+            }
+            Ok(total)
+        };
         deadline.check()?;
         request.validate()?;
         let info = self.info(request.revision)?;
@@ -697,14 +737,14 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             for column in &columns {
                 let cache_key = (column.name.clone(), index.chunk_start);
                 if !chunks.contains_key(&cache_key) {
-                    let retained = checked_bytes(cached_decoded_bytes, decoded_bytes)?;
+                    let retained = checked(cached_decoded_bytes, decoded_bytes)?;
                     let (chunk, chunk_bytes) = self.read_chunk(
                         column,
                         index.chunk_start,
                         info.samples,
-                        MAX_DECODED_BYTES - retained,
+                        memory_bytes - retained,
                     )?;
-                    cached_decoded_bytes = checked_bytes(cached_decoded_bytes, chunk_bytes)?;
+                    cached_decoded_bytes = checked(cached_decoded_bytes, chunk_bytes)?;
                     chunks.insert(cache_key.clone(), chunk);
                 }
                 let chunk = chunks.get(&cache_key).ok_or_else(|| {
@@ -718,8 +758,8 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
                     .ok_or_else(|| {
                         TensorError::Corruption("chunk position is outside stored data".to_owned())
                     })?;
-                decoded_bytes = checked_bytes(decoded_bytes, tensor_decoded_bytes(tensor)?)?;
-                checked_bytes(cached_decoded_bytes, decoded_bytes)?;
+                decoded_bytes = checked(decoded_bytes, tensor_decoded_bytes(tensor)?)?;
+                checked(cached_decoded_bytes, decoded_bytes)?;
                 deadline.check()?;
                 output
                     .get_mut(&column.name)
@@ -813,7 +853,8 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             .saturating_add(u64::try_from(request.max_samples).unwrap_or(u64::MAX))
             .min(info.samples);
         let mut hits = Vec::with_capacity(request.k + 1);
-        let (working_bytes, chunk_budget) = cpu_search_budget(request, hits.capacity())?;
+        let (working_bytes, chunk_budget) =
+            cpu_search_budget(request, hits.capacity(), self.execution_memory_bytes)?;
         let mut skipped = 0;
         if request.start < end
             && request.revision.is_none()
@@ -847,7 +888,7 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
                 drop(cached_chunk.take());
                 let (chunk, chunk_bytes) =
                     self.read_chunk(column, index.chunk_start, info.samples, chunk_budget)?;
-                checked_bytes(working_bytes, chunk_bytes)?;
+                self.checked_read_bytes(working_bytes, chunk_bytes)?;
                 cached_chunk = Some(chunk);
             }
             deadline.check()?;
@@ -1266,7 +1307,9 @@ impl<'a> WireCursor<'a> {
             .ok_or_else(|| TensorError::Corruption("decoded binary size overflow".to_owned()))?;
         if bytes > self.decoded_limit.min(MAX_DECODED_BYTES) {
             if self.decoded_limit < MAX_DECODED_BYTES {
-                return invalid("retained tensor chunks and output exceed the 64 MiB read budget");
+                return invalid(
+                    "retained tensor chunks and output exceed the available read budget",
+                );
             }
             return corrupt("decoded binary tensor footprint exceeds its byte budget");
         }
@@ -1496,6 +1539,7 @@ fn cpu_search_column<'a>(
 fn cpu_search_budget(
     request: &TensorSearchRequest,
     hit_capacity: usize,
+    memory_limit: usize,
 ) -> Result<(usize, usize), TensorError> {
     // Search borrows one decoded float chunk instead of cloning a batch of
     // Tensor values. Keep the caller's logical query, top-k storage and
@@ -1513,11 +1557,11 @@ fn cpu_search_budget(
         .ok_or_else(|| {
             TensorError::InvalidValue("search working size overflows usize".to_owned())
         })?;
-    let chunk_budget = MAX_DECODED_BYTES
-        .checked_sub(working_bytes)
-        .ok_or_else(|| {
-            TensorError::InvalidValue("search working data exceeds the 64 MiB budget".to_owned())
-        })?;
+    let chunk_budget = memory_limit.checked_sub(working_bytes).ok_or_else(|| {
+        TensorError::InvalidValue(
+            "search working data exceeds the configured memory budget".to_owned(),
+        )
+    })?;
     Ok((working_bytes, chunk_budget))
 }
 
@@ -2152,6 +2196,49 @@ mod tests {
             dataset.search_cpu(&TensorSearchRequest::new("embedding", vec![1.0, 0.0])),
             Err(TensorError::Timeout(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_tensor_memory_limits_reads_and_cpu_search_before_allocating_chunks() -> TestResult
+    {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset = create(
+            &database,
+            TensorDatasetConfig::new(
+                "configured_memory",
+                vec![TensorColumn::new(
+                    "embedding",
+                    TensorDType::F32,
+                    vec![Some(128)],
+                )],
+            ),
+        )?;
+        dataset.append(&BTreeMap::from([(
+            "embedding".to_owned(),
+            vec![tensor(&[128], TensorData::F32(vec![1.; 128]))],
+        )]))?;
+        let dataset = dataset.with_memory_limit(256);
+        assert!(matches!(
+            dataset.read(&TensorReadRequest::new(0, 1)),
+            Err(TensorError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            dataset.search_cpu(&TensorSearchRequest::new("embedding", vec![1.; 128])),
+            Err(TensorError::InvalidValue(_))
+        ));
+        let dataset = dataset.with_memory_limit(256 * 1024);
+        assert_eq!(
+            dataset.read(&TensorReadRequest::new(0, 1))?.tensors["embedding"].len(),
+            1
+        );
+        assert_eq!(
+            dataset
+                .search_cpu(&TensorSearchRequest::new("embedding", vec![1.; 128]))?
+                .hits[0]
+                .distance,
+            0.
+        );
         Ok(())
     }
 

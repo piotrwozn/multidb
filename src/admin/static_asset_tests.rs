@@ -45,3 +45,27 @@ async fn head_reports_get_length_and_oversized_assets_are_refused() -> TestResul
     );
     Ok(())
 }
+
+#[test]
+fn studio_assets_and_spa_fallback_refuse_framing_and_inline_scripts() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("index.html"),
+        b"<script src='/app.js'></script>",
+    )?;
+    fs::write(directory.path().join("app.js"), b"console.log('studio')")?;
+    for path in ["/", "/app.js", "/settings"] {
+        let response = studio_static_response(directory.path(), path, &Method::GET);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let csp = response.headers()["content-security-policy"].to_str()?;
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("script-src 'self';"));
+        assert!(
+            csp.contains("connect-src 'self' http: https:"),
+            "custom API bases must remain supported"
+        );
+    }
+    Ok(())
+}

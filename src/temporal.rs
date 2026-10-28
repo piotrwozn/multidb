@@ -13,6 +13,12 @@ use crate::{
     txn::{self, TxnId},
 };
 
+mod commit_metadata;
+mod guarded;
+pub(crate) use guarded::{
+    history_rows_for_table_guarded, resolve_temporal_point_guarded, rows_as_of_lsn_guarded,
+};
+
 pub const TEMPORAL_TABLES_TABLE: &str = "__temporal_tables";
 pub const TEMPORAL_RETENTION_TABLE: &str = "__temporal_retention";
 

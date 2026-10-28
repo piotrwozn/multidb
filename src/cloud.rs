@@ -382,6 +382,12 @@ impl LocalObjectStore {
         &self.uri
     }
 
+    /// Opens a local object without materializing its payload. The file handle
+    /// pins the selected inode while a foreign scan reads bounded portions.
+    pub(crate) fn open_file(&self, path: &str) -> Result<File, CloudError> {
+        Ok(File::open(self.full_path(path)?)?)
+    }
+
     fn full_path(&self, path: &str) -> Result<PathBuf, CloudError> {
         Ok(self.uri.local_root()?.join(path))
     }
@@ -1025,6 +1031,99 @@ pub fn resolve_tiered_segment_payload(bytes: &[u8]) -> Result<Bytes, StorageErro
     }
     observability::record_cloud_tier_read("remote", pointer.bytes);
     Ok(loaded)
+}
+
+/// An owned segment and its live statement reservation. Field order matters:
+/// the allocation is destroyed before its memory is returned to the pool.
+pub(crate) struct GuardedSegmentPayload {
+    bytes: Bytes,
+    _reservation: Box<dyn crate::storage::ReadReservation>,
+}
+
+impl AsRef<[u8]> for GuardedSegmentPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Resolves a segment without allocating a remote object before admission.
+/// Local and remote buffers retain their reservations for their entire lifetime.
+pub(crate) fn resolve_tiered_segment_payload_guarded(
+    bytes: &[u8],
+    budget: &dyn crate::storage::ReadBudget,
+) -> Result<GuardedSegmentPayload, StorageError> {
+    use std::io::Read;
+
+    budget.check()?;
+    if !bytes.starts_with(TIERED_SEGMENT_MAGIC) {
+        let reservation = budget.reserve(bytes.len().saturating_add(128))?;
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(bytes.len()).map_err(|_| {
+            StorageError::ResourceLimit("cannot allocate local segment payload".to_owned())
+        })?;
+        owned.extend_from_slice(bytes);
+        observability::record_cloud_tier_read("local", bytes.len() as u64);
+        return Ok(GuardedSegmentPayload {
+            bytes: owned,
+            _reservation: reservation,
+        });
+    }
+
+    // A pointer has fixed fields and two strings. Reserve their decoded storage
+    // before serde; never use untrusted metadata as an allocation instruction.
+    let pointer_bytes = bytes
+        .len()
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(2048))
+        .ok_or_else(|| StorageError::ResourceLimit("tiered pointer is too large".to_owned()))?;
+    let pointer_reservation = budget.reserve(pointer_bytes)?;
+    let pointer = decode_tiered_segment_pointer(bytes)?
+        .ok_or_else(|| StorageError::Corruption("missing tiered segment pointer".to_owned()))?;
+    budget.check()?;
+    let mut file = LocalObjectStore::new(pointer.uri.clone())
+        .open_file(&pointer.path)
+        .map_err(|error| match error {
+            CloudError::Io(error) => StorageError::Io(error),
+            error => StorageError::Backend(format!("remote segment open failed: {error}")),
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != pointer.bytes {
+        return Err(StorageError::Corruption(
+            "remote segment size/type differs from its pointer".to_owned(),
+        ));
+    }
+    let size = usize::try_from(pointer.bytes).map_err(|_| {
+        StorageError::ResourceLimit("remote segment exceeds address space".to_owned())
+    })?;
+    let allocation = size
+        .checked_add(128)
+        .ok_or_else(|| StorageError::ResourceLimit("remote segment size overflow".to_owned()))?;
+    let reservation = budget.reserve(allocation)?;
+    let mut loaded = Vec::new();
+    loaded.try_reserve_exact(size).map_err(|_| {
+        StorageError::ResourceLimit("cannot allocate remote segment payload".to_owned())
+    })?;
+    loaded.resize(size, 0);
+    for chunk in loaded.chunks_mut(8192) {
+        budget.check()?;
+        file.read_exact(chunk)?;
+    }
+    budget.check()?;
+    let mut trailing = [0; 1];
+    if file.read(&mut trailing)? != 0 || crc32fast::hash(&loaded) != pointer.checksum {
+        return Err(StorageError::Corruption(
+            "remote segment changed or its checksum differs".to_owned(),
+        ));
+    }
+    budget.check()?;
+    observability::record_cloud_tier_read("remote", pointer.bytes);
+    // Explicitly destroy pointer strings before returning their temporary lease.
+    drop(pointer);
+    drop(pointer_reservation);
+    Ok(GuardedSegmentPayload {
+        bytes: loaded,
+        _reservation: reservation,
+    })
 }
 
 /// Tiers columnar segments into the configured object store.
@@ -3002,3 +3101,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod guarded_segment_tests;

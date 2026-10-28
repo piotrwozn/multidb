@@ -459,7 +459,7 @@ pub const KNOB_REGISTRY: &[KnobDefinition] = &[
         sink: "GuaranteeValidator GUARANTEE_BELOW_PROFILE_FLOOR \
                (guarantees.encryption.at_rest); at runtime, db::create_database_with_profile \
                refuses a database without OperationalConfig.encryption (ProfileFloorNotMet), and \
-               restore, whose target is never encrypted, refuses unless \
+               restore defaults to plaintext; an explicit RestoreConfig.target_encryption satisfies the floor, otherwise it refuses unless \
                RestoreConfig.allow_unmet_profile_floors (multidb restore --allow-unmet-floors)",
         enforcement: KnobEnforcement::Enforced,
         after_creation: ChangePolicy::NotApplicable,

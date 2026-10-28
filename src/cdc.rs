@@ -10,6 +10,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod guarded;
+mod guarded_decode;
+pub(crate) use guarded::read_materialized_view_guarded;
+
 #[cfg(test)]
 #[path = "cdc_metadata_race_tests.rs"]
 mod metadata_race_tests;
@@ -2178,19 +2182,43 @@ fn decode_view_state(
 ) -> Result<MaterializedViewState, MaterializedViewError> {
     let mut state: MaterializedViewState = serde_json::from_slice(bytes)
         .map_err(|error| MaterializedViewError::Serde(error.to_string()))?;
+    upgrade_legacy_view_counts(spec, &mut state, None)?;
+    Ok(state)
+}
+
+fn upgrade_legacy_view_counts(
+    spec: &MaterializedViewSpec,
+    state: &mut MaterializedViewState,
+    budget: Option<&dyn crate::storage::ReadBudget>,
+) -> Result<(), MaterializedViewError> {
     if state.groups.values().any(|group| group.row_count.is_none()) {
         for group in state.groups.values_mut() {
+            if let Some(budget) = budget {
+                budget.check()?;
+            }
             group.row_count = Some(0);
         }
-        for row in state
-            .source_rows
-            .values()
-            .filter(|row| row_matches(spec, row))
-        {
+        for row in state.source_rows.values() {
+            if let Some(budget) = budget {
+                budget.check()?;
+            }
+            if !row_matches(spec, row) {
+                continue;
+            }
             let value = row.get(spec.group_by).ok_or_else(|| {
                 MaterializedViewError::Unsupported("group_by column is out of range".to_owned())
             })?;
-            if let Some(group) = state.groups.get_mut(&group_key(value)?) {
+            let _key = budget
+                .map(|budget| {
+                    budget.reserve(
+                        crate::query::json_value_upper_bytes(value)
+                            .saturating_mul(4)
+                            .saturating_add(256),
+                    )
+                })
+                .transpose()?;
+            let key = group_key(value)?;
+            if let Some(group) = state.groups.get_mut(&key) {
                 let count = group.row_count.get_or_insert(0);
                 *count = count.checked_add(1).ok_or_else(|| {
                     MaterializedViewError::Unsupported(
@@ -2201,7 +2229,7 @@ fn decode_view_state(
         }
         state.groups.retain(|_, group| !group_is_empty(group));
     }
-    Ok(state)
+    Ok(())
 }
 
 fn apply_view_changefeed(

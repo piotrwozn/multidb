@@ -8,7 +8,9 @@ use super::encrypted::{
 };
 use super::memory::{MemEngine, MemReadTxn, MemWriteTxn};
 use super::redb::{RedbEngine, RedbReadTxn, RedbWriteTxn};
-use super::{RangeIter, ReadTransaction, StorageEngine, StorageError, WriteTransaction};
+use super::{
+    RangeIter, ReadBudget, ReadTransaction, StorageEngine, StorageError, WriteTransaction,
+};
 
 pub enum AnyEngine {
     Memory(MemEngine),
@@ -457,6 +459,19 @@ fn local_envelope_for(
 }
 
 impl StorageEngine for AnyEngine {
+    fn supports_guarded_reads(&self) -> bool {
+        match self {
+            Self::Memory(engine) => engine.supports_guarded_reads(),
+            Self::Redb(engine) => engine.supports_guarded_reads(),
+            Self::EncryptedMemory(engine) => engine.supports_guarded_reads(),
+            Self::EncryptedRedb(engine) => engine.supports_guarded_reads(),
+            Self::CompressedMemory(engine) => engine.supports_guarded_reads(),
+            Self::CompressedRedb(engine) => engine.supports_guarded_reads(),
+            Self::CompressedEncryptedMemory(engine) => engine.supports_guarded_reads(),
+            Self::CompressedEncryptedRedb(engine) => engine.supports_guarded_reads(),
+        }
+    }
+
     type ReadTxn<'a>
         = AnyReadTxn
     where
@@ -513,6 +528,81 @@ impl StorageEngine for AnyEngine {
 }
 
 impl ReadTransaction for AnyReadTxn {
+    fn supports_guarded_reads(&self) -> bool {
+        match self {
+            Self::Memory(txn) => txn.supports_guarded_reads(),
+            Self::Redb(txn) => txn.supports_guarded_reads(),
+            Self::EncryptedMemory(txn) => txn.supports_guarded_reads(),
+            Self::EncryptedRedb(txn) => txn.supports_guarded_reads(),
+            Self::CompressedMemory(txn) => txn.supports_guarded_reads(),
+            Self::CompressedRedb(txn) => txn.supports_guarded_reads(),
+            Self::CompressedEncryptedMemory(txn) => txn.supports_guarded_reads(),
+            Self::CompressedEncryptedRedb(txn) => txn.supports_guarded_reads(),
+        }
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::Redb(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::EncryptedMemory(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::EncryptedRedb(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::CompressedMemory(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::CompressedRedb(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::CompressedEncryptedMemory(txn) => txn.visit_get(table, key, budget, visitor),
+            Self::CompressedEncryptedRedb(txn) => txn.visit_get(table, key, budget, visitor),
+        }
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[super::Bytes],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::Redb(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::EncryptedMemory(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::EncryptedRedb(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::CompressedMemory(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::CompressedRedb(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::CompressedEncryptedMemory(txn) => txn.visit_many(table, keys, budget, visitor),
+            Self::CompressedEncryptedRedb(txn) => txn.visit_many(table, keys, budget, visitor),
+        }
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(txn) => txn.visit_range(table, start, end, budget, visitor),
+            Self::Redb(txn) => txn.visit_range(table, start, end, budget, visitor),
+            Self::EncryptedMemory(txn) => txn.visit_range(table, start, end, budget, visitor),
+            Self::EncryptedRedb(txn) => txn.visit_range(table, start, end, budget, visitor),
+            Self::CompressedMemory(txn) => txn.visit_range(table, start, end, budget, visitor),
+            Self::CompressedRedb(txn) => txn.visit_range(table, start, end, budget, visitor),
+            Self::CompressedEncryptedMemory(txn) => {
+                txn.visit_range(table, start, end, budget, visitor)
+            }
+            Self::CompressedEncryptedRedb(txn) => {
+                txn.visit_range(table, start, end, budget, visitor)
+            }
+        }
+    }
+
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<crate::storage::Bytes>, StorageError> {
         match self {
             Self::Memory(txn) => txn.get(table, key),

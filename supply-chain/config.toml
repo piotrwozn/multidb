@@ -1412,6 +1412,21 @@ criteria = "safe-to-deploy"
 version = "58.3.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.parquet-variant]]
+version = "58.3.0"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Newly reachable through parquet/experimental for guarded Parquet decoding. Accepted RC review debt; independent production security acceptance remains blocked. See docs/operations/supply-chain-rc1.md."
+
+[[exemptions.parquet-variant-compute]]
+version = "58.3.0"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Newly reachable through parquet/experimental for guarded Parquet decoding. Accepted RC review debt; independent production security acceptance remains blocked. See docs/operations/supply-chain-rc1.md."
+
+[[exemptions.parquet-variant-json]]
+version = "58.3.0"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Newly reachable through parquet/experimental for guarded Parquet decoding. Accepted RC review debt; independent production security acceptance remains blocked. See docs/operations/supply-chain-rc1.md."
+
 [[exemptions.parse-zoneinfo]]
 version = "0.3.1"
 criteria = "safe-to-deploy"
@@ -1998,11 +2013,13 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tls_codec]]
 version = "0.4.2"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Existing dev-only TLS graph is now reached by the regular tokio-postgres-rustls foreign PostgreSQL connector dependency. Criterion promoted from safe-to-run as accepted RC review debt; production security acceptance remains blocked. See docs/operations/supply-chain-rc1.md."
 
 [[exemptions.tls_codec_derive]]
 version = "0.4.2"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Existing TLS codec derive dependency now lies on the regular PostgreSQL TLS dependency graph. Criterion promoted from safe-to-run to satisfy that graph's policy; no claim that the proc macro executes at server runtime. Accepted RC review debt; see docs/operations/supply-chain-rc1.md."
 
 [[exemptions.tokio]]
 version = "1.53.3"
@@ -2018,7 +2035,8 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tokio-postgres-rustls]]
 version = "0.14.0"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Promoted from a dev-only test adapter to a regular dependency for authenticated TLS connections in the foreign PostgreSQL connector. Criterion promoted from safe-to-run as accepted RC review debt; independent production security acceptance remains blocked. See docs/operations/supply-chain-rc1.md."
 
 [[exemptions.tokio-rustls]]
 version = "0.26.4"
@@ -2502,7 +2520,8 @@ criteria = "safe-to-deploy"
 
 [[exemptions.x509-cert]]
 version = "0.2.5"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
+notes = "RC1 bootstrap exemption, not an independent code audit. Existing certificate dependency is now reached by the regular tokio-postgres-rustls connector graph. Criterion promoted from safe-to-run as accepted RC review debt; independent production security acceptance remains blocked. See docs/operations/supply-chain-rc1.md."
 
 [[exemptions.x509-certificate]]
 version = "0.25.0"

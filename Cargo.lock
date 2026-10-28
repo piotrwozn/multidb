@@ -2419,6 +2419,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
+ "crc32fast",
  "miniz_oxide",
  "zlib-rs",
 ]
@@ -3472,21 +3473,24 @@ dependencies = [
 
 [[package]]
 name = "multidb"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "argon2",
  "async-trait",
  "axum",
  "blake3",
+ "brotli",
  "bson",
  "bytes",
  "chacha20poly1305",
  "crc32fast",
  "criterion",
  "datafusion",
+ "flate2",
  "futures",
  "getrandom 0.3.4",
  "hnsw_rs",
+ "log",
  "lz4_flex",
  "moka",
  "object_store",
@@ -3504,6 +3508,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "socket2",
  "sqllogictest",
  "sqlparser",
  "stateright",
@@ -3882,6 +3887,9 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
  "paste",
  "seq-macro",
  "simdutf8",
@@ -3889,6 +3897,53 @@ dependencies = [
  "thrift",
  "twox-hash",
  "zstd 0.13.4",
+]
+
+[[package]]
+name = "parquet-variant"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74c8db065291f088a2aad8ab831853eae1871c0d311c8d0b83bbc3b7e735d0fc"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "chrono",
+ "half",
+ "indexmap",
+ "num-traits",
+ "simdutf8",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-compute"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a530e8d5b5e14efcb39c9a6ec55432ad11f6afb7dc4455a79be0dc615fe3cc31"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "chrono",
+ "half",
+ "indexmap",
+ "parquet-variant",
+ "parquet-variant-json",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-json"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00ed89908289f67caa2ca078f9ff9aacd6229a313ec92b12bf4f48f613dc2b97"
+dependencies = [
+ "arrow-schema",
+ "base64",
+ "chrono",
+ "parquet-variant",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

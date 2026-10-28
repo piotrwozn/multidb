@@ -1,0 +1,15 @@
+# Requires AMD device plugin and host Vulkan support, including render-node access.
+# Set supplementalGroups to the actual node render/video GIDs; never run asroot.
+config:
+  profile: tensor
+gpu:
+  enabled: true
+  vendor: amd
+resources:
+  requests:
+    amd.com/gpu: 1
+  limits:
+    amd.com/gpu: 1
+nodeSelector:
+  kubernetes.io/os: linux
+  multidb.io/gpu-vendor: amd

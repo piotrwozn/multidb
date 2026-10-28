@@ -1123,6 +1123,7 @@ impl StatsCatalog {
     }
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn build_table_stats(
     object_name: &str,
@@ -1142,7 +1143,7 @@ pub fn build_table_stats(
         .map(|(index, (name, _))| {
             (
                 name.clone(),
-                build_column_stats(rows, &sample, index, stats_version, analyzed_at_txn),
+                build_column_stats(rows, &sample, index, stats_version, analyzed_at_txn, None),
             )
         })
         .collect();
@@ -1156,6 +1157,72 @@ pub fn build_table_stats(
         stats_version,
         analyzed_at_txn,
     }
+}
+
+pub(super) fn build_table_stats_guarded(
+    object_name: &str,
+    object_kind: StatsObjectKind,
+    columns: &[(String, ColumnType)],
+    rows: &[Row],
+    mode: AnalyzeMode,
+    stats_version: u64,
+    budget: &super::budget::Budget,
+) -> Result<TableStats, QueryError> {
+    budget.check()?;
+    // Frequencies retain encoded keys and Values; histograms/MCVs can repeat a
+    // large cell, and JSON persistence can expand every control byte sixfold.
+    // Reserve a conservative complete working set before any of those copies.
+    budget.charge(
+        columns
+            .len()
+            .saturating_mul(4 * std::mem::size_of::<usize>()),
+    )?;
+    let mut bytes = rows.len().saturating_mul(4 * std::mem::size_of::<&Row>());
+    let mut largest = vec![0_usize; columns.len()];
+    for row in rows {
+        budget.check()?;
+        for (index, value) in row.iter().enumerate() {
+            let heap = super::row_scan::value_heap_bytes(value, usize::MAX)?;
+            bytes = bytes
+                .saturating_add(1_024)
+                .saturating_add(heap.saturating_mul(8));
+            if let Some(largest) = largest.get_mut(index) {
+                *largest = (*largest).max(heap);
+            }
+        }
+    }
+    for ((name, _), largest) in columns.iter().zip(largest) {
+        bytes = bytes
+            .saturating_add(4_096)
+            .saturating_add(name.len().saturating_mul(8))
+            .saturating_add(largest.saturating_mul(512));
+    }
+    budget.charge(bytes)?;
+    let sample = sample_rows(rows, mode);
+    let sample_count = usize_to_u64(sample.len());
+    let mut result = BTreeMap::new();
+    for (index, (name, _)) in columns.iter().enumerate() {
+        budget.check()?;
+        let stats = build_column_stats(
+            rows,
+            &sample,
+            index,
+            stats_version,
+            stats_version,
+            Some(budget),
+        );
+        budget.check()?;
+        result.insert(name.clone(), stats);
+    }
+    Ok(TableStats {
+        object_name: object_name.to_owned(),
+        object_kind,
+        row_count: usize_to_u64(rows.len()),
+        sample_count,
+        columns: result,
+        stats_version,
+        analyzed_at_txn: stats_version,
+    })
 }
 
 pub fn explain_node_for_eq(
@@ -1208,6 +1275,7 @@ fn build_column_stats(
     column: usize,
     stats_version: u64,
     analyzed_at_txn: u64,
+    budget: Option<&super::budget::Budget>,
 ) -> ColumnStats {
     let row_count = usize_to_u64(rows.len());
     let sample_count = usize_to_u64(sample.len());
@@ -1215,6 +1283,9 @@ fn build_column_stats(
     let mut frequencies: BTreeMap<Bytes, (Value, u64)> = BTreeMap::new();
 
     for row in sample {
+        if budget.is_some_and(super::budget::Budget::expired) {
+            break;
+        }
         let value = row.get(column).cloned().unwrap_or(Value::Null);
         if matches!(value, Value::Null) {
             nulls = nulls.saturating_add(1);

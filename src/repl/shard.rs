@@ -11,6 +11,8 @@ use super::{
     Vote, WriteCondition, dist_txn, propose_system, propose_system_conditional_batch,
 };
 
+mod guarded;
+
 pub type ShardId = u32;
 pub type PartitionId = u32;
 
@@ -356,6 +358,41 @@ impl ShardedReplication {
             .ok_or_else(|| ReplError::Unsupported(format!("unknown shard {shard}")))
     }
 
+    fn next_owned_row(
+        &self,
+        shard_id: ShardId,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<(Bytes, Bytes)>, ReplError> {
+        let mut row = None;
+        self.shard(shard_id)?.scan_range_batches(
+            table,
+            start,
+            end,
+            consistency,
+            1,
+            cancelled,
+            &mut |batch| {
+                for (key, value) in batch {
+                    if cancelled() {
+                        return Ok(false);
+                    }
+                    // Migration leaves stale physical copies behind. Keep the
+                    // same current-owner rule as `range`, before selecting a head.
+                    if self.shard_for_route(table, key)? == shard_id {
+                        row = Some((key.clone(), value.clone()));
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(row)
+    }
+
     fn ensure_shard_exists(&self, shard: ShardId) -> Result<(), ReplError> {
         if self.shards.contains_key(&shard) {
             Ok(())
@@ -616,6 +653,67 @@ impl ShardedReplication {
 }
 
 impl Replication for ShardedReplication {
+    fn supports_guarded_reads(&self) -> bool {
+        self.shards
+            .values()
+            .all(|shard| shard.supports_guarded_reads())
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _routing = self.guarded_routing_read(budget)?;
+        let _route_memory = budget.reserve(key.len().saturating_mul(4).saturating_add(256))?;
+        let shard = self.shard_for_route(table, key)?;
+        self.shard(shard)?
+            .visit_get(table, key, consistency, budget, visitor)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _routing = self.guarded_routing_read(budget)?;
+        for (index, key) in keys.iter().enumerate() {
+            budget.check()?;
+            let _route_memory = budget.reserve(key.len().saturating_mul(4).saturating_add(256))?;
+            let shard = self.shard_for_route(table, key)?;
+            let mut keep_going = true;
+            self.shard(shard)?
+                .visit_get(table, key, consistency, budget, &mut |value| {
+                    keep_going = visitor(index, value)?;
+                    Ok(keep_going)
+                })?;
+            if !keep_going {
+                break;
+            }
+        }
+        budget.check().map_err(Into::into)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        self.guarded_range(table, start, end, consistency, budget, visitor)
+    }
+
     fn propose_authorized_conditional_batch(
         &self,
         batch: ConditionalBatch,
@@ -639,6 +737,12 @@ impl Replication for ShardedReplication {
         }
         self.shard(target.unwrap_or(self.global_shard))?
             .propose_authorized_conditional_batch(batch, authorization)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        self.shards
+            .values()
+            .all(|shard| shard.supports_bounded_scans())
     }
 
     fn supports_commit_log(&self) -> bool {
@@ -791,6 +895,101 @@ impl Replication for ShardedReplication {
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         rows.dedup_by(|left, right| left.0 == right.0);
         Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn scan_range_batches(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        batch_rows: usize,
+        cancelled: &dyn Fn() -> bool,
+        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        if cancelled() || (!end.is_empty() && start >= end) {
+            return Ok(());
+        }
+        if !self.supports_bounded_scans() {
+            // Preserve ordering and compatibility for external range-only shards.
+            // Their legacy adapter cannot promise bounded backend materialization.
+            let rows = self.range(table, start, end, consistency)?;
+            for batch in rows.chunks(batch_rows.clamp(1, 1_024)) {
+                if cancelled() || !on_batch(batch)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        let _routing = self.routing_read()?;
+        if is_global_table(table) {
+            observability::record_shard_operation(self.global_shard, "scan_global");
+            return self.shard(self.global_shard)?.scan_range_batches(
+                table,
+                start,
+                end,
+                consistency,
+                batch_rows,
+                cancelled,
+                on_batch,
+            );
+        }
+        // An ordered merge needs only one owned row per shard. A whole-shard
+        // Vec followed by sorting would materialize everything before LIMIT,
+        // cancellation, or the SQL consumer's memory reservation can intervene.
+        let mut heads = Vec::new();
+        for shard_id in self.shards.keys().copied() {
+            if cancelled() {
+                return Ok(());
+            }
+            observability::record_shard_operation(shard_id, "scatter_scan");
+            heads.push((
+                shard_id,
+                self.next_owned_row(shard_id, table, start, end, consistency, cancelled)?,
+            ));
+        }
+        let batch_rows = batch_rows.clamp(1, 1_024);
+        let mut batch = Vec::new();
+        loop {
+            if cancelled() {
+                return Ok(());
+            }
+            let next = heads
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, row))| row.as_ref().map(|(key, _)| (index, key)))
+                .min_by(|(_, left), (_, right)| left.cmp(right))
+                .map(|(index, _)| index);
+            let Some(index) = next else {
+                break;
+            };
+            let (key, value) = heads[index]
+                .1
+                .take()
+                .ok_or_else(|| ReplError::Transport("missing shard scan head".to_owned()))?;
+            let mut next_start = key.clone();
+            next_start.push(0);
+            batch.push((key, value));
+            if batch.len() >= batch_rows {
+                if cancelled() || !on_batch(&batch)? {
+                    return Ok(());
+                }
+                batch.clear();
+            }
+            heads[index].1 = self.next_owned_row(
+                heads[index].0,
+                table,
+                &next_start,
+                end,
+                consistency,
+                cancelled,
+            )?;
+        }
+        if !batch.is_empty() && !cancelled() {
+            let _ = on_batch(&batch)?;
+        }
+        Ok(())
     }
 }
 

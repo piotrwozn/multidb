@@ -24,7 +24,7 @@ const HISTOGRAM_BUCKETS: [f64; 11] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0,
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MetricsConfig {
     pub bind_addr: SocketAddr,
     pub max_series: usize,
@@ -77,6 +77,20 @@ struct MetricKey {
 }
 
 static GLOBAL_REGISTRY: OnceLock<MetricsRegistry> = OnceLock::new();
+
+impl std::fmt::Debug for MetricsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetricsConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("max_series", &self.max_series)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
 
 impl MetricsConfig {
     #[must_use]
@@ -1135,6 +1149,17 @@ mod tests {
         record_replication_operation, record_restore,
     };
     use crate::security::{Permission, Resource};
+
+    #[test]
+    fn configuration_debug_redacts_metrics_bearer_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let configuration = super::MetricsConfig::new("127.0.0.1:9000".parse()?)
+            .with_bearer_token("private-metrics-bearer");
+        let diagnostic = format!("{configuration:?}");
+        assert!(!diagnostic.contains("private-metrics-bearer"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        Ok(())
+    }
 
     #[test]
     fn prometheus_render_contains_counters_and_histograms() {

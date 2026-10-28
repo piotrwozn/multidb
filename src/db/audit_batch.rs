@@ -2,9 +2,12 @@
 //! are durable; concurrent requests share commits without delaying an isolated request.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 mod anchor;
@@ -22,9 +25,11 @@ type Completion = Result<(), Arc<DbError>>;
 
 #[derive(Default)]
 pub(super) struct AuditBatchCoordinator {
+    fatal: Arc<AtomicBool>,
     state: Mutex<BatchState>,
     changed: Condvar,
     anchor_checkpoint: Mutex<Option<anchor::Checkpoint>>,
+    pub(super) key_fingerprint: Mutex<Option<[u8; 32]>>,
 }
 
 #[derive(Default)]
@@ -37,14 +42,48 @@ struct BatchState {
 }
 
 impl AuditBatchCoordinator {
+    pub(super) fn failure_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fatal)
+    }
+
+    pub(super) fn mark_failed(&self) {
+        self.fatal.store(true, Ordering::Release);
+    }
+
+    pub(super) fn check_admission(&self) -> Result<(), DbError> {
+        let state = self.state.lock().map_err(|_| {
+            self.mark_failed();
+            poisoned()
+        })?;
+        if let Some(error) = &state.failed {
+            return Err(copy_error(error));
+        }
+        if self.fatal.load(Ordering::Acquire) {
+            return Err(DbError::AuditIntegrity(
+                "audit runtime is sealed; restore its configuration and reopen the database"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn record(
         &self,
         event: &AuditEvent,
         mut persist: impl FnMut(&[AuditEvent]) -> Result<(), DbError>,
     ) -> Result<(), DbError> {
-        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let mut state = self.state.lock().map_err(|_| {
+            self.mark_failed();
+            poisoned()
+        })?;
         if let Some(error) = &state.failed {
             return Err(copy_error(error));
+        }
+        if self.fatal.load(Ordering::Acquire) {
+            return Err(DbError::AuditIntegrity(
+                "audit runtime is sealed; restore its configuration and reopen the database"
+                    .to_owned(),
+            ));
         }
         let ticket = state.next_ticket;
         state.next_ticket = ticket
@@ -79,6 +118,7 @@ impl AuditBatchCoordinator {
                 Ok(result) => {
                     let completion = result.map_err(Arc::new);
                     if let Err(error) = &completion {
+                        self.mark_failed();
                         // A failed sink may have accepted only part of the batch. Never
                         // acknowledge later events past that unknown durable prefix.
                         // Pending callers also fail without attempting another commit.
@@ -90,6 +130,7 @@ impl AuditBatchCoordinator {
                     }
                 }
                 Err(panic) => {
+                    self.mark_failed();
                     let error = Arc::new(DbError::AuditIntegrity(
                         "audit batch leader panicked; reopen the database before retrying"
                             .to_owned(),
@@ -113,6 +154,17 @@ impl AuditBatchCoordinator {
 }
 
 impl Database {
+    /// Startup holds `audit_lock` and verifies the complete chain before recovering a
+    /// missing/short anchor. Keep the private Prepared type inside this module.
+    pub(super) fn recover_verified_audit_anchor(
+        &self,
+        key: &[u8; 32],
+        head: &AuditHead,
+    ) -> Result<(), DbError> {
+        let prepared = self.prepare_audit_anchor(key, head)?;
+        self.finish_audit_anchor(prepared, &[], key, head)
+    }
+
     pub(super) fn persist_audit_batch(&self, events: &[AuditEvent]) -> Result<(), DbError> {
         self.persist_audit_batch_with_anchor(events, |_| Ok(()))
     }
@@ -132,9 +184,11 @@ impl Database {
         // Read both anew for every batch. A failed commit never leaves a cached head,
         // and replacing an audit key/config does not retain stale signing material.
         let key = self.audit_key()?;
+        self.verify_audit_prefix_before_append(&key)?;
         let mut head = self.audit_head()?;
         let prepared_anchor = self.prepare_audit_anchor(&key, &head)?;
         let mut signed = Vec::with_capacity(events.len());
+        let mut keys = BTreeSet::new();
         let mut operations = Vec::with_capacity(events.len() + 1);
         for event in events {
             let sequence = head
@@ -145,6 +199,12 @@ impl Database {
                 .clone()
                 .with_integrity(head.hash.clone(), sequence, &key)
                 .map_err(DbError::AuditIntegrity)?;
+            let physical_key = event.key();
+            if !keys.insert(physical_key.clone()) {
+                return Err(DbError::AuditIntegrity(
+                    "audit event key collision; historical records were not replaced".to_owned(),
+                ));
+            }
             head = AuditHead {
                 sequence,
                 hash: event
@@ -159,11 +219,12 @@ impl Database {
             }
             operations.push(Op::Put {
                 table: AUDIT_TABLE.to_owned(),
-                key: event.key(),
+                key: physical_key,
                 value,
             });
             signed.push(event);
         }
+        self.ensure_unused_audit_keys(&keys.into_iter().collect::<Vec<_>>())?;
         operations.push(Op::Put {
             table: AUDIT_HEAD_TABLE.to_owned(),
             key: b"head".to_vec(),
@@ -184,7 +245,8 @@ impl Database {
                 .map_err(|_| poisoned())?
                 .take();
         }
-        result
+        result?;
+        self.bind_audit_key(&key)
     }
 }
 
@@ -244,6 +306,9 @@ fn copy_storage_error(error: &StorageError) -> StorageError {
         )),
         StorageError::Corruption(message) => StorageError::Corruption(message.clone()),
         StorageError::Conflict => StorageError::Conflict,
+        StorageError::ResourceLimit(message) => StorageError::ResourceLimit(message.clone()),
+        StorageError::Timeout(message) => StorageError::Timeout(message.clone()),
+        StorageError::Cancelled(message) => StorageError::Cancelled(message.clone()),
         StorageError::Backend(message) => StorageError::Backend(message.clone()),
     }
 }

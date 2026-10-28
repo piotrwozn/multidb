@@ -4,7 +4,8 @@ use crate::{
     keyenc,
     model::{Value, decode_value, encode_value},
     repl::{Op, ReadConsistency, ReplError, Replication},
-    storage::{Bytes, StorageError},
+    storage::{Bytes, ReadBudget, ReadReservation, StorageError},
+    vector::execution::{ExecutionLimits, ExecutionReadBudget, retained_value_bytes},
 };
 
 pub const GRAPH_OUT_EDGES_TABLE: &str = "graph_out_edges";
@@ -58,6 +59,8 @@ pub struct TraversalOptions {
 
 #[derive(thiserror::Error, Debug)]
 pub enum GraphError {
+    #[error("execution: {0}")]
+    Execution(#[from] crate::query::QueryError),
     #[error("replication: {0}")]
     Repl(#[from] ReplError),
 
@@ -73,8 +76,11 @@ pub enum GraphError {
 
 pub struct Graph<'repl, R: Replication + ?Sized> {
     repl: &'repl R,
-    graph_id: GraphId,
+    id: GraphId,
+    execution: ExecutionLimits,
 }
+
+pub(crate) type GuardedTraversal = (Vec<GraphNodeId>, Vec<Box<dyn ReadReservation>>);
 
 impl GraphId {
     #[must_use]
@@ -117,7 +123,28 @@ impl Default for TraversalOptions {
 impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
     #[must_use]
     pub const fn new(repl: &'repl R, graph_id: GraphId) -> Self {
-        Self { repl, graph_id }
+        Self {
+            repl,
+            id: graph_id,
+            execution: ExecutionLimits::unbounded(),
+        }
+    }
+
+    pub(crate) fn with_execution_limits(mut self, execution: ExecutionLimits) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    pub(crate) fn with_memory_cap(&self, bytes: usize) -> Self {
+        Self {
+            repl: self.repl,
+            id: self.id,
+            execution: self.execution.cap_memory(bytes),
+        }
+    }
+
+    pub(crate) fn content_version(&self) -> Result<Option<u64>, GraphError> {
+        Ok(self.repl.table_data_version(GRAPH_OUT_EDGES_TABLE)?)
     }
 
     /// Adds or replaces a directed edge and its mirrored incoming edge.
@@ -141,12 +168,12 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         self.repl.propose_batch(vec![
             Op::Put {
                 table: GRAPH_OUT_EDGES_TABLE.to_owned(),
-                key: out_key(self.graph_id, &edge.src, &edge.label, &edge.dst),
+                key: out_key(self.id, &edge.src, &edge.label, &edge.dst),
                 value: encode_value(&edge.props)?,
             },
             Op::Put {
                 table: GRAPH_IN_EDGES_TABLE.to_owned(),
-                key: in_key(self.graph_id, &edge.dst, &edge.label, &edge.src),
+                key: in_key(self.id, &edge.dst, &edge.label, &edge.src),
                 value: Vec::new(),
             },
         ])?;
@@ -165,11 +192,11 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         self.repl.propose_batch(vec![
             Op::Delete {
                 table: GRAPH_OUT_EDGES_TABLE.to_owned(),
-                key: out_key(self.graph_id, src, label, dst),
+                key: out_key(self.id, src, label, dst),
             },
             Op::Delete {
                 table: GRAPH_IN_EDGES_TABLE.to_owned(),
-                key: in_key(self.graph_id, dst, label, src),
+                key: in_key(self.id, dst, label, src),
             },
         ])?;
         Ok(())
@@ -179,7 +206,7 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
     /// # Errors
     /// Fails when storage cannot be scanned.
     pub fn neighbors(&self, src: &GraphNodeId, label: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        let prefix = out_prefix(self.graph_id, src, label);
+        let prefix = out_prefix(self.id, src, label);
         let end = keyenc::range_end(&prefix);
         let mut edges = Vec::new();
         for (key, value) in self.repl.range(
@@ -215,6 +242,7 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         label: &str,
         max_edges: usize,
     ) -> Result<BoundedNeighbors, GraphError> {
+        self.execution.check()?;
         validate_label(label)?;
         let mut result = BoundedNeighbors {
             neighbors: Vec::new(),
@@ -230,35 +258,70 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
             )
             .into());
         }
-        let prefix = out_prefix(self.graph_id, src, label);
+        let prefix = out_prefix(self.id, src, label);
         let end = keyenc::range_end(&prefix);
-        self.repl.scan_range_batches(
+        let mut retained = 0_usize;
+        let mut execution_error = None;
+        let scanned = self.repl.scan_range_batches(
             GRAPH_OUT_EDGES_TABLE,
             &prefix,
             &end,
             ReadConsistency::Strong,
             1,
-            &|| false,
+            &|| self.execution.expired(),
             &mut |batch| {
                 for (key, value) in batch
                     .iter()
                     .take(max_edges.saturating_sub(result.scanned_count))
                 {
                     result.scanned_count += 1;
+                    let envelope = retained
+                        .saturating_add(key.len().saturating_mul(2))
+                        .saturating_add(src.0.capacity())
+                        .saturating_add(label.len())
+                        .saturating_add(value.len().saturating_mul(2))
+                        .saturating_add(256);
+                    let remaining = match self.execution.remaining_memory(envelope) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            execution_error = Some(error);
+                            return Ok(false);
+                        }
+                    };
+                    let decoded = crate::model::value_decode_memory_bound(value, remaining)?;
+                    if let Err(error) = self
+                        .execution
+                        .check_memory(envelope.saturating_add(decoded), "bounded graph properties")
+                    {
+                        execution_error = Some(error);
+                        return Ok(false);
+                    }
                     let Some(dst) = trailing_node(key) else {
                         continue;
                     };
+                    let props = decode_value(value)?;
+                    retained = retained
+                        .saturating_add(dst.0.capacity())
+                        .saturating_add(src.0.capacity())
+                        .saturating_add(label.len())
+                        .saturating_add(retained_value_bytes(&props))
+                        .saturating_add(256);
                     result.neighbors.push(GraphEdge {
                         src: src.clone(),
                         label: label.to_owned(),
                         dst,
-                        props: decode_value(value)?,
+                        props,
                     });
                 }
                 result.truncated = result.scanned_count == max_edges;
                 Ok(result.scanned_count < max_edges)
             },
-        )?;
+        );
+        self.execution.check()?;
+        if let Some(error) = execution_error {
+            return Err(error.into());
+        }
+        scanned?;
         Ok(result)
     }
 
@@ -274,6 +337,7 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         label: &str,
         max_edges: usize,
     ) -> Result<BoundedNeighborIds, GraphError> {
+        self.execution.check()?;
         validate_label(label)?;
         let mut result = BoundedNeighborIds {
             neighbors: Vec::new(),
@@ -283,27 +347,78 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         if max_edges == 0 {
             return Ok(result);
         }
+        if self.repl.supports_guarded_reads() {
+            let budget = ExecutionReadBudget::new(self.execution);
+            let mut reservations = Vec::new();
+            let prefix = out_prefix(self.id, src, label);
+            let end = keyenc::range_end(&prefix);
+            self.repl
+                .visit_range(
+                    GRAPH_OUT_EDGES_TABLE,
+                    &prefix,
+                    &end,
+                    ReadConsistency::Strong,
+                    &budget,
+                    &mut |key, _| {
+                        budget.check()?;
+                        result.scanned_count += 1;
+                        if let Some(dst) = trailing_node_slice(key) {
+                            reservations.push(budget.reserve(dst.len().saturating_add(128))?);
+                            result.neighbors.push(GraphNodeId::new(dst.to_vec()));
+                        }
+                        result.truncated = result.scanned_count == max_edges;
+                        Ok(result.scanned_count < max_edges)
+                    },
+                )
+                .map_err(|error| match error {
+                    ReplError::Storage(error) => {
+                        GraphError::Execution(crate::query::QueryError::from(error))
+                    }
+                    other => GraphError::Repl(other),
+                })?;
+            self.execution.check()?;
+            return Ok(result);
+        }
+        if self.execution.bounded() {
+            return Err(ReplError::Unsupported(
+                "guarded graph destination reads are unavailable on this backend".to_owned(),
+            )
+            .into());
+        }
         if !self.repl.supports_bounded_scans() {
             return Err(ReplError::Unsupported(
                 "bounded graph scans are not supported by this replication backend".to_owned(),
             )
             .into());
         }
-        let prefix = out_prefix(self.graph_id, src, label);
+        let prefix = out_prefix(self.id, src, label);
         let end = keyenc::range_end(&prefix);
-        self.repl.scan_range_batches(
+        let mut retained = 0_usize;
+        let mut memory_exceeded = false;
+        let scanned = self.repl.scan_range_batches(
             GRAPH_OUT_EDGES_TABLE,
             &prefix,
             &end,
             ReadConsistency::Strong,
             1,
-            &|| false,
+            &|| self.execution.expired(),
             &mut |batch| {
                 for (key, _) in batch
                     .iter()
                     .take(max_edges.saturating_sub(result.scanned_count))
                 {
                     result.scanned_count += 1;
+                    retained = retained
+                        .saturating_add(key.len().saturating_mul(2))
+                        .saturating_add(128);
+                    if self
+                        .execution
+                        .check_memory(retained, "bounded graph destinations")
+                        .is_err()
+                    {
+                        memory_exceeded = true;
+                        return Ok(false);
+                    }
                     if let Some(dst) = trailing_node(key) {
                         result.neighbors.push(dst);
                     }
@@ -311,7 +426,13 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
                 result.truncated = result.scanned_count == max_edges;
                 Ok(result.scanned_count < max_edges)
             },
-        )?;
+        );
+        self.execution.check()?;
+        if memory_exceeded {
+            self.execution
+                .check_memory(retained, "bounded graph destinations")?;
+        }
+        scanned?;
         Ok(result)
     }
 
@@ -332,6 +453,7 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         let mut expanded = 0_usize;
 
         while let Some((node, depth)) = queue.pop_front() {
+            self.execution.check()?;
             if depth >= options.max_depth {
                 continue;
             }
@@ -345,6 +467,75 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
             }
         }
         Ok(result)
+    }
+
+    /// SQL traversal keeps its output and backend codec scratch in one budget.
+    /// Reservations remain live while the caller converts node IDs to SQL rows.
+    pub(crate) fn k_hop_guarded(
+        &self,
+        start: &GraphNodeId,
+        label: &str,
+        options: TraversalOptions,
+        budget: &dyn ReadBudget,
+    ) -> Result<GuardedTraversal, GraphError> {
+        budget.check()?;
+        validate_label(label)?;
+        if !self.repl.supports_guarded_reads() {
+            return Err(ReplError::Unsupported(
+                "guarded graph traversal is unavailable on this backend".to_owned(),
+            )
+            .into());
+        }
+        let mut reservations =
+            vec![budget.reserve(start.0.len().saturating_mul(2).saturating_add(1024))?];
+        let mut visited = BTreeSet::from([start.0.clone()]);
+        let mut queue = VecDeque::from([(start.clone(), 0_usize)]);
+        let mut result = Vec::new();
+        let mut expanded = 0_usize;
+        while let Some((node, depth)) = queue.pop_front() {
+            budget.check()?;
+            if depth >= options.max_depth {
+                continue;
+            }
+            let prefix = out_prefix(self.id, &node, label);
+            let end = keyenc::range_end(&prefix);
+            let mut exhausted = false;
+            self.repl.visit_range(
+                GRAPH_OUT_EDGES_TABLE,
+                &prefix,
+                &end,
+                ReadConsistency::Strong,
+                budget,
+                &mut |key, _| {
+                    budget.check()?;
+                    if expanded >= options.max_expansion {
+                        exhausted = true;
+                        return Ok(false);
+                    }
+                    expanded += 1;
+                    let Some(dst) = trailing_node_slice(key) else {
+                        return Ok(true);
+                    };
+                    if visited.contains(dst) {
+                        return Ok(true);
+                    }
+                    // Tree/queue/result copies plus up to three UTF-8 bytes per
+                    // input byte in the SQL string conversion, with Vec growth.
+                    reservations
+                        .push(budget.reserve(dst.len().saturating_mul(6).saturating_add(1024))?);
+                    visited.insert(dst.to_vec());
+                    let dst = GraphNodeId::new(dst.to_vec());
+                    result.push(dst.clone());
+                    queue.push_back((dst, depth + 1));
+                    Ok(true)
+                },
+            )?;
+            if exhausted {
+                return Err(GraphError::TraversalLimit);
+            }
+        }
+        budget.check()?;
+        Ok((result, reservations))
     }
 
     /// Finds an unweighted shortest path with BFS.
@@ -364,6 +555,7 @@ impl<'repl, R: Replication + ?Sized> Graph<'repl, R> {
         let mut expanded = 0_usize;
 
         while let Some(path) = queue.pop_front() {
+            self.execution.check()?;
             let Some(node) = path.last() else {
                 continue;
             };
@@ -436,11 +628,14 @@ fn in_key(graph_id: GraphId, dst: &GraphNodeId, label: &str, src: &GraphNodeId) 
 }
 
 fn trailing_node(key: &[u8]) -> Option<GraphNodeId> {
+    trailing_node_slice(key).map(|bytes| GraphNodeId::new(bytes.to_vec()))
+}
+
+fn trailing_node_slice(key: &[u8]) -> Option<&[u8]> {
     let mut cursor = 4_usize;
     skip_len_bytes(key, &mut cursor)?;
     skip_len_bytes(key, &mut cursor)?;
-    let bytes = read_len_bytes(key, &mut cursor)?;
-    Some(GraphNodeId::new(bytes.to_vec()))
+    read_len_bytes(key, &mut cursor)
 }
 
 fn read_len_bytes<'a>(key: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
@@ -468,15 +663,85 @@ mod tests {
 
     use super::{Graph, GraphId, GraphNodeId, TraversalOptions};
 
+    #[test]
+    fn bounded_graph_limits_deadline_and_decoded_metadata_without_string_multiplier()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::GraphError;
+        use crate::{
+            query::QueryError, repl::SingleNode, storage::MemEngine,
+            vector::execution::ExecutionLimits,
+        };
+        use std::time::Duration;
+
+        let repl = SingleNode::new(MemEngine::new());
+        let graph = Graph::new(&repl, GraphId::new(8));
+        let src = GraphNodeId::from_str_id("source");
+        let dst = GraphNodeId::from_str_id("destination");
+        graph.add_edge(
+            src.clone(),
+            "text",
+            dst.clone(),
+            &Value::Str("x".repeat(128 * 1024)),
+        )?;
+        graph.add_edge(
+            src.clone(),
+            "array",
+            dst,
+            &Value::Array(vec![Value::Null; 10_000]),
+        )?;
+        let bounded =
+            graph.with_execution_limits(ExecutionLimits::new(Duration::from_secs(5), 1024 * 1024)?);
+        assert_eq!(
+            bounded.neighbors_bounded(&src, "text", 1)?.neighbors.len(),
+            1
+        );
+        let bounded = bounded
+            .with_execution_limits(ExecutionLimits::new(Duration::from_secs(5), 128 * 1024)?);
+        assert!(matches!(
+            bounded.neighbors_bounded(&src, "array", 1),
+            Err(GraphError::Execution(QueryError::ResourceLimit(_)))
+        ));
+        let expired =
+            bounded.with_execution_limits(ExecutionLimits::new(Duration::ZERO, usize::MAX)?);
+        assert!(matches!(
+            expired.neighbor_ids_bounded(&src, "text", 1),
+            Err(GraphError::Execution(QueryError::Timeout(_)))
+        ));
+        Ok(())
+    }
+
     /// Rejects unbounded range reads and counts records actually delivered by the
     /// real storage-backed batched scanner, including records the caller cannot use.
     struct ScanOnlyRepl {
         inner: Arc<dyn Replication>,
         scanned: AtomicUsize,
         calls: AtomicUsize,
+        guarded_calls: AtomicUsize,
     }
 
     impl Replication for ScanOnlyRepl {
+        fn supports_guarded_reads(&self) -> bool {
+            true
+        }
+
+        fn visit_range(
+            &self,
+            table: &str,
+            start: &[u8],
+            end: &[u8],
+            consistency: ReadConsistency,
+            budget: &dyn crate::storage::ReadBudget,
+            visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+        ) -> Result<(), ReplError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.guarded_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .visit_range(table, start, end, consistency, budget, &mut |key, value| {
+                    self.scanned.fetch_add(1, Ordering::SeqCst);
+                    visitor(key, value)
+                })
+        }
+
         fn supports_bounded_scans(&self) -> bool {
             true
         }
@@ -622,6 +887,7 @@ mod tests {
             inner: Arc::new(database),
             scanned: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
+            guarded_calls: AtomicUsize::new(0),
         };
         let graph = Graph::new(&repl, GraphId::new(1));
         let node = GraphNodeId::from_str_id("root");
@@ -725,12 +991,43 @@ mod tests {
     }
 
     #[test]
+    fn guarded_neighbor_ids_borrow_large_invalid_properties_with_a_small_output_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::vector::execution::ExecutionLimits;
+        use std::time::Duration;
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let repl = ScanOnlyRepl {
+            inner: Arc::new(database),
+            scanned: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            guarded_calls: AtomicUsize::new(0),
+        };
+        let source = GraphNodeId::from_str_id("source");
+        let target = GraphNodeId::from_str_id("target");
+        let id = GraphId::new(42);
+        repl.propose(Op::Put {
+            table: super::GRAPH_OUT_EDGES_TABLE.to_owned(),
+            key: super::out_key(id, &source, "link", &target),
+            value: vec![0xff; 2 * 1024 * 1024],
+        })?;
+        let graph = Graph::new(&repl, id)
+            .with_execution_limits(ExecutionLimits::new(Duration::from_secs(5), 4096)?);
+        let result = graph.neighbor_ids_bounded(&source, "link", 1)?;
+        assert_eq!(result.neighbors, vec![target]);
+        assert_eq!(result.scanned_count, 1);
+        assert_eq!(repl.guarded_calls.load(Ordering::SeqCst), 1);
+        assert!(graph.neighbors_bounded(&source, "link", 1).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn traversals_bound_high_degree_scans_before_materializing_neighbors()
     -> Result<(), Box<dyn std::error::Error>> {
         let repl = ScanOnlyRepl {
             inner: Arc::new(create_database(DbConfig::new(Profile::InMemory))?),
             scanned: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
+            guarded_calls: AtomicUsize::new(0),
         };
         let graph = Graph::new(&repl, GraphId::new(1));
         let root = GraphNodeId::from_str_id("root");
@@ -772,6 +1069,7 @@ mod tests {
             inner: Arc::new(create_database(DbConfig::new(Profile::InMemory))?),
             scanned: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
+            guarded_calls: AtomicUsize::new(0),
         };
         let id = GraphId::new(1);
         let graph = Graph::new(&repl, id);

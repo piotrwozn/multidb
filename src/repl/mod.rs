@@ -5,7 +5,9 @@ use std::{
 };
 
 use crate::observability;
-use crate::storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction};
+use crate::storage::{
+    Bytes, ReadBudget, ReadTransaction, StorageEngine, StorageError, WriteTransaction,
+};
 use crate::txn::{self, TxnId, WriteSet};
 
 pub mod ap;
@@ -134,6 +136,116 @@ impl ReplError {
 }
 
 pub trait Replication: Send + Sync {
+    /// Whether borrowed point, multi-key and range reads admit owned allocations
+    /// through the supplied budget before copying/decoding native values.
+    fn supports_guarded_reads(&self) -> bool {
+        false
+    }
+
+    /// Visits one borrowed value. Legacy implementations retain their ordinary
+    /// owned read behavior and do not advertise guarded-read support.
+    /// # Errors
+    /// Fails on read, budget, or callback errors.
+    // Keep source-compatible borrowed callback lifetimes for custom replication
+    // adapters and admission before copying or decoding data.
+    #[allow(clippy::type_complexity)]
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let value = self.read(table, key, consistency)?;
+        budget.check()?;
+        let _input = value
+            .as_ref()
+            .map(|value| budget.reserve(value.len()))
+            .transpose()?;
+        let _ = visitor(value.as_deref())?;
+        budget.check().map_err(Into::into)
+    }
+
+    /// Visits keys in order, including duplicates and missing values. Native
+    /// backends retain one snapshot; compatibility implementations retain their
+    /// established `read_many` semantics and may materialize its inputs first.
+    /// # Errors
+    /// Fails on read, budget, or callback errors.
+    // Keep source-compatible borrowed callback lifetimes for custom replication
+    // adapters and admission before copying or decoding data.
+    #[allow(clippy::type_complexity)]
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let values = self.read_many(table, keys, consistency)?;
+        budget.check()?;
+        if values.len() != keys.len() {
+            return Err(
+                StorageError::Corruption("multi-key read length mismatch".to_owned()).into(),
+            );
+        }
+        let bytes = values
+            .iter()
+            .flatten()
+            .fold(0_usize, |sum, value| sum.saturating_add(value.len()));
+        let _inputs = budget.reserve(bytes)?;
+        for (index, value) in values.iter().enumerate() {
+            budget.check()?;
+            if !visitor(index, value.as_deref())? {
+                break;
+            }
+        }
+        budget.check().map_err(Into::into)
+    }
+
+    /// Visits borrowed entries in ordered `[start, end)`, empty end unbounded.
+    /// A visitor must reserve any output retained after it returns. The legacy
+    /// default preserves `scan_range_batches` compatibility without claiming a
+    /// bound on its backend's temporary materialization.
+    /// # Errors
+    /// Fails on read, budget, or callback errors.
+    // Keep source-compatible borrowed callback lifetimes for custom replication
+    // adapters and admission before copying or decoding data.
+    #[allow(clippy::type_complexity)]
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        self.scan_range_batches(
+            table,
+            start,
+            end,
+            consistency,
+            1,
+            &|| budget.check().is_err(),
+            &mut |entries| {
+                for (key, value) in entries {
+                    budget.check()?;
+                    let _input = budget.reserve(key.len().saturating_add(value.len()))?;
+                    if !visitor(key, value)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        budget.check().map_err(Into::into)
+    }
+
     /// Lists tracked public physical keyspaces for complete native migrations.
     /// # Errors
     /// Fails when inventory is unsupported or its metadata is corrupt.
@@ -314,6 +426,9 @@ pub trait Replication: Send + Sync {
         cancelled: &dyn Fn() -> bool,
         on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
     ) -> Result<(), ReplError> {
+        if cancelled() {
+            return Ok(());
+        }
         let rows = self.range(table, start, end, consistency)?;
         for batch in rows.chunks(batch_rows.max(1)) {
             if cancelled() || !on_batch(batch)? {
@@ -321,6 +436,16 @@ pub trait Replication: Send + Sync {
             }
         }
         Ok(())
+    }
+}
+
+fn visit_keep_going(result: Result<bool, ReplError>, error: &mut Option<ReplError>) -> bool {
+    match result {
+        Ok(keep_going) => keep_going,
+        Err(cause) => {
+            *error = Some(cause);
+            false
+        }
     }
 }
 
@@ -731,11 +856,76 @@ fn clone_storage_error(error: &StorageError) -> StorageError {
         StorageError::Io(error) => StorageError::Backend(error.to_string()),
         StorageError::Corruption(message) => StorageError::Corruption(message.clone()),
         StorageError::Conflict => StorageError::Conflict,
+        StorageError::ResourceLimit(message) => StorageError::ResourceLimit(message.clone()),
+        StorageError::Timeout(message) => StorageError::Timeout(message.clone()),
+        StorageError::Cancelled(message) => StorageError::Cancelled(message.clone()),
         StorageError::Backend(message) => StorageError::Backend(message.clone()),
     }
 }
 
 impl<S: StorageEngine> Replication for SingleNode<S> {
+    fn supports_guarded_reads(&self) -> bool {
+        self.storage.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _ = consistency;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_key_guarded(&txn, table, key, budget)?;
+        let mut callback_error = None;
+        txn.visit_get(table, key, budget, &mut |value| {
+            Ok(visit_keep_going(visitor(value), &mut callback_error))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _ = consistency;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_keys_guarded(&txn, table, keys, budget)?;
+        let mut callback_error = None;
+        txn.visit_many(table, keys, budget, &mut |index, value| {
+            Ok(visit_keep_going(visitor(index, value), &mut callback_error))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _ = consistency;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_range_guarded(&txn, table, start, end, budget)?;
+        let mut callback_error = None;
+        txn.visit_range(table, start, end, budget, &mut |key, value| {
+            Ok(visit_keep_going(visitor(key, value), &mut callback_error))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
     fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
         registered_public_keyspaces(self)
     }
@@ -919,15 +1109,20 @@ impl<S: StorageEngine> Replication for SingleNode<S> {
         cancelled: &dyn Fn() -> bool,
         on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
     ) -> Result<(), ReplError> {
+        if cancelled() {
+            return Ok(());
+        }
         let txn = self.storage.begin_read()?;
         dist_txn::locks::validate_read_range(&txn, table, start, end)?;
-        let mut batch = Vec::with_capacity(batch_rows.max(1));
-        for entry in txn.range(table, start, end)? {
-            if cancelled() {
+        let batch_rows = batch_rows.clamp(1, 1_024);
+        let mut batch = Vec::new();
+        let mut entries = txn.range(table, start, end)?;
+        while !cancelled() {
+            let Some(entry) = entries.next() else {
                 break;
-            }
+            };
             batch.push(entry?);
-            if batch.len() >= batch_rows.max(1) {
+            if batch.len() >= batch_rows {
                 if !on_batch(&batch)? {
                     return Ok(());
                 }

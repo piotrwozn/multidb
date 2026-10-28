@@ -50,9 +50,12 @@ multidb config plan --spec .\multidb.yaml --db .\secure_saas.redb
 
 Guarantee statuses a CLI plan reports for this spec:
 
-- `guarantees.audit.enabled`: `enforced_with_development_key`. Audit is on, but the
-  CLI, `multidb serve` and the Control Plane chain audit events with the built-in
-  development key (`AUDIT_DEVELOPMENT_KEY`); only the Rust API takes an audit key.
+- `guarantees.audit.enabled`: `enforced` with `MULTIDB_AUDIT_KEY_PATH`; without it,
+  local CLI usage reports `enforced_with_development_key` (`AUDIT_DEVELOPMENT_KEY`).
+  Production `multidb serve` requires an existing private audit key and, for durable
+  profiles, `MULTIDB_AUDIT_ANCHOR_PATH`. The Control Plane inherits these runtime
+  settings. Existing audit history requires its original signing key; changing the
+  path does not re-sign it. Follow the repository's `docs/docker.md` audit setup.
 - `guarantees.backup.enabled` and `guarantees.backup.pitr`: `operator_managed`. This
   build has no backup scheduler, so the plan prints the backup and restore runbook
   (`GUARANTEE_OPERATOR_MANAGED`).

@@ -12,16 +12,23 @@ impl Database {
         &mut self,
         requested: SecurityConfig,
     ) -> Result<(), ConfigError> {
-        let security = if let Some(mut persisted) = read_security_from_repl(self.replication_ref())?
-        {
+        let persisted = read_security_from_repl(self.replication_ref())?;
+        let missing = persisted.is_none();
+        let security = if let Some(mut persisted) = persisted {
             // Key and anchor paths belong to the process, not persisted RBAC.
             persisted.audit = requested.audit;
             persisted
         } else {
-            write_security_to_repl(self.replication_ref(), &requested)?;
             requested
         };
-        self.apply_security_config(security);
+        self.apply_security_config(security.clone());
+        if security.audit.key_path.is_some() || security.audit.anchor_path.is_some() {
+            self.apply_audit_config(security.audit.clone())
+                .map_err(|error| ConfigError::Unsupported(error.to_string()))?;
+        }
+        if missing {
+            write_security_to_repl(self.replication_ref(), &security)?;
+        }
         Ok(())
     }
 }
@@ -63,6 +70,15 @@ mod tests {
         }
 
         // Even an explicit different bootstrap policy is not an update request.
+        // Selecting an explicit path to the same signing key keeps the old signed
+        // history verifiable; changing the material is not an implicit rekey request.
+        std::fs::write(
+            temp.path().join("audit.key"),
+            blake3::derive_key(
+                "multidb default audit integrity key",
+                b"development default audit key",
+            ),
+        )?;
         let requested = SecurityConfig {
             authz_policy: AuthzPolicy::new([
                 Role::new("replacement").grant(Resource::Database, Permission::Admin)

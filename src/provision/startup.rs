@@ -310,11 +310,10 @@ fn open_with_environment(
     if let Some(encryption) = &env.encryption {
         operational = operational.with_encryption(encryption.clone());
     }
-    let mut db = open_database_with_ops(config, &operational)?;
     if let Some(audit) = &env.audit {
-        db.apply_audit_config(audit.clone())?;
+        operational.security.audit.clone_from(audit);
     }
-    Ok(db)
+    Ok(open_database_with_ops(config, &operational)?)
 }
 
 /// The database after a startup apply, or the refusal of an apply that failed part-way.

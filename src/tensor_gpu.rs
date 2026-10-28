@@ -6,7 +6,7 @@
 mod dataset;
 pub(crate) use dataset::search_dataset;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, atomic::AtomicBool};
 
 use crate::{
     tensor::{TensorDeadline, TensorDevice, TensorError, TensorExecution, TensorGpuOperation},
@@ -29,6 +29,25 @@ pub struct TensorGpuEngine {
 struct CachedInitError {
     unavailable: bool,
     message: String,
+}
+
+static ENGINE: OnceLock<Result<Arc<TensorGpuEngine>, CachedInitError>> = OnceLock::new();
+
+/// Observes an already initialized process device without opening an adapter,
+/// taking a dispatch lock or caching a new initialization error. A set flag is
+/// terminal for this process; initial configuration/driver errors return None.
+pub(crate) fn cached_device_failure_flag() -> Option<Arc<AtomicBool>> {
+    #[cfg(feature = "tensor-gpu")]
+    {
+        match ENGINE.get() {
+            Some(Ok(engine)) => Some(Arc::clone(&engine.inner.failed)),
+            _ => None,
+        }
+    }
+    #[cfg(not(feature = "tensor-gpu"))]
+    {
+        None
+    }
 }
 
 impl TensorGpuEngine {
@@ -55,7 +74,6 @@ impl TensorGpuEngine {
     /// # Errors
     /// Fails for the same reasons as `new`; a failed initialization remains failed for this process.
     pub fn shared() -> Result<Arc<Self>, TensorError> {
-        static ENGINE: OnceLock<Result<Arc<TensorGpuEngine>, CachedInitError>> = OnceLock::new();
         ENGINE
             .get_or_init(|| {
                 Self::new().map(Arc::new).map_err(|error| CachedInitError {
@@ -228,7 +246,7 @@ mod native {
     use std::{
         borrow::Cow,
         sync::{
-            Mutex, TryLockError,
+            Arc, Mutex, TryLockError,
             atomic::{AtomicBool, Ordering},
             mpsc,
         },
@@ -244,7 +262,7 @@ mod native {
         pub(super) execution: TensorExecution,
         // Error scopes are device-wide. Keep dispatch, mapping and scope draining together.
         serial: Mutex<()>,
-        failed: AtomicBool,
+        pub(super) failed: Arc<AtomicBool>,
     }
 
     pub(super) fn hardware_type(kind: wgpu::DeviceType) -> bool {
@@ -298,7 +316,10 @@ mod native {
                         "GPU device initialization failed: {error}"
                     ))
                 })?;
-            device.on_uncaptured_error(Box::new(|error| {
+            let failed = Arc::new(AtomicBool::new(false));
+            let uncaptured_failure = Arc::clone(&failed);
+            device.on_uncaptured_error(Box::new(move |error| {
+                uncaptured_failure.store(true, Ordering::Release);
                 tracing::error!(error = %error, "uncaptured tensor GPU device error");
             }));
             push_scopes(&device);
@@ -322,7 +343,7 @@ mod native {
                 queue,
                 pipeline,
                 serial: Mutex::new(()),
-                failed: AtomicBool::new(false),
+                failed,
                 execution: TensorExecution {
                     device: TensorDevice::Gpu,
                     adapter: Some(info.name),
@@ -348,6 +369,7 @@ mod native {
                 match self.serial.try_lock() {
                     Ok(guard) => break guard,
                     Err(TryLockError::Poisoned(_)) => {
+                        self.failed.store(true, Ordering::Release);
                         return Err(TensorError::Gpu("GPU dispatch lock poisoned".to_owned()));
                     }
                     Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
@@ -357,6 +379,9 @@ mod native {
             push_scopes(&self.device);
             let result = self.dispatch_scoped(rows, query, mode, deadline);
             let errors = check_scopes(&self.device);
+            if result.is_ok() {
+                self.ensure_available()?;
+            }
             match result {
                 Err(error @ TensorError::Timeout(_)) => Err(error),
                 other => errors.and(other),
@@ -476,17 +501,20 @@ mod native {
                     self.device.destroy();
                     return Err(error);
                 }
-                self.device
-                    .poll(wgpu::PollType::Poll)
-                    .map_err(|error| TensorError::Gpu(format!("GPU polling failed: {error}")))?;
+                self.device.poll(wgpu::PollType::Poll).map_err(|error| {
+                    self.failed.store(true, Ordering::Release);
+                    TensorError::Gpu(format!("GPU polling failed: {error}"))
+                })?;
                 match receiver.try_recv() {
                     Ok(result) => {
                         result.map_err(|error| {
+                            self.failed.store(true, Ordering::Release);
                             TensorError::Gpu(format!("GPU readback failed: {error}"))
                         })?;
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.failed.store(true, Ordering::Release);
                         return Err(TensorError::Gpu(
                             "GPU readback callback disconnected".to_owned(),
                         ));
@@ -519,7 +547,7 @@ mod native {
 
         fn ensure_available(&self) -> Result<(), TensorError> {
             if self.failed.load(Ordering::Acquire) {
-                return Err(TensorError::GpuUnavailable("tensor GPU device stopped after a timeout; restart the server to reinitialize it".to_owned()));
+                return Err(TensorError::GpuUnavailable("tensor GPU device stopped after a fatal error or timeout; restart the server to reinitialize it".to_owned()));
             }
             Ok(())
         }
