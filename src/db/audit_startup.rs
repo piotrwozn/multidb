@@ -78,6 +78,14 @@ fn private_file(path: &Path) -> Result<(), DbError> {
 }
 
 impl AuditConfig {
+    /// Checks an explicitly supplied runtime key before a caller opens storage.
+    /// Keeps audit failures typed for APIs whose storage opener returns `ConfigError`.
+    /// # Errors
+    /// Fails when the key cannot be read or is not a bounded raw/hex signing key.
+    pub(crate) fn validate_key(&self) -> Result<(), DbError> {
+        configured_key(self).map(|_| ())
+    }
+
     /// Validates serve's process-local audit settings without changing the database.
     /// Production requires an existing private key and, for durable profiles, an anchor.
     /// Key files are never generated. Anchor parents must already exist; a missing anchor

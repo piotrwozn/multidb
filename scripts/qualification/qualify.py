@@ -28,6 +28,7 @@ import socket
 import statistics
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -251,13 +252,17 @@ class Server:
     def __init__(self, binary, database, output, profile, port, pg_port):
         self.binary, self.database, self.output, self.profile = binary, database, output, profile
         self.port, self.pg_port, self.process, self.log = port, pg_port, None, None
+        self.pg_password = os.urandom(32).hex()
+        self.shutdowns = []
 
     def environment(self):
         env = {key: value for key, value in os.environ.items() if not key.startswith("MULTIDB_")}
         env.update(MULTIDB_RUNTIME_MODE="local-dev", MULTIDB_PG_TLS_MODE="disabled", MULTIDB_PROFILE="transactional",
                    MULTIDB_DB_PATH=str(self.database), MULTIDB_BIND=f"127.0.0.1:{self.port}",
                    MULTIDB_PG_BIND=f"127.0.0.1:{self.pg_port}", MULTIDB_ADMIN_TOKEN=TOKEN,
-                   MULTIDB_ADMIN_PASSWORD=PASSWORD, MULTIDB_HISTORY_RETAIN_LSNS=str(self.profile["history_retain_lsns"]))
+                   MULTIDB_ADMIN_PASSWORD=PASSWORD, MULTIDB_PG_USER="qualification",
+                   MULTIDB_PG_PASSWORD=self.pg_password,
+                   MULTIDB_HISTORY_RETAIN_LSNS=str(self.profile["history_retain_lsns"]))
         return env
 
     def start(self):
@@ -279,14 +284,15 @@ class Server:
                 finally:
                     api.close()
             raise TimeoutError("owned server did not become authenticated and ready")
-        except BaseException:
-            self.stop()
+        except BaseException as error:
+            self.stop(primary_error=error)
             raise
 
-    def stop(self):
+    def stop(self, primary_error=None):
         if not self.process:
             return
         forced = False
+        outcome = {"status": "unrun"}
         try:
             if self.process.poll() is None:
                 os.killpg(self.process.pid, signal.SIGTERM)
@@ -298,7 +304,15 @@ class Server:
                     self.process.wait(timeout=10)
             if forced or self.process.returncode != 0:
                 raise RuntimeError(f"owned server did not exit cleanly:{self.process.returncode}, forced={forced}")
+            outcome["status"] = "accepted"
+        except Exception as error:
+            outcome.update(status="failed", error={"type": type(error).__name__, "message": str(error)})
+            if primary_error is None:
+                raise
+            primary_error.add_note("secondary server shutdown failure:" + str(error))
         finally:
+            outcome.update(returncode=self.process.returncode, forced_kill=forced)
+            self.shutdowns.append(outcome)
             if self.log:
                 self.log.close()
                 self.log = None
@@ -705,12 +719,23 @@ def execute(args, profile, report):
             "scope": "offline full backup and plaintext fresh-target restore; encryption/PITR use separate recovery evidence"}
         enforce_resources(resource_sample(server, output), profile)
     finally:
+        primary_error = sys.exc_info()[1]
         stop.set()
-        if api:
-            api.close()
-        if measurements:
-            measurements.close()
-        server.stop()
+        cleanup_failures = []
+        for name, close in (("api", api.close if api else None),
+                            ("measurements", measurements.close if measurements else None),
+                            ("server", server.stop)):
+            if close:
+                try:
+                    close()
+                except Exception as error:
+                    cleanup_failures.append((name, error))
+        report["shutdowns"] = server.shutdowns
+        if cleanup_failures:
+            report["secondary_shutdown_failures"] = [{"component": name, "type": type(error).__name__, "message": str(error)}
+                                                      for name, error in cleanup_failures]
+            if primary_error is None:
+                raise cleanup_failures[0][1]
     if digest(binary) != report["artifact"]["sha256"] or digest(snapshot) != report["artifact"]["sha256"]:
         raise AssertionError("qualification artifact changed during execution")
 
@@ -725,6 +750,7 @@ def main(argv=None):
     parser.add_argument("--http-port", type=int, default=18180)
     parser.add_argument("--pg-port", type=int, default=15533)
     parser.add_argument("--plan", action="store_true", help="validate and print plan; never launch a server")
+    parser.add_argument("--functional-calibration", action="store_true", help="smoke tool exercise only; latency is not qualification evidence")
     args = parser.parse_args(argv)
     args.binary, args.output = args.binary.resolve(), args.output.resolve()
     if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
@@ -732,11 +758,14 @@ def main(argv=None):
     if not args.revision.strip() or args.output.exists() or args.http_port == args.pg_port or any(not 1024 <= p <= 65535 for p in (args.http_port, args.pg_port)):
         raise ValueError("fresh output, explicit revision and distinct unprivileged ports required")
     profile = load_profile(args.profile, args.profile_overrides)
+    if args.functional_calibration and args.profile != "smoke":
+        raise ValueError("functional calibration is restricted to the smoke profile")
     source_hashes = {str(p.relative_to(ROOT)): digest(p) for p in sorted(ROOT.rglob("*")) if p.is_file() and "__pycache__" not in p.parts}
     report = {"schema_version": 1, "status": "unrun", "profile_name": args.profile, "slo": profile,
               "criteria_sha256": hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
               "started_at_utc": utc_now(), "artifact": {"path": str(args.binary), "sha256": digest(args.binary), "revision": args.revision},
               "runner_sha256": source_hashes, "scope": {"local_owned_database": True, "production_release_approved": False,
+                  "functional_calibration": args.functional_calibration, "performance_qualified": False,
                   "physical_gpu_measured": False, "power_loss_certified": False, "authenticated_pgwire_load": False},
               "sections": {name: {"status": "unrun"} for name in ("preflight", "fixture", "sustained_http", "resources", "reconnect",
                   "slow_and_disconnected_clients", "readback_after_load", "online_gc", "offline_gc", "offline_backup_restore")}}
@@ -768,6 +797,7 @@ def main(argv=None):
         execute(args, profile, report)
         required = [v for v in report["sections"].values() if v.get("required_in_local_scope", True)]
         report["status"] = "failed" if any(v["status"] == "failed" for v in required) else ("blocked" if any(v["status"] == "blocked" for v in required) else ("unrun" if any(v["status"] == "unrun" for v in required) else "accepted"))
+        report["scope"]["performance_qualified"] = report["status"] == "accepted" and not args.functional_calibration
     except Exception as error:
         report["status"] = "blocked" if isinstance(error, Blocked) else "failed"
         current = report.get("active_section", "preflight")

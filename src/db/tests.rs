@@ -5842,6 +5842,13 @@ async fn public_as_of_queries_share_the_governor_and_authorize_before_queueing()
         matches!(&authorized, Err(DbError::Query(QueryError::Busy(_)))),
         "{authorized:?}"
     );
+    let authorized_suffix = database
+        .query_as(&reader, &format!("SELECT id FROM counters AS OF LSN {lsn}"))
+        .await;
+    assert!(
+        matches!(&authorized_suffix, Err(DbError::Query(QueryError::Busy(_)))),
+        "{authorized_suffix:?}"
+    );
     let unauthorized = database
         .query_as_of_as(&denied, "SELECT id FROM counters", TemporalPoint::Lsn(lsn))
         .await;

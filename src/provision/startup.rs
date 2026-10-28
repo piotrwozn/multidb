@@ -153,9 +153,9 @@ pub fn serve_startup_decision(plan: &ProvisionPlan, mode: StartupMode) -> Startu
 /// with `open_database_with_ops`, which loads its persisted RBAC state, with
 /// `ProvisionEnvironment.encryption`; an encrypted database, whose metadata the
 /// probe cannot read without the key, is opened with that config and the storage profile of the
-/// spec, which the open checks against the decrypted metadata. Then `ProvisionEnvironment.audit`
-/// is applied to the handle, since `open_database_with_ops` does not apply an audit config, so
-/// the audit chain stays on the caller's key. The plan of `spec` against the database, or against
+/// spec, which the open checks against the decrypted metadata. `ProvisionEnvironment.audit`
+/// supplies the opener's runtime key and anchor, and the stored signed prefix is verified
+/// before planning or new audit events. The plan of `spec` against the database, or against
 /// the absent target, goes to [`serve_startup_decision`]: `Start` returns the database as it
 /// is, and `ApplyThenStart` applies the plan with `Confirmation::AutoApproveAdditive` as the
 /// local operator of the surface (`local:serve` or `local:embedded`), creating a missing
@@ -185,6 +185,11 @@ pub fn open_from_spec(
              config plan|apply --spec, and the Control Plane provisions the database it serves",
         )
     })?;
+    if let Some(audit) = &env.audit {
+        // Preserve the audit error contract and reject invalid credentials even before
+        // metadata probing/crash recovery. The operational opener also rechecks the key.
+        audit.validate_key()?;
+    }
     let path = path
         .map(Path::to_path_buf)
         .or_else(|| spec.deployment.storage_path.as_deref().map(PathBuf::from));
@@ -300,8 +305,8 @@ fn open_existing(
     open_with_environment(DbConfig::on_disk(metadata.storage_profile, path), env).map(Some)
 }
 
-/// Opens an existing database with `open_database_with_ops` and the encryption config of the
-/// environment, then applies its audit config to the handle.
+/// Opens an existing database with `open_database_with_ops` and the environment's
+/// encryption/audit configuration, verifying the signed prefix before returning it.
 fn open_with_environment(
     config: DbConfig,
     env: &ProvisionEnvironment,

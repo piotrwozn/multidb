@@ -2,6 +2,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -129,6 +130,63 @@ class OracleAndSlo(unittest.TestCase):
                              ("directory_bytes", "maximum_directory_bytes")):
             with self.subTest(field=field), self.assertRaises(AssertionError):
                 qualify.enforce_resources({**sample, field: profile[limit] + 1}, profile)
+
+
+class OwnedServer(unittest.TestCase):
+    def test_pg_credentials_are_generated_owned_and_local_http_scope_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "MULTIDB_PG_PASSWORD": "foreign deployment secret", "MULTIDB_PG_TLS_MODE": "required", "MULTIDB_SERVE_SPEC": "foreign-spec"}):
+            root = Path(directory)
+            server = qualify.Server(root / "binary", root / "db", root, qualify.load_profile("smoke"), 18180, 15533)
+            environment = server.environment()
+            self.assertEqual(environment["MULTIDB_PG_USER"], "qualification")
+            self.assertEqual(environment["MULTIDB_RUNTIME_MODE"], "local-dev")
+            self.assertEqual(environment["MULTIDB_PG_TLS_MODE"], "disabled")
+            self.assertRegex(environment["MULTIDB_PG_PASSWORD"], r"^[0-9a-f]{64}$")
+            self.assertNotEqual(environment["MULTIDB_PG_PASSWORD"], "foreign deployment secret")
+            self.assertNotIn("MULTIDB_SERVE_SPEC", environment)
+            self.assertEqual(environment["MULTIDB_PG_PASSWORD"], server.environment()["MULTIDB_PG_PASSWORD"])
+            other = qualify.Server(root / "binary", root / "db", root, qualify.load_profile("smoke"), 18180, 15533)
+            self.assertNotEqual(environment["MULTIDB_PG_PASSWORD"], other.environment()["MULTIDB_PG_PASSWORD"])
+
+    def test_startup_failure_survives_nonzero_shutdown_and_records_secondary_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = qualify.Server(root / "binary", root / "db", root, qualify.load_profile("smoke"), 18180, 15533)
+            process = Mock(returncode=1)
+            process.poll.return_value = 1
+            with patch("qualify.free_ports"), patch("qualify.subprocess.Popen", return_value=process):
+                with self.assertRaisesRegex(RuntimeError, "exited at startup:1"):
+                    server.start()
+            self.assertIsNone(server.process)
+            self.assertEqual(server.shutdowns[0]["status"], "failed")
+            self.assertEqual(server.shutdowns[0]["returncode"], 1)
+            self.assertIn("did not exit cleanly", server.shutdowns[0]["error"]["message"])
+
+    def test_execute_preserves_primary_failure_when_final_teardown_also_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "original"
+            binary.write_bytes(b"synthetic artifact")
+            server = Mock(shutdowns=[{"status": "failed", "returncode": 1}])
+            server.start.side_effect = RuntimeError("primary startup diagnostic")
+            server.stop.side_effect = RuntimeError("secondary shutdown diagnostic")
+            report = {"artifact": {"sha256": qualify.digest(binary)}, "sections": {}}
+            args = qualify.argparse.Namespace(binary=binary, output=root, http_port=18180, pg_port=15533)
+            with patch("qualify.require_idle"), patch("qualify.free_ports"), patch("qualify.Server", return_value=server):
+                with self.assertRaisesRegex(RuntimeError, "primary startup diagnostic"):
+                    qualify.execute(args, qualify.load_profile("smoke"), report)
+            self.assertEqual(report["secondary_shutdown_failures"][0]["message"], "secondary shutdown diagnostic")
+            self.assertEqual(report["shutdowns"][0]["returncode"], 1)
+
+    def test_functional_calibration_never_claims_performance_or_production(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(qualify.main(["--binary", sys.executable, "--revision", "calibration-only",
+                "--output", str(Path(directory) / "fresh"), "--plan", "--functional-calibration"]), 0)
+            report = json.loads(output.getvalue())
+            self.assertTrue(report["scope"]["functional_calibration"])
+            self.assertFalse(report["scope"]["performance_qualified"])
+            self.assertFalse(report["scope"]["production_release_approved"])
 
 
 class ExternalEvidence(unittest.TestCase):

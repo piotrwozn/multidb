@@ -625,7 +625,16 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         if state.loaded {
             return Ok(());
         }
-        self.rebuild_locked(&mut state)
+        match self.rebuild_locked(&mut state) {
+            Err(VectorError::Repl(ReplError::Conflict)) => {
+                // Another durable writer invalidated this optional cache fill.
+                // A write need not wait for a complete read index; keep the
+                // cache invalid until a later read validates its generation.
+                state.loaded = false;
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     #[allow(

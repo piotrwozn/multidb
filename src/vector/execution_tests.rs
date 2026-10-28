@@ -17,6 +17,7 @@ fn config() -> VectorCollectionConfig {
 struct Counted<'a> {
     inner: &'a SingleNode<MemEngine>,
     scanned: AtomicUsize,
+    after_scan: std::sync::Mutex<Option<Vec<Op>>>,
 }
 impl Replication for Counted<'_> {
     fn supports_guarded_reads(&self) -> bool {
@@ -46,7 +47,16 @@ impl Replication for Counted<'_> {
             .visit_range(table, start, end, consistency, budget, &mut |key, value| {
                 self.scanned.fetch_add(1, Ordering::Relaxed);
                 visitor(key, value)
-            })
+            })?;
+        let mutation = self
+            .after_scan
+            .lock()
+            .map_err(|_| ReplError::Rejected("test mutation lock poisoned".to_owned()))?
+            .take();
+        if let Some(ops) = mutation {
+            self.inner.propose_batch(ops)?;
+        }
+        Ok(())
     }
     fn supports_bounded_scans(&self) -> bool {
         true
@@ -123,6 +133,7 @@ fn shared_handles_load_lazily_and_failed_cold_budget_does_not_publish_partial_in
     let counted = Counted {
         inner: &backend,
         scanned: AtomicUsize::new(0),
+        after_scan: std::sync::Mutex::new(None),
     };
     let state = Arc::new(RwLock::new(VectorIndexState::new(
         VectorMetric::L2,
@@ -176,6 +187,90 @@ fn local_insert_cannot_certify_a_cache_that_missed_an_external_commit() -> TestR
     let closest = second.insert_vector(&Value::Null, vec![0., 0.])?;
     first.insert_vector(&Value::Null, vec![5., 0.])?;
     assert_eq!(first.knn(&[0., 0.], 1)?[0].id, closest);
+    Ok(())
+}
+
+#[test]
+fn conflicting_cold_cache_fill_does_not_reject_a_durable_insert() -> TestResult {
+    for cold in [true, false] {
+        let backend = SingleNode::new(MemEngine::new());
+        let seeded = VectorCollection::new(&backend, config())?;
+        let first = seeded.insert_vector(&Value::Int(1), vec![10., 0.])?;
+        let counted = Counted {
+            inner: &backend,
+            scanned: AtomicUsize::new(0),
+            after_scan: std::sync::Mutex::new(None),
+        };
+        let writer = if cold {
+            VectorCollection::with_shared_state(
+                &counted,
+                config(),
+                Arc::new(RwLock::new(VectorIndexState::new(
+                    VectorMetric::L2,
+                    config().hnsw,
+                    0,
+                ))),
+            )?
+        } else {
+            VectorCollection::new(&counted, config())?
+        }
+        .with_execution_limits(ExecutionLimits::new(Duration::from_secs(5), 1024 * 1024)?);
+        let external = DocumentId::generate();
+        let mut ops = seeded.metadata.put_ops_for_id(external, &Value::Int(2))?;
+        ops.push(put_vector_op(config().collection_id, external, &[0., 0.]));
+        *counted
+            .after_scan
+            .lock()
+            .map_err(|_| "poisoned test mutation")? = Some(ops);
+        let local = writer.insert_vector(&Value::Int(3), vec![5., 0.])?;
+        assert_eq!(writer.get_metadata(local)?, Some(Value::Int(3)));
+        assert!(!writer.state.read().map_err(|_| "poisoned index")?.loaded);
+        let found = writer.knn(&[0., 0.], 3)?;
+        assert_eq!(
+            found.iter().map(|hit| hit.id).collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, external, local])
+        );
+        assert_eq!(found[0].id, external);
+    }
+    Ok(())
+}
+
+#[test]
+fn conflicting_bounded_read_does_not_publish_a_mixed_generation() -> TestResult {
+    let backend = SingleNode::new(MemEngine::new());
+    let seeded = VectorCollection::new(&backend, config())?;
+    let first = seeded.insert_vector(&Value::Null, vec![10., 0.])?;
+    let external = DocumentId::generate();
+    let mut ops = seeded.metadata.put_ops_for_id(external, &Value::Int(2))?;
+    ops.push(put_vector_op(config().collection_id, external, &[0., 0.]));
+    let counted = Counted {
+        inner: &backend,
+        scanned: AtomicUsize::new(0),
+        after_scan: std::sync::Mutex::new(Some(ops)),
+    };
+    let reader = VectorCollection::with_shared_state(
+        &counted,
+        config(),
+        Arc::new(RwLock::new(VectorIndexState::new(
+            VectorMetric::L2,
+            config().hnsw,
+            0,
+        ))),
+    )?
+    .with_execution_limits(ExecutionLimits::new(Duration::from_secs(5), 1024 * 1024)?);
+    assert!(matches!(
+        reader.knn(&[0., 0.], 2),
+        Err(VectorError::Repl(ReplError::Conflict))
+    ));
+    assert!(!reader.state.read().map_err(|_| "poisoned index")?.loaded);
+    assert_eq!(
+        reader
+            .knn(&[0., 0.], 2)?
+            .iter()
+            .map(|hit| hit.id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([first, external])
+    );
     Ok(())
 }
 

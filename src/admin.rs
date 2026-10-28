@@ -16,6 +16,8 @@ mod http_guard;
 mod readiness_tests;
 #[cfg(test)]
 mod static_asset_tests;
+#[cfg(test)]
+mod temporal_query_tests;
 mod time_series_policy;
 
 use argon2::{

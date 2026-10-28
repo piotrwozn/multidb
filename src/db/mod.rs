@@ -8059,6 +8059,13 @@ fn sql_requirements(
     limits: &QueryExecutionConfig,
 ) -> Result<Vec<(Resource, Permission)>, DbError> {
     validate_sql_text_size(sql, limits)?;
+    // Execution intercepts the temporal suffix before the SQL parser. Extract
+    // permissions from exactly that same statement, retaining the original
+    // input-size check and all nested relation/policy checks.
+    let temporal = parse_as_of_query(sql)?;
+    let sql = temporal
+        .as_ref()
+        .map_or(sql, |(statement, _)| statement.as_str());
     if compat::compat_sql_requirements(sql, limits)? {
         return Ok(vec![(Resource::Database, Permission::Read)]);
     }

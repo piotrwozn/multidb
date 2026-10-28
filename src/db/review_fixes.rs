@@ -21,6 +21,28 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "describe_query")?;
         }
         let mut guard = self.sql_read_authorizer(principal, "describe_query", &requirements)?;
+        if let Some((rewritten, point)) = parse_as_of_query(sql)? {
+            if self.repl.is_ap() || self.repl.is_sharded() {
+                return Err(TemporalError::Unsupported(
+                    "temporal AS OF requires single-node commit-log storage".to_owned(),
+                )
+                .into());
+            }
+            let lsn = crate::query::resolve_temporal_point_with_budget(
+                self.replication_ref(),
+                point,
+                &self.performance.query,
+            )?;
+            self.validate_temporal_retention_for_sql(&rewritten, lsn)?;
+            let _pin = self.pin_history_lsn(lsn)?;
+            return Ok(self
+                .sql_engine()?
+                .as_ref()
+                .clone()
+                .with_snapshot_lsn(lsn)
+                .describe_with_read_guard(&rewritten, &mut guard)
+                .await?);
+        }
         // Compatibility statements have fixed engine-owned results. They do not
         // evaluate user SQL or read user tables.
         if let Some(output) = compat::execute_compat_sql(
@@ -54,24 +76,6 @@ impl Database {
                         .collect::<Vec<_>>(),
                 ))),
             });
-        }
-        if let Some((rewritten, point)) = parse_as_of_query(sql)? {
-            if self.repl.is_ap() || self.repl.is_sharded() {
-                return Err(TemporalError::Unsupported(
-                    "temporal AS OF requires single-node commit-log storage".to_owned(),
-                )
-                .into());
-            }
-            let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
-            self.validate_temporal_retention_for_sql(&rewritten, lsn)?;
-            let _pin = self.pin_history_lsn(lsn)?;
-            return Ok(self
-                .sql_engine()?
-                .as_ref()
-                .clone()
-                .with_snapshot_lsn(lsn)
-                .describe_with_read_guard(&rewritten, &mut guard)
-                .await?);
         }
         Ok(self
             .sql_engine()?
