@@ -48,7 +48,7 @@ jobs:
             sdk/typescript/package-lock.json
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: sdk/go/go.mod
+          go-version: "1.27.3"
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
 
       - name: Validate release version

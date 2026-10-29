@@ -28,7 +28,7 @@ jobs:
           cache-dependency-path: studio/package-lock.json
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: sdk/go/go.mod
+          go-version: "1.27.3"
       - name: cargo-deny
         run: |
           mkdir -p "$HOME/.cargo/bin"
@@ -104,6 +104,15 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit --deny warnings
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+          cargo audit --file sdk/rust/Cargo.lock --deny warnings
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Audit locked Studio and TypeScript SDK dependencies
+        run: |
+          npm --prefix studio audit --package-lock-only --audit-level=low
+          npm --prefix sdk/typescript audit --package-lock-only --audit-level=low
       - name: SBOM CycloneDX
         run: |
           cargo install cargo-cyclonedx --locked
@@ -145,7 +154,7 @@ jobs:
             sdk/typescript/package-lock.json
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: sdk/go/go.mod
+          go-version: "1.27.3"
       - name: Resolve and enforce the secure default feature graph
         run: |
           mkdir "$MULTIDB_DEFAULT_ARTIFACT"
