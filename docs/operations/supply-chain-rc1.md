@@ -1,6 +1,6 @@
 # RC1 dependency policy and review debt
 
-This record covers dependency-policy checks for `1.0.0-rc.1`. It does not grant independent security acceptance or production readiness. The release owner explicitly accepted the version-pinned bootstrap exemptions below as RC review debt. `supply-chain/audits.toml` remains empty: no audit was fabricated or imported to hide these exemptions.
+This record covers dependency-policy checks for `1.0.0-rc.1`. It does not grant independent security acceptance or production readiness. The RC policy baseline records the version-pinned bootstrap exemptions below as unresolved review debt; this is not independent review or production risk acceptance. `supply-chain/audits.toml` remains empty: no audit was fabricated or imported to hide these exemptions.
 
 ## Executed checks
 

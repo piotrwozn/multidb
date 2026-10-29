@@ -371,6 +371,11 @@ class RuntimeMatrix:
         imported = next((name for name in possible if any(line.split() and line.split()[0] == name and evidence["manifest_digest"] in line for line in listing.splitlines())), None)
         if imported is None:
             raise AssertionError("imported reference does not point to the actual expected OCI manifest")
+        # CRI normalizes short Docker names when it resolves the config ID.
+        # Keep that exact name in containerd as well as the digest-pinned name.
+        normalized = repository + ":" + evidence["reference"].rsplit(":", 1)[1]
+        if imported != normalized:
+            self.run("image-normalized-tag", self.fixture.docker("exec", node[0], "ctr", "--namespace=k8s.io", "images", "tag", imported, normalized))
         self.run("image-pin", self.fixture.docker("exec", node[0], "ctr", "--namespace=k8s.io", "images", "tag", imported, pinned))
         listing = self.run("image-pinned-list", self.fixture.docker("exec", node[0], "ctr", "--namespace=k8s.io", "images", "list"))
         matching = [line for line in listing.splitlines() if line.split() and line.split()[0] == pinned]
@@ -427,7 +432,7 @@ class RuntimeMatrix:
         return items[0]
 
     def verify_pod_binary(self, pod, expected_hash):
-        actual = self.run("binary-sha", self.kubectl("exec", pod["metadata"]["name"], "--", "sha256sum", "/usr/local/bin/multidb")).split()[0]
+        actual = self.run("binary-sha", self.kubectl("exec", pod["metadata"]["name"], "--container=multidb", "--", "sha256sum", "/usr/local/bin/multidb")).split()[0]
         if actual != expected_hash:
             raise AssertionError("actual Pod executable differs from the qualified artifact")
         return actual
@@ -532,7 +537,7 @@ class RuntimeMatrix:
             self.denial(api)
         before_signal = self.pod(release)
         before_uid = before_signal["metadata"]["uid"]
-        self.run("sigterm", self.kubectl("exec", before_signal["metadata"]["name"], "--", "/bin/sh", "-c", "kill -TERM 1"))
+        self.run("sigterm", self.kubectl("exec", before_signal["metadata"]["name"], "--container=multidb", "--", "/bin/sh", "-c", "kill -TERM 1"))
         exit_code = None
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:

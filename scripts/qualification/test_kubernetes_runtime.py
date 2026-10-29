@@ -118,7 +118,7 @@ class RuntimeSafety(unittest.TestCase):
                 def run(name, command, **_kwargs):
                     calls.append((name, command))
                     if name == "image-imported-list":
-                        return "docker.io/library/qualified:tag type " + actual_digest
+                        return "qualified:tag type " + actual_digest
                     if name == "image-pinned-list":
                         return "docker.io/library/qualified@" + evidence["manifest_digest"] + " type " + actual_digest
                     return "ok"
@@ -126,10 +126,13 @@ class RuntimeSafety(unittest.TestCase):
                         patch.object(matrix, "run", side_effect=run):
                     if actual_digest == evidence["manifest_digest"]:
                         self.assertEqual(matrix.import_image(Path(directory) / "verified.oci.tar", evidence), "docker.io/library/qualified")
+                        normalized = next(command for name, command in calls if name == "image-normalized-tag")
+                        self.assertEqual(normalized[-2:], ["qualified:tag", "docker.io/library/qualified:tag"])
                     else:
                         with self.assertRaises(AssertionError):
                             matrix.import_image(Path(directory) / "verified.oci.tar", evidence)
                         self.assertNotIn("image-pin", [name for name, _command in calls])
+                        self.assertNotIn("image-normalized-tag", [name for name, _command in calls])
                 command = next(command for name, command in calls if name == "image-import")
                 self.assertEqual(command[command.index("--platform") + 1], "linux/amd64")
                 self.assertEqual(command[command.index("--snapshotter") + 1], "native")
@@ -155,6 +158,22 @@ class RuntimeSafety(unittest.TestCase):
                     runtime.RuntimeMatrix(fixture, Path(directory), Path(directory) / "binary", "source")
             self.assertFalse(fixture.private.exists())
             self.assertFalse(fixture.public.exists())
+
+    def test_actual_binary_verification_selects_main_container_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = runtime.Fixture(Path(directory), Path(directory), "multidb-qualification")
+            fixture.private.mkdir()
+            fixture.public.mkdir()
+            with patch.object(fixture, "verify_runtime_owner"):
+                matrix = runtime.RuntimeMatrix(fixture, Path(directory), Path(directory) / "binary", "source")
+            expected = "1" * 64
+            def command_output(_name, command):
+                prefix = "" if "--container=multidb" in command else 'Defaulted container "multidb" out of: multidb, init-runtime (init)\n'
+                return prefix + expected + "  /usr/local/bin/multidb\n"
+            with patch.object(fixture, "tool", return_value="fixture-tool"), patch.object(matrix, "run", side_effect=command_output):
+                self.assertEqual(matrix.verify_pod_binary({"metadata": {"name": "pod"}}, expected), expected)
+                with self.assertRaises(AssertionError):
+                    matrix.verify_pod_binary({"metadata": {"name": "pod"}}, "2" * 64)
 
     def test_partial_infrastructure_record_cannot_authorize_runtime(self):
         with tempfile.TemporaryDirectory() as directory:

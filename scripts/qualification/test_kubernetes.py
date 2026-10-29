@@ -8,7 +8,10 @@ import copy
 from decimal import Decimal
 import importlib.util
 import json
+import os
 from pathlib import Path
+import stat
+import subprocess
 import tempfile
 import types
 import unittest
@@ -38,6 +41,48 @@ class StrictYamlTests(unittest.TestCase):
         for bad in ("1bogus", "Gi", "NaN", "2KiB"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 kube.quantity(bad)
+
+
+class PrivateAnchorInitializationTests(unittest.TestCase):
+    def test_actual_init_preserves_private_anchor_and_refuses_symlinks_or_legacy_evidence(self):
+        for case in ("fresh", "existing", "directory-symlink", "legacy-file", "legacy-dangling-symlink"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                data = root / "data"
+                data.mkdir(mode=0o777)
+                data.chmod(0o777)
+                private = data / "audit-private"
+                legacy = data / "audit.anchor"
+                target = root / "untouched-target"
+                if case == "existing":
+                    private.mkdir(mode=0o700)
+                    (private / "audit.anchor").write_bytes(b"independent-existing-anchor")
+                elif case == "directory-symlink":
+                    target.mkdir(mode=0o777)
+                    target.chmod(0o777)
+                    private.symlink_to(target, target_is_directory=True)
+                elif case == "legacy-file":
+                    legacy.write_bytes(b"independent-legacy-anchor")
+                elif case == "legacy-dangling-symlink":
+                    legacy.symlink_to(root / "missing-legacy-evidence")
+                command = kube.PRIVATE_INIT_COMMAND.replace("/runtime/private", str(root / "runtime-private"))
+                command = command.replace("/var/lib/multidb/audit.anchor", str(legacy))
+                result = subprocess.run(["/bin/sh", "-ec", command], env={**os.environ, "AUDIT_ANCHOR_DIR": str(private)},
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                self.assertEqual(result.returncode == 0, case in ("fresh", "existing"))
+                self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o777)
+                if case in ("fresh", "existing"):
+                    self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o700)
+                if case == "existing":
+                    self.assertEqual((private / "audit.anchor").read_bytes(), b"independent-existing-anchor")
+                elif case == "directory-symlink":
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o777)
+                elif case == "legacy-file":
+                    self.assertEqual(legacy.read_bytes(), b"independent-legacy-anchor")
+                    self.assertFalse(private.exists())
+                elif case == "legacy-dangling-symlink":
+                    self.assertTrue(legacy.is_symlink())
+                    self.assertFalse(private.exists())
 
 
 class SemanticMutationTests(unittest.TestCase):
@@ -104,6 +149,13 @@ class SemanticMutationTests(unittest.TestCase):
             next(item for item in env if item["name"] == "MULTIDB_AUDIT_ANCHOR_PATH")["value"] = "/tmp/lost.anchor"
         self.check_mutation_rejected("Deployment", exposed_key)
         self.check_mutation_rejected("Deployment", wrong_anchor)
+
+    def test_private_anchor_init_cannot_omit_mount_permissions_or_parent(self):
+        def initializer(obj):
+            return obj["spec"]["template"]["spec"]["initContainers"][0]
+        self.check_mutation_rejected("Deployment", lambda obj: initializer(obj)["volumeMounts"].pop())
+        self.check_mutation_rejected("Deployment", lambda obj: initializer(obj).update(command=["/bin/sh", "-ec", "mkdir -p /runtime/private"]))
+        self.check_mutation_rejected("Deployment", lambda obj: initializer(obj)["env"][0].update(value="/var/lib/multidb"))
 
 
 class EvidenceTests(unittest.TestCase):
@@ -184,8 +236,7 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
  {'apiVersion': 'v1',
   'kind': 'ConfigMap',
   'metadata': {'name': 'qualification-multidb-config',
-               'labels': {'app.kubernetes.io/name': 'multidb',
-                          'app.kubernetes.io/instance': 'qualification'}},
+               'labels': {'app.kubernetes.io/name': 'multidb', 'app.kubernetes.io/instance': 'qualification'}},
   'data': {'MULTIDB_RUNTIME_MODE': 'production',
            'MULTIDB_DB_PATH': '/var/lib/multidb/multidb.redb',
            'MULTIDB_BIND': '0.0.0.0:8080',
@@ -204,14 +255,12 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
   'kind': 'PersistentVolumeClaim',
   'metadata': {'name': 'qualification-multidb-data',
                'annotations': {'helm.sh/resource-policy': 'keep'},
-               'labels': {'app.kubernetes.io/name': 'multidb',
-                          'app.kubernetes.io/instance': 'qualification'}},
+               'labels': {'app.kubernetes.io/name': 'multidb', 'app.kubernetes.io/instance': 'qualification'}},
   'spec': {'accessModes': ['ReadWriteOnce'], 'resources': {'requests': {'storage': '10Gi'}}}},
  {'apiVersion': 'v1',
   'kind': 'Service',
   'metadata': {'name': 'qualification-multidb',
-               'labels': {'app.kubernetes.io/name': 'multidb',
-                          'app.kubernetes.io/instance': 'qualification'}},
+               'labels': {'app.kubernetes.io/name': 'multidb', 'app.kubernetes.io/instance': 'qualification'}},
   'spec': {'type': 'ClusterIP',
            'selector': {'app.kubernetes.io/name': 'multidb', 'app.kubernetes.io/instance': 'qualification'},
            'ports': [{'name': 'pgwire', 'port': 5432, 'targetPort': 'pgwire'},
@@ -219,8 +268,7 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
  {'apiVersion': 'apps/v1',
   'kind': 'Deployment',
   'metadata': {'name': 'qualification-multidb',
-               'labels': {'app.kubernetes.io/name': 'multidb',
-                          'app.kubernetes.io/instance': 'qualification'}},
+               'labels': {'app.kubernetes.io/name': 'multidb', 'app.kubernetes.io/instance': 'qualification'}},
   'spec': {'replicas': 1,
            'revisionHistoryLimit': 3,
            'selector': {'matchLabels': {'app.kubernetes.io/name': 'multidb',
@@ -246,17 +294,25 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
                                                      'imagePullPolicy': 'IfNotPresent',
                                                      'command': ['/bin/sh',
                                                                  '-ec',
-                                                                 'umask 077; mkdir -p /runtime/private; '
-                                                                 'chmod 0700 /runtime/private'],
+                                                                 'umask 077; mkdir -p /runtime/private; chmod 0700 '
+                                                                 '/runtime/private; if [ -n "${AUDIT_ANCHOR_DIR:-}" ]; '
+                                                                 'then if [ -e /var/lib/multidb/audit.anchor ] || [ -L '
+                                                                 '/var/lib/multidb/audit.anchor ]; then echo "preserve '
+                                                                 'and migrate the existing flat audit.anchor before '
+                                                                 'starting this chart" >&2; exit 1; fi; test ! -L '
+                                                                 '"$AUDIT_ANCHOR_DIR"; mkdir -p "$AUDIT_ANCHOR_DIR"; '
+                                                                 'test ! -L "$AUDIT_ANCHOR_DIR"; chmod 0700 '
+                                                                 '"$AUDIT_ANCHOR_DIR"; fi'],
+                                                     'env': [{'name': 'AUDIT_ANCHOR_DIR',
+                                                              'value': '/var/lib/multidb/audit-private'}],
                                                      'securityContext': {'allowPrivilegeEscalation': False,
                                                                          'readOnlyRootFilesystem': True,
                                                                          'capabilities': {'drop': ['ALL']}},
-                                                     'resources': {'requests': {'cpu': '10m',
-                                                                                'memory': '16Mi'},
-                                                                   'limits': {'cpu': '100m',
-                                                                              'memory': '32Mi'}},
-                                                     'volumeMounts': [{'name': 'runtime',
-                                                                       'mountPath': '/runtime'}]}],
+                                                     'resources': {'requests': {'cpu': '10m', 'memory': '16Mi'},
+                                                                   'limits': {'cpu': '100m', 'memory': '32Mi'}},
+                                                     'volumeMounts': [{'name': 'runtime', 'mountPath': '/runtime'},
+                                                                      {'name': 'data',
+                                                                       'mountPath': '/var/lib/multidb'}]}],
                                  'containers': [{'name': 'multidb',
                                                  'image': 'ghcr.io/piotrwozn/multidb@sha256:1111111111111111111111111111111111111111111111111111111111111111',
                                                  'imagePullPolicy': 'IfNotPresent',
@@ -273,7 +329,7 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
                                                          {'name': 'MULTIDB_AUDIT_KEY_PATH',
                                                           'value': '/etc/multidb/audit-key/key.bin'},
                                                          {'name': 'MULTIDB_AUDIT_ANCHOR_PATH',
-                                                          'value': '/var/lib/multidb/audit.anchor'},
+                                                          'value': '/var/lib/multidb/audit-private/audit.anchor'},
                                                          {'name': 'MULTIDB_PG_TLS_CERT',
                                                           'value': '/etc/multidb/pg-tls/tls.crt'},
                                                          {'name': 'MULTIDB_PG_TLS_KEY',
@@ -282,27 +338,23 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
                                                           'value': '/tmp/multidb-runtime/private'}],
                                                  'ports': [{'name': 'pgwire', 'containerPort': 5432},
                                                            {'name': 'admin', 'containerPort': 8080}],
-                                                 'startupProbe': {'httpGet': {'path': '/health',
-                                                                              'port': 'admin'},
+                                                 'startupProbe': {'httpGet': {'path': '/health', 'port': 'admin'},
                                                                   'periodSeconds': 5,
                                                                   'failureThreshold': 60,
                                                                   'timeoutSeconds': 2},
-                                                 'readinessProbe': {'httpGet': {'path': '/ready',
-                                                                                'port': 'admin'},
+                                                 'readinessProbe': {'httpGet': {'path': '/ready', 'port': 'admin'},
                                                                     'initialDelaySeconds': 5,
                                                                     'periodSeconds': 10,
                                                                     'failureThreshold': 3,
                                                                     'timeoutSeconds': 2},
-                                                 'livenessProbe': {'httpGet': {'path': '/health',
-                                                                               'port': 'admin'},
+                                                 'livenessProbe': {'httpGet': {'path': '/health', 'port': 'admin'},
                                                                    'periodSeconds': 10,
                                                                    'failureThreshold': 6,
                                                                    'timeoutSeconds': 2},
                                                  'lifecycle': {'preStop': {'exec': {'command': ['/bin/sh',
                                                                                                 '-c',
                                                                                                 'sleep 5']}}},
-                                                 'volumeMounts': [{'name': 'data',
-                                                                   'mountPath': '/var/lib/multidb'},
+                                                 'volumeMounts': [{'name': 'data', 'mountPath': '/var/lib/multidb'},
                                                                   {'name': 'tmp', 'mountPath': '/tmp'},
                                                                   {'name': 'runtime',
                                                                    'mountPath': '/tmp/multidb-runtime'},
@@ -320,8 +372,7 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
                                  'volumes': [{'name': 'data',
                                               'persistentVolumeClaim': {'claimName': 'qualification-multidb-data'}},
                                              {'name': 'tmp', 'emptyDir': {'sizeLimit': '256Mi'}},
-                                             {'name': 'runtime',
-                                              'emptyDir': {'medium': 'Memory', 'sizeLimit': '16Mi'}},
+                                             {'name': 'runtime', 'emptyDir': {'medium': 'Memory', 'sizeLimit': '16Mi'}},
                                              {'name': 'auth',
                                               'projected': {'defaultMode': 288,
                                                             'sources': [{'secret': {'name': 'multidb-admin',
@@ -341,8 +392,7 @@ BASE_OBJECTS = [{'apiVersion': 'networking.k8s.io/v1',
                                               'secret': {'secretName': 'multidb-pg-tls',
                                                          'defaultMode': 288,
                                                          'items': [{'key': 'tls.crt', 'path': 'tls.crt'},
-                                                                   {'key': 'tls.key',
-                                                                    'path': 'tls.key'}]}}]}}}}]
+                                                                   {'key': 'tls.key', 'path': 'tls.key'}]}}]}}}}]
 
 BASE_VALUES = {'replicaCount': 1,
  'nameOverride': '',
@@ -372,7 +422,7 @@ BASE_VALUES = {'replicaCount': 1,
            'secretName': 'multidb-audit',
            'key': 'audit-key',
            'mountPath': '/etc/multidb/audit-key',
-           'anchorPath': '/var/lib/multidb/audit.anchor'},
+           'anchorPath': '/var/lib/multidb/audit-private/audit.anchor'},
  'secrets': {'adminPassword': {'name': 'multidb-admin', 'key': 'admin-password'},
              'adminToken': {'name': 'multidb-admin', 'key': 'admin-token'},
              'pgPassword': {'name': 'multidb-pg', 'key': 'password'},
@@ -421,10 +471,7 @@ BASE_VALUES = {'replicaCount': 1,
              'tls': [],
              'principalHeaderTrustAcknowledged': False},
  'monitoring': {'enabled': False,
-                'serviceMonitor': {'enabled': False,
-                                   'interval': '30s',
-                                   'scrapeTimeout': '10s',
-                                   'labels': {}}},
+                'serviceMonitor': {'enabled': False, 'interval': '30s', 'scrapeTimeout': '10s', 'labels': {}}},
  'podAnnotations': {},
  'nodeSelector': {},
  'affinity': {},

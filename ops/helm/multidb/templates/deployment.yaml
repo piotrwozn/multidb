@@ -61,7 +61,24 @@ spec:
         - name: init-runtime
           image: {{ include "multidb.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/bin/sh", "-ec", "umask 077; mkdir -p /runtime/private; chmod 0700 /runtime/private"]
+          command:
+            - /bin/sh
+            - -ec
+            - >-
+              umask 077; mkdir -p /runtime/private; chmod 0700 /runtime/private;
+              if [ -n "${AUDIT_ANCHOR_DIR:-}" ]; then
+              if [ -e /var/lib/multidb/audit.anchor ] || [ -L /var/lib/multidb/audit.anchor ]; then
+              echo "preserve and migrate the existing flat audit.anchor before starting this chart" >&2; exit 1; fi;
+              test ! -L "$AUDIT_ANCHOR_DIR";
+              mkdir -p "$AUDIT_ANCHOR_DIR";
+              test ! -L "$AUDIT_ANCHOR_DIR";
+              chmod 0700 "$AUDIT_ANCHOR_DIR";
+              fi
+          {{- if and .Values.audit.enabled (not .Values.runtime.allowVolatile) }}
+          env:
+            - name: AUDIT_ANCHOR_DIR
+              value: {{ dir .Values.audit.anchorPath | quote }}
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -77,6 +94,10 @@ spec:
           volumeMounts:
             - name: runtime
               mountPath: /runtime
+            {{- if and .Values.audit.enabled (not .Values.runtime.allowVolatile) }}
+            - name: data
+              mountPath: /var/lib/multidb
+            {{- end }}
       containers:
         - name: multidb
           image: {{ include "multidb.image" . | quote }}

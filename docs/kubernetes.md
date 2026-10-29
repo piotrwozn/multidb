@@ -58,8 +58,18 @@ The certificate SAN must match the service name that pgwire clients verify.
 Production always mounts pgwire TLS and never sets the local plaintext bypass.
 Production also requires a private existing audit key (32 raw bytes or64 hex
 characters), projected read-only as0440 with the trusted fsGroup. The durable
-anchor defaults to `/var/lib/multidb/audit.anchor`, separate from the database
-and key, on the same PVC; its parent already exists. Retain the correct key and
+anchor defaults to `/var/lib/multidb/audit-private/audit.anchor`, separate from the database
+and key, on the same PVC. The non-root init container creates its private parent
+with mode0700, including on StorageClasses whose PVC root is world-writable;
+it refuses a symlink parent and never changes permissions on the PVC root.
+Custom anchors must also use one private child directory below `/var/lib/multidb`.
+When upgrading an existing deployment with a flat anchor at the PVC root, stop
+the writer and preserve that exact anchor in the new private directory before
+changing the configured path; do not discard it or regenerate its history.
+The init container refuses to start while the legacy flat default `audit.anchor`
+still exists (including a dangling symlink), so its independent antirollback
+anchor cannot be silently abandoned by this default-path change.
+Retain the correct key and
 anchor as operational security evidence, and never replace a bad/wrong-key
 prefix to force startup. InMemory receives the real key but omits a persistent
 anchor because its audit history is explicitly volatile. Local-development

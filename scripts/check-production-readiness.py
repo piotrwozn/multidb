@@ -39,7 +39,7 @@ KUBERNETES_NEGATIVE = (
     "queue-out-of-range", "concurrency-out-of-range", "unsupported-setting", "unsupported-replication", "empty-network-peer",
     "monitor-without-crd", "memory-without-volatile-ack", "durable-with-volatile-ack", "tensor-without-device",
     "gpu-without-resource", "gpu-mismatched-resource-count", "unsupported-gpu-vendor", "encryption-empty-secret",
-    "studio-overlaps-secret", "production-audit-disabled", "audit-anchor-database-collision", "audit-empty-secret", "audit-empty-secret-key",
+    "studio-overlaps-secret", "production-audit-disabled", "audit-anchor-database-collision", "audit-anchor-world-writable-pvc-root", "audit-secret-masks-private-anchor", "audit-parent-is-database-file", "audit-secret-noncanonical-data-overlap", "audit-empty-secret", "audit-empty-secret-key",
 )
 STATIC_TOOL_SHA256 = {"helm": "b66cb19f2b31f9d427632ea6c4b4a1ff89b74ecaeaee323cd166da41a7af53bd",
                       "kubeconform": "457722b36e98d7bdbc91525e594951ef5d7ea3a29da2d13b9b28a2fb8a5097b7"}

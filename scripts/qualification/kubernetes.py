@@ -37,6 +37,12 @@ API_VERSIONS = {"Deployment": "apps/v1", "Service": "v1", "ConfigMap": "v1",
                 "PersistentVolumeClaim": "v1", "ServiceAccount": "v1",
                 "NetworkPolicy": "networking.k8s.io/v1", "Ingress": "networking.k8s.io/v1",
                 "PodDisruptionBudget": "policy/v1"}
+PRIVATE_INIT_COMMAND = ('umask 077; mkdir -p /runtime/private; chmod 0700 /runtime/private; '
+                        'if [ -n "${AUDIT_ANCHOR_DIR:-}" ]; then '
+                        'if [ -e /var/lib/multidb/audit.anchor ] || [ -L /var/lib/multidb/audit.anchor ]; then '
+                        'echo "preserve and migrate the existing flat audit.anchor before starting this chart" >&2; exit 1; fi; '
+                        'test ! -L "$AUDIT_ANCHOR_DIR"; mkdir -p "$AUDIT_ANCHOR_DIR"; '
+                        'test ! -L "$AUDIT_ANCHOR_DIR"; chmod 0700 "$AUDIT_ANCHOR_DIR"; fi')
 
 
 def utc_now():
@@ -193,9 +199,20 @@ def validate_objects(documents, values):
     for item in (container, initializer):
         require(item["image"] == reference and item["imagePullPolicy"] == image["pullPolicy"], "image reference/policy differs")
         require(item["securityContext"] == hardening, "container hardening changed")
-    require(initializer["command"] == ["/bin/sh", "-ec", "umask 077; mkdir -p /runtime/private; chmod 0700 /runtime/private"],
+    require(initializer["command"] == ["/bin/sh", "-ec", PRIVATE_INIT_COMMAND],
             "private runtime directory initialization changed")
-    require(initializer["volumeMounts"] == [{"name": "runtime", "mountPath": "/runtime"}], "init runtime mount differs")
+    private_anchor = audit["enabled"] and not volatile
+    init_mounts = [{"name": "runtime", "mountPath": "/runtime"}]
+    if private_anchor:
+        init_mounts.append({"name": "data", "mountPath": "/var/lib/multidb"})
+    for path in (values["secrets"]["pgTls"]["mountPath"], values["spec"]["mountPath"], encryption["mountPath"], audit["mountPath"]):
+        require("//" not in path and not any(part in (".", "..") for part in path.split("/")), "credential/spec/key mount path is not canonical")
+        mount = Path(path)
+        data = Path("/var/lib/multidb")
+        require(not (mount.is_relative_to(data) or data.is_relative_to(mount)), "credential/spec/key mount overlaps the writable data volume")
+    require(initializer["volumeMounts"] == init_mounts, "init private runtime/audit volume mount differs")
+    init_env = [{"name": "AUDIT_ANCHOR_DIR", "value": str(Path(audit["anchorPath"]).parent)}] if private_anchor else []
+    require(initializer.get("env", []) == init_env, "private persistent audit directory initialization differs")
     require(container["envFrom"] == [{"configMapRef": {"name": name + "-config"}}], "configmap source differs")
     secrets, runtime, probes = values["secrets"], values["runtime"], values["probes"]
     env = {"MULTIDB_ADMIN_PASSWORD_FILE": "/etc/multidb/auth/admin-password",
@@ -207,8 +224,10 @@ def validate_objects(documents, values):
     if audit["enabled"]:
         env["MULTIDB_AUDIT_KEY_PATH"] = audit["mountPath"] + "/key.bin"
         if not volatile:
-            require(Path(audit["anchorPath"]).parent == Path("/var/lib/multidb")
-                    and audit["anchorPath"] != runtime["dbPath"], "audit anchor must be a separate file on the data volume")
+            require(re.fullmatch(r"/var/lib/multidb/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", audit["anchorPath"])
+                    and not any(part in (".", "..") for part in Path(audit["anchorPath"]).parts)
+                    and not Path(audit["anchorPath"]).is_relative_to(Path(runtime["dbPath"]))
+                    and not Path(runtime["dbPath"]).is_relative_to(Path(audit["anchorPath"])), "audit anchor must be a separate file on the data volume")
             env["MULTIDB_AUDIT_ANCHOR_PATH"] = audit["anchorPath"]
     if gpu["enabled"] and gpu["vendor"] == "nvidia":
         env["NVIDIA_DRIVER_CAPABILITIES"] = "compute,utility,graphics"
@@ -375,7 +394,7 @@ def scenarios():
         "secrets": {"adminPassword": {"name": "custom-admin", "key": "login"}, "adminToken": {"name": "custom-token", "key": "bearer"},
                     "pgPassword": {"name": "custom-pg", "key": "pg-login"}, "pgTls": {"name": "custom-tls", "certKey": "public.pem", "privateKey": "private.pem"}},
         "spec": {"enabled": True, "configMap": "qualification-spec", "key": "database.yaml", "apply": "create"},
-        "audit": {"secretName": "custom-audit", "key": "audit-authentication", "mountPath": "/etc/multidb/custom-audit", "anchorPath": "/var/lib/multidb/custom-audit.anchor"},
+        "audit": {"secretName": "custom-audit", "key": "audit-authentication", "mountPath": "/etc/multidb/custom-audit", "anchorPath": "/var/lib/multidb/custom-private/custom-audit.anchor"},
         "ingress": {"enabled": True, "className": "nginx", "hosts": ["db.example.test"], "tls": [{"secretName": "http-tls", "hosts": ["db.example.test"]}],
                     "principalHeaderTrustAcknowledged": True},
         "probes": {"startupPeriodSeconds": 3, "startupFailureThreshold": 80, "readinessFailureThreshold": 4,
@@ -419,7 +438,11 @@ def scenarios():
         "encryption-empty-secret": {"encryption": {"enabled": True, "secretName": ""}},
         "studio-overlaps-secret": {"runtime": {"studioDir": "/etc/multidb/auth"}},
         "production-audit-disabled": {"audit": {"enabled": False}},
-        "audit-anchor-database-collision": {"audit": {"anchorPath": "/var/lib/multidb/multidb.redb"}},
+        "audit-anchor-database-collision": {"audit": {"anchorPath": "/var/lib/multidb/audit-private/audit.anchor"}, "runtime": {"dbPath": "/var/lib/multidb/audit-private/audit.anchor"}},
+        "audit-anchor-world-writable-pvc-root": {"audit": {"anchorPath": "/var/lib/multidb/audit.anchor"}},
+        "audit-secret-masks-private-anchor": {"audit": {"mountPath": "/var/lib/multidb/audit-private"}},
+        "audit-parent-is-database-file": {"runtime": {"dbPath": "/var/lib/multidb/audit-private"}},
+        "audit-secret-noncanonical-data-overlap": {"audit": {"mountPath": "/var//lib/multidb/audit-private"}},
         "audit-empty-secret": {"audit": {"secretName": ""}},
         "audit-empty-secret-key": {"audit": {"key": ""}},
     }

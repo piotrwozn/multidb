@@ -46,7 +46,7 @@ audit:
   secretName: multidb-audit
   key: audit-key
   mountPath: /etc/multidb/audit-key
-  anchorPath: /var/lib/multidb/audit.anchor
+  anchorPath: /var/lib/multidb/audit-private/audit.anchor
 
 secrets:
   adminPassword:
