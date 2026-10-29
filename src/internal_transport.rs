@@ -38,6 +38,15 @@ use crate::{
 const INTERNAL_ALPN: &[u8] = b"multidb-internal/1";
 const FRAME_LEN_BYTES: usize = 4;
 
+mod frame_budget;
+mod guarded;
+mod peer_identity;
+mod response_budget;
+use frame_budget::{FrameWire, MAX_WIRE_BYTES};
+#[cfg(test)]
+pub(crate) use guarded::PageBudget as TestReadBudget;
+use peer_identity::{PeerIdentities, check_request_sender};
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum InternalRequest {
     HealthPing {
@@ -61,6 +70,7 @@ pub enum InternalResponse {
     ClusterAdmin(ClusterAdminResponse),
     Ap(ApResponse),
     Error(String),
+    ResourceLimit(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -90,6 +100,17 @@ pub enum RaftRequest {
     },
 }
 
+impl RaftRequest {
+    pub(crate) const fn sender(&self) -> NodeId {
+        match self {
+            Self::AppendEntries { from, .. }
+            | Self::Vote { from, .. }
+            | Self::PreVote { from, .. }
+            | Self::InstallSnapshot { from, .. } => *from,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum RaftResponse {
     Accepted { term: u64, payload: Bytes },
@@ -116,11 +137,35 @@ pub enum ClusterAdminResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ApRequest {
-    SendBatch { writes: Vec<VersionedWrite> },
-    ReadVersions { table: String, key: Bytes },
-    ReadRecords { version_keys: Vec<Bytes> },
+    SendBatch {
+        writes: Vec<VersionedWrite>,
+    },
+    ReadVersions {
+        table: String,
+        key: Bytes,
+    },
+    ReadRecords {
+        version_keys: Vec<Bytes>,
+    },
     ReadAllVersions,
-    ReadMerkle { prefix: Bytes, limit: usize },
+    ReadMerkle {
+        prefix: Bytes,
+        limit: usize,
+    },
+    ReadRangePage {
+        table: String,
+        start: Bytes,
+        end: Bytes,
+        limit: usize,
+    },
+    ReadRangePageGuarded {
+        table: String,
+        start: Bytes,
+        end: Bytes,
+        limit: usize,
+        max_wire_bytes: usize,
+        max_decoded_bytes: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -133,6 +178,8 @@ pub enum ApResponse {
 
 #[derive(thiserror::Error, Debug)]
 pub enum InternalTransportError {
+    #[error("read budget: {0}")]
+    Budget(#[from] crate::storage::StorageError),
     #[error("io: {0}")]
     Io(#[from] io::Error),
 
@@ -165,6 +212,7 @@ pub struct InternalTransportClient {
     peers: Arc<BTreeMap<NodeId, String>>,
     flow: Arc<Mutex<BTreeMap<NodeId, Inflight>>>,
     client_tls: Option<Arc<ClientConfig>>,
+    identities: Option<Arc<PeerIdentities>>,
 }
 
 pub struct TcpApTransport {
@@ -172,6 +220,12 @@ pub struct TcpApTransport {
 }
 
 pub struct InternalTransportServer;
+
+#[derive(Clone)]
+struct ServerSecurity {
+    acceptor: TlsAcceptor,
+    identities: Arc<PeerIdentities>,
+}
 
 pub trait InternalRaftEndpoint: Send + Sync {
     /// Handles one mounted Raft protocol RPC.
@@ -209,6 +263,12 @@ impl InternalTransportClient {
         config: InternalTransportConfig,
         peers: BTreeMap<NodeId, String>,
     ) -> Result<Self, InternalTransportError> {
+        let identities = load_identities(&config)?;
+        if let Some(identities) = &identities {
+            for node in peers.keys() {
+                identities.server_name(*node)?;
+            }
+        }
         let client_tls = match &config.security {
             InternalTransportSecurity::Mtls(tls) => Some(Arc::new(client_config(tls)?)),
             #[cfg(any(test, feature = "insecure-transport"))]
@@ -219,6 +279,7 @@ impl InternalTransportClient {
             peers: Arc::new(peers),
             flow: Arc::new(Mutex::new(BTreeMap::new())),
             client_tls,
+            identities,
         })
     }
 
@@ -266,6 +327,9 @@ impl InternalTransportClient {
             .get(&target)
             .cloned()
             .ok_or(InternalTransportError::MissingPeer(target))?;
+        if let Some(identities) = &self.identities {
+            check_request_sender(&request, identities.local_node)?;
+        }
         let bytes = encode_frame(&request, self.config.max_frame_bytes)?;
         let _reservation = self.reserve(target, bytes.len())?;
         let connect_timeout = Duration::from_millis(self.config.connect_timeout_ms.max(1));
@@ -281,7 +345,7 @@ impl InternalTransportClient {
                     )
                 })??;
             socket.set_nodelay(true)?;
-            let mut stream = self.client_stream(socket).await?;
+            let mut stream = self.client_stream(socket, target).await?;
             write_encoded_frame(&mut stream, &bytes).await?;
             let response = read_frame::<_, InternalResponse>(
                 &mut stream,
@@ -289,8 +353,19 @@ impl InternalTransportClient {
                 self.config.idle_timeout_ms,
             )
             .await?;
+            if self.identities.is_some()
+                && let InternalResponse::HealthPong { node } = &response
+                && *node != target
+            {
+                return Err(InternalTransportError::Tls(
+                    "health response node does not match the authenticated peer".to_owned(),
+                ));
+            }
             match response {
                 InternalResponse::Error(error) => Err(InternalTransportError::Remote(error)),
+                InternalResponse::ResourceLimit(error) => Err(InternalTransportError::Budget(
+                    crate::storage::StorageError::ResourceLimit(error),
+                )),
                 other => Ok(other),
             }
         })
@@ -306,19 +381,19 @@ impl InternalTransportClient {
     async fn client_stream(
         &self,
         socket: TcpStream,
+        target: NodeId,
     ) -> Result<MaybeTlsStream, InternalTransportError> {
         match &self.config.security {
-            InternalTransportSecurity::Mtls(tls) => {
+            InternalTransportSecurity::Mtls(_) => {
                 let Some(config) = &self.client_tls else {
                     return Err(InternalTransportError::Tls(
                         "mTLS client config is unavailable".to_owned(),
                     ));
                 };
-                let server_name = tls
-                    .server_name
-                    .clone()
-                    .try_into()
-                    .map_err(|error| InternalTransportError::Tls(format!("{error:?}")))?;
+                let identities = self.identities.as_ref().ok_or_else(|| {
+                    InternalTransportError::Tls("mTLS peer identities are unavailable".to_owned())
+                })?;
+                let server_name = identities.server_name(target)?;
                 let connector = TlsConnector::from(Arc::clone(config));
                 let stream = tokio::time::timeout(
                     Duration::from_millis(self.config.handshake_timeout_ms.max(1)),
@@ -332,6 +407,11 @@ impl InternalTransportClient {
                     ))
                 })?
                 .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
+                identities.authenticate(
+                    stream.get_ref().1.peer_certificates(),
+                    stream.get_ref().1.alpn_protocol(),
+                    Some(target),
+                )?;
                 Ok(MaybeTlsStream::Tls(Box::new(TlsStream::Client(stream))))
             }
             #[cfg(any(test, feature = "insecure-transport"))]
@@ -406,6 +486,109 @@ impl TcpApTransport {
 }
 
 impl ApTransport for TcpApTransport {
+    fn supports_guarded_range_pages(&self) -> bool {
+        true
+    }
+
+    fn send_batch_guarded(
+        &self,
+        target: NodeId,
+        writes: &[VersionedWrite],
+        budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let cost = writes.iter().fold(512_usize, |sum, write| {
+            sum.saturating_add(
+                std::mem::size_of::<VersionedWrite>()
+                    .saturating_mul(2)
+                    .saturating_add(write.table.len().saturating_mul(2))
+                    .saturating_add(write.key.len().saturating_mul(2))
+                    .saturating_add(
+                        write
+                            .version
+                            .value
+                            .as_ref()
+                            .map_or(0, Vec::len)
+                            .saturating_mul(2),
+                    )
+                    .saturating_add(write.version.clock.entries().len().saturating_mul(1_024)),
+            )
+        });
+        let _request = budget.reserve(cost)?;
+        let response = self
+            .client
+            .request_guarded(
+                target,
+                InternalRequest::Ap(ApRequest::SendBatch {
+                    writes: writes.to_vec(),
+                }),
+                budget,
+            )
+            .map_err(guarded::into_repl)?;
+        match response.response {
+            InternalResponse::Ap(ApResponse::Ack) => Ok(()),
+            other => Err(ReplError::Transport(format!(
+                "unexpected guarded AP repair response {other:?}"
+            ))),
+        }
+    }
+
+    fn read_range_page_guarded(
+        &self,
+        target: NodeId,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<crate::repl::ap::GuardedApPage, ReplError> {
+        budget.check()?;
+        let _request = budget.reserve(
+            table
+                .len()
+                .saturating_add(start.len())
+                .saturating_add(end.len())
+                .saturating_mul(2)
+                .saturating_add(512),
+        )?;
+        let remaining = budget.remaining_bytes();
+        let response = self
+            .client
+            .request_guarded(
+                target,
+                InternalRequest::Ap(ApRequest::ReadRangePageGuarded {
+                    table: table.to_owned(),
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                    limit,
+                    max_wire_bytes: remaining.min(
+                        self.client
+                            .config
+                            .max_frame_bytes
+                            .clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES),
+                    ),
+                    max_decoded_bytes: remaining.min(frame_budget::MAX_DECODED_BYTES),
+                }),
+                budget,
+            )
+            .map_err(guarded::into_repl)?;
+        match response.response {
+            InternalResponse::Ap(ApResponse::Records(records)) => {
+                Ok(crate::repl::ap::GuardedApPage {
+                    records,
+                    reservation: response.reservation,
+                })
+            }
+            other => Err(ReplError::Transport(format!(
+                "unexpected guarded AP response {other:?}"
+            ))),
+        }
+    }
+
+    fn supports_range_pages(&self) -> bool {
+        true
+    }
+
     fn send_batch(&self, target: NodeId, writes: &[VersionedWrite]) -> Result<(), ReplError> {
         match self.ap_request(
             target,
@@ -490,6 +673,30 @@ impl ApTransport for TcpApTransport {
             ))),
         }
     }
+
+    fn read_range_page(
+        &self,
+        target: NodeId,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<VersionedRecord>, ReplError> {
+        match self.ap_request(
+            target,
+            ApRequest::ReadRangePage {
+                table: table.to_owned(),
+                start: start.to_vec(),
+                end: end.to_vec(),
+                limit,
+            },
+        )? {
+            ApResponse::Records(records) => Ok(records),
+            other => Err(ReplError::Transport(format!(
+                "unexpected AP range response {other:?}"
+            ))),
+        }
+    }
 }
 
 impl InternalTransportServer {
@@ -547,8 +754,15 @@ impl InternalTransportServer {
     where
         F: Future<Output = ()>,
     {
-        let acceptor = match &config.security {
-            InternalTransportSecurity::Mtls(tls) => Some(tls_acceptor(tls)?),
+        let security = match &config.security {
+            InternalTransportSecurity::Mtls(tls) => {
+                let identities = Arc::new(PeerIdentities::load(tls)?);
+                identities.check_local(local_node)?;
+                Some(ServerSecurity {
+                    acceptor: tls_acceptor(tls)?,
+                    identities,
+                })
+            }
             #[cfg(any(test, feature = "insecure-transport"))]
             InternalTransportSecurity::PlaintextForTests => None,
         };
@@ -567,14 +781,14 @@ impl InternalTransportServer {
                     let endpoint = Arc::clone(&endpoint);
                     let raft_endpoint = raft_endpoint.clone();
                     let config = config.clone();
-                    let acceptor = acceptor.clone();
+                    let security = security.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(error) = handle_connection(
                             socket,
                             peer,
                             config,
-                            acceptor,
+                            security,
                             local_node,
                             endpoint,
                             raft_endpoint,
@@ -656,16 +870,16 @@ async fn handle_connection(
     socket: TcpStream,
     peer: SocketAddr,
     config: InternalTransportConfig,
-    acceptor: Option<TlsAcceptor>,
+    security: Option<ServerSecurity>,
     local_node: NodeId,
     endpoint: Arc<dyn ApReplicaEndpoint>,
     raft_endpoint: Option<Arc<dyn InternalRaftEndpoint>>,
 ) -> Result<(), InternalTransportError> {
-    let mut stream = match acceptor {
-        Some(acceptor) => {
+    let (mut stream, authenticated_peer) = match security {
+        Some(security) => {
             let tls = tokio::time::timeout(
                 Duration::from_millis(config.handshake_timeout_ms.max(1)),
-                acceptor.accept(socket),
+                security.acceptor.accept(socket),
             )
             .await
             .map_err(|_| {
@@ -675,9 +889,17 @@ async fn handle_connection(
                 ))
             })?
             .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
-            MaybeTlsStream::Tls(Box::new(TlsStream::Server(tls)))
+            let peer_node = security.identities.authenticate(
+                tls.get_ref().1.peer_certificates(),
+                tls.get_ref().1.alpn_protocol(),
+                None,
+            )?;
+            (
+                MaybeTlsStream::Tls(Box::new(TlsStream::Server(tls))),
+                Some(peer_node),
+            )
         }
-        None => MaybeTlsStream::Plain(socket),
+        None => (MaybeTlsStream::Plain(socket), None),
     };
 
     let request = read_frame::<_, InternalRequest>(
@@ -686,15 +908,37 @@ async fn handle_connection(
         config.idle_timeout_ms,
     )
     .await?;
+    if let Some(peer) = authenticated_peer {
+        check_request_sender(&request, peer)?;
+    }
     // Endpoints are synchronous and may block on work that runs on this same runtime (the CP
     // Raft core), so they run on the blocking pool and never occupy the runtime's workers.
     let response = tokio::task::spawn_blocking(move || {
-        handle_request(
-            request,
-            local_node,
-            endpoint.as_ref(),
-            raft_endpoint.as_deref(),
-        )
+        let cap = config
+            .max_frame_bytes
+            .clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES);
+        match request {
+            InternalRequest::Ap(request @ ApRequest::ReadRangePageGuarded { .. }) => {
+                guarded::page_response(
+                    request,
+                    endpoint.as_ref(),
+                    cap,
+                    Duration::from_millis(config.request_timeout_ms.max(1)),
+                )
+            }
+            request => handle_request(
+                request,
+                local_node,
+                endpoint.as_ref(),
+                raft_endpoint.as_deref(),
+                config.max_frame_bytes,
+            )
+            .map(|response| guarded::ServedResponse {
+                response,
+                reservation: None,
+                wire_cap: cap,
+            }),
+        }
     })
     .await
     .unwrap_or_else(|error| {
@@ -702,9 +946,26 @@ async fn handle_connection(
             "internal transport handler failed: {error}"
         )))
     });
-    let response = response.unwrap_or_else(|error| InternalResponse::Error(error.to_string()));
-    write_frame(&mut stream, config.max_frame_bytes, &response).await?;
-    stream.shutdown().await?;
+    let response = response.unwrap_or_else(|error| guarded::ServedResponse {
+        response: match error {
+            ReplError::Storage(crate::storage::StorageError::ResourceLimit(message)) => {
+                InternalResponse::ResourceLimit(message)
+            }
+            other => InternalResponse::Error(other.to_string()),
+        },
+        reservation: None,
+        wire_cap: config
+            .max_frame_bytes
+            .clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES),
+    });
+    let _decoded_reservation = &response.reservation;
+    write_response_and_shutdown(
+        &mut stream,
+        response.wire_cap,
+        config.request_timeout_ms,
+        &response.response,
+    )
+    .await?;
     observability::record_internal_transport_connection("ok");
     tracing::debug!(%peer, "internal transport request served");
     Ok(())
@@ -715,6 +976,7 @@ fn handle_request(
     local_node: NodeId,
     endpoint: &dyn ApReplicaEndpoint,
     raft_endpoint: Option<&dyn InternalRaftEndpoint>,
+    max_frame_bytes: usize,
 ) -> Result<InternalResponse, ReplError> {
     match request {
         InternalRequest::HealthPing { .. } => Ok(InternalResponse::HealthPong { node: local_node }),
@@ -736,15 +998,19 @@ fn handle_request(
             })?
             .handle_cluster_admin(request)
             .map(InternalResponse::ClusterAdmin),
-        InternalRequest::Ap(request) => {
-            handle_ap_request(request, endpoint).map(InternalResponse::Ap)
-        }
+        InternalRequest::Ap(request) => handle_ap_request(
+            request,
+            endpoint,
+            max_frame_bytes.clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES),
+        )
+        .map(InternalResponse::Ap),
     }
 }
 
 fn handle_ap_request(
     request: ApRequest,
     endpoint: &dyn ApReplicaEndpoint,
+    max_frame_bytes: usize,
 ) -> Result<ApResponse, ReplError> {
     match request {
         ApRequest::SendBatch { writes } => {
@@ -754,13 +1020,27 @@ fn handle_ap_request(
         ApRequest::ReadVersions { table, key } => endpoint
             .read_versions(&table, &key)
             .map(ApResponse::Versions),
-        ApRequest::ReadAllVersions => endpoint.read_all_versions().map(ApResponse::Records),
+        ApRequest::ReadAllVersions => {
+            response_budget::records(endpoint, max_frame_bytes).map(ApResponse::Records)
+        }
         ApRequest::ReadRecords { version_keys } => endpoint
             .read_records_by_version_keys(&version_keys)
             .map(ApResponse::Records),
-        ApRequest::ReadMerkle { prefix, limit } => endpoint
-            .read_merkle_range(&prefix, limit)
-            .map(ApResponse::Merkle),
+        ApRequest::ReadMerkle { prefix, limit } => {
+            response_budget::merkle(endpoint, &prefix, limit, max_frame_bytes)
+                .map(ApResponse::Merkle)
+        }
+        ApRequest::ReadRangePage {
+            table,
+            start,
+            end,
+            limit,
+        } => endpoint
+            .read_range_page(&table, &start, &end, limit)
+            .map(ApResponse::Records),
+        ApRequest::ReadRangePageGuarded { .. } => Err(ReplError::Rejected(
+            "guarded AP pages require the budgeted dispatcher".to_owned(),
+        )),
     }
 }
 
@@ -771,28 +1051,62 @@ async fn read_frame<S, T>(
 ) -> Result<T, InternalTransportError>
 where
     S: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: DeserializeOwned + FrameWire,
 {
     tokio::time::timeout(Duration::from_millis(idle_timeout_ms.max(1)), async {
         let len = stream.read_u32().await?;
         let len = usize::try_from(len).map_err(|error| {
             InternalTransportError::Codec(format!("invalid frame length: {error}"))
         })?;
-        if len > max_frame_bytes.max(FRAME_LEN_BYTES) {
+        let limit = max_frame_bytes.clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES);
+        if len > limit {
             return Err(InternalTransportError::Codec(format!(
-                "frame length {len} exceeds limit {max_frame_bytes}"
+                "frame length {len} exceeds limit {limit}"
             )));
         }
         let mut bytes = vec![0; len];
         stream.read_exact(&mut bytes).await?;
-        postcard::from_bytes(&bytes)
-            .map_err(|error| InternalTransportError::Codec(error.to_string()))
+        T::preflight(&bytes)?;
+        let (value, trailing) = postcard::take_from_bytes(&bytes)
+            .map_err(|error| InternalTransportError::Codec(error.to_string()))?;
+        if !trailing.is_empty() {
+            return Err(InternalTransportError::Codec(
+                "trailing bytes in internal frame".to_owned(),
+            ));
+        }
+        Ok(value)
     })
     .await
     .map_err(|_| {
         InternalTransportError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
             "internal transport idle timeout",
+        ))
+    })?
+}
+
+async fn write_response_and_shutdown<S, T>(
+    stream: &mut S,
+    max_frame_bytes: usize,
+    timeout_ms: u64,
+    value: &T,
+) -> Result<(), InternalTransportError>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    // Bound response I/O while keeping the connection permit alive. A blocking
+    // endpoint is awaited separately: dropping its JoinHandle cannot cancel it.
+    tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), async {
+        write_frame(stream, max_frame_bytes, value).await?;
+        stream.shutdown().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        InternalTransportError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "internal transport response write/shutdown timed out",
         ))
     })?
 }
@@ -826,23 +1140,71 @@ fn encode_frame<T>(value: &T, max_frame_bytes: usize) -> Result<Vec<u8>, Interna
 where
     T: Serialize,
 {
-    let bytes = postcard::to_allocvec(value)
-        .map_err(|error| InternalTransportError::Codec(error.to_string()))?;
-    if bytes.len() > max_frame_bytes.max(FRAME_LEN_BYTES) {
-        return Err(InternalTransportError::Codec(format!(
-            "encoded frame length {} exceeds limit {}",
-            bytes.len(),
-            max_frame_bytes
-        )));
+    let limit = max_frame_bytes.clamp(FRAME_LEN_BYTES, MAX_WIRE_BYTES);
+    response_budget::encode(value, limit)
+}
+
+fn load_identities(
+    config: &InternalTransportConfig,
+) -> Result<Option<Arc<PeerIdentities>>, InternalTransportError> {
+    match &config.security {
+        InternalTransportSecurity::Mtls(tls) => {
+            PeerIdentities::load(tls).map(|identities| Some(Arc::new(identities)))
+        }
+        #[cfg(any(test, feature = "insecure-transport"))]
+        InternalTransportSecurity::PlaintextForTests => Ok(None),
     }
-    Ok(bytes)
+}
+
+/// Validate TLS files synchronously, before a cluster constructor returns success.
+pub(crate) fn validate_node_config(
+    config: &InternalTransportConfig,
+    node: NodeId,
+) -> Result<(), InternalTransportError> {
+    if let Some(identities) = load_identities(config)? {
+        identities.check_local(node)?;
+    }
+    match &config.security {
+        InternalTransportSecurity::Mtls(tls) => {
+            tls_acceptor(tls)?;
+            client_config(tls)?;
+        }
+        #[cfg(any(test, feature = "insecure-transport"))]
+        InternalTransportSecurity::PlaintextForTests => {}
+    }
+    Ok(())
+}
+
+fn load_crls(
+    config: &InternalTlsConfig,
+) -> Result<Vec<rustls_pki_types::CertificateRevocationListDer<'static>>, InternalTransportError> {
+    let mut crls = Vec::new();
+    for path in &config.crl_paths {
+        let bytes = std::fs::read(path)?;
+        let parsed = rustls_pki_types::CertificateRevocationListDer::pem_slice_iter(&bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
+        if parsed.is_empty() {
+            return Err(InternalTransportError::Tls(format!(
+                "CRL file {} is empty",
+                path.display()
+            )));
+        }
+        crls.extend(parsed);
+    }
+    Ok(crls)
 }
 
 fn tls_acceptor(config: &InternalTlsConfig) -> Result<TlsAcceptor, InternalTransportError> {
     let roots = load_root_store(&config.ca_cert_path)?;
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
+    let verifier = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(ring::default_provider()),
+    )
+    .with_crls(load_crls(config)?)
+    .enforce_revocation_expiration()
+    .build()
+    .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
     let mut config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|error| InternalTransportError::Tls(error.to_string()))?
@@ -853,14 +1215,24 @@ fn tls_acceptor(config: &InternalTlsConfig) -> Result<TlsAcceptor, InternalTrans
         )
         .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
     config.alpn_protocols = vec![INTERNAL_ALPN.to_vec()];
+    config.max_early_data_size = 0;
+    // Do not resume sessions across admission or CRL changes. Every connection
+    // proves possession of the currently admitted certificate.
+    config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 fn client_config(config: &InternalTlsConfig) -> Result<ClientConfig, InternalTransportError> {
     let roots = load_root_store(&config.ca_cert_path)?;
-    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
+    let verifier = WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(ring::default_provider()),
+    )
+    .with_crls(load_crls(config)?)
+    .enforce_revocation_expiration()
+    .build()
+    .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
     let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|error| InternalTransportError::Tls(error.to_string()))?
@@ -871,6 +1243,8 @@ fn client_config(config: &InternalTlsConfig) -> Result<ClientConfig, InternalTra
         )
         .map_err(|error| InternalTransportError::Tls(error.to_string()))?;
     config.alpn_protocols = vec![INTERNAL_ALPN.to_vec()];
+    config.enable_early_data = false;
+    config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     Ok(config)
 }
 
@@ -941,8 +1315,8 @@ mod tests {
     };
 
     #[derive(Default)]
-    struct FakeApEndpoint {
-        writes: Mutex<Vec<VersionedWrite>>,
+    pub(super) struct FakeApEndpoint {
+        pub(super) writes: Mutex<Vec<VersionedWrite>>,
     }
 
     impl ApReplicaEndpoint for FakeApEndpoint {
@@ -1048,6 +1422,22 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn frame_decoder_rejects_trailing_payload_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use tokio::io::AsyncWriteExt;
+        let (mut sender, mut receiver) = tokio::io::duplex(128);
+        let mut bytes = encode_frame(&InternalRequest::HealthPing { from: 1 }, 64)?;
+        bytes.push(0);
+        sender.write_u32(u32::try_from(bytes.len())?).await?;
+        sender.write_all(&bytes).await?;
+        assert!(matches!(
+            super::read_frame::<_, InternalRequest>(&mut receiver, 64, 1000).await,
+            Err(super::InternalTransportError::Codec(message)) if message.contains("trailing")
+        ));
+        Ok(())
+    }
+
     #[test]
     fn unmounted_raft_and_admin_rpcs_fail_closed() {
         let endpoint = FakeApEndpoint::default();
@@ -1060,6 +1450,7 @@ mod tests {
             1,
             &endpoint,
             None,
+            4096,
         );
         assert!(matches!(raft, Err(ReplError::Unsupported(_))));
 
@@ -1075,14 +1466,25 @@ mod tests {
             1,
             &endpoint,
             None,
+            4096,
         );
         assert!(matches!(admin, Err(ReplError::Unsupported(_))));
 
-        let health =
-            match handle_request(InternalRequest::HealthPing { from: 2 }, 1, &endpoint, None) {
-                Ok(response) => response,
-                Err(error) => panic!("health remains mounted: {error}"),
-            };
+        let health = match handle_request(
+            InternalRequest::HealthPing { from: 2 },
+            1,
+            &endpoint,
+            None,
+            4096,
+        ) {
+            Ok(response) => response,
+            Err(error) => panic!("health remains mounted: {error}"),
+        };
         assert_eq!(health, InternalResponse::HealthPong { node: 1 });
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;
+#[cfg(test)]
+mod process_smoke;

@@ -30,7 +30,7 @@ jobs:
           toolchain: nightly
       - name: Fuzz smoke
         shell: pwsh
-        run: ./scripts/fuzz-smoke.ps1
+        run: ./scripts/fuzz-smoke.ps1 -Required
       - name: Performance gate self-test
         shell: pwsh
         run: ./scripts/perf_gate.ps1 -SelfTest

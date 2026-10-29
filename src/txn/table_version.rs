@@ -2,24 +2,23 @@
 //! keyspace; it is committed with its data and reconstructed by commit replay.
 
 use crate::{
-    repl::{ReadConsistency, ReplError, Replication},
+    storage::{ReadTransaction, StorageError},
     txn::{TxnId, decode_txn_id, table_is_reserved},
 };
 
 pub const TABLE_DATA_VERSION_TABLE: &str = "__txn_table_data_versions";
 
-pub(crate) fn read_table_data_version<R: Replication + ?Sized>(
-    repl: &R,
+pub(crate) fn read_table_data_version_from(
+    read: &impl ReadTransaction,
     table: &str,
-) -> Result<Option<TxnId>, ReplError> {
+) -> Result<Option<TxnId>, StorageError> {
     if table_is_reserved(table) {
         return Ok(None);
     }
-    let version = repl.read(
-        TABLE_DATA_VERSION_TABLE,
-        table.as_bytes(),
-        ReadConsistency::Strong,
-    )?;
+    if crate::repl::dist_txn::locks::has_range_locks(read, table, &[], &[])? {
+        return Ok(None);
+    }
+    let version = read.get(TABLE_DATA_VERSION_TABLE, table.as_bytes())?;
     // Databases created before tokens were introduced have version zero until
     // their first write under the token-aware commit path.
     Ok(Some(

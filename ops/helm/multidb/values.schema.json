@@ -1,0 +1,1578 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "const": 1
+    },
+    "nameOverride": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 63,
+      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 63,
+      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 0,
+          "pattern": "^$|^sha256:[a-f0-9]{64}$"
+        },
+        "pullPolicy": {
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      },
+      "required": [
+        "repository",
+        "tag",
+        "digest",
+        "pullPolicy"
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer"
+          ]
+        },
+        "pgwirePort": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535
+        },
+        "adminPort": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "type",
+        "pgwirePort",
+        "adminPort"
+      ]
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "production",
+            "local-dev"
+          ]
+        },
+        "dbPath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/var/lib/multidb/[A-Za-z0-9._/-]+$"
+        },
+        "studioDir": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/[A-Za-z0-9._/-]+$"
+        },
+        "adminBind": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^0[.]0[.]0[.]0:[0-9]+$"
+        },
+        "pgBind": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^0[.]0[.]0[.]0:[0-9]+$"
+        },
+        "pgUser": {
+          "type": "string",
+          "minLength": 1
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600
+        },
+        "preStopDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "allowVolatile": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "dbPath",
+        "studioDir",
+        "adminBind",
+        "pgBind",
+        "pgUser",
+        "terminationGracePeriodSeconds",
+        "preStopDelaySeconds",
+        "allowVolatile"
+      ]
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adminPassword": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "required": [
+            "name",
+            "key"
+          ]
+        },
+        "adminToken": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "required": [
+            "name",
+            "key"
+          ]
+        },
+        "pgPassword": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "required": [
+            "name",
+            "key"
+          ]
+        },
+        "pgTls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            },
+            "certKey": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "privateKey": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "mountPath": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^/[A-Za-z0-9._/-]+$"
+            }
+          },
+          "required": [
+            "name",
+            "certKey",
+            "privateKey",
+            "mountPath"
+          ]
+        }
+      },
+      "required": [
+        "adminPassword",
+        "adminToken",
+        "pgPassword",
+        "pgTls"
+      ]
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "devEmptyDir": {
+          "type": "boolean"
+        },
+        "existingClaim": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+        },
+        "storageClassName": {
+          "type": "string",
+          "minLength": 0
+        },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "enum": [
+              "ReadWriteOnce",
+              "ReadWriteOncePod"
+            ]
+          }
+        },
+        "size": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+        },
+        "retainOnDelete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "devEmptyDir",
+        "existingClaim",
+        "storageClassName",
+        "accessModes",
+        "size",
+        "retainOnDelete"
+      ]
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "replication": {
+          "enum": [
+            "",
+            "cp",
+            "ap"
+          ]
+        },
+        "auditJsonlPath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/[A-Za-z0-9._/-]+$"
+        },
+        "backupTarget": {
+          "type": "string",
+          "minLength": 1
+        },
+        "minioEndpoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vaultAddress": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vaultKekPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maxConcurrentQueries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "queryQueueTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "historyRetainLsns": {
+          "type": "string",
+          "minLength": 0,
+          "pattern": "^$|^[1-9][0-9]*$"
+        }
+      },
+      "required": [
+        "profile",
+        "replication",
+        "auditJsonlPath",
+        "backupTarget",
+        "minioEndpoint",
+        "vaultAddress",
+        "vaultKekPath",
+        "maxConcurrentQueries",
+        "queryQueueTimeoutMs",
+        "historyRetainLsns"
+      ]
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "configMap": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
+        },
+        "mountPath": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/[A-Za-z0-9._/-]+$"
+        },
+        "apply": {
+          "enum": [
+            "verify",
+            "create",
+            "additive"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "configMap",
+        "key",
+        "mountPath",
+        "apply"
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+            },
+            "memory": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+            },
+            "ephemeral-storage": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+            }
+          },
+          "required": [
+            "cpu",
+            "memory"
+          ],
+          "patternProperties": {
+            "^[a-z0-9.-]+/[A-Za-z0-9_.-]+$": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]*$"
+                }
+              ]
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+            },
+            "memory": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+            },
+            "ephemeral-storage": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)(m|Ki|Mi|Gi|Ti|K|M|G|T)?$"
+            }
+          },
+          "required": [
+            "cpu",
+            "memory"
+          ],
+          "patternProperties": {
+            "^[a-z0-9.-]+/[A-Za-z0-9_.-]+$": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]*$"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "required": [
+        "requests",
+        "limits"
+      ]
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "readinessPath": {
+          "const": "/ready"
+        },
+        "livenessPath": {
+          "const": "/health"
+        },
+        "initialDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        },
+        "startupPeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "startupFailureThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "readinessFailureThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "livenessFailureThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        }
+      },
+      "required": [
+        "readinessPath",
+        "livenessPath",
+        "initialDelaySeconds",
+        "periodSeconds",
+        "timeoutSeconds",
+        "startupPeriodSeconds",
+        "startupFailureThreshold",
+        "readinessFailureThreshold",
+        "livenessFailureThreshold"
+      ]
+    },
+    "pdb": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "clientPeers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "namespaceSelector": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "matchLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "matchExpressions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "operator": {
+                          "enum": [
+                            "In",
+                            "NotIn",
+                            "Exists",
+                            "DoesNotExist"
+                          ]
+                        },
+                        "values": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "operator"
+                      ]
+                    }
+                  }
+                },
+                "required": []
+              },
+              "podSelector": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "matchLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "matchExpressions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "operator": {
+                          "enum": [
+                            "In",
+                            "NotIn",
+                            "Exists",
+                            "DoesNotExist"
+                          ]
+                        },
+                        "values": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "operator"
+                      ]
+                    }
+                  }
+                },
+                "required": []
+              },
+              "ipBlock": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "cidr": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "except": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                },
+                "required": [
+                  "cidr"
+                ]
+              }
+            },
+            "required": [],
+            "minProperties": 1,
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "ipBlock"
+                  ]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "namespaceSelector"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "podSelector"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "proxyPeers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "namespaceSelector": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "matchLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "matchExpressions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "operator": {
+                          "enum": [
+                            "In",
+                            "NotIn",
+                            "Exists",
+                            "DoesNotExist"
+                          ]
+                        },
+                        "values": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "operator"
+                      ]
+                    }
+                  }
+                },
+                "required": []
+              },
+              "podSelector": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "matchLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "matchExpressions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "operator": {
+                          "enum": [
+                            "In",
+                            "NotIn",
+                            "Exists",
+                            "DoesNotExist"
+                          ]
+                        },
+                        "values": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "operator"
+                      ]
+                    }
+                  }
+                },
+                "required": []
+              },
+              "ipBlock": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "cidr": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "except": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                },
+                "required": [
+                  "cidr"
+                ]
+              }
+            },
+            "required": [],
+            "minProperties": 1,
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "ipBlock"
+                  ]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "namespaceSelector"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "podSelector"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "metricsPeers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "namespaceSelector": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "matchLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "matchExpressions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "operator": {
+                          "enum": [
+                            "In",
+                            "NotIn",
+                            "Exists",
+                            "DoesNotExist"
+                          ]
+                        },
+                        "values": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "operator"
+                      ]
+                    }
+                  }
+                },
+                "required": []
+              },
+              "podSelector": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "matchLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "matchExpressions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "operator": {
+                          "enum": [
+                            "In",
+                            "NotIn",
+                            "Exists",
+                            "DoesNotExist"
+                          ]
+                        },
+                        "values": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "key",
+                        "operator"
+                      ]
+                    }
+                  }
+                },
+                "required": []
+              },
+              "ipBlock": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "cidr": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "except": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                },
+                "required": [
+                  "cidr"
+                ]
+              }
+            },
+            "required": [],
+            "minProperties": 1,
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "ipBlock"
+                  ]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "namespaceSelector"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "podSelector"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "egress": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "to": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "namespaceSelector": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "matchLabels": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "string"
+                          }
+                        },
+                        "matchExpressions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "key": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "operator": {
+                                "enum": [
+                                  "In",
+                                  "NotIn",
+                                  "Exists",
+                                  "DoesNotExist"
+                                ]
+                              },
+                              "values": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "operator"
+                            ]
+                          }
+                        }
+                      },
+                      "required": []
+                    },
+                    "podSelector": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "matchLabels": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "string"
+                          }
+                        },
+                        "matchExpressions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "key": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "operator": {
+                                "enum": [
+                                  "In",
+                                  "NotIn",
+                                  "Exists",
+                                  "DoesNotExist"
+                                ]
+                              },
+                              "values": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "operator"
+                            ]
+                          }
+                        }
+                      },
+                      "required": []
+                    },
+                    "ipBlock": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cidr": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "except": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "required": [
+                        "cidr"
+                      ]
+                    }
+                  },
+                  "required": [],
+                  "minProperties": 1,
+                  "allOf": [
+                    {
+                      "if": {
+                        "required": [
+                          "ipBlock"
+                        ]
+                      },
+                      "then": {
+                        "not": {
+                          "anyOf": [
+                            {
+                              "required": [
+                                "namespaceSelector"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "podSelector"
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "ports": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "protocol": {
+                      "enum": [
+                        "TCP",
+                        "UDP",
+                        "SCTP"
+                      ]
+                    },
+                    "port": {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 65535
+                        },
+                        {
+                          "type": "string",
+                          "minLength": 1,
+                          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+                        }
+                      ]
+                    },
+                    "endPort": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535
+                    }
+                  },
+                  "required": []
+                }
+              }
+            },
+            "required": []
+          }
+        }
+      },
+      "required": [
+        "enabled",
+        "clientPeers",
+        "proxyPeers",
+        "metricsPeers",
+        "egress"
+      ]
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string",
+          "minLength": 0
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9*][A-Za-z0-9.*-]*$"
+          }
+        },
+        "tls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "secretName": {
+                "type": "string",
+                "minLength": 1
+              },
+              "hosts": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "secretName",
+              "hosts"
+            ]
+          }
+        },
+        "principalHeaderTrustAcknowledged": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "className",
+        "annotations",
+        "hosts",
+        "tls",
+        "principalHeaderTrustAcknowledged"
+      ]
+    },
+    "monitoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "interval": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[1-9][0-9]*(ms|s|m|h)$"
+            },
+            "scrapeTimeout": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[1-9][0-9]*(ms|s|m|h)$"
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "enabled",
+            "interval",
+            "scrapeTimeout",
+            "labels"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "serviceMonitor"
+      ]
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "affinity": {
+      "type": "object"
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "topologySpreadConstraints": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    "runtimeClassName": {
+      "type": "string",
+      "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+    },
+    "supplementalGroups": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2147483647
+      }
+    },
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "vendor": {
+          "enum": [
+            "",
+            "nvidia",
+            "amd",
+            "intel"
+          ]
+        },
+        "resourceName": {
+          "type": "string",
+          "pattern": "^$|^[a-z0-9.-]+/[A-Za-z0-9_.-]+$"
+        }
+      },
+      "required": [
+        "enabled",
+        "vendor",
+        "resourceName"
+      ]
+    },
+    "encryption": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "secretName": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "mountPath": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9._/-]+$"
+        }
+      },
+      "required": [
+        "enabled",
+        "secretName",
+        "key",
+        "mountPath"
+      ]
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "secretName": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "mountPath": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9._/-]+$"
+        },
+        "anchorPath": {
+          "type": "string",
+          "pattern": "^/var/lib/multidb/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"
+        }
+      },
+      "required": [
+        "enabled",
+        "secretName",
+        "key",
+        "mountPath",
+        "anchorPath"
+      ]
+    }
+  },
+  "required": [
+    "replicaCount",
+    "nameOverride",
+    "fullnameOverride",
+    "image",
+    "service",
+    "runtime",
+    "secrets",
+    "persistence",
+    "config",
+    "spec",
+    "resources",
+    "probes",
+    "pdb",
+    "networkPolicy",
+    "ingress",
+    "monitoring",
+    "podAnnotations",
+    "nodeSelector",
+    "affinity",
+    "tolerations",
+    "topologySpreadConstraints",
+    "imagePullSecrets",
+    "runtimeClassName",
+    "supplementalGroups",
+    "gpu",
+    "encryption",
+    "audit"
+  ],
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "MultiDB single-writer deployment values",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "mode": {
+                "const": "production"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "image": {
+            "properties": {
+              "digest": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^sha256:[a-f0-9]{64}$"
+              }
+            }
+          },
+          "networkPolicy": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "service": {
+            "properties": {
+              "type": {
+                "const": "ClusterIP"
+              }
+            }
+          },
+          "audit": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "mode": {
+                "const": "production"
+              },
+              "allowVolatile": {
+                "const": false
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "persistence": {
+            "properties": {
+              "enabled": {
+                "const": true
+              },
+              "devEmptyDir": {
+                "const": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

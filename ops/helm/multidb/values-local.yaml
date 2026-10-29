@@ -1,0 +1,14 @@
+# Explicit disposable development override; never use for production exposure.
+image:
+  repository: multidb
+  tag: local
+  digest: ""
+runtime:
+  mode: local-dev
+persistence:
+  enabled: false
+  devEmptyDir: true
+pdb:
+  enabled: false
+audit:
+  enabled: false

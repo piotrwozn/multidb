@@ -1,6 +1,6 @@
 //! Native tensor dataset catalog, authorization and execution boundaries.
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
 use super::{
     CatalogEntry, ConfigError, Database, DatabaseRepl, DbError, Profile, catalog_put_op,
@@ -14,8 +14,8 @@ use crate::{
     storage::Bytes,
     tensor::{
         TensorAppendResult, TensorBatch, TensorComputeRequest, TensorComputeResult, TensorDType,
-        TensorData, TensorDataset, TensorDatasetConfig, TensorDatasetInfo, TensorError,
-        TensorExecution, TensorGpuOperation, TensorReadBatch, TensorReadRequest,
+        TensorData, TensorDataset, TensorDatasetConfig, TensorDatasetInfo, TensorDeadline,
+        TensorError, TensorExecution, TensorGpuOperation, TensorReadBatch, TensorReadRequest,
         TensorSearchRequest, TensorSearchResult,
     },
     tensor_gpu::TensorGpuEngine,
@@ -84,7 +84,11 @@ impl Database {
             Some(CatalogEntry::TensorDataset { config }) => {
                 let repl: &dyn Replication = self;
                 Ok(TensorDataset::new(repl, config.clone())?
-                    .with_gpu_required(self.profile() == Profile::Tensor))
+                    .with_gpu_required(self.profile() == Profile::Tensor)
+                    .with_execution_timeout(Duration::from_millis(
+                        self.performance.query.timeout_ms,
+                    ))
+                    .with_memory_limit(self.performance.query.memory_limit_bytes))
             }
             Some(other) => Err(kind_mismatch(name, "tensor dataset", other)),
             None => Err(DbError::MissingCatalogObject(name.to_owned())),
@@ -329,11 +333,16 @@ impl Replication for TensorPolicyReplication<'_> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the bounded read, flush and reduction transaction together so all retained buffers share one budget."
+)]
 fn compute_tensor_rows(
     dataset: &TensorDataset<'_, dyn Replication + '_>,
     request: &TensorComputeRequest,
     gpu: bool,
 ) -> Result<TensorComputeResult, TensorError> {
+    let deadline = dataset.execution_deadline()?;
     request.validate()?;
     let column = dataset
         .config()
@@ -358,13 +367,47 @@ fn compute_tensor_rows(
     // reductions whose aggregate GPU input stays inside the storage-buffer budget.
     let mut rows = Vec::new();
     let mut floats = 0_usize;
+    let max_floats = (dataset.memory_limit() / if gpu { 16 } else { 8 }).min(MAX_GPU_BATCH_FLOATS);
     for index in request.start..end {
-        let mut batch = dataset.read(&TensorReadRequest {
+        deadline.check()?;
+        let read = TensorReadRequest {
             start: index,
             limit: 1,
             columns: Some(vec![request.tensor.clone()]),
             revision: Some(info.revision),
-        })?;
+        };
+        let retained = floats
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(
+                rows.capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<f32>>()),
+            )
+            .saturating_add(values.capacity().saturating_mul(std::mem::size_of::<f32>()));
+        let available = dataset.memory_limit().saturating_sub(retained);
+        let read_result = dataset.read_with_budget(&read, deadline, available);
+        let mut batch = match read_result {
+            Err(TensorError::InvalidValue(_)) if !rows.is_empty() => {
+                // A large ragged successor may fit by itself. Flush the
+                // previous GPU/CPU reduction batch and retry the bounded read.
+                reduce_tensor_rows(
+                    &rows,
+                    request.operation,
+                    engine.as_deref(),
+                    &mut values,
+                    deadline,
+                )?;
+                rows = Vec::new();
+                floats = 0;
+                dataset.read_with_budget(
+                    &read,
+                    deadline,
+                    dataset.memory_limit().saturating_sub(
+                        values.capacity().saturating_mul(std::mem::size_of::<f32>()),
+                    ),
+                )?
+            }
+            result => result?,
+        };
         let tensor = batch
             .tensors
             .remove(&request.tensor)
@@ -372,6 +415,31 @@ fn compute_tensor_rows(
             .ok_or_else(|| {
                 TensorError::Corruption("compute tensor missing from selected row".to_owned())
             })?;
+        let row_elements = match &tensor.data {
+            TensorData::F32(values) => values.len(),
+            TensorData::U8(values) => values.len(),
+            _ => {
+                return Err(TensorError::Corruption(
+                    "compute tensor has another dtype".to_owned(),
+                ));
+            }
+        };
+        if row_elements > max_floats {
+            return Err(TensorError::GpuUnsupported(
+                "one tensor exceeds the configured reduction buffer budget".to_owned(),
+            ));
+        }
+        if rows.len() >= MAX_GPU_BATCH_ROWS || floats.saturating_add(row_elements) > max_floats {
+            reduce_tensor_rows(
+                &rows,
+                request.operation,
+                engine.as_deref(),
+                &mut values,
+                deadline,
+            )?;
+            rows.clear();
+            floats = 0;
+        }
         let row = match tensor.data {
             TensorData::F32(values) => values,
             TensorData::U8(values) => values.into_iter().map(f32::from).collect(),
@@ -381,22 +449,17 @@ fn compute_tensor_rows(
                 ));
             }
         };
-        if row.len() > MAX_GPU_BATCH_FLOATS {
-            return Err(TensorError::GpuUnsupported(
-                "one tensor exceeds the reduction buffer budget".to_owned(),
-            ));
-        }
-        if rows.len() >= MAX_GPU_BATCH_ROWS
-            || floats.saturating_add(row.len()) > MAX_GPU_BATCH_FLOATS
-        {
-            reduce_tensor_rows(&rows, request.operation, engine.as_deref(), &mut values)?;
-            rows.clear();
-            floats = 0;
-        }
         floats += row.len();
         rows.push(row);
     }
-    reduce_tensor_rows(&rows, request.operation, engine.as_deref(), &mut values)?;
+    reduce_tensor_rows(
+        &rows,
+        request.operation,
+        engine.as_deref(),
+        &mut values,
+        deadline,
+    )?;
+    deadline.check()?;
     Ok(TensorComputeResult {
         start: request.start,
         end,
@@ -411,17 +474,35 @@ fn reduce_tensor_rows(
     operation: TensorGpuOperation,
     engine: Option<&TensorGpuEngine>,
     values: &mut Vec<f32>,
+    deadline: TensorDeadline,
 ) -> Result<(), TensorError> {
+    deadline.check()?;
     if rows.is_empty() {
         return Ok(());
     }
     if let Some(engine) = engine {
-        values.extend(engine.reduce_rows(rows, operation)?);
+        values.extend(engine.reduce_rows_until(rows, operation, deadline)?);
         return Ok(());
     }
     for row in rows {
+        deadline.check()?;
+        let mut total = 0.0;
+        for chunk in row.chunks(4096) {
+            deadline.check()?;
+            total += chunk
+                .iter()
+                .map(|value| {
+                    let value = f64::from(*value);
+                    if operation == TensorGpuOperation::L2Norm {
+                        value * value
+                    } else {
+                        value
+                    }
+                })
+                .sum::<f64>();
+        }
         let result = match operation {
-            TensorGpuOperation::Sum => row.iter().map(|value| f64::from(*value)).sum(),
+            TensorGpuOperation::Sum => total,
             TensorGpuOperation::Mean => {
                 if row.is_empty() {
                     return Err(TensorError::InvalidValue(
@@ -430,16 +511,13 @@ fn reduce_tensor_rows(
                 }
                 #[allow(clippy::cast_precision_loss)]
                 let length = row.len() as f64;
-                row.iter().map(|value| f64::from(*value)).sum::<f64>() / length
+                total / length
             }
-            TensorGpuOperation::L2Norm => row
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>()
-                .sqrt(),
+            TensorGpuOperation::L2Norm => total.sqrt(),
         };
         values.push(checked_f32(result)?);
     }
+    deadline.check()?;
     Ok(())
 }
 
@@ -580,6 +658,37 @@ mod tests {
             .append(&rows())?;
         database.set_authz_policy(authz());
         Ok(database)
+    }
+
+    #[test]
+    fn tensor_reads_searches_and_reductions_inherit_the_database_query_deadline() -> TestResult {
+        let mut database = fixture()?;
+        database.performance.query.timeout_ms = 0;
+        assert!(matches!(
+            database.read_tensors_as(&alice(), "samples", &TensorReadRequest::default()),
+            Err(DbError::Tensor(TensorError::Timeout(_)))
+        ));
+        assert!(matches!(
+            database.search_tensors_as(
+                &alice(),
+                "samples",
+                &TensorSearchRequest::new("embedding", vec![1.0, 0.0])
+            ),
+            Err(DbError::Tensor(TensorError::Timeout(_)))
+        ));
+        assert!(matches!(
+            database.compute_tensors_as(&alice(), "samples", &compute(TensorGpuOperation::Sum)),
+            Err(DbError::Tensor(TensorError::Timeout(_)))
+        ));
+        // Reusing the same dataset after a completed operation starts a fresh budget.
+        database.performance.query.timeout_ms = 1_000;
+        assert_eq!(
+            database
+                .read_tensors_as(&alice(), "samples", &TensorReadRequest::new(0, 1))?
+                .end,
+            1
+        );
+        Ok(())
     }
 
     #[test]

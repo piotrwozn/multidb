@@ -1,13 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "text_refresh_race_tests.rs"]
+mod refresh_race_tests;
+
 use crate::{
     cdc::{self, ChangeOp, ChangefeedFilter, ChangefeedOptions, ChangefeedTarget, ResumeToken},
     db::CatalogEntry,
     keyenc,
     model::{
         CollectionId, DOCUMENT_TABLE, DocumentId, FieldPath, Value, decode_value, extract_path,
+        make_document_key,
     },
-    repl::{Op, ReadConsistency, ReplError, Replication, propose_system_batch},
+    repl::{
+        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition,
+        propose_system_batch, propose_system_conditional_batch,
+    },
     storage::{Bytes, StorageError},
 };
 
@@ -168,15 +176,21 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
     /// land during the rebuild.
     /// # Errors
     /// Fails when source documents cannot be read or decoded, or writes fail.
+    /// Concurrent source/index changes return a conflict without advancing the refresh
+    /// frontier. Retry the repair; search suppresses entries that disagree with their source.
     pub fn refresh_full(&self) -> Result<FullTextIndexState, TextError> {
-        let state = self.rebuild_entries()?;
-        propose_system_batch(
+        let metadata = self.repair_metadata_conditions()?;
+        let state = self.rebuild_entries_with_conditions(&metadata)?;
+        propose_system_conditional_batch(
             self.repl,
-            vec![put_json_op(
-                FULL_TEXT_META_TABLE,
-                meta_state_key(&self.config.name),
-                &state,
-            )?],
+            ConditionalBatch::new(
+                metadata,
+                vec![put_json_op(
+                    FULL_TEXT_META_TABLE,
+                    meta_state_key(&self.config.name),
+                    &state,
+                )?],
+            ),
         )?;
         Ok(state)
     }
@@ -186,6 +200,13 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
     /// # Errors
     /// Fails when source documents cannot be read or decoded, or writes fail.
     pub(crate) fn rebuild_entries(&self) -> Result<FullTextIndexState, TextError> {
+        self.rebuild_entries_with_conditions(&self.repair_metadata_conditions()?)
+    }
+
+    fn rebuild_entries_with_conditions(
+        &self,
+        metadata: &[WriteCondition],
+    ) -> Result<FullTextIndexState, TextError> {
         let TextSource::Collection {
             collection_id,
             path,
@@ -197,10 +218,11 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
         } else {
             ResumeToken::default()
         };
-        clear_index_entries(self.repl, &self.config.name)?;
+        clear_index_entries(self.repl, &self.config, metadata)?;
 
         let (mut cursor, end) = keyenc::u32_prefix_range(collection_id.as_u32());
         let mut ops = Vec::new();
+        let mut conditions = metadata.to_vec();
         let mut buffered_docs = 0_usize;
         let mut indexed = 0_usize;
         loop {
@@ -209,14 +231,18 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
                 let Some(id) = document_id_from_key(key) else {
                     continue;
                 };
-                let Some(text) = document_text(value, path)? else {
-                    continue;
-                };
-                append_index_doc_ops(&self.config.name, id, &text, &mut ops)?;
-                indexed += 1;
+                let text = document_text(value, path)?;
+                self.reconcile_document_ops(id, Some(value.clone()), &mut conditions, &mut ops)?;
+                indexed += usize::from(text.is_some());
                 buffered_docs += 1;
                 if buffered_docs >= REFRESH_PAGE_ROWS || ops.len() >= REFRESH_PAGE_OPS {
-                    propose_system_batch(self.repl, std::mem::take(&mut ops))?;
+                    propose_system_conditional_batch(
+                        self.repl,
+                        ConditionalBatch::new(
+                            std::mem::replace(&mut conditions, metadata.to_vec()),
+                            std::mem::take(&mut ops),
+                        ),
+                    )?;
                     buffered_docs = 0;
                 }
             }
@@ -226,7 +252,7 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
             cursor = next;
         }
         if !ops.is_empty() {
-            propose_system_batch(self.repl, ops)?;
+            propose_system_conditional_batch(self.repl, ConditionalBatch::new(conditions, ops))?;
         }
         Ok(FullTextIndexState {
             refreshed_to,
@@ -238,7 +264,8 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
     ///
     /// This is a catch-up/repair tool for raw-key writes that bypass `Database::collection`
     /// handles (stored procedures, raw batches). Changes to the same document within one
-    /// changefeed page are coalesced, so only its final version is indexed.
+    /// changefeed page are coalesced, then reconciled against current source bytes. Source,
+    /// previous index and metadata snapshots are checked in the same conditional commit.
     /// # Errors
     /// Fails when the database uses AP replication (no commit log to replay; use
     /// `refresh_full`), or CDC or storage fails.
@@ -253,18 +280,13 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
                     .to_owned(),
             )));
         }
-        let TextSource::Collection {
-            collection_id,
-            path,
-        } = &self.config.source;
+        let TextSource::Collection { collection_id, .. } = &self.config.source;
         let Some(collection_name) = collection_name_for(catalog, *collection_id) else {
             return self.refresh_full();
         };
 
-        let mut state = self.state()?.unwrap_or(FullTextIndexState {
-            refreshed_to: ResumeToken::default(),
-            indexed_documents: 0,
-        });
+        let mut metadata = self.repair_metadata_conditions()?;
+        let mut state = self.repair_state(&metadata)?;
         let target_lsn = cdc::current_resume_token(self.repl)?.lsn;
         while state.refreshed_to.lsn < target_lsn {
             let filter = ChangefeedFilter {
@@ -283,13 +305,14 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
             }
 
             let mut ops = Vec::new();
-            for (id, value_after) in coalesce_document_changes(events) {
-                remove_existing_doc_ops(self.repl, &self.config.name, id, &mut ops)?;
-                if let Some(value_after) = value_after
-                    && let Some(text) = document_text(&value_after, path)?
-                {
-                    append_index_doc_ops(&self.config.name, id, &text, &mut ops)?;
-                }
+            let mut conditions = metadata.clone();
+            for id in coalesce_document_changes(events).into_keys() {
+                let current = self.repl.read(
+                    DOCUMENT_TABLE,
+                    &make_document_key(*collection_id, id),
+                    ReadConsistency::Strong,
+                )?;
+                self.reconcile_document_ops(id, current, &mut conditions, &mut ops)?;
             }
             state.refreshed_to = next;
             state.indexed_documents = count_indexed_after_ops(self.repl, &self.config.name, &ops)?;
@@ -298,7 +321,9 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
                 meta_state_key(&self.config.name),
                 &state,
             )?);
-            propose_system_batch(self.repl, ops)?;
+            propose_system_conditional_batch(self.repl, ConditionalBatch::new(conditions, ops))?;
+            metadata = self.repair_metadata_conditions()?;
+            state = self.repair_state(&metadata)?;
         }
         Ok(state)
     }
@@ -378,11 +403,113 @@ impl<'repl, R: Replication + ?Sized> FullTextIndex<'repl, R> {
     }
 
     fn read_doc(&self, id: DocumentId) -> Result<Option<IndexedDoc>, TextError> {
-        read_json(
+        let Some(doc) = read_json::<IndexedDoc, _>(
             self.repl,
             FULL_TEXT_DOCS_TABLE,
             &doc_key(&self.config.name, id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let TextSource::Collection {
+            collection_id,
+            path,
+        } = &self.config.source;
+        let source = self.repl.read(
+            DOCUMENT_TABLE,
+            &make_document_key(*collection_id, id),
+            ReadConsistency::Strong,
+        )?;
+        let current = source
+            .as_deref()
+            .map(|bytes| document_text(bytes, path))
+            .transpose()?
+            .flatten();
+        Ok((current.as_deref() == Some(doc.text.as_str())).then_some(doc))
+    }
+
+    fn repair_metadata_conditions(&self) -> Result<Vec<WriteCondition>, TextError> {
+        let mut conditions = Vec::new();
+        for key in [
+            meta_config_key(&self.config.name),
+            meta_state_key(&self.config.name),
+        ] {
+            let expected = self
+                .repl
+                .read(FULL_TEXT_META_TABLE, &key, ReadConsistency::Strong)?;
+            if key == meta_config_key(&self.config.name)
+                && let Some(bytes) = &expected
+            {
+                let config: FullTextIndexConfig = serde_json::from_slice(bytes)
+                    .map_err(|error| TextError::Serde(error.to_string()))?;
+                if config != self.config {
+                    return Err(TextError::InvalidConfig(
+                        "index definition changed; reopen its handle before refreshing".to_owned(),
+                    ));
+                }
+            }
+            conditions.push(WriteCondition::ValueEquals {
+                table: FULL_TEXT_META_TABLE.to_owned(),
+                key,
+                expected,
+            });
+        }
+        Ok(conditions)
+    }
+
+    fn repair_state(&self, conditions: &[WriteCondition]) -> Result<FullTextIndexState, TextError> {
+        let state_key = meta_state_key(&self.config.name);
+        let bytes = conditions.iter().find_map(|condition| match condition {
+            WriteCondition::ValueEquals { key, expected, .. } if key == &state_key => {
+                expected.as_deref()
+            }
+            _ => None,
+        });
+        bytes.map_or_else(
+            || {
+                Ok(FullTextIndexState {
+                    refreshed_to: ResumeToken::default(),
+                    indexed_documents: 0,
+                })
+            },
+            |bytes| {
+                serde_json::from_slice(bytes).map_err(|error| TextError::Serde(error.to_string()))
+            },
         )
+    }
+
+    fn reconcile_document_ops(
+        &self,
+        id: DocumentId,
+        source: Option<Bytes>,
+        conditions: &mut Vec<WriteCondition>,
+        ops: &mut Vec<Op>,
+    ) -> Result<(), TextError> {
+        let TextSource::Collection {
+            collection_id,
+            path,
+        } = &self.config.source;
+        let indexed_key = doc_key(&self.config.name, id);
+        let indexed =
+            self.repl
+                .read(FULL_TEXT_DOCS_TABLE, &indexed_key, ReadConsistency::Strong)?;
+        conditions.push(WriteCondition::ValueEquals {
+            table: DOCUMENT_TABLE.to_owned(),
+            key: make_document_key(*collection_id, id),
+            expected: source.clone(),
+        });
+        conditions.push(WriteCondition::ValueEquals {
+            table: FULL_TEXT_DOCS_TABLE.to_owned(),
+            key: indexed_key,
+            expected: indexed.clone(),
+        });
+        remove_existing_doc_ops(&self.config.name, id, indexed.as_deref(), ops)?;
+        if let Some(source) = source
+            && let Some(text) = document_text(&source, path)?
+        {
+            append_index_doc_ops(&self.config.name, id, &text, ops)?;
+        }
+        Ok(())
     }
 }
 
@@ -478,14 +605,51 @@ fn coalesce_document_changes(
 }
 
 /// Deletes every entry of `index` in bounded batches.
-fn clear_index_entries<R: Replication + ?Sized>(repl: &R, index: &str) -> Result<(), TextError> {
-    let prefix = index_prefix(index);
+fn clear_index_entries<R: Replication + ?Sized>(
+    repl: &R,
+    config: &FullTextIndexConfig,
+    metadata: &[WriteCondition],
+) -> Result<(), TextError> {
+    let prefix = index_prefix(&config.name);
+    let TextSource::Collection { collection_id, .. } = &config.source;
     let end = keyenc::range_end(&prefix);
     for table in [FULL_TEXT_DOCS_TABLE, FULL_TEXT_POSTINGS_TABLE] {
         let mut cursor = prefix.clone();
         loop {
             let page = scan_page(repl, table, &cursor, &end, CLEAR_PAGE_KEYS)?;
             let next = next_page_start(&page, CLEAR_PAGE_KEYS, &end);
+            let mut conditions = metadata.to_vec();
+            let mut documents = BTreeSet::new();
+            for (key, value) in &page {
+                conditions.push(WriteCondition::ValueEquals {
+                    table: table.to_owned(),
+                    key: key.clone(),
+                    expected: Some(value.clone()),
+                });
+                let id = posting_doc_id(key);
+                if let Some(id) = id
+                    && documents.insert(id)
+                {
+                    if table != FULL_TEXT_DOCS_TABLE {
+                        let key = doc_key(&config.name, id);
+                        conditions.push(WriteCondition::ValueEquals {
+                            table: FULL_TEXT_DOCS_TABLE.to_owned(),
+                            expected: repl.read(
+                                FULL_TEXT_DOCS_TABLE,
+                                &key,
+                                ReadConsistency::Strong,
+                            )?,
+                            key,
+                        });
+                    }
+                    let key = make_document_key(*collection_id, id);
+                    conditions.push(WriteCondition::ValueEquals {
+                        table: DOCUMENT_TABLE.to_owned(),
+                        expected: repl.read(DOCUMENT_TABLE, &key, ReadConsistency::Strong)?,
+                        key,
+                    });
+                }
+            }
             let ops = page
                 .into_iter()
                 .map(|(key, _)| Op::Delete {
@@ -494,7 +658,7 @@ fn clear_index_entries<R: Replication + ?Sized>(repl: &R, index: &str) -> Result
                 })
                 .collect::<Vec<_>>();
             if !ops.is_empty() {
-                propose_system_batch(repl, ops)?;
+                propose_system_conditional_batch(repl, ConditionalBatch::new(conditions, ops))?;
             }
             let Some(next) = next else {
                 break;
@@ -621,16 +785,17 @@ fn append_index_doc_ops(
     Ok(())
 }
 
-fn remove_existing_doc_ops<R: Replication + ?Sized>(
-    repl: &R,
+fn remove_existing_doc_ops(
     index: &str,
     id: DocumentId,
+    previous: Option<&[u8]>,
     ops: &mut Vec<Op>,
 ) -> Result<(), TextError> {
-    let Some(doc) = read_json::<IndexedDoc, _>(repl, FULL_TEXT_DOCS_TABLE, &doc_key(index, id))?
-    else {
+    let Some(previous) = previous else {
         return Ok(());
     };
+    let doc: IndexedDoc =
+        serde_json::from_slice(previous).map_err(|error| TextError::Serde(error.to_string()))?;
     let mut unique = BTreeSet::new();
     for term in doc.terms {
         unique.insert(term);

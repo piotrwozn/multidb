@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     backup::Lsn,
@@ -8,6 +11,12 @@ use crate::{
     repl::{ReadConsistency, ReplError, Replication},
     storage::{Bytes, StorageError},
     txn::{self, TxnId},
+};
+
+mod commit_metadata;
+mod guarded;
+pub(crate) use guarded::{
+    history_rows_for_table_guarded, resolve_temporal_point_guarded, rows_as_of_lsn_guarded,
 };
 
 pub const TEMPORAL_TABLES_TABLE: &str = "__temporal_tables";
@@ -172,39 +181,103 @@ pub fn rows_as_of_lsn(
 /// # Errors
 /// Fails when MVCC data is unavailable, corrupt, or outside retention, and with
 /// `RetentionExpired` when `retention.min_lsn` is below the history GC horizon,
-/// where pruned versions would silently be missing.
+/// or retained pre-GC anchors cannot be listed as a complete version history.
+/// Missing commit timestamps fail with `MissingPoint` rather than guessed dates.
 pub fn history_rows_for_table(
     repl: &dyn Replication,
     table: &str,
     schema: &TableSchema,
     retention: TemporalRetention,
 ) -> Result<Vec<Row>, TemporalError> {
+    validate_retention(retention, retention.min_lsn)?;
     ensure_history_retained(repl, retention.min_lsn)?;
     let prefix = txn::version_key(REL_ROWS_TABLE, &table_prefix(table))?;
     let end = keyenc::range_end(&prefix);
     let versions = repl.range(txn::TXN_MVCC_TABLE, &prefix, &end, ReadConsistency::Strong)?;
     // History GC may have committed between the first check and the range read.
-    ensure_history_retained(repl, retention.min_lsn)?;
-    let mut rows = Vec::new();
+    let history_horizon = ensure_history_retained(repl, retention.min_lsn)?;
+    let mut by_key = BTreeMap::<Bytes, BTreeMap<TxnId, Option<Bytes>>>::new();
     for (version_key, value) in versions {
         if version_key.len() < prefix.len() + 8 || !version_key.starts_with(&prefix) {
             continue;
         }
         let version = txn::decode_txn_id(&version_key[version_key.len() - 8..])?;
-        validate_retention(retention, version)?;
+        // GC keeps a pre-horizon anchor for AS OF snapshots, but earlier
+        // versions may be gone. Omitting it would present an incomplete history
+        // as complete; listing it would invent an unbounded validity interval.
+        if version < history_horizon {
+            return Err(TemporalError::RetentionExpired {
+                requested: version,
+                earliest: history_horizon,
+            });
+        }
+        if version < retention.min_lsn {
+            continue;
+        }
         let record = txn::decode_mvcc_record(&value)?;
-        let mut row = match record.value {
-            Some(bytes) => decode_row_bytes(&bytes)?.unwrap_or_default(),
-            None => vec![Value::Null; schema.columns.len()],
-        };
-        validate_temporal_row(schema, &row)?;
-        row.push(Value::Int(i64::try_from(version).unwrap_or(i64::MAX)));
-        row.push(Value::Null);
-        row.push(Value::Int(system_time_to_millis(SystemTime::now())));
-        row.push(Value::Null);
-        rows.push(row);
+        let logical_key = version_key[prefix.len()..version_key.len() - 8].to_vec();
+        by_key
+            .entry(logical_key)
+            .or_default()
+            .insert(version, record.value);
+    }
+    let mut timestamps = BTreeMap::new();
+    let mut rows = Vec::new();
+    for versions in by_key.into_values() {
+        let mut versions = versions.into_iter().peekable();
+        while let Some((version, bytes)) = versions.next() {
+            // A tombstone closes the previous version but is not itself a row.
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let mut row = decode_row_bytes(&bytes)?
+                .ok_or_else(|| StorageError::Corruption("temporal row is missing".to_owned()))?;
+            validate_temporal_row(schema, &row)?;
+            let (from_lsn, from_time) = history_boundary(repl, version, &mut timestamps)?;
+            let (to_lsn, to_time) = versions
+                .peek()
+                .map(|(next_version, _)| history_boundary(repl, *next_version, &mut timestamps))
+                .transpose()?
+                .unwrap_or((Value::Null, Value::Null));
+            row.extend([from_lsn, to_lsn, from_time, to_time]);
+            rows.push(row);
+        }
     }
     Ok(rows)
+}
+
+fn history_boundary(
+    repl: &dyn Replication,
+    lsn: Lsn,
+    timestamps: &mut BTreeMap<Lsn, i64>,
+) -> Result<(Value, Value), TemporalError> {
+    let sql_lsn = i64::try_from(lsn).map_err(|_| {
+        StorageError::Corruption("temporal LSN exceeds the SQL integer range".to_owned())
+    })?;
+    let millis = if let Some(millis) = timestamps.get(&lsn) {
+        *millis
+    } else {
+        // One point read per distinct LSN, even when a large transaction changed
+        // many rows or supplies both sides of adjacent intervals.
+        let bytes = repl
+            .read(
+                txn::COMMIT_LOG_TABLE,
+                &txn::commit_log_key(lsn),
+                ReadConsistency::Strong,
+            )?
+            .ok_or(TemporalError::MissingPoint(TemporalPoint::Lsn(lsn)))?;
+        let record = txn::decode_commit_log_record(&bytes)?;
+        if record.txn_id != lsn {
+            return Err(StorageError::Corruption(
+                "temporal commit record does not match its LSN".to_owned(),
+            )
+            .into());
+        }
+        let millis = system_time_to_millis(record.committed_at)?;
+        timestamps.insert(lsn, millis);
+        millis
+    };
+    Ok((Value::Int(sql_lsn), Value::Int(millis)))
 }
 
 fn lsn_for_timestamp(repl: &dyn Replication, timestamp: SystemTime) -> Result<Lsn, TemporalError> {
@@ -214,7 +287,7 @@ fn lsn_for_timestamp(repl: &dyn Replication, timestamp: SystemTime) -> Result<Ls
 }
 
 /// Rejects reads below the history GC horizon, where MVCC versions may be pruned.
-fn ensure_history_retained(repl: &dyn Replication, lsn: Lsn) -> Result<(), TemporalError> {
+fn ensure_history_retained(repl: &dyn Replication, lsn: Lsn) -> Result<Lsn, TemporalError> {
     let horizon = txn::history::history_horizon(repl)?;
     if lsn < horizon {
         return Err(TemporalError::RetentionExpired {
@@ -222,7 +295,7 @@ fn ensure_history_retained(repl: &dyn Replication, lsn: Lsn) -> Result<(), Tempo
             earliest: horizon,
         });
     }
-    Ok(())
+    Ok(horizon)
 }
 
 fn validate_temporal_row(schema: &TableSchema, row: &Row) -> Result<(), TemporalError> {
@@ -256,10 +329,20 @@ pub fn system_versioned_schema(schema: &TableSchema) -> TableSchema {
     out
 }
 
-fn system_time_to_millis(value: SystemTime) -> i64 {
-    value
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(0)
+fn system_time_to_millis(value: SystemTime) -> Result<i64, TemporalError> {
+    let millis = match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::try_from(duration.as_millis()).ok(),
+        Err(before_epoch) => i128::try_from(before_epoch.duration().as_millis())
+            .ok()
+            .map(|millis| -millis),
+    };
+    millis
+        .and_then(|millis| i64::try_from(millis).ok())
+        .ok_or_else(|| {
+            StorageError::Corruption("temporal timestamp exceeds the SQL integer range".to_owned())
+                .into()
+        })
 }
+
+#[cfg(test)]
+mod tests;

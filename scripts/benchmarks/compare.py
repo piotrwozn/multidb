@@ -123,6 +123,9 @@ def require_free_ports():
     with contextlib.ExitStack() as stack:
         for port in PORTS:
             probe = stack.enter_context(socket.socket())
+            # Clean shutdown can leave TIME_WAIT sockets, which are safe for a
+            # restarting server; an active listener still makes bind fail.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
 
 

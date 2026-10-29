@@ -11,7 +11,7 @@ pub mod history;
 mod table_version;
 
 pub use table_version::TABLE_DATA_VERSION_TABLE;
-pub(crate) use table_version::read_table_data_version;
+pub(crate) use table_version::read_table_data_version_from;
 
 pub type TxnId = u64;
 pub type WriteKey = (String, Bytes);
@@ -218,9 +218,7 @@ pub fn commit_log_key(txn_id: TxnId) -> [u8; 8] {
 /// Fails when the record is neither the binary v2 format nor legacy JSON.
 pub fn decode_commit_log_record(bytes: &[u8]) -> Result<CommitLogRecord, StorageError> {
     if let Some(payload) = bytes.strip_prefix(COMMIT_LOG_BINARY_MAGIC) {
-        return postcard::from_bytes(payload).map_err(|error| {
-            StorageError::Corruption(format!("binary commit log record: {error}"))
-        });
+        return decode_binary_exact(payload, "binary commit log record");
     }
 
     serde_json::from_slice(bytes).map_err(|error| {
@@ -420,6 +418,10 @@ where
     F: FnOnce(&mut T) -> Result<(), StorageError>,
     E: FnOnce(&mut T, TxnId) -> Result<(), StorageError>,
 {
+    if let Err(error) = crate::repl::dist_txn::locks::validate_write_locks(&txn, &write_set) {
+        txn.rollback();
+        return Err(error);
+    }
     for (table, key) in write_set.keys() {
         if last_key_version(&txn, table, key)? > snapshot_id {
             txn.rollback();
@@ -597,8 +599,7 @@ pub fn encode_mvcc_record(record: &MvccRecord) -> Result<Bytes, StorageError> {
 /// # Errors
 /// Fails when the bytes are corrupt.
 pub fn decode_mvcc_record(bytes: &[u8]) -> Result<MvccRecord, StorageError> {
-    postcard::from_bytes(bytes)
-        .map_err(|error| StorageError::Corruption(format!("mvcc record: {error}")))
+    decode_binary_exact(bytes, "mvcc record")
 }
 
 /// Removes obsolete MVCC versions while preserving the last version before the watermark.
@@ -720,8 +721,21 @@ fn encode_hlc(timestamp: HlcTimestamp) -> Result<Bytes, StorageError> {
 }
 
 fn decode_hlc(bytes: &[u8]) -> Result<HlcTimestamp, StorageError> {
-    postcard::from_bytes(bytes)
-        .map_err(|error| StorageError::Corruption(format!("hlc timestamp: {error}")))
+    decode_binary_exact(bytes, "hlc timestamp")
+}
+
+fn decode_binary_exact<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    context: &str,
+) -> Result<T, StorageError> {
+    let (value, trailing) = postcard::take_from_bytes(bytes)
+        .map_err(|error| StorageError::Corruption(format!("{context}: {error}")))?;
+    if !trailing.is_empty() {
+        return Err(StorageError::Corruption(format!(
+            "{context}: trailing bytes"
+        )));
+    }
+    Ok(value)
 }
 
 fn keyspaces_for_commit<'a>(tables: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {

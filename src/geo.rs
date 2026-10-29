@@ -338,6 +338,9 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
         }
         let bbox = bounding_box(center, radius_meters);
         let mut hits = self.within_bbox(bbox.0, bbox.1)?;
+        for hit in &mut hits {
+            hit.distance_meters = haversine_meters(center, hit.point);
+        }
         hits.retain(|hit| hit.distance_meters <= radius_meters);
         hits.sort_by(|left, right| {
             left.distance_meters
@@ -417,11 +420,13 @@ impl<'repl, R: Replication + ?Sized> GeoIndex<'repl, R> {
 #[must_use]
 pub fn haversine_meters(a: GeoPoint, b: GeoPoint) -> f64 {
     let d_lat = (b.lat - a.lat).to_radians();
-    let d_lon = (b.lon - a.lon).to_radians();
+    let d_lon = normalize_lon(b.lon - a.lon).to_radians();
     let lat1 = a.lat.to_radians();
     let lat2 = b.lat.to_radians();
-    let h = (d_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (d_lon / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_METERS * h.sqrt().asin()
+    let cos1 = if a.lat.abs() >= 90.0 { 0.0 } else { lat1.cos() };
+    let cos2 = if b.lat.abs() >= 90.0 { 0.0 } else { lat2.cos() };
+    let h = (d_lat / 2.0).sin().powi(2) + cos1 * cos2 * (d_lon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_METERS * h.clamp(0.0, 1.0).sqrt().asin()
 }
 
 /// Appends the index writes for one document change.
@@ -699,20 +704,39 @@ fn validate_point(point: GeoPoint) -> Result<(), GeoError> {
 }
 
 fn bounding_box(center: GeoPoint, radius_meters: f64) -> (GeoPoint, GeoPoint) {
-    let lat_delta = (radius_meters / EARTH_RADIUS_METERS).to_degrees();
-    let lon_delta = if center.lat.abs() >= 89.999 {
-        180.0
-    } else {
-        (radius_meters / (EARTH_RADIUS_METERS * center.lat.to_radians().cos().abs())).to_degrees()
-    };
+    // The angular radius never needs to exceed a half circumference. A cap that
+    // touches either pole includes every longitude. Other caps use the spherical
+    // longitude extremum, rather than a tangent-plane approximation.
+    let angular = (radius_meters / EARTH_RADIUS_METERS).min(std::f64::consts::PI);
+    let padding = 1.0e-9; // Conservative outward rounding; the exact distance filters hits.
+    let lat_delta = angular.to_degrees() + padding;
+    let min_lat = (center.lat - lat_delta).max(-90.0);
+    let max_lat = (center.lat + lat_delta).min(90.0);
+    if min_lat <= -90.0 || max_lat >= 90.0 {
+        return (
+            GeoPoint {
+                lon: -180.0,
+                lat: min_lat,
+            },
+            GeoPoint {
+                lon: 180.0,
+                lat: max_lat,
+            },
+        );
+    }
+    let lon_delta = (angular.sin() / center.lat.to_radians().cos())
+        .clamp(-1.0, 1.0)
+        .asin()
+        .to_degrees()
+        + padding;
     (
         GeoPoint {
             lon: normalize_lon(center.lon - lon_delta),
-            lat: (center.lat - lat_delta).max(-90.0),
+            lat: min_lat,
         },
         GeoPoint {
             lon: normalize_lon(center.lon + lon_delta),
-            lat: (center.lat + lat_delta).min(90.0),
+            lat: max_lat,
         },
     )
 }
@@ -734,14 +758,18 @@ fn midpoint_lon(min: f64, max: f64) -> f64 {
     }
 }
 
-fn normalize_lon(mut lon: f64) -> f64 {
-    while lon < -180.0 {
-        lon += 360.0;
+fn normalize_lon(lon: f64) -> f64 {
+    if (-180.0..=180.0).contains(&lon) {
+        return lon;
     }
-    while lon > 180.0 {
-        lon -= 360.0;
+    let wrapped = lon.rem_euclid(360.0);
+    if wrapped > 180.0 {
+        wrapped - 360.0
+    } else if wrapped >= 180.0 && lon < 0.0 {
+        -180.0
+    } else {
+        wrapped
     }
-    lon
 }
 
 fn geo_hash(point: GeoPoint, precision: u8) -> String {
@@ -860,6 +888,99 @@ mod tests {
             "expected an empty value, got {:?}",
             index.within_radius(GeoPoint::new(-179.9, 0.0)?, 50_000.0)?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn huge_finite_radius_covers_the_globe_and_normalization_is_constant_time() -> TestResult {
+        for (longitude, expected) in [
+            (f64::MAX, 128.0),
+            (-f64::MAX, -128.0),
+            (1.0e30, 16.0),
+            (-1.0e30, -16.0),
+        ] {
+            let wrapped = super::normalize_lon(longitude);
+            assert!(
+                (-180.0..=180.0).contains(&wrapped),
+                "{longitude} became {wrapped}"
+            );
+            assert!((wrapped - expected).abs() <= f64::EPSILON);
+        }
+        let mut database = places_database()?;
+        let ids = [(0.0, 0.0), (180.0, 0.0), (-179.0, -89.0)]
+            .map(|(lon, lat)| {
+                database
+                    .collection("places")
+                    .and_then(|collection| collection.insert(&doc(lon, lat)).map_err(Into::into))
+            })
+            .into_iter()
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        database.create_geo_index(places_geo_config())?;
+        let hits = database
+            .geo_index("places_geo")?
+            .within_radius(GeoPoint::new(0.0, 80.0)?, f64::MAX)?;
+        assert_eq!(hits.iter().map(|hit| hit.id).collect::<BTreeSet<_>>(), ids);
+        assert!(hits.iter().all(|hit| hit.distance_meters.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn polar_radius_bounds_include_spherical_caps_and_use_the_original_center() -> TestResult {
+        for sign in [1.0, -1.0] {
+            let mut database = places_database()?;
+            let collection = database.collection("places")?;
+            let across_pole = collection.insert(&doc(180.0, sign * 89.0))?;
+            let same_meridian = collection.insert(&doc(0.0, sign * 89.0))?;
+            let curved_cap = collection.insert(&doc(60.0, sign * 85.0))?;
+            database.create_geo_index(places_geo_config())?;
+            let index = database.geo_index("places_geo")?;
+            let center = GeoPoint::new(0.0, sign * 80.0)?;
+            let hits = index.within_radius(center, 2_000_000.0)?;
+            assert_eq!(
+                hits.iter().map(|hit| hit.id).collect::<BTreeSet<_>>(),
+                BTreeSet::from([across_pole, same_meridian, curved_cap])
+            );
+            for hit in hits {
+                assert!((hit.distance_meters - haversine_meters(center, hit.point)).abs() < 1e-6);
+            }
+            let narrow = index.within_radius(center, 1_000_000.0)?;
+            assert_eq!(
+                narrow.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                vec![curved_cap]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dateline_bounds_preserve_nearby_hits_and_equivalent_endpoints() -> TestResult {
+        let mut database = places_database()?;
+        let collection = database.collection("places")?;
+        let west = collection.insert(&doc(-179.9, 0.0))?;
+        let east = collection.insert(&doc(179.9, 0.0))?;
+        let boundary = collection.insert(&doc(-180.0, 0.0))?;
+        collection.insert(&doc(0.0, 0.0))?;
+        database.create_geo_index(places_geo_config())?;
+        let index = database.geo_index("places_geo")?;
+        for longitude in [-179.95, 179.95] {
+            let hits = index.within_radius(GeoPoint::new(longitude, 0.0)?, 30_000.0)?;
+            assert_eq!(
+                hits.iter().map(|hit| hit.id).collect::<BTreeSet<_>>(),
+                BTreeSet::from([west, east, boundary])
+            );
+        }
+        let hits = index.within_radius(GeoPoint::new(180.0, 0.0)?, 0.0)?;
+        assert_eq!(
+            hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![boundary]
+        );
+        assert!(hits[0].distance_meters.abs() <= f64::EPSILON);
+        assert!(
+            haversine_meters(GeoPoint::new(0.0, 90.0)?, GeoPoint::new(180.0, 90.0)?).abs()
+                <= f64::EPSILON
+        );
+        let antipodal = haversine_meters(GeoPoint::new(0.0, -88.03)?, GeoPoint::new(180.0, 88.03)?);
+        assert!((antipodal - std::f64::consts::PI * super::EARTH_RADIUS_METERS).abs() < 1e-6);
         Ok(())
     }
 

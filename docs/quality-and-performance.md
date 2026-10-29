@@ -57,7 +57,13 @@ Compare a candidate report with the matching checked-in or archived baseline:
 .\scripts\perf_gate.ps1 -Baseline baselines/perf/local-smoke.json -Candidate target/perf/candidate.json -SummaryOutput target/perf/gate-summary.json
 ```
 
-The gate validates profile compatibility by default. Use `-ThresholdPercent`
+The gate validates profile compatibility, required benchmark coverage, finite metrics
+and ordered percentiles by default. Empty or malformed evidence fails the gate.
+The `p50_ms`/`p95_ms`/`p99_ms` values in the legacy PowerShell wall-clock envelope
+are whole Criterion-process durations, not per-request latency distributions. Use
+the raw-operation runners in `scripts/benchmarks` for latency comparisons.
+
+Use `-ThresholdPercent`
 only for an explicit one-off override, and use `-AllowProfileMismatch` only for
 manual investigation. The JSON report is intentionally small so it can travel
 through CI and release artifacts. Criterion's detailed output remains in
@@ -112,3 +118,13 @@ when they compare a candidate envelope to the matching versioned baseline.
 
 Release performance claims should point to versioned baselines and release
 artifacts, not local `target/` output.
+
+
+Browser tests can use an explicitly selected installed Chromium via
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/absolute/path/to/chromium`. Without that
+override, Playwright uses its pinned downloaded browser, as CI does. Record the
+actual browser version when using the override.
+
+Fuzz smoke accepts `-Required`; CI and nightly use it so missing cargo-fuzz,
+nightly or sanitizer support fails the check instead of reporting a skipped run
+as success. Local optional smoke retains its explicit skip behavior.

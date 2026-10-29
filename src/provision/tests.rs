@@ -5741,10 +5741,16 @@ fn open_from_spec_keeps_the_audit_chain_on_the_callers_key() -> TestResult {
 
     // An unusable key is refused when it is applied, before anything is planned or written.
     std::fs::write(&key_path, "not a key")?;
-    assert!(matches!(
-        open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed),
-        Err(ProvisionError::Db(DbError::AuditIntegrity(_)))
-    ));
+    let before = std::fs::read(&path)?;
+    let error = open_from_spec(&spec, Some(&path), StartupMode::Verify, &defaults, &keyed)
+        .err()
+        .ok_or("an unusable audit key unexpectedly opened the database")?;
+    assert!(
+        matches!(&error, ProvisionError::Db(DbError::AuditIntegrity(_))),
+        "{error:?}"
+    );
+    assert!(!error.to_string().contains("not a key"));
+    assert_eq!(std::fs::read(&path)?, before);
     Ok(())
 }
 

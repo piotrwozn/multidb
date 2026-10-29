@@ -139,6 +139,8 @@ pub struct GraphRagRelation {
 
 #[derive(thiserror::Error, Debug)]
 pub enum GraphRagError {
+    #[error("vector or graph data changed during retrieval; retry the request")]
+    ConcurrentMutation,
     #[error("invalid GraphRAG request: {0}")]
     InvalidRequest(String),
     #[error("vector: {0}")]
@@ -185,6 +187,10 @@ pub fn parse_document_node_id(node: &GraphNodeId) -> Result<DocumentId, GraphRag
 /// Zero depth performs vector-only retrieval. Graph nodes with noncanonical ids are skipped.
 /// # Errors
 /// Fails for invalid requests, vector/graph read failures, or callback policy errors.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep citation ordering, visibility and cross-model version validation in one retrieval operation."
+)]
 pub fn retrieve<R, F>(
     vectors: &VectorCollection<'_, R>,
     graph: &Graph<'_, R>,
@@ -196,6 +202,19 @@ where
     F: FnMut(DocumentId, Value) -> Result<Option<Value>, GraphRagError>,
 {
     request.validate()?;
+    let reservation = request
+        .max_context_bytes
+        .saturating_mul(2)
+        .saturating_add(request.max_nodes.saturating_mul(2_048))
+        .saturating_add(request.max_edges.saturating_mul(768))
+        .saturating_add(65_536);
+    let bounded_vectors = vectors.with_reserved_memory(reservation)?;
+    let vectors = &bounded_vectors;
+    let bounded_graph = graph.with_memory_cap(reservation);
+    let graph = &bounded_graph;
+    vectors.check_execution()?;
+    let vector_versions = vectors.content_versions()?;
+    let graph_version = graph.content_version()?;
     let mut candidates = vectors.knn_bounded(&request.query_vector, request.max_nodes)?;
     candidates.sort_by(|left, right| {
         left.distance
@@ -216,6 +235,7 @@ where
     let mut queue = VecDeque::new();
     let mut seed_count = 0;
     for hit in candidates {
+        vectors.check_execution()?;
         if !hit.distance.is_finite() {
             return invalid("query_vector produces a non-finite distance for this collection");
         }
@@ -241,6 +261,7 @@ where
     let mut examined_edges = 0;
     let mut relationships = BTreeSet::new();
     'walk: while let Some((node, source_index)) = queue.pop_front() {
+        vectors.check_execution()?;
         let source = &state.result.sources[source_index];
         let depth = source.depth;
         if depth >= request.max_depth {
@@ -250,6 +271,7 @@ where
         let seed_id = source.seed_id.clone();
         let seed_distance = source.seed_distance;
         for label in &labels {
+            vectors.check_execution()?;
             let remaining = request.max_edges.saturating_sub(examined_edges);
             if remaining == 0 {
                 state.result.truncated = true;
@@ -286,6 +308,14 @@ where
             }
         }
     }
+    vectors.check_execution()?;
+    // Native version tokens change atomically with the model writes. Refuse a
+    // mixed set of citations/relationships rather than presenting it as one
+    // retrieval. Backends without these tokens retain their documented weaker
+    // snapshot semantics; no token is invented for them.
+    if vectors.content_versions()? != vector_versions || graph.content_version()? != graph_version {
+        return Err(GraphRagError::ConcurrentMutation);
+    }
     Ok(state.result)
 }
 
@@ -316,6 +346,7 @@ where
         depth: usize,
         seed_id: &str,
     ) -> Result<Visit, GraphRagError> {
+        vectors.check_execution()?;
         if let Some(seen) = self.visited.get(&id) {
             return Ok(seen.map_or(Visit::Blocked, |index| Visit::Visible {
                 index,
@@ -333,6 +364,7 @@ where
         let Some(metadata) = (self.visible_metadata)(id, metadata)? else {
             return Ok(Visit::Blocked);
         };
+        vectors.check_execution()?;
         let Some(Value::Str(text)) = extract_path(&metadata, &self.text_path) else {
             return Ok(Visit::Blocked);
         };
@@ -474,6 +506,41 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn concurrent_metadata_vector_and_edge_changes_do_not_publish_mixed_citations() -> TestResult {
+        for mutation in 0..3 {
+            let database = create_database(DbConfig::new(Profile::InMemory))?;
+            let vectors = VectorCollection::new(&database, config())?;
+            let graph = Graph::new(&database, GraphId::new(4));
+            let [seed, _, _, leaf] = populate(&vectors, &graph)?;
+            let changed = Cell::new(false);
+            let result = retrieve(&vectors, &graph, &request(), |_, value| {
+                if !changed.replace(true) {
+                    match mutation {
+                        0 => {
+                            crate::model::DocumentCollection::new(
+                                &database,
+                                config().collection_id,
+                            )
+                            .update(seed, &metadata("changed during retrieval"))
+                            .map_err(VectorError::from)?;
+                        }
+                        1 => vectors.delete_vector(seed)?,
+                        _ => graph.add_edge(
+                            document_node_id(seed),
+                            "related",
+                            document_node_id(leaf),
+                            &Value::Null,
+                        )?,
+                    }
+                }
+                Ok(Some(value))
+            });
+            assert!(matches!(result, Err(GraphRagError::ConcurrentMutation)));
+        }
+        Ok(())
+    }
 
     fn config() -> VectorCollectionConfig {
         VectorCollectionConfig::new(CollectionId::new(7), 2)

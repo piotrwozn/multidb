@@ -1,11 +1,36 @@
 use std::{collections::BTreeMap, env};
 
 use crate::{
-    cloud::{ObjectStoreConfig, ObjectStoreUri, open_object_store},
-    migration::{json_object_to_row, parse_csv_line},
+    cloud::ObjectStoreUri,
     model::Value,
-    query::{ColumnType, QueryError, Row, TableSchema, parquet_bytes_to_rows},
+    query::{ColumnType, QueryError, Row, TableSchema},
 };
+
+mod stream;
+pub(crate) use stream::guarded_parquet_bytes_to_batches;
+pub use stream::scan_foreign_table_guarded;
+
+/// A statement's shared cancellation and memory accounting boundary.
+pub trait ForeignScanGuard: Send + Sync {
+    /// Checks the statement deadline and cancellation state.
+    /// # Errors
+    /// Fails after cancellation, timeout or an exhausted resource budget.
+    fn check(&self) -> Result<(), QueryError>;
+    /// Reserves retained result storage until the statement finishes.
+    /// # Errors
+    /// Fails when the statement cannot retain another result.
+    fn charge(&self, retained_bytes: usize) -> Result<(), QueryError>;
+    /// Reports the currently available shared statement memory.
+    fn remaining_bytes(&self) -> usize;
+    /// Reserves temporary decoder storage; dropping the token releases it.
+    /// # Errors
+    /// Fails before allocation when the shared budget cannot cover the decoder.
+    fn reserve(&self, bytes: usize) -> Result<Box<dyn ForeignScanReservation>, QueryError>;
+}
+
+/// A type-erased reservation whose destructor releases temporary memory.
+pub trait ForeignScanReservation: Send {}
+impl<T: Send> ForeignScanReservation for T {}
 
 pub const FOREIGN_TABLES_TABLE: &str = "__foreign_tables";
 
@@ -137,16 +162,7 @@ pub async fn scan_foreign_table(
     spec: &ForeignTableSpec,
     request: ForeignScanRequest,
 ) -> Result<ForeignScanResult, FederationError> {
-    match &spec.source {
-        ForeignSource::Parquet { .. }
-        | ForeignSource::Csv { .. }
-        | ForeignSource::JsonLines { .. } => {
-            scan_local_source(&spec.schema, &spec.source, &request)
-        }
-        ForeignSource::Postgres { .. } | ForeignSource::MultidbPgWire { .. } => {
-            scan_remote_postgres(&spec.schema, &spec.source, &spec.options, &request).await
-        }
-    }
+    scan_foreign_table_guarded(spec, request, None).await
 }
 
 impl ForeignScanRequest {
@@ -172,33 +188,7 @@ pub fn scan_local_source(
     source: &ForeignSource,
     request: &ForeignScanRequest,
 ) -> Result<ForeignScanResult, FederationError> {
-    let bytes = match source {
-        ForeignSource::Parquet { uri, path }
-        | ForeignSource::Csv { uri, path, .. }
-        | ForeignSource::JsonLines { uri, path } => read_object_bytes(uri, path)?,
-        ForeignSource::Postgres { .. } | ForeignSource::MultidbPgWire { .. } => {
-            return Err(FederationError::Unsupported(
-                "remote sources must be scanned asynchronously".to_owned(),
-            ));
-        }
-    };
-    let scanned_bytes = bytes.len() as u64;
-    let rows = match source {
-        ForeignSource::Parquet { .. } => parquet_bytes_to_rows(&bytes, schema)?,
-        ForeignSource::Csv { has_header, .. } => csv_bytes_to_rows(schema, &bytes, *has_header)?,
-        ForeignSource::JsonLines { .. } => jsonl_bytes_to_rows(schema, &bytes)?,
-        ForeignSource::Postgres { .. } | ForeignSource::MultidbPgWire { .. } => unreachable!(),
-    };
-    let rows = apply_filters_and_projection(schema, rows, request)?;
-    Ok(ForeignScanResult {
-        stats: ForeignTableStats {
-            row_count: Some(rows.len() as u64),
-            scanned_rows: rows.len() as u64,
-            scanned_bytes,
-            pushed_filters: request.filters.len(),
-        },
-        rows,
-    })
+    stream::scan_local(schema, source, request, 256, &None)
 }
 
 /// Scans a PG-compatible remote foreign source.
@@ -210,46 +200,7 @@ pub async fn scan_remote_postgres(
     options: &ForeignTableOptions,
     request: &ForeignScanRequest,
 ) -> Result<ForeignScanResult, FederationError> {
-    let (connection, table) = match source {
-        ForeignSource::Postgres { connection, table }
-        | ForeignSource::MultidbPgWire { connection, table } => (connection, table),
-        ForeignSource::Parquet { .. }
-        | ForeignSource::Csv { .. }
-        | ForeignSource::JsonLines { .. } => {
-            return Err(FederationError::Unsupported(
-                "local object sources are not remote postgres".to_owned(),
-            ));
-        }
-    };
-    let connection = resolve_secret(connection)?;
-    let (client, connection_task) = tokio_postgres::connect(&connection, tokio_postgres::NoTls)
-        .await
-        .map_err(|error| FederationError::Postgres(error.to_string()))?;
-    tokio::spawn(async move {
-        if let Err(error) = connection_task.await {
-            tracing::debug!("foreign postgres connection ended: {error}");
-        }
-    });
-
-    let sql = remote_select_sql(schema, table, options, request)?;
-    let rows = client
-        .query(&sql, &[])
-        .await
-        .map_err(|error| FederationError::Postgres(error.to_string()))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(postgres_row_to_values(schema, &row)?);
-    }
-    let filtered = apply_filters_and_projection(schema, out, request)?;
-    Ok(ForeignScanResult {
-        stats: ForeignTableStats {
-            row_count: Some(filtered.len() as u64),
-            scanned_rows: filtered.len() as u64,
-            scanned_bytes: 0,
-            pushed_filters: request.filters.len(),
-        },
-        rows: filtered,
-    })
+    stream::scan_remote(schema, source, options, request, None).await
 }
 
 #[must_use]
@@ -297,58 +248,6 @@ pub fn validate_foreign_source(source: &ForeignSource) -> Result<(), FederationE
     Ok(())
 }
 
-fn read_object_bytes(uri: &ObjectStoreUri, path: &str) -> Result<Vec<u8>, FederationError> {
-    let store = open_object_store(&ObjectStoreConfig { uri: uri.clone() })?;
-    store.get(path).map_err(Into::into)
-}
-
-fn csv_bytes_to_rows(
-    schema: &TableSchema,
-    bytes: &[u8],
-    has_header: bool,
-) -> Result<Vec<Row>, FederationError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| FederationError::InvalidSource(error.to_string()))?;
-    let mut rows = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if index == 0 && has_header {
-            continue;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let values = parse_csv_line(line);
-        if values.len() != schema.columns.len() {
-            return Err(FederationError::InvalidSource(format!(
-                "CSV row has {} fields, expected {}",
-                values.len(),
-                schema.columns.len()
-            )));
-        }
-        let mut row = Vec::with_capacity(values.len());
-        for (raw, column) in values.iter().zip(&schema.columns) {
-            row.push(csv_value_to_value(raw, &column.ty)?);
-        }
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn jsonl_bytes_to_rows(schema: &TableSchema, bytes: &[u8]) -> Result<Vec<Row>, FederationError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| FederationError::InvalidSource(error.to_string()))?;
-    let mut rows = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let value = serde_json::from_str::<serde_json::Value>(line)
-            .map_err(|error| FederationError::InvalidSource(error.to_string()))?;
-        rows.push(
-            json_object_to_row(Some(schema), &value)
-                .map_err(|error| FederationError::InvalidSource(error.to_string()))?,
-        );
-    }
-    Ok(rows)
-}
-
 fn csv_value_to_value(raw: &str, ty: &ColumnType) -> Result<Value, FederationError> {
     if raw.is_empty() {
         return Ok(Value::Null);
@@ -380,6 +279,10 @@ pub fn apply_filters_and_projection(
     rows: Vec<Row>,
     request: &ForeignScanRequest,
 ) -> Result<Vec<Row>, FederationError> {
+    validate_scan_request(schema, request)?;
+    if request.limit == Some(0) {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for row in rows {
         if request
@@ -408,6 +311,26 @@ pub fn apply_filters_and_projection(
         }
     }
     Ok(out)
+}
+
+fn validate_scan_request(
+    schema: &TableSchema,
+    request: &ForeignScanRequest,
+) -> Result<(), FederationError> {
+    for index in request
+        .projection
+        .iter()
+        .flatten()
+        .copied()
+        .chain(request.filters.iter().map(|filter| filter.column))
+    {
+        if index >= schema.columns.len() {
+            return Err(FederationError::InvalidSource(format!(
+                "scan column {index} is out of range"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn foreign_filter_matches(row: &[Value], filter: &ForeignFilter) -> bool {
@@ -441,83 +364,170 @@ fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         (Value::Int(left), Value::Int(right)) => Some(left.cmp(right)),
         (Value::Float(left), Value::Float(right)) => left.partial_cmp(right),
         (Value::Str(left), Value::Str(right)) => Some(left.cmp(right)),
+        (Value::Bytes(left), Value::Bytes(right)) => Some(left.cmp(right)),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
         _ => None,
     }
 }
 
+struct RemotePlan<'a> {
+    sql: String,
+    needed: Vec<usize>,
+    limit: Option<usize>,
+    params: Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
+    types: Vec<tokio_postgres::types::Type>,
+    overflow_limit: Option<usize>,
+}
+
+#[cfg(test)]
 fn remote_select_sql(
     schema: &TableSchema,
     table: &str,
     options: &ForeignTableOptions,
     request: &ForeignScanRequest,
 ) -> Result<String, FederationError> {
+    remote_plan(schema, table, options, request).map(|plan| plan.sql)
+}
+
+#[cfg(test)]
+fn remote_plan<'a>(
+    schema: &TableSchema,
+    table: &str,
+    options: &ForeignTableOptions,
+    request: &'a ForeignScanRequest,
+) -> Result<RemotePlan<'a>, FederationError> {
+    remote_plan_with_cap(schema, table, options, request, false)
+}
+
+fn remote_plan_with_cap<'a>(
+    schema: &TableSchema,
+    table: &str,
+    options: &ForeignTableOptions,
+    request: &'a ForeignScanRequest,
+    guarded: bool,
+) -> Result<RemotePlan<'a>, FederationError> {
     validate_remote_identifier_path(table)?;
-    let columns: Vec<String> = if let Some(projection) = request.projection.as_ref() {
-        projection
-            .iter()
-            .map(|index| {
-                schema
-                    .columns
-                    .get(*index)
-                    .map(|column| quote_ident(&column.name))
-                    .ok_or_else(|| {
-                        FederationError::InvalidSource(format!(
-                            "projection column {index} is out of range"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        schema
-            .columns
-            .iter()
-            .map(|column| quote_ident(&column.name))
-            .collect::<Vec<_>>()
-    };
-    let mut sql = format!("SELECT {} FROM {}", columns.join(", "), quote_path(table));
-    let predicates = request
-        .filters
-        .iter()
-        .map(|filter| remote_predicate_sql(schema, filter))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !predicates.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&predicates.join(" AND "));
-    }
-    let limit = request.limit.unwrap_or(options.remote_scan_limit);
-    if limit == 0 && !options.allow_remote_without_limit {
+    validate_scan_request(schema, request)?;
+    let limit = request
+        .limit
+        .or_else(|| (options.remote_scan_limit != 0).then_some(options.remote_scan_limit));
+    if limit.is_none() && !options.allow_remote_without_limit {
         return Err(FederationError::InvalidSource(
             "remote foreign scan requires a non-zero limit".to_owned(),
         ));
     }
-    if limit > 0 {
-        sql.push_str(" LIMIT ");
-        sql.push_str(&limit.to_string());
+    let overflow_limit = (guarded && request.limit.is_none() && options.remote_scan_limit != 0)
+        .then_some(options.remote_scan_limit);
+    let limit = if let Some(cap) = overflow_limit {
+        Some(cap.checked_add(1).ok_or_else(|| {
+            QueryError::ResourceLimit("foreign scan cap sentinel overflow".to_owned())
+        })?)
+    } else {
+        limit
+    };
+    let mut needed = request
+        .projection
+        .clone()
+        .unwrap_or_else(|| (0..schema.columns.len()).collect());
+    needed.extend(request.filters.iter().map(|filter| filter.column));
+    needed.sort_unstable();
+    needed.dedup();
+    let columns = if needed.is_empty() {
+        "1".to_owned()
+    } else {
+        needed
+            .iter()
+            .map(|index| quote_ident(&schema.columns[*index].name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut plan = RemotePlan {
+        sql: format!("SELECT {columns} FROM {}", quote_path(table)),
+        needed,
+        limit,
+        params: Vec::new(),
+        types: Vec::new(),
+        overflow_limit,
+    };
+    let mut predicates = Vec::new();
+    let mut exact = true;
+    for filter in &request.filters {
+        let (predicate, filter_exact) =
+            remote_predicate(schema, filter, &mut plan.params, &mut plan.types)?;
+        exact &= filter_exact;
+        if let Some(predicate) = predicate {
+            predicates.push(predicate);
+        }
     }
-    Ok(sql)
+    if !predicates.is_empty() {
+        plan.sql.push_str(" WHERE ");
+        plan.sql.push_str(&predicates.join(" AND "));
+    }
+    // Superset prefilters (locale text equality, float NaN ordering) and local
+    // string ordering must not consume LIMIT before their residual is checked.
+    if exact && let Some(limit) = limit {
+        use std::fmt::Write;
+        write!(&mut plan.sql, " LIMIT {limit}")
+            .map_err(|error| FederationError::InvalidSource(error.to_string()))?;
+    }
+    Ok(plan)
 }
 
-fn remote_predicate_sql(
+fn remote_predicate<'a>(
     schema: &TableSchema,
-    filter: &ForeignFilter,
-) -> Result<String, FederationError> {
+    filter: &'a ForeignFilter,
+    params: &mut Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
+    types: &mut Vec<tokio_postgres::types::Type>,
+) -> Result<(Option<String>, bool), FederationError> {
+    use tokio_postgres::types::{ToSql, Type};
     let column = schema
         .columns
         .get(filter.column)
         .ok_or_else(|| FederationError::InvalidSource("filter column out of range".to_owned()))?;
-    Ok(format!(
-        "{} {} {}",
-        quote_ident(&column.name),
-        match filter.op {
-            ForeignFilterOp::Eq => "=",
-            ForeignFilterOp::Lt => "<",
-            ForeignFilterOp::Le => "<=",
-            ForeignFilterOp::Gt => ">",
-            ForeignFilterOp::Ge => ">=",
-        },
-        sql_literal(&filter.value)?
-    ))
+    let name = quote_ident(&column.name);
+    if filter.value == Value::Null {
+        return Ok((
+            Some(if filter.op == ForeignFilterOp::Eq {
+                format!("{name} IS NULL")
+            } else {
+                "FALSE".to_owned()
+            }),
+            true,
+        ));
+    }
+    if matches!(
+        &filter.value,
+        Value::Array(_) | Value::Object(_) | Value::Vector(_) | Value::GeoPoint { .. }
+    ) || matches!(&filter.value, Value::Float(value) if !value.is_finite())
+    {
+        return Err(FederationError::Unsupported(
+            "foreign pushdown supports scalar finite values only".to_owned(),
+        ));
+    }
+    let (value, ty, exact): (&(dyn ToSql + Sync), Type, bool) = match (&column.ty, &filter.value) {
+        (ColumnType::Int, Value::Int(value)) => (value, Type::INT8, true),
+        (ColumnType::Bool, Value::Bool(value)) => (value, Type::BOOL, true),
+        (ColumnType::Float, Value::Float(value)) => {
+            (value, Type::FLOAT8, filter.op == ForeignFilterOp::Eq)
+        }
+        (ColumnType::Str, Value::Str(value)) if filter.op == ForeignFilterOp::Eq => {
+            (value, Type::TEXT, false)
+        }
+        (ColumnType::Str, Value::Str(_)) => return Ok((None, false)),
+        (ColumnType::Bytes, Value::Bytes(value)) => (value, Type::BYTEA, true),
+        // Local foreign comparison does not coerce types.
+        _ => return Ok((Some("FALSE".to_owned()), true)),
+    };
+    params.push(value);
+    types.push(ty);
+    let operator = match filter.op {
+        ForeignFilterOp::Eq => "=",
+        ForeignFilterOp::Lt => "<",
+        ForeignFilterOp::Le => "<=",
+        ForeignFilterOp::Gt => ">",
+        ForeignFilterOp::Ge => ">=",
+    };
+    Ok((Some(format!("{name} {operator} ${}", params.len())), exact))
 }
 
 fn postgres_row_to_values(
@@ -552,24 +562,6 @@ fn postgres_row_to_values(
         values.push(value);
     }
     Ok(values)
-}
-
-fn sql_literal(value: &Value) -> Result<String, FederationError> {
-    match value {
-        Value::Null => Ok("NULL".to_owned()),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Int(value) => Ok(value.to_string()),
-        Value::Float(value) if value.is_finite() => Ok(value.to_string()),
-        Value::Str(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        Value::Bytes(value) => Ok(format!("'{}'", hex_bytes(value))),
-        Value::Array(_)
-        | Value::Object(_)
-        | Value::Vector(_)
-        | Value::GeoPoint { .. }
-        | Value::Float(_) => Err(FederationError::Unsupported(
-            "foreign pushdown supports scalar finite literals only".to_owned(),
-        )),
-    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -681,3 +673,8 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::GeoPoint { lon, lat } => serde_json::json!({ "lon": lon, "lat": lat }),
     }
 }
+
+#[cfg(test)]
+mod cap_tests;
+#[cfg(test)]
+mod tests;

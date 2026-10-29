@@ -2,13 +2,15 @@
 //! are durable; concurrent requests share commits without delaying an isolated request.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
-    fs::OpenOptions,
-    io::Write,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    path::Path,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+
+mod anchor;
 
 use super::{Database, DbError};
 use crate::{
@@ -23,8 +25,11 @@ type Completion = Result<(), Arc<DbError>>;
 
 #[derive(Default)]
 pub(super) struct AuditBatchCoordinator {
+    fatal: Arc<AtomicBool>,
     state: Mutex<BatchState>,
     changed: Condvar,
+    anchor_checkpoint: Mutex<Option<anchor::Checkpoint>>,
+    pub(super) key_fingerprint: Mutex<Option<[u8; 32]>>,
 }
 
 #[derive(Default)]
@@ -37,14 +42,48 @@ struct BatchState {
 }
 
 impl AuditBatchCoordinator {
+    pub(super) fn failure_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fatal)
+    }
+
+    pub(super) fn mark_failed(&self) {
+        self.fatal.store(true, Ordering::Release);
+    }
+
+    pub(super) fn check_admission(&self) -> Result<(), DbError> {
+        let state = self.state.lock().map_err(|_| {
+            self.mark_failed();
+            poisoned()
+        })?;
+        if let Some(error) = &state.failed {
+            return Err(copy_error(error));
+        }
+        if self.fatal.load(Ordering::Acquire) {
+            return Err(DbError::AuditIntegrity(
+                "audit runtime is sealed; restore its configuration and reopen the database"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn record(
         &self,
         event: &AuditEvent,
         mut persist: impl FnMut(&[AuditEvent]) -> Result<(), DbError>,
     ) -> Result<(), DbError> {
-        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let mut state = self.state.lock().map_err(|_| {
+            self.mark_failed();
+            poisoned()
+        })?;
         if let Some(error) = &state.failed {
             return Err(copy_error(error));
+        }
+        if self.fatal.load(Ordering::Acquire) {
+            return Err(DbError::AuditIntegrity(
+                "audit runtime is sealed; restore its configuration and reopen the database"
+                    .to_owned(),
+            ));
         }
         let ticket = state.next_ticket;
         state.next_ticket = ticket
@@ -78,11 +117,20 @@ impl AuditBatchCoordinator {
             match outcome {
                 Ok(result) => {
                     let completion = result.map_err(Arc::new);
+                    if let Err(error) = &completion {
+                        self.mark_failed();
+                        // A failed sink may have accepted only part of the batch. Never
+                        // acknowledge later events past that unknown durable prefix.
+                        // Pending callers also fail without attempting another commit.
+                        state.failed = Some(Arc::clone(error));
+                        state.pending.clear();
+                    }
                     for done in tickets {
                         state.completed.insert(done, completion.clone());
                     }
                 }
                 Err(panic) => {
+                    self.mark_failed();
                     let error = Arc::new(DbError::AuditIntegrity(
                         "audit batch leader panicked; reopen the database before retrying"
                             .to_owned(),
@@ -106,13 +154,19 @@ impl AuditBatchCoordinator {
 }
 
 impl Database {
+    /// Startup holds `audit_lock` and verifies the complete chain before recovering a
+    /// missing/short anchor. Keep the private Prepared type inside this module.
+    pub(super) fn recover_verified_audit_anchor(
+        &self,
+        key: &[u8; 32],
+        head: &AuditHead,
+    ) -> Result<(), DbError> {
+        let prepared = self.prepare_audit_anchor(key, head)?;
+        self.finish_audit_anchor(prepared, &[], key, head)
+    }
+
     pub(super) fn persist_audit_batch(&self, events: &[AuditEvent]) -> Result<(), DbError> {
-        self.persist_audit_batch_with_anchor(events, |signed| {
-            if let Some(path) = &self.audit_config.anchor_path {
-                append_anchor(path, signed)?;
-            }
-            Ok(())
-        })
+        self.persist_audit_batch_with_anchor(events, |_| Ok(()))
     }
 
     fn persist_audit_batch_with_anchor(
@@ -130,8 +184,11 @@ impl Database {
         // Read both anew for every batch. A failed commit never leaves a cached head,
         // and replacing an audit key/config does not retain stale signing material.
         let key = self.audit_key()?;
+        self.verify_audit_prefix_before_append(&key)?;
         let mut head = self.audit_head()?;
+        let prepared_anchor = self.prepare_audit_anchor(&key, &head)?;
         let mut signed = Vec::with_capacity(events.len());
+        let mut keys = BTreeSet::new();
         let mut operations = Vec::with_capacity(events.len() + 1);
         for event in events {
             let sequence = head
@@ -142,6 +199,12 @@ impl Database {
                 .clone()
                 .with_integrity(head.hash.clone(), sequence, &key)
                 .map_err(DbError::AuditIntegrity)?;
+            let physical_key = event.key();
+            if !keys.insert(physical_key.clone()) {
+                return Err(DbError::AuditIntegrity(
+                    "audit event key collision; historical records were not replaced".to_owned(),
+                ));
+            }
             head = AuditHead {
                 sequence,
                 hash: event
@@ -149,34 +212,58 @@ impl Database {
                     .as_ref()
                     .map(|integrity| integrity.hash.clone()),
             };
+            let value =
+                serde_json::to_vec(&event).map_err(|error| DbError::Serde(error.to_string()))?;
+            if prepared_anchor.is_some() {
+                anchor::validate_record_size(&value)?;
+            }
             operations.push(Op::Put {
                 table: AUDIT_TABLE.to_owned(),
-                key: event.key(),
-                value: serde_json::to_vec(&event)
-                    .map_err(|error| DbError::Serde(error.to_string()))?,
+                key: physical_key,
+                value,
             });
             signed.push(event);
         }
+        self.ensure_unused_audit_keys(&keys.into_iter().collect::<Vec<_>>())?;
         operations.push(Op::Put {
             table: AUDIT_HEAD_TABLE.to_owned(),
             key: b"head".to_vec(),
             value: serde_json::to_vec(&head).map_err(|error| DbError::Serde(error.to_string()))?,
         });
-        let result = propose_system_batch(&self.repl, operations);
-        observability::record_audit_write(if result.is_ok() { "ok" } else { "error" });
+        let result = (|| {
+            let committed = propose_system_batch(&self.repl, operations);
+            observability::record_audit_write(if committed.is_ok() { "ok" } else { "error" });
+            committed?;
+            // Retain the audit lock until the ordered anchor prefix is durable too.
+            self.finish_audit_anchor(prepared_anchor, &signed, &key, &head)?;
+            anchor(&signed)
+        })();
+        if result.is_err() {
+            self.audit_batch
+                .anchor_checkpoint
+                .lock()
+                .map_err(|_| poisoned())?
+                .take();
+        }
         result?;
-        // Retain the audit lock until the ordered anchor prefix is durable too. A later
-        // batch cannot publish an anchor ahead of this one, and no caller is acknowledged.
-        anchor(&signed)
+        self.bind_audit_key(&key)
     }
 }
 
-fn append_anchor(path: &Path, events: &[AuditEvent]) -> Result<(), DbError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| DbError::AuditIntegrity(error.to_string()))?;
+#[cfg(test)]
+fn append_anchor(path: &std::path::Path, events: &[AuditEvent]) -> Result<(), DbError> {
+    use std::{fs::OpenOptions, io::Write};
+    let (mut file, created) = match OpenOptions::new().create_new(true).append(true).open(path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|error| DbError::AuditIntegrity(error.to_string()))?,
+            false,
+        ),
+        Err(error) => return Err(DbError::AuditIntegrity(error.to_string())),
+    };
     let mut bytes = Vec::new();
     for event in events {
         serde_json::to_writer(&mut bytes, event)
@@ -186,7 +273,12 @@ fn append_anchor(path: &Path, events: &[AuditEvent]) -> Result<(), DbError> {
     file.write_all(&bytes)
         .map_err(|error| DbError::AuditIntegrity(error.to_string()))?;
     file.sync_all()
-        .map_err(|error| DbError::AuditIntegrity(error.to_string()))
+        .map_err(|error| DbError::AuditIntegrity(error.to_string()))?;
+    if created {
+        crate::fileio::sync_parent(path)
+            .map_err(|error| DbError::AuditIntegrity(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn poisoned() -> DbError {
@@ -214,6 +306,9 @@ fn copy_storage_error(error: &StorageError) -> StorageError {
         )),
         StorageError::Corruption(message) => StorageError::Corruption(message.clone()),
         StorageError::Conflict => StorageError::Conflict,
+        StorageError::ResourceLimit(message) => StorageError::ResourceLimit(message.clone()),
+        StorageError::Timeout(message) => StorageError::Timeout(message.clone()),
+        StorageError::Cancelled(message) => StorageError::Cancelled(message.clone()),
         StorageError::Backend(message) => StorageError::Backend(message.clone()),
     }
 }
@@ -373,11 +468,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_anchor_seals_auditing_even_if_the_path_is_repaired() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let missing = temp.path().join("missing");
+        database.audit_config.anchor_path = Some(missing.join("audit.jsonl"));
+        assert!(matches!(
+            database.record_audit(&event("failed")),
+            Err(DbError::AuditIntegrity(_))
+        ));
+        assert_eq!(database.audit_head()?.sequence, 0);
+        std::fs::create_dir(&missing)?;
+        assert!(matches!(
+            database.record_audit(&event("later")),
+            Err(DbError::AuditIntegrity(_))
+        ));
+        assert_eq!(database.audit_head()?.sequence, 0);
+        assert!(!missing.join("audit.jsonl").exists());
+        database.verify_audit_chain()?;
+        Ok(())
+    }
+
+    #[test]
     fn batch_commit_failure_reaches_every_waiter_with_original_error_category() -> TestResult {
         let (sizes, results) = queued_group(Some(DbError::Repl(ReplError::Storage(
             StorageError::Io(std::io::Error::from_raw_os_error(5)),
         ))))?;
-        assert_eq!(sizes, vec![1, 8]);
+        assert_eq!(sizes, vec![1]);
         for result in results {
             assert!(
                 matches!(result, Err(DbError::Repl(ReplError::Storage(StorageError::Io(error)))) if error.raw_os_error() == Some(5))
@@ -448,7 +565,11 @@ mod tests {
             database.persist_audit_batch(&events),
             Err(DbError::AuditIntegrity(_))
         ));
-        assert_eq!(database.audit_events()?.len(), 3);
+        assert_eq!(
+            database.audit_events()?.len(),
+            0,
+            "an unusable anchor is rejected before committing new database events"
+        );
         database.verify_audit_chain()?;
         let (_, outcomes) = queued_group(Some(DbError::AuditIntegrity(
             "injected anchor failure".to_owned(),

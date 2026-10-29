@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_DENY_VERSION: "0.19.9"
@@ -23,9 +26,9 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: studio/package-lock.json
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: sdk/go/go.mod
+          go-version: "1.27.3"
       - name: cargo-deny
         run: |
           mkdir -p "$HOME/.cargo/bin"
@@ -34,8 +37,10 @@ jobs:
           cargo-deny --log-level warn --manifest-path ./Cargo.toml --all-features check
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --lib phase33 -- --nocapture
       - run: cargo test --locked --all-features -- --test-threads=1
+      - run: cargo test --locked --no-default-features -- --test-threads=1
+      - name: Release and benchmark tooling tests
+        run: python3 -m unittest discover -s scripts/benchmarks -p 'test_*.py'
       - name: Template smoke
         shell: pwsh
         run: ./scripts/templates-smoke.ps1
@@ -51,15 +56,6 @@ jobs:
       - name: Studio Playwright smoke
         working-directory: studio
         run: npm run e2e
-      - name: Docker runtime smoke
-        shell: pwsh
-        run: ./scripts/docker-smoke.ps1 -UsePrebuiltArtifacts -PrebuiltBin ./target/debug/multidb
-      - name: SDK examples smoke
-        shell: pwsh
-        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo -ImageTag multidb:docker-smoke
-      - name: Fuzz smoke
-        shell: pwsh
-        run: ./scripts/fuzz-smoke.ps1
       - name: Performance gate self-test
         shell: pwsh
         run: ./scripts/perf_gate.ps1 -SelfTest
@@ -72,6 +68,19 @@ jobs:
         with:
           name: multidb-ci-performance
           path: target/perf/*.json
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+      - run: cargo install cargo-fuzz --locked
+      - name: Required fuzz smoke
+        shell: pwsh
+        run: ./scripts/fuzz-smoke.ps1 -Required
 
   msrv:
     runs-on: ubuntu-latest
@@ -95,6 +104,15 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit --deny warnings
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+          cargo audit --file sdk/rust/Cargo.lock --deny warnings
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Audit locked Studio and TypeScript SDK dependencies
+        run: |
+          npm --prefix studio audit --package-lock-only --audit-level=low
+          npm --prefix sdk/typescript audit --package-lock-only --audit-level=low
       - name: SBOM CycloneDX
         run: |
           cargo install cargo-cyclonedx --locked
@@ -109,3 +127,252 @@ jobs:
         with:
           name: multidb-sbom
           path: target/sbom/*.json
+
+  secure-default:
+    name: secure-default
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set isolated qualification paths
+        run: printf 'MULTIDB_DEFAULT_ARTIFACT=%s/multidb-default-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+        with:
+          key: secure-default-release
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            studio/package-lock.json
+            sdk/typescript/package-lock.json
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.27.3"
+      - name: Resolve and enforce the secure default feature graph
+        run: |
+          mkdir "$MULTIDB_DEFAULT_ARTIFACT"
+          cargo metadata --locked --format-version 1 > "$MULTIDB_DEFAULT_ARTIFACT/cargo-metadata.json"
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          metadata = json.loads((Path(os.environ["MULTIDB_DEFAULT_ARTIFACT"]) / "cargo-metadata.json").read_text())
+          root = metadata["resolve"]["root"]
+          features = next(node["features"] for node in metadata["resolve"]["nodes"] if node["id"] == root)
+          if "default" not in features or "insecure-transport" in features:
+              raise SystemExit("runtime artifact must use the secure Cargo default configuration")
+          PYCODE
+      - name: Test the complete default release configuration once
+        run: cargo test --locked --release -- --test-threads=1
+      - name: Build the same default release binary
+        run: cargo build --locked --release --bin multidb
+      - name: Build the Studio shipped with the exact binary
+        run: |
+          npm --prefix sdk/typescript ci
+          npm --prefix sdk/typescript run build
+          npm --prefix studio ci
+          npm --prefix studio run build
+      - name: Stage exact binary and Studio provenance
+        run: |
+          install -m 0755 target/release/multidb "$MULTIDB_DEFAULT_ARTIFACT/multidb"
+          cp -a studio/dist "$MULTIDB_DEFAULT_ARTIFACT/studio"
+          cp Cargo.lock "$MULTIDB_DEFAULT_ARTIFACT/Cargo.lock"
+          python3 - <<'PYCODE'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ["MULTIDB_DEFAULT_ARTIFACT"])
+          def sha(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(chunk)
+              return value.hexdigest()
+          metadata = json.loads((root / "cargo-metadata.json").read_text())
+          features = next(node["features"] for node in metadata["resolve"]["nodes"] if node["id"] == metadata["resolve"]["root"])
+          revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if revision != os.environ["GITHUB_SHA"] or "default" not in features or "insecure-transport" in features:
+              raise SystemExit("source/default feature binding changed during the build")
+          if not (root / "studio/index.html").is_file():
+              raise SystemExit("built Studio index is missing")
+          files = {}
+          for path in sorted(root.rglob("*")):
+              if path.is_symlink():
+                  raise SystemExit("runtime artifact symlinks are forbidden")
+              if path.is_file():
+                  files[str(path.relative_to(root))] = sha(path)
+          provenance = {"schema_version": 1, "source_revision": revision, "configuration": "cargo-default",
+                        "profile": "release", "features": sorted(features), "files_sha256": files,
+                        "build_command": ["cargo", "build", "--locked", "--release", "--bin", "multidb"]}
+          (root / "provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+          PYCODE
+      - name: Docker smoke of the exact secure default artifact
+        shell: pwsh
+        run: ./scripts/docker-smoke.ps1 -UsePrebuiltArtifacts -PrebuiltBin "$env:MULTIDB_DEFAULT_ARTIFACT/multidb" -PrebuiltStudioDir "$env:MULTIDB_DEFAULT_ARTIFACT/studio"
+      - name: SDK examples against the tested secure default image
+        shell: pwsh
+        run: ./scripts/sdk-examples-smoke.ps1 -RequireGo -ImageTag multidb:docker-smoke
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-qualification-default-release
+          path: ${{ env.MULTIDB_DEFAULT_ARTIFACT }}
+          if-no-files-found: error
+
+  kubernetes-tooling:
+    name: kubernetes-tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set isolated qualification paths
+        run: |
+          printf 'MULTIDB_K8S_TOOLS=%s/multidb-kubernetes-tools\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_K8S_EVIDENCE=%s/multidb-kubernetes-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Initialize public tooling evidence
+        run: |
+          mkdir "$MULTIDB_K8S_EVIDENCE"
+          python3 --version > "$MULTIDB_K8S_EVIDENCE/python-version.txt"
+          cp scripts/qualification/requirements-kubernetes.txt "$MULTIDB_K8S_EVIDENCE/requirements-kubernetes.txt"
+      - name: Install the pinned YAML parser in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/multidb-kubernetes-python"
+          "$RUNNER_TEMP/multidb-kubernetes-python/bin/python" -m pip install --disable-pip-version-check -r scripts/qualification/requirements-kubernetes.txt 2>&1 | tee "$MULTIDB_K8S_EVIDENCE/python-install.log"
+          echo "$RUNNER_TEMP/multidb-kubernetes-python/bin" >> "$GITHUB_PATH"
+      - name: Run qualification tooling regressions
+        run: |
+          python3 -m unittest discover -s scripts/qualification -p 'test_*.py' -v 2>&1 | tee "$MULTIDB_K8S_EVIDENCE/unittests.log"
+      - name: Install and verify pinned Helm, kubeconform and runtime tools
+        run: python3 scripts/qualification/install_kubernetes_tools.py --runtime --output "$MULTIDB_K8S_TOOLS"
+      - name: Validate every stable chart profile with real Helm and strict schemas
+        run: >-
+          python3 scripts/qualification/kubernetes.py
+          --chart ops/helm/multidb --output "$MULTIDB_K8S_EVIDENCE/chart"
+          --helm "$MULTIDB_K8S_TOOLS/helm" --kubeconform "$MULTIDB_K8S_TOOLS/kubeconform"
+          --kubernetes-version 1.35.0
+      - name: Preserve public tooling and schema evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-kubernetes-tooling-evidence
+          path: |
+            ${{ env.MULTIDB_K8S_EVIDENCE }}
+            ${{ env.MULTIDB_K8S_TOOLS }}/provenance.json
+          if-no-files-found: error
+      - name: Reusable verified tools for the runtime job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-kubernetes-tools-linux-amd64
+          path: ${{ env.MULTIDB_K8S_TOOLS }}
+          if-no-files-found: error
+
+  kubernetes-runtime:
+    name: kubernetes-runtime
+    needs: [secure-default, kubernetes-tooling]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set isolated qualification paths
+        run: |
+          printf 'MULTIDB_DEFAULT_ARTIFACT=%s/multidb-default-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_K8S_TOOLS=%s/multidb-kubernetes-tools\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_KIND_OUTPUT=%s/multidb-kind-runtime\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MULTIDB_RUNTIME_EVIDENCE=%s/multidb-kind-bootstrap-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Initialize public runtime bootstrap evidence
+        run: |
+          mkdir "$MULTIDB_RUNTIME_EVIDENCE"
+          python3 --version > "$MULTIDB_RUNTIME_EVIDENCE/python-version.txt"
+          printf '%s\n' 'Runtime execution is unrun until the verified artifact and owned Kind fixture are ready.' > "$MULTIDB_RUNTIME_EVIDENCE/scope.txt"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: multidb-qualification-default-release
+          path: ${{ env.MULTIDB_DEFAULT_ARTIFACT }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: multidb-kubernetes-tools-linux-amd64
+          path: ${{ env.MULTIDB_K8S_TOOLS }}
+      - name: Install the pinned YAML parser in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/multidb-kubernetes-python"
+          "$RUNNER_TEMP/multidb-kubernetes-python/bin/python" -m pip install --disable-pip-version-check -r scripts/qualification/requirements-kubernetes.txt 2>&1 | tee "$MULTIDB_RUNTIME_EVIDENCE/python-install.log"
+          echo "$RUNNER_TEMP/multidb-kubernetes-python/bin" >> "$GITHUB_PATH"
+      - name: Reverify the exact downloaded artifact and tool pins
+        run: |
+          chmod 0755 "$MULTIDB_K8S_TOOLS/helm" "$MULTIDB_K8S_TOOLS/kubeconform" "$MULTIDB_K8S_TOOLS/kind" "$MULTIDB_K8S_TOOLS/kubectl" "$MULTIDB_DEFAULT_ARTIFACT/multidb"
+          python3 scripts/qualification/install_kubernetes_tools.py --runtime --verify "$MULTIDB_K8S_TOOLS" > "$MULTIDB_RUNTIME_EVIDENCE/tool-verification.json"
+          python3 - <<'PYCODE'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["MULTIDB_DEFAULT_ARTIFACT"])
+          report = json.loads((root / "provenance.json").read_text())
+          if report["source_revision"] != os.environ["GITHUB_SHA"] or report["configuration"] != "cargo-default" or report["profile"] != "release":
+              raise SystemExit("runtime artifact source/configuration does not match this workflow")
+          if "default" not in report["features"] or "insecure-transport" in report["features"]:
+              raise SystemExit("runtime artifact is not the secure default configuration")
+          actual = set()
+          for path in root.rglob("*"):
+              if path.is_symlink():
+                  raise SystemExit("runtime artifact contains a symlink")
+              if path.is_file() and path != root / "provenance.json":
+                  name = str(path.relative_to(root))
+                  actual.add(name)
+                  digest = hashlib.sha256()
+                  with path.open("rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  if report["files_sha256"].get(name) != digest.hexdigest():
+                      raise SystemExit("runtime artifact checksum mismatch: " + name)
+          if actual != set(report["files_sha256"]) or not {"multidb", "studio/index.html", "Cargo.lock", "cargo-metadata.json"} <= actual:
+              raise SystemExit("runtime artifact file inventory is incomplete or unexpected")
+          destination = Path(os.environ["MULTIDB_RUNTIME_EVIDENCE"]) / "artifact-provenance.json"
+          destination.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+          PYCODE
+      - name: Pull the exact Kind node image with real disk preflight
+        run: |
+          command -v docker
+          command -v openssl
+          df -h | tee "$MULTIDB_RUNTIME_EVIDENCE/disk-before.log"
+          docker --host=unix:///var/run/docker.sock info --format '{{json .DockerRootDir}}' > "$MULTIDB_RUNTIME_EVIDENCE/docker-root.json"
+          python3 - <<'PYCODE'
+          import json, os, shutil
+          from pathlib import Path
+          evidence = Path(os.environ["MULTIDB_RUNTIME_EVIDENCE"])
+          root = Path(json.loads((evidence / "docker-root.json").read_text()))
+          if not root.is_absolute() or not root.is_dir():
+              raise SystemExit("Docker reported an unavailable data directory")
+          free = shutil.disk_usage(root).free
+          (evidence / "disk-preflight.json").write_text(json.dumps({"docker_root": str(root), "free_bytes": free, "required_free_bytes": 6 * 1024**3}, indent=2) + "\n")
+          if free < 6 * 1024**3:
+              raise SystemExit("at least 6 GiB free on the Docker filesystem is required before pulling the Kind node")
+          PYCODE
+          docker --host=unix:///var/run/docker.sock pull 'kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0' 2>&1 | tee "$MULTIDB_RUNTIME_EVIDENCE/node-pull.log"
+      - name: Prepare only the private owned Kind fixture
+        run: >-
+          python3 scripts/qualification/kubernetes_runtime.py --prepare-cluster --nested-kmsg-device
+          --cluster multidb-qualification-ci --output "$MULTIDB_KIND_OUTPUT" --tools "$MULTIDB_K8S_TOOLS"
+      - name: Execute all CPU profiles and encrypted reopen with the exact image
+        run: >-
+          python3 scripts/qualification/kubernetes_runtime.py --runtime
+          --cluster multidb-qualification-ci --output "$MULTIDB_KIND_OUTPUT" --tools "$MULTIDB_K8S_TOOLS"
+          --binary "$MULTIDB_DEFAULT_ARTIFACT/multidb" --revision "$GITHUB_SHA"
+          --studio-dir "$MULTIDB_DEFAULT_ARTIFACT/studio" --repository "$GITHUB_WORKSPACE"
+      - name: Clean up only the recorded owned fixture
+        if: always()
+        run: |
+          if test -f "$MULTIDB_KIND_OUTPUT/private/owner.json"; then
+            python3 scripts/qualification/kubernetes_runtime.py --cleanup --cluster multidb-qualification-ci --output "$MULTIDB_KIND_OUTPUT" --tools "$MULTIDB_K8S_TOOLS"
+          fi
+      - name: Upload public runtime evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-kubernetes-cpu-runtime-evidence
+          path: |
+            ${{ env.MULTIDB_KIND_OUTPUT }}/evidence
+            ${{ env.MULTIDB_RUNTIME_EVIDENCE }}
+          if-no-files-found: error

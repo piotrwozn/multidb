@@ -1,8 +1,12 @@
 replicaCount: 1
+nameOverride: ""
+fullnameOverride: ""
 
 image:
-  repository: multidb
-  tag: local
+  repository: ghcr.io/piotrwozn/multidb
+  tag: 1.0.0-rc.1
+  # Required in production: use a real verified image digest.
+  digest: ""
   pullPolicy: IfNotPresent
 
 service:
@@ -16,6 +20,33 @@ runtime:
   studioDir: /usr/share/multidb/studio
   adminBind: 0.0.0.0:8080
   pgBind: 0.0.0.0:5432
+  pgUser: multidb
+  terminationGracePeriodSeconds: 60
+  preStopDelaySeconds: 5
+  # InMemory only: all database state is lost on process/pod restart.
+  allowVolatile: false
+
+runtimeClassName: ""
+supplementalGroups: []
+
+gpu:
+  enabled: false
+  vendor: ""
+  # Optional exact resource advertised by the installed device plugin (e.g.xe).
+  resourceName: ""
+
+encryption:
+  enabled: false
+  secretName: multidb-encryption
+  key: key
+  mountPath: /etc/multidb/encryption
+
+audit:
+  enabled: true
+  secretName: multidb-audit
+  key: audit-key
+  mountPath: /etc/multidb/audit-key
+  anchorPath: /var/lib/multidb/audit-private/audit.anchor
 
 secrets:
   adminPassword:
@@ -35,22 +66,29 @@ secrets:
 
 persistence:
   enabled: true
+  # local-dev or explicitly acknowledged InMemory only.
   devEmptyDir: false
   existingClaim: ""
   storageClassName: ""
   accessModes:
     - ReadWriteOnce
   size: 10Gi
+  retainOnDelete: true
 
 config:
-  # Ignored when spec.enabled: the spec decides the profile and the replication.
+  # Flat serve is SINGLE NODE. The legacy replication hint never creates HA.
+  # Spec mode decides profile/replication and rejects unsupported live CP/AP.
   profile: transactional
-  replication: cp
+  replication: ""
   auditJsonlPath: /var/lib/multidb/audit/audit.jsonl
   backupTarget: s3://multidb-local/backups
   minioEndpoint: http://minio:9000
   vaultAddress: http://vault:8200
   vaultKekPath: secret/data/multidb/kek
+  # Transactional profile can reserve512MiB/query; leave native/index headroom.
+  maxConcurrentQueries: 2
+  queryQueueTimeoutMs: 5000
+  historyRetainLsns: ""
 
 # Spec mode (preview, docs/provisioning.md#serve): serve builds the database from a
 # DatabaseSpec mounted read-only from a ConfigMap and checks it against the spec at every
@@ -68,14 +106,55 @@ spec:
 
 resources:
   requests:
-    cpu: 100m
-    memory: 256Mi
-  limits:
     cpu: "1"
     memory: 1Gi
+  limits:
+    cpu: "4"
+    memory: 4Gi
 
 probes:
   readinessPath: /ready
   livenessPath: /health
   initialDelaySeconds: 5
   periodSeconds: 10
+  timeoutSeconds: 2
+  startupPeriodSeconds: 5
+  startupFailureThreshold: 60
+  readinessFailureThreshold: 3
+  livenessFailureThreshold: 6
+
+# Protect accidental drains; approved maintenance must acknowledge downtime.
+pdb:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+  # Standard NetworkPolicyPeer objects; empty means deny application clients.
+  clientPeers: []
+  proxyPeers: []
+  metricsPeers: []
+  # Standard egress rules; DNS/cloud access must be explicitly declared.
+  egress: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+  principalHeaderTrustAcknowledged: false
+
+monitoring:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+podAnnotations: {}
+nodeSelector: {}
+affinity: {}
+tolerations: []
+topologySpreadConstraints: []
+imagePullSecrets: []

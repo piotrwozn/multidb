@@ -11,10 +11,10 @@ use datafusion::{
     arrow::{
         array::{
             Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Float64Array, Int64Array,
-            NullArray, StringArray, UInt64Array,
+            NullArray, StringArray, StringBuilder, UInt64Array,
         },
         datatypes::{DataType, Field, Schema, SchemaRef},
-        record_batch::RecordBatch,
+        record_batch::{RecordBatch, RecordBatchOptions},
     },
     catalog::Session,
     common::{
@@ -26,16 +26,14 @@ use datafusion::{
         source_as_provider,
     },
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{
-        disk_manager::DiskManagerBuilder, memory_pool::GreedyMemoryPool,
-        runtime_env::RuntimeEnvBuilder,
-    },
+    execution::{disk_manager::DiskManagerBuilder, runtime_env::RuntimeEnvBuilder},
     logical_expr::{
         Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, lit,
     },
-    physical_plan::{ExecutionPlan, collect},
+    physical_plan::ExecutionPlan,
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
+use futures::StreamExt;
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 use rayon::prelude::*;
 use sqlparser::ast::{
@@ -65,12 +63,18 @@ use crate::{
 };
 
 mod batch_cache;
+mod budget;
 mod explain_fallback;
+mod guarded_rows;
 mod optimizer;
 mod parser;
 mod row_scan;
+mod simple_grammar;
 mod write_batch;
 
+pub(crate) use guarded_rows::{
+    GuardedRows, json_unescape_working_bytes, json_value_upper_bytes, owned_value_memory_bound,
+};
 pub use optimizer::{
     AccessPath, AnalyzeMode, AnalyzeReport, AnalyzeTarget, Bucket, CachedPlan,
     CardinalityEstimator, ColumnStats, Cost, CostCoefficients, CostModel, CostProfile,
@@ -232,13 +236,13 @@ pub enum SqlOutput {
 #[derive(thiserror::Error, Debug)]
 pub enum QueryError {
     #[error("replication: {0}")]
-    Repl(#[from] ReplError),
+    Repl(#[source] ReplError),
 
     #[error("storage: {0}")]
-    Storage(#[from] StorageError),
+    Storage(#[source] StorageError),
 
     #[error("model: {0}")]
-    Model(#[from] ModelError),
+    Model(#[source] ModelError),
 
     #[error("sql parse: {0}")]
     Parse(String),
@@ -289,6 +293,48 @@ pub enum QueryError {
 
     #[error("authorization denied: {0}")]
     AuthzDenied(AuthzError),
+}
+
+impl From<StorageError> for QueryError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::ResourceLimit(reason) => Self::ResourceLimit(reason),
+            StorageError::Timeout(reason) => Self::Timeout(reason),
+            StorageError::Cancelled(reason) => Self::Cancelled(reason),
+            other => Self::Storage(other),
+        }
+    }
+}
+
+impl From<ReplError> for QueryError {
+    fn from(error: ReplError) -> Self {
+        match error {
+            ReplError::Storage(StorageError::ResourceLimit(reason)) => Self::ResourceLimit(reason),
+            ReplError::Storage(StorageError::Timeout(reason)) => Self::Timeout(reason),
+            ReplError::Storage(StorageError::Cancelled(reason)) => Self::Cancelled(reason),
+            other => Self::Repl(other),
+        }
+    }
+}
+
+impl From<ModelError> for QueryError {
+    fn from(error: ModelError) -> Self {
+        match error {
+            ModelError::Storage(StorageError::ResourceLimit(reason))
+            | ModelError::Repl(ReplError::Storage(StorageError::ResourceLimit(reason))) => {
+                Self::ResourceLimit(reason)
+            }
+            ModelError::Storage(StorageError::Timeout(reason))
+            | ModelError::Repl(ReplError::Storage(StorageError::Timeout(reason))) => {
+                Self::Timeout(reason)
+            }
+            ModelError::Storage(StorageError::Cancelled(reason))
+            | ModelError::Repl(ReplError::Storage(StorageError::Cancelled(reason))) => {
+                Self::Cancelled(reason)
+            }
+            other => Self::Model(other),
+        }
+    }
 }
 
 /// A relation that a planned SQL statement reads.
@@ -348,6 +394,7 @@ enum PreparedSelect {
         plan: Box<LogicalPlan>,
         /// Time already spent planning; execution gets the rest of the query timeout.
         planning: std::time::Duration,
+        budget: Arc<budget::Budget>,
     },
 }
 
@@ -360,6 +407,7 @@ pub struct RelTable {
     schema: Option<TableSchema>,
     indexes: Vec<RelIndexSpec>,
     layout: TableLayout,
+    read_budget: Option<Arc<budget::Budget>>,
 }
 
 #[derive(Clone)]
@@ -385,6 +433,7 @@ struct StorageTableProvider {
     performance: PerformanceConfig,
     snapshot_lsn: Option<u64>,
     batch_cache: Arc<batch_cache::BatchCache>,
+    budget: Arc<budget::Budget>,
 }
 
 #[derive(Clone)]
@@ -396,12 +445,14 @@ pub struct DocCollectionProvider {
     arrow_schema: SchemaRef,
     /// Row policies decided on each stored document, as in `SqlRelationPolicy::visible_when`.
     visible_when: Arc<[Vec<(FieldPath, Value)>]>,
+    budget: Option<Arc<budget::Budget>>,
 }
 
 #[derive(Clone)]
 pub struct ForeignTableProvider {
     spec: ForeignTableSpec,
     arrow_schema: SchemaRef,
+    budget: Option<Arc<budget::Budget>>,
 }
 
 #[derive(Clone)]
@@ -409,6 +460,7 @@ pub struct MaterializedViewProvider {
     repl: Arc<dyn Replication>,
     spec: cdc::MaterializedViewSpec,
     arrow_schema: SchemaRef,
+    budget: Option<Arc<budget::Budget>>,
 }
 
 #[derive(Clone)]
@@ -418,6 +470,7 @@ pub struct TemporalTableProvider {
     base_schema: TableSchema,
     retention: TemporalRetention,
     arrow_schema: SchemaRef,
+    budget: Option<Arc<budget::Budget>>,
 }
 
 impl ColumnDef {
@@ -581,6 +634,7 @@ impl RelTable {
             schema,
             indexes,
             layout,
+            read_budget: None,
         })
     }
 
@@ -656,6 +710,7 @@ impl RelTable {
             schema,
             indexes,
             layout,
+            read_budget: None,
         })
     }
 
@@ -992,19 +1047,41 @@ impl RelTable {
     /// # Errors
     /// Fails when rows cannot be scanned or statistics cannot be written.
     pub fn analyze(&self, mode: AnalyzeMode) -> Result<TableStats, QueryError> {
-        let rows = self.scan()?;
-        let schema_columns = stats_columns_for_schema(self.schema.as_ref(), &rows);
+        let budget = budget::Budget::new(&crate::performance::QueryExecutionConfig::default());
+        let _cancel_on_drop = budget.start(std::time::Duration::ZERO)?;
+        self.analyze_with_budget(mode, &budget)
+    }
+
+    fn analyze_with_budget(
+        &self,
+        mode: AnalyzeMode,
+        budget: &Arc<budget::Budget>,
+    ) -> Result<TableStats, QueryError> {
+        let mut source = self.clone();
+        source.repl = budget::replication(Arc::clone(&self.repl), budget);
+        source.read_budget = Some(Arc::clone(budget));
+        let rows = source.scan()?;
+        budget.check()?;
+        if let Some(schema) = &self.schema {
+            for column in &schema.columns {
+                budget
+                    .charge(4 * std::mem::size_of::<(String, ColumnType)>() + column.name.len())?;
+            }
+        }
+        let columns = stats_columns_for_schema(self.schema.as_ref(), &rows);
         let stats_version = StatsCatalog::next_stats_version(self.repl.as_ref())?;
-        let stats = optimizer::build_table_stats(
+        let stats = optimizer::build_table_stats_guarded(
             &self.name,
             StatsObjectKind::Table,
-            &schema_columns,
+            &columns,
             &rows,
             mode,
             stats_version,
-            stats_version,
-        );
+            budget,
+        )?;
+        budget.check()?;
         StatsCatalog::write_table(self.repl.as_ref(), &stats)?;
+        budget.check()?;
         Ok(stats)
     }
 
@@ -1406,8 +1483,50 @@ impl RelTable {
         };
 
         let schema = self.required_schema()?;
+        if let Some(budget) = &self.read_budget {
+            let batches = self.decode_segment_batches(bytes, None, None)?;
+            let mut rows = Vec::new();
+            for batch in &batches {
+                budget.charge_batch(batch)?;
+                append_record_batch_rows(batch, &mut rows, Some(budget))?;
+            }
+            for row in &rows {
+                validate_row(Some(schema), row)?;
+            }
+            return Ok(rows);
+        }
         let bytes = cloud::resolve_tiered_segment_payload(bytes)?;
         parquet_bytes_to_rows(&bytes, schema)
+    }
+
+    fn decode_segment_batches(
+        &self,
+        bytes: &[u8],
+        projection: Option<&[usize]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let Some(budget) = &self.read_budget {
+            budget.check()?;
+            let owner = cloud::resolve_tiered_segment_payload_guarded(bytes, budget.as_ref())?;
+            // Bytes owns the lease-bearing payload; no second segment-sized copy,
+            // and the reservation cannot drop before a retained input slice.
+            let payload = ByteBuf::from_owner(owner);
+            return federation::guarded_parquet_bytes_to_batches(
+                payload,
+                self.required_schema()?,
+                projection,
+                limit,
+                Arc::clone(budget) as Arc<dyn federation::ForeignScanGuard>,
+            );
+        }
+        let bytes = cloud::resolve_tiered_segment_payload(bytes)?;
+        Ok(limit_record_batches(
+            parquet_bytes_to_batches(&bytes, projection)?,
+            limit,
+        ))
     }
 
     /// Builds ops that replace every stored row with `rows`, for seeding columnar
@@ -1729,27 +1848,59 @@ impl RelTable {
     fn columnar_record_batches(
         &self,
         projection: Option<&[usize]>,
+        limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let (start, end) = columnar_segment_range_bounds(&self.name);
+        if let Some(budget) = &self.read_budget {
+            let mut batches = Vec::new();
+            let mut rows = 0_usize;
+            let mut error = None;
+            self.repl.visit_range(
+                REL_COLUMNAR_SEGMENTS_TABLE,
+                &start,
+                &end,
+                ReadConsistency::Strong,
+                budget.as_ref(),
+                &mut |_, bytes| {
+                    let remaining = limit.map(|limit| limit.saturating_sub(rows));
+                    match self.decode_segment_batches(bytes, projection, remaining) {
+                        Ok(decoded) => {
+                            rows = rows.saturating_add(
+                                decoded.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                            );
+                            batches.extend(decoded);
+                            Ok(limit.is_none_or(|limit| rows < limit))
+                        }
+                        Err(cause) => {
+                            error = Some(cause);
+                            Ok(false)
+                        }
+                    }
+                },
+            )?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            budget.check()?;
+            return Ok(batches);
+        }
         let segments = self.repl.range(
             REL_COLUMNAR_SEGMENTS_TABLE,
             &start,
             &end,
             ReadConsistency::Strong,
         )?;
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let decoded = segments
             .par_iter()
-            .map(|(_, bytes)| {
-                let bytes = cloud::resolve_tiered_segment_payload(bytes)?;
-                parquet_bytes_to_batches(&bytes, projection)
-            })
+            .map(|(_, bytes)| self.decode_segment_batches(bytes, projection, None))
             .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(decoded.into_iter().flatten().collect())
+        Ok(limit_record_batches(
+            decoded.into_iter().flatten().collect(),
+            limit,
+        ))
     }
 
     /// Reports how many columnar segments a simple filter can skip.
@@ -1993,6 +2144,11 @@ impl SqlEngine {
         self
     }
 
+    pub(crate) fn with_query_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.performance.query.timeout_ms = timeout_ms;
+        self
+    }
+
     /// Creates and registers a relational table.
     /// # Errors
     /// Fails when schema metadata cannot be written.
@@ -2140,12 +2296,15 @@ impl SqlEngine {
             AnalyzeTarget::Named(name) => vec![name],
         };
 
+        let budget = budget::Budget::new(&self.performance.query);
+        let _cancel_on_drop = budget.start(std::time::Duration::ZERO)?;
         let mut analyzed = Vec::new();
         for name in names {
+            budget.check()?;
             if let Some(table) = self.tables.get(&name) {
-                analyzed.push(table.analyze(mode)?);
+                analyzed.push(table.analyze_with_budget(mode, &budget)?);
             } else if let Some(collection) = self.collections.get(&name) {
-                analyzed.push(collection.analyze(&name, mode)?);
+                analyzed.push(collection.analyze(&name, mode, &budget)?);
             } else {
                 return Err(QueryError::MissingTable(name));
             }
@@ -2153,6 +2312,30 @@ impl SqlEngine {
 
         self.invalidate_plan_cache()?;
         Ok(AnalyzeReport { mode, analyzed })
+    }
+
+    /// Statistics expose raw row counts and value distributions, so they cannot
+    /// be computed under a caller's row or masking policies.
+    fn analyze_read_targets(
+        &self,
+        target: &AnalyzeTarget,
+        policies: &BTreeMap<String, SqlRelationPolicy>,
+    ) -> Result<BTreeSet<SqlReadTarget>, QueryError> {
+        let names: BTreeSet<String> = match target {
+            AnalyzeTarget::All => self
+                .tables
+                .keys()
+                .chain(self.collections.keys())
+                .cloned()
+                .collect(),
+            AnalyzeTarget::Named(name) => BTreeSet::from([name.clone()]),
+        };
+        if let Some(name) = names.iter().find(|name| policies.contains_key(*name)) {
+            return Err(QueryError::Unsupported(format!(
+                "ANALYZE over {name} is unsupported while it has row or masking policies"
+            )));
+        }
+        Ok(names.into_iter().map(SqlReadTarget::Catalog).collect())
     }
 
     /// Builds an optimizer explanation without necessarily executing the query.
@@ -2182,7 +2365,7 @@ impl SqlEngine {
             .tables
             .get(&simple.table)
             .ok_or_else(|| QueryError::MissingTable(simple.table.clone()))?;
-        let stats = StatsCatalog::read_table(self.repl.as_ref(), &simple.table)?;
+        let stats = StatsCatalog::read_table(table.repl.as_ref(), &simple.table)?;
         let fingerprint = QueryFingerprint::new(sql);
         let plan = self.choose_eq_plan(
             &fingerprint,
@@ -2194,15 +2377,13 @@ impl SqlEngine {
 
         let (actual_rows, actual_ms) = if options.analyze {
             let started = std::time::Instant::now();
-            let result = table.query_filter_with_access_path(
-                &simple.filter,
-                &simple.projection,
-                &plan.access_path,
-            )?;
+            let SqlOutput::Rows(result) = self.run_simple_select(sql, simple)? else {
+                return Err(QueryError::Unsupported(
+                    "EXPLAIN requires a read query".to_owned(),
+                ));
+            };
             (
-                Some(usize_to_u64(
-                    result.rows.len().min(simple.limit.unwrap_or(usize::MAX)),
-                )),
+                Some(usize_to_u64(result.rows.len())),
                 Some(optimizer::elapsed_ms(started)),
             )
         } else {
@@ -2260,6 +2441,16 @@ impl SqlEngine {
         }
 
         if let Some((target, mode)) = parse_analyze_command(sql)? {
+            let policies = guard
+                .as_deref()
+                .map(SqlReadGuard::relation_policies)
+                .unwrap_or_default();
+            let reads = self.analyze_read_targets(&target, &policies)?;
+            if let Some(guard) = guard.as_deref_mut() {
+                guard
+                    .authorize_reads(&reads)
+                    .map_err(QueryError::AuthzDenied)?;
+            }
             return Ok(self.analyze(target, mode)?.to_sql_output());
         }
 
@@ -2348,7 +2539,7 @@ impl SqlEngine {
             Statement::Analyze(_) => return Ok(None),
             other => return Err(QueryError::Unsupported(other.to_string())),
         };
-        let (ctx, providers) = self.datafusion_catalog_context(&policies)?;
+        let (ctx, providers, _) = self.datafusion_catalog_context(&policies)?;
         let plan = self.plan_datafusion_select(&ctx, &select_sql).await?;
         guard
             .authorize_reads(&planned_read_targets(&plan, &providers)?)
@@ -2378,7 +2569,8 @@ impl SqlEngine {
                     .map_or(Ok(AnalyzeTarget::All), |name| {
                         object_name_to_string(name).map(AnalyzeTarget::Named)
                     })?;
-                Ok((PreparedStatement::Analyze(target), None))
+                let reads = self.analyze_read_targets(&target, policies)?;
+                Ok((PreparedStatement::Analyze(target), Some(reads)))
             }
             Statement::Explain {
                 analyze, statement, ..
@@ -2423,7 +2615,11 @@ impl SqlEngine {
                 ctx,
                 plan,
                 planning,
-            }) => self.run_datafusion_select(&ctx, *plan, planning).await,
+                budget,
+            }) => {
+                self.run_datafusion_select(&ctx, *plan, planning, &budget)
+                    .await
+            }
             PreparedStatement::Analyze(target) => Ok(self
                 .analyze(target, AnalyzeMode::default())?
                 .to_sql_output()),
@@ -2464,7 +2660,7 @@ impl SqlEngine {
             ));
         }
 
-        let (ctx, providers) = self.datafusion_catalog_context(policies)?;
+        let (ctx, providers, budget) = self.datafusion_catalog_context(policies)?;
         let started = std::time::Instant::now();
         let plan = self.plan_datafusion_select(&ctx, sql).await?;
         let planning = started.elapsed();
@@ -2474,6 +2670,7 @@ impl SqlEngine {
                 ctx,
                 plan: Box::new(plan),
                 planning,
+                budget,
             },
             reads,
         ))
@@ -2486,36 +2683,56 @@ impl SqlEngine {
     fn datafusion_catalog_context(
         &self,
         policies: &BTreeMap<String, SqlRelationPolicy>,
-    ) -> Result<(SessionContext, RegisteredProviders), QueryError> {
-        let ctx = self.datafusion_context()?;
+    ) -> Result<(SessionContext, RegisteredProviders, Arc<budget::Budget>), QueryError> {
+        let budget = budget::Budget::new(&self.performance.query);
+        let ctx = self.datafusion_context(&budget)?;
         let mut providers: RegisteredProviders = Vec::new();
 
         for (name, table) in &self.tables {
             providers.push((
                 name.clone(),
                 Arc::new(StorageTableProvider::new(
-                    table.clone(),
+                    {
+                        let mut table = table.clone();
+                        table.read_budget = Some(Arc::clone(&budget));
+                        if self.snapshot_lsn.is_some() || table.layout == TableLayout::Columnar {
+                            table.repl = budget::replication(Arc::clone(&table.repl), &budget);
+                        }
+                        table
+                    },
                     self.performance.clone(),
                     self.snapshot_lsn,
                     Arc::clone(&self.batch_cache),
+                    Arc::clone(&budget),
                 )),
             ));
         }
 
         for (name, provider) in &self.collections {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.repl = budget::replication(Arc::clone(&provider.repl), &budget);
+            provider.budget = Some(Arc::clone(&budget));
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &self.foreign_tables {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.budget = Some(Arc::clone(&budget));
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &self.materialized_views {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.repl = budget::replication(Arc::clone(&provider.repl), &budget);
+            provider.budget = Some(Arc::clone(&budget));
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &self.temporal_tables {
-            providers.push((name.clone(), Arc::new(provider.clone())));
+            let mut provider = provider.clone();
+            provider.repl = budget::replication(Arc::clone(&provider.repl), &budget);
+            provider.budget = Some(Arc::clone(&budget));
+            providers.push((name.clone(), Arc::new(provider)));
         }
 
         for (name, provider) in &mut providers {
@@ -2525,6 +2742,7 @@ impl SqlEngine {
                     Arc::clone(provider),
                     self.collections.get(name),
                     policy,
+                    Arc::clone(&budget),
                 )?;
             }
         }
@@ -2534,7 +2752,7 @@ impl SqlEngine {
                 .map_err(|error| QueryError::DataFusion(error.to_string()))?;
         }
 
-        Ok((ctx, providers))
+        Ok((ctx, providers, budget))
     }
 
     async fn plan_datafusion_select(
@@ -2565,7 +2783,9 @@ impl SqlEngine {
         ctx: &SessionContext,
         plan: LogicalPlan,
         planning: std::time::Duration,
+        budget: &Arc<budget::Budget>,
     ) -> Result<SqlOutput, QueryError> {
+        let _cancel_on_drop = budget.start(planning)?;
         // Planning and execution share one `timeout_ms` budget per statement.
         let timeout = std::time::Duration::from_millis(self.performance.query.timeout_ms)
             .saturating_sub(planning);
@@ -2580,18 +2800,25 @@ impl SqlEngine {
                 .iter()
                 .map(|field| field.name().clone())
                 .collect::<Vec<_>>();
-            let batches = dataframe
-                .collect()
+            let mut stream = dataframe
+                .execute_stream()
                 .await
                 .map_err(|error| datafusion_to_query_error(&error))?;
-            Ok::<_, QueryError>((columns, batches))
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(|error| datafusion_to_query_error(&error))?;
+                budget.charge_batch(&batch)?;
+                append_record_batch_rows(&batch, &mut rows, Some(budget))?;
+                // Release this Arrow batch before asking the executor for the next
+                // one. Only the public owned-row result needs to remain retained.
+            }
+            budget.check()?;
+            Ok::<_, QueryError>(SqlOutput::Rows(SqlRows { columns, rows }))
         };
 
-        let (columns, batches) = tokio::time::timeout(timeout, execution)
+        tokio::time::timeout(timeout, execution)
             .await
-            .map_err(|_| self.timeout_error())??;
-
-        Ok(SqlOutput::Rows(record_batches_to_rows(&batches, columns)?))
+            .map_err(|_| self.timeout_error())?
     }
 
     fn timeout_error(&self) -> QueryError {
@@ -2601,11 +2828,9 @@ impl SqlEngine {
         ))
     }
 
-    fn datafusion_context(&self) -> Result<SessionContext, QueryError> {
+    fn datafusion_context(&self, budget: &budget::Budget) -> Result<SessionContext, QueryError> {
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(
-                self.performance.query.memory_limit_bytes,
-            )))
+            .with_memory_pool(Arc::clone(&budget.pool))
             .with_disk_manager_builder(
                 DiskManagerBuilder::default()
                     .with_max_temp_directory_size(self.performance.query.spill_limit_bytes),
@@ -2651,11 +2876,16 @@ impl SqlEngine {
             .tables
             .get(&simple.table)
             .ok_or_else(|| QueryError::MissingTable(simple.table.clone()))?;
+        let budget = budget::Budget::new(&self.performance.query);
+        let _cancel_on_drop = budget.start(std::time::Duration::ZERO)?;
+        let mut table = table.clone();
+        table.repl = budget::replication(Arc::clone(&table.repl), &budget);
+        table.read_budget = Some(Arc::clone(&budget));
         let stats = StatsCatalog::read_table(self.repl.as_ref(), &simple.table)?;
         let fingerprint = QueryFingerprint::new(sql);
         let plan = self.choose_eq_plan(
             &fingerprint,
-            table,
+            &table,
             &simple.filter,
             &simple.projection,
             stats.as_ref(),
@@ -2665,7 +2895,12 @@ impl SqlEngine {
             &simple.filter,
             &simple.projection,
             &plan.access_path,
-        )?;
+        );
+        budget.check()?;
+        let result = result?;
+        for row in &result.rows {
+            budget.charge_row(row, Some(&simple.projection))?;
+        }
         let mut rows = result
             .rows
             .into_iter()
@@ -2686,6 +2921,9 @@ impl SqlEngine {
         let [Statement::Query(query)] = statements.as_slice() else {
             return Ok(None);
         };
+        if !simple_grammar::supported(query) {
+            return Ok(None);
+        }
 
         if query.with.is_some()
             || query.order_by.is_some()
@@ -2790,6 +3028,12 @@ impl SqlEngine {
                 QueryError::Storage(StorageError::Backend("plan cache lock poisoned".to_owned()))
             })?
             .get(fingerprint, stats_version)
+            && optimizer::cached_path_applies(
+                &cached.access_path,
+                &table.indexes,
+                filter,
+                projection,
+            )
         {
             return Ok(EqPlan {
                 access_path: cached.access_path,
@@ -2848,6 +3092,7 @@ impl StorageTableProvider {
         performance: PerformanceConfig,
         snapshot_lsn: Option<u64>,
         batch_cache: Arc<batch_cache::BatchCache>,
+        budget: Arc<budget::Budget>,
     ) -> Self {
         Self {
             arrow_schema: schema_to_arrow(table.schema.as_ref()),
@@ -2855,6 +3100,7 @@ impl StorageTableProvider {
             performance,
             snapshot_lsn,
             batch_cache,
+            budget,
         }
     }
 }
@@ -2877,6 +3123,7 @@ impl DocCollectionProvider {
             fields,
             indexes,
             visible_when: Arc::from(Vec::new()),
+            budget: None,
         })
     }
 
@@ -2893,6 +3140,9 @@ impl DocCollectionProvider {
         schema: SchemaRef,
         limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let collection = DocumentCollection::with_indexes(
             self.repl.as_ref(),
             self.collection_id,
@@ -2919,27 +3169,44 @@ impl DocCollectionProvider {
             .into_iter()
             .map(|(id, doc)| self.document_to_row(id, &doc))
             .collect::<Vec<_>>();
+        if let Some(budget) = &self.budget {
+            budget.charge_arrow_build(&schema, &rows)?;
+        }
         Ok(vec![rows_to_record_batch(schema, &rows)?])
     }
 
-    fn analyze(&self, name: &str, mode: AnalyzeMode) -> Result<TableStats, QueryError> {
-        let rows = batches_to_rows(&self.scan_record_batches(self.arrow_schema.clone(), None)?)?;
+    fn analyze(
+        &self,
+        name: &str,
+        mode: AnalyzeMode,
+        budget: &Arc<budget::Budget>,
+    ) -> Result<TableStats, QueryError> {
+        let mut source = self.clone();
+        source.repl = budget::replication(Arc::clone(&self.repl), budget);
+        source.budget = Some(Arc::clone(budget));
+        let rows = batches_to_rows(&source.scan_record_batches(self.arrow_schema.clone(), None)?)?;
+        budget.check()?;
+        for field in &self.fields {
+            budget.charge(4 * std::mem::size_of::<(String, ColumnType)>() + field.name.len())?;
+        }
         let columns = self
             .fields
             .iter()
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect::<Vec<_>>();
         let stats_version = StatsCatalog::next_stats_version(self.repl.as_ref())?;
-        let stats = optimizer::build_table_stats(
+        let stats = optimizer::build_table_stats_guarded(
             name,
             StatsObjectKind::Collection,
             &columns,
             &rows,
             mode,
             stats_version,
-            stats_version,
-        );
+            budget,
+        )?;
+        budget.check()?;
         StatsCatalog::write_table(self.repl.as_ref(), &stats)?;
+        budget.check()?;
         Ok(stats)
     }
 
@@ -2964,6 +3231,7 @@ impl ForeignTableProvider {
         Self {
             arrow_schema: schema_to_arrow(Some(&spec.schema)),
             spec,
+            budget: None,
         }
     }
 
@@ -2972,16 +3240,23 @@ impl ForeignTableProvider {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> Result<Vec<Row>, QueryError> {
-        let result = federation::scan_foreign_table(
+        let result = federation::scan_foreign_table_guarded(
             &self.spec,
             ForeignScanRequest {
                 projection,
                 filters: Vec::new(),
                 limit,
             },
+            self.budget
+                .as_ref()
+                .map(|budget| Arc::clone(budget) as Arc<dyn federation::ForeignScanGuard>),
         )
         .await
-        .map_err(|error| QueryError::Storage(StorageError::Backend(error.to_string())))?;
+        .map_err(|error| match error {
+            federation::FederationError::Query(error) => error,
+            federation::FederationError::Unsupported(reason) => QueryError::Unsupported(reason),
+            error => QueryError::Storage(StorageError::Backend(error.to_string())),
+        })?;
         Ok(result.rows)
     }
 }
@@ -3004,10 +3279,47 @@ impl MaterializedViewProvider {
             repl,
             arrow_schema: materialized_view_arrow_schema(&spec, source_schema)?,
             spec,
+            budget: None,
         })
     }
 
+    fn scan_batches(
+        &self,
+        schema: SchemaRef,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let Some(budget) = &self.budget {
+            let mut guarded = cdc::read_materialized_view_guarded(
+                self.repl.as_ref(),
+                &self.spec.name,
+                budget.as_ref(),
+            )
+            .map_err(view_to_query_error)?;
+            if let Some(limit) = limit {
+                guarded.truncate(limit);
+            }
+            let rows = guarded.as_rows();
+            if rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            budget.charge_arrow_build(&schema, rows)?;
+            return Ok(vec![rows_to_record_batch(schema, rows)?]);
+        }
+        let rows = self.scan_rows(limit)?;
+        if rows.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![rows_to_record_batch(schema, &rows)?])
+        }
+    }
+
     fn scan_rows(&self, limit: Option<usize>) -> Result<Vec<Row>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let mut rows = cdc::read_materialized_view(self.repl.as_ref(), &self.spec.name)
             .map_err(|error| QueryError::Storage(StorageError::Backend(error.to_string())))?
             .rows;
@@ -3041,10 +3353,49 @@ impl TemporalTableProvider {
             base_schema,
             retention,
             arrow_schema: schema_to_arrow(Some(&history_schema)),
+            budget: None,
+        }
+    }
+
+    fn scan_batches(
+        &self,
+        schema: SchemaRef,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let Some(budget) = &self.budget {
+            let mut guarded = temporal::history_rows_for_table_guarded(
+                self.repl.as_ref(),
+                &self.base_table,
+                &self.base_schema,
+                self.retention,
+                budget.as_ref(),
+            )
+            .map_err(temporal_to_query_error)?;
+            if let Some(limit) = limit {
+                guarded.truncate(limit);
+            }
+            let rows = guarded.as_rows();
+            if rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            budget.charge_arrow_build(&schema, rows)?;
+            return Ok(vec![rows_to_record_batch(schema, rows)?]);
+        }
+        let rows = self.scan_rows(limit)?;
+        if rows.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![rows_to_record_batch(schema, &rows)?])
         }
     }
 
     fn scan_rows(&self, limit: Option<usize>) -> Result<Vec<Row>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let mut rows = temporal::history_rows_for_table(
             self.repl.as_ref(),
             &self.base_table,
@@ -3095,8 +3446,8 @@ impl TableProvider for StorageTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        let stats =
-            StatsCatalog::read_table(self.table.repl.as_ref(), self.table.name()).ok()??;
+        let guarded = budget::replication(Arc::clone(&self.table.repl), &self.budget);
+        let stats = StatsCatalog::read_table(guarded.as_ref(), self.table.name()).ok()??;
         let mut statistics = Statistics::new_unknown(self.arrow_schema.as_ref());
         statistics.num_rows = Precision::Inexact(usize::try_from(stats.row_count).ok()?);
         statistics.calculate_total_byte_size(self.arrow_schema.as_ref());
@@ -3137,8 +3488,10 @@ impl TableProvider for StorageTableProvider {
         let snapshot_lsn = self.snapshot_lsn;
         let row_filters = filters.to_vec();
         let batch_cache = Arc::clone(&self.batch_cache);
+        let budget = Arc::clone(&self.budget);
 
         let batches = tokio::task::spawn_blocking(move || {
+            budget.check()?;
             if let Some(snapshot_lsn) = snapshot_lsn {
                 table.scan_record_batches_as_of_lsn(&schema, limit, batch_rows, snapshot_lsn)
             } else if table.layout == TableLayout::Row {
@@ -3150,16 +3503,20 @@ impl TableProvider for StorageTableProvider {
                         &row_filters,
                         limit,
                         batch_rows,
+                        Some(&budget),
                     )
                 };
                 if row_filters.is_empty() && limit.is_none() {
-                    batch_cache.batches(
+                    let batches = batch_cache.batches(
                         &table,
                         &schema,
                         projection_for_scan.as_deref(),
                         batch_rows,
+                        &budget,
                         scan,
-                    )
+                    )?;
+                    budget.check()?;
+                    Ok(batches)
                 } else {
                     scan()
                 }
@@ -3243,19 +3600,20 @@ impl TableProvider for ForeignTableProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let rows = self
-            .scan_rows(None, limit)
+            .scan_rows(projection.cloned(), limit)
             .await
             .map_err(query_to_datafusion)?;
+        let schema = projection.map_or_else(
+            || Arc::clone(&self.arrow_schema),
+            |projection| project_schema(&self.arrow_schema, projection),
+        );
         let batches = if rows.is_empty() {
             Vec::new()
         } else {
-            vec![
-                rows_to_record_batch(self.arrow_schema.clone(), &rows)
-                    .map_err(query_to_datafusion)?,
-            ]
+            vec![rows_to_record_batch(Arc::clone(&schema), &rows).map_err(query_to_datafusion)?]
         };
-        let mem = MemTable::try_new(self.arrow_schema.clone(), vec![batches])?;
-        mem.scan(state, projection, filters, limit).await
+        let mem = MemTable::try_new(schema, vec![batches])?;
+        mem.scan(state, None, filters, limit).await
     }
 }
 
@@ -3288,17 +3646,10 @@ impl TableProvider for MaterializedViewProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let provider = self.clone();
         let schema = self.arrow_schema.clone();
-        let batches = tokio::task::spawn_blocking(move || {
-            let rows = provider.scan_rows(limit)?;
-            if rows.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Ok(vec![rows_to_record_batch(schema, &rows)?])
-            }
-        })
-        .await
-        .map_err(|error| DataFusionError::Execution(error.to_string()))?
-        .map_err(query_to_datafusion)?;
+        let batches = tokio::task::spawn_blocking(move || provider.scan_batches(schema, limit))
+            .await
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .map_err(query_to_datafusion)?;
         let mem = MemTable::try_new(self.arrow_schema.clone(), vec![batches])?;
         mem.scan(state, projection, filters, limit).await
     }
@@ -3333,17 +3684,10 @@ impl TableProvider for TemporalTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let provider = self.clone();
         let schema = self.arrow_schema.clone();
-        let batches = tokio::task::spawn_blocking(move || {
-            let rows = provider.scan_rows(limit)?;
-            if rows.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Ok(vec![rows_to_record_batch(schema, &rows)?])
-            }
-        })
-        .await
-        .map_err(|error| DataFusionError::Execution(error.to_string()))?
-        .map_err(query_to_datafusion)?;
+        let batches = tokio::task::spawn_blocking(move || provider.scan_batches(schema, limit))
+            .await
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .map_err(query_to_datafusion)?;
         let mem = MemTable::try_new(self.arrow_schema.clone(), vec![batches])?;
         mem.scan(state, projection, filters, limit).await
     }
@@ -3398,9 +3742,12 @@ impl RelTable {
         limit: Option<usize>,
         batch_rows: usize,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         if self.layout == TableLayout::Columnar {
             return Ok(limit_record_batches(
-                self.columnar_record_batches(projection)?,
+                self.columnar_record_batches(projection, limit)?,
                 limit,
             ));
         }
@@ -3415,7 +3762,12 @@ impl RelTable {
         }
 
         rows.chunks(batch_rows.max(1))
-            .map(|chunk| rows_to_record_batch(schema.clone(), chunk))
+            .map(|chunk| {
+                if let Some(budget) = &self.read_budget {
+                    budget.charge_arrow_build(schema, chunk)?;
+                }
+                rows_to_record_batch(schema.clone(), chunk)
+            })
             .collect()
     }
 
@@ -3426,6 +3778,9 @@ impl RelTable {
         batch_rows: usize,
         snapshot_lsn: u64,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         if self.layout == TableLayout::Columnar {
             return Err(QueryError::Unsupported(
                 "temporal AS OF scans are supported for row-layout tables".to_owned(),
@@ -3435,6 +3790,27 @@ impl RelTable {
             .schema
             .as_ref()
             .ok_or_else(|| QueryError::InvalidSchema("AS OF requires a typed table".to_owned()))?;
+        if let Some(budget) = &self.read_budget {
+            let mut guarded = temporal::rows_as_of_lsn_guarded(
+                self.repl.as_ref(),
+                &self.name,
+                table_schema,
+                snapshot_lsn,
+                budget.as_ref(),
+            )
+            .map_err(temporal_to_query_error)?;
+            if let Some(limit) = limit {
+                guarded.truncate(limit);
+            }
+            let rows = guarded.as_rows();
+            return rows
+                .chunks(batch_rows.max(1))
+                .map(|chunk| {
+                    budget.charge_arrow_build(schema, chunk)?;
+                    rows_to_record_batch(Arc::clone(schema), chunk)
+                })
+                .collect();
+        }
         let mut rows =
             temporal::rows_as_of_lsn(self.repl.as_ref(), &self.name, table_schema, snapshot_lsn)
                 .map_err(|error| QueryError::Storage(StorageError::Backend(error.to_string())))?;
@@ -3445,7 +3821,12 @@ impl RelTable {
             return Ok(Vec::new());
         }
         rows.chunks(batch_rows.max(1))
-            .map(|chunk| rows_to_record_batch(schema.clone(), chunk))
+            .map(|chunk| {
+                if let Some(budget) = &self.read_budget {
+                    budget.charge_arrow_build(schema, chunk)?;
+                }
+                rows_to_record_batch(schema.clone(), chunk)
+            })
             .collect()
     }
 }
@@ -3850,7 +4231,7 @@ fn validate_schema(schema: &TableSchema) -> Result<(), QueryError> {
     Ok(())
 }
 
-fn validate_row(schema: Option<&TableSchema>, row: &Row) -> Result<(), QueryError> {
+pub(crate) fn validate_row(schema: Option<&TableSchema>, row: &Row) -> Result<(), QueryError> {
     let Some(schema) = schema else {
         if row.len() == 1 {
             return Ok(());
@@ -4305,7 +4686,12 @@ pub(crate) fn rows_to_record_batch(
         .map(|(column_index, field)| values_to_array(rows, column_index, field.data_type()))
         .collect::<Result<Vec<_>, _>>()?;
 
-    RecordBatch::try_new(schema, arrays).map_err(|error| QueryError::DataFusion(error.to_string()))
+    RecordBatch::try_new_with_options(
+        schema,
+        arrays,
+        &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+    )
+    .map_err(|error| QueryError::DataFusion(error.to_string()))
 }
 
 fn columnar_segment_meta(
@@ -4478,7 +4864,7 @@ fn parquet_bytes_to_batches(
         .map_err(|error| QueryError::Storage(StorageError::Corruption(error.to_string())))
 }
 
-fn batches_to_rows(batches: &[RecordBatch]) -> Result<Vec<Row>, QueryError> {
+pub(crate) fn batches_to_rows(batches: &[RecordBatch]) -> Result<Vec<Row>, QueryError> {
     let mut rows = Vec::new();
     for batch in batches {
         for row_index in 0..batch.num_rows() {
@@ -4520,20 +4906,34 @@ fn values_to_array(
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
-        DataType::Utf8 => Ok(Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| match row.get(column_index) {
-                    Some(Value::Str(value)) => Ok(Some(value.clone())),
-                    Some(Value::Null) => Ok(None),
-                    Some(value) if column_index == 0 && row.len() == 1 => {
-                        serde_json::to_string(value)
-                            .map(Some)
-                            .map_err(|error| QueryError::Serde(error.to_string()))
-                    }
-                    _ => Err(invalid_arrow_value(column_index)),
+        DataType::Utf8 => {
+            // Append borrowed text directly to Arrow, avoiding one String clone
+            // per cell and a temporary Vec<Option<String>> for the entire column.
+            let capacity = rows
+                .iter()
+                .filter_map(|row| match row.get(column_index) {
+                    Some(Value::Str(value)) => Some(value.len()),
+                    _ => None,
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
+                .try_fold(0_usize, usize::checked_add)
+                .ok_or_else(|| {
+                    QueryError::ResourceLimit("UTF8 builder size overflows".to_owned())
+                })?;
+            let mut builder = StringBuilder::with_capacity(rows.len(), capacity);
+            for row in rows {
+                match row.get(column_index) {
+                    Some(Value::Str(value)) => builder.append_value(value),
+                    Some(Value::Null) => builder.append_null(),
+                    Some(value) if column_index == 0 && row.len() == 1 => {
+                        let json = serde_json::to_string(value)
+                            .map_err(|error| QueryError::Serde(error.to_string()))?;
+                        builder.append_value(json);
+                    }
+                    _ => return Err(invalid_arrow_value(column_index)),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         DataType::Boolean => Ok(Arc::new(BooleanArray::from(
             rows.iter()
                 .map(|row| match row.get(column_index) {
@@ -4544,7 +4944,17 @@ fn values_to_array(
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
         DataType::Binary => {
-            let mut builder = BinaryBuilder::new();
+            let capacity = rows
+                .iter()
+                .filter_map(|row| match row.get(column_index) {
+                    Some(Value::Bytes(value)) => Some(value.len()),
+                    _ => None,
+                })
+                .try_fold(0_usize, usize::checked_add)
+                .ok_or_else(|| {
+                    QueryError::ResourceLimit("binary builder size overflows".to_owned())
+                })?;
+            let mut builder = BinaryBuilder::with_capacity(rows.len(), capacity);
             for row in rows {
                 match row.get(column_index) {
                     Some(Value::Bytes(value)) => builder.append_value(value),
@@ -4587,6 +4997,7 @@ fn limit_record_batches(batches: Vec<RecordBatch>, limit: Option<usize>) -> Vec<
     limited
 }
 
+#[cfg(test)]
 fn record_batches_to_rows(
     batches: &[RecordBatch],
     fallback_columns: Vec<String>,
@@ -4611,20 +5022,32 @@ fn record_batches_to_rows(
 
     let mut rows = Vec::new();
     for batch in batches {
-        for row_index in 0..batch.num_rows() {
-            let mut row = Vec::with_capacity(batch.num_columns());
-            for column_index in 0..batch.num_columns() {
-                row.push(arrow_value_to_value(
-                    batch.column(column_index).as_ref(),
-                    batch.schema().field(column_index).data_type(),
-                    row_index,
-                )?);
-            }
-            rows.push(row);
-        }
+        append_record_batch_rows(batch, &mut rows, None)?;
     }
-
     Ok(SqlRows { columns, rows })
+}
+
+fn append_record_batch_rows(
+    batch: &RecordBatch,
+    rows: &mut Vec<Row>,
+    budget: Option<&budget::Budget>,
+) -> Result<(), QueryError> {
+    let schema = batch.schema();
+    for row_index in 0..batch.num_rows() {
+        if let Some(budget) = budget {
+            budget.check()?;
+        }
+        let mut row = Vec::with_capacity(batch.num_columns());
+        for (column, field) in batch.columns().iter().zip(schema.fields()) {
+            row.push(arrow_value_to_value(
+                column.as_ref(),
+                field.data_type(),
+                row_index,
+            )?);
+        }
+        rows.push(row);
+    }
+    Ok(())
 }
 
 fn arrow_value_to_value(
@@ -5184,6 +5607,7 @@ struct PolicyTableProvider {
     plan: Result<LogicalPlan, String>,
     schema: SchemaRef,
     table_type: TableType,
+    budget: Arc<budget::Budget>,
 }
 
 #[async_trait]
@@ -5209,7 +5633,15 @@ impl TableProvider for PolicyTableProvider {
                 return Err(query_to_datafusion(QueryError::Unsupported(reason.clone())));
             }
         };
-        let batches = collect(plan, state.task_ctx()).await?;
+        let mut stream = datafusion::physical_plan::execute_stream(plan, state.task_ctx())?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            self.budget
+                .charge_batch(&batch)
+                .map_err(query_to_datafusion)?;
+            batches.push(batch);
+        }
         let mem = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
         mem.scan(state, projection, &[], limit).await
     }
@@ -5225,6 +5657,7 @@ fn policy_table_provider(
     provider: Arc<dyn TableProvider>,
     collection: Option<&DocCollectionProvider>,
     policy: &SqlRelationPolicy,
+    budget: Arc<budget::Budget>,
 ) -> Result<Arc<dyn TableProvider>, QueryError> {
     // A collection column reads NULL where a document lacks its path or holds
     // a value of another type, so SQL predicates cannot decide its row policies.
@@ -5306,6 +5739,7 @@ fn policy_table_provider(
                                 )),
                                 schema: Arc::clone(&schema),
                                 table_type,
+                                budget,
                             }));
                         }
                     };
@@ -5326,6 +5760,7 @@ fn policy_table_provider(
         plan: Ok(plan),
         schema,
         table_type,
+        budget,
     }))
 }
 
@@ -5345,13 +5780,92 @@ fn policy_scalar(value: &Value) -> Option<ScalarValue> {
     })
 }
 
+fn temporal_to_query_error(error: temporal::TemporalError) -> QueryError {
+    match error {
+        temporal::TemporalError::Query(error) => error,
+        temporal::TemporalError::Storage(error) => error.into(),
+        temporal::TemporalError::Repl(error) => error.into(),
+        other => QueryError::Storage(StorageError::Backend(other.to_string())),
+    }
+}
+
+fn view_to_query_error(error: cdc::MaterializedViewError) -> QueryError {
+    match error {
+        cdc::MaterializedViewError::Query(error) => error,
+        cdc::MaterializedViewError::Storage(error) => error.into(),
+        cdc::MaterializedViewError::Repl(error) => error.into(),
+        other => QueryError::Storage(StorageError::Backend(other.to_string())),
+    }
+}
+
+pub(crate) fn resolve_temporal_point_with_budget(
+    repl: &dyn Replication,
+    point: temporal::TemporalPoint,
+    config: &crate::performance::QueryExecutionConfig,
+) -> Result<u64, temporal::TemporalError> {
+    let budget = budget::Budget::new(config);
+    let _cancel_on_drop = budget.start(std::time::Duration::ZERO)?;
+    let lsn = temporal::resolve_temporal_point_guarded(repl, point, budget.as_ref())?;
+    budget.check()?;
+    Ok(lsn)
+}
+
 fn datafusion_to_query_error(error: &DataFusionError) -> QueryError {
+    // Our adapters carry typed errors through External/Context. Preserve them
+    // before applying the compatibility heuristic for DataFusion-native errors.
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    for _ in 0..64 {
+        if let Some(query) = source.downcast_ref::<QueryError>() {
+            let typed = match query {
+                QueryError::ResourceLimit(reason) => {
+                    Some(QueryError::ResourceLimit(reason.clone()))
+                }
+                QueryError::Timeout(reason) => Some(QueryError::Timeout(reason.clone())),
+                QueryError::Cancelled(reason) => Some(QueryError::Cancelled(reason.clone())),
+                QueryError::Unsupported(reason) => Some(QueryError::Unsupported(reason.clone())),
+                QueryError::InputLimit(reason) => Some(QueryError::InputLimit(reason.clone())),
+                QueryError::Busy(reason) => Some(QueryError::Busy(reason.clone())),
+                _ => None,
+            };
+            if let Some(typed) = typed {
+                return typed;
+            }
+        }
+        if let Some(storage) = source.downcast_ref::<StorageError>() {
+            match storage {
+                StorageError::ResourceLimit(reason) => {
+                    return QueryError::ResourceLimit(reason.clone());
+                }
+                StorageError::Timeout(reason) => return QueryError::Timeout(reason.clone()),
+                StorageError::Cancelled(reason) => return QueryError::Cancelled(reason.clone()),
+                _ => {}
+            }
+        }
+        if let Some(AuthzError::Denied {
+            principal,
+            resource,
+            permission,
+        }) = source.downcast_ref::<AuthzError>()
+        {
+            return QueryError::AuthzDenied(AuthzError::Denied {
+                principal: principal.clone(),
+                resource: resource.clone(),
+                permission: *permission,
+            });
+        }
+        let Some(next) = source.source() else {
+            break;
+        };
+        source = next;
+    }
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
     // DataFusion parses the SQL again: its sqlparser errors, its own recursion limit of 50
     // included, are client errors like the engine's parse errors.
     if matches!(error.find_root(), DataFusionError::SQL(..)) {
         QueryError::Parse(message)
+    } else if lower.contains("query timeout") || lower.contains("query exceeded") {
+        QueryError::Timeout(message)
     } else if lower.contains("cancel") {
         QueryError::Cancelled(message)
     } else if lower.contains("memory")
@@ -5369,6 +5883,12 @@ fn query_to_datafusion(error: QueryError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
+#[cfg(test)]
+mod analyze_guard_tests;
+#[cfg(test)]
+mod audit_tests;
+#[cfg(test)]
+mod bounded_backend_tests;
 #[cfg(test)]
 mod index_read_tests;
 #[cfg(test)]

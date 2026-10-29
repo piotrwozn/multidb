@@ -40,6 +40,9 @@ struct Counted {
     counts: Arc<Counts>,
 }
 impl Replication for Counted {
+    fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
+        self.inner.table_data_version(table)
+    }
     fn supports_bounded_scans(&self) -> bool {
         self.inner.supports_bounded_scans()
     }
@@ -288,6 +291,7 @@ async fn datafusion_residuals_and_projected_batches_keep_range_reads_bounded() -
         &[],
         None,
         127,
+        None,
     )?;
     assert!(result.len() > 1);
     assert!(
@@ -495,5 +499,110 @@ async fn range_fast_path_cancels_slow_storage_and_limits_retained_projected_outp
         Err(QueryError::ResourceLimit(_))
     ));
     assert!(counts.rows.load(Ordering::SeqCst) < 100);
+    Ok(())
+}
+
+#[tokio::test]
+async fn datafusion_source_stops_after_timeout_and_before_over_budget_materialization() -> TestResult
+{
+    let (mut engine, counts) = fixture()?;
+    engine.performance.query.timeout_ms = 1;
+    engine.performance.query.batch_rows = 1;
+    counts.delay_ms.store(5, Ordering::SeqCst);
+    let result = engine
+        .execute("SELECT id+1 FROM bench WHERE id>=0 AND id<100")
+        .await;
+    assert!(matches!(&result, Err(QueryError::Timeout(_))), "{result:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let stopped = counts.rows.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(counts.rows.load(Ordering::SeqCst), stopped);
+    assert!(stopped <= 1, "expired source scanned {stopped} records");
+
+    counts.delay_ms.store(0, Ordering::SeqCst);
+    counts.reset();
+    engine.performance.query.timeout_ms = 30_000;
+    engine.performance.query.memory_limit_bytes = 8_192;
+    let result = engine
+        .execute("SELECT payload || 'x' FROM bench WHERE id>=0 AND id<100")
+        .await;
+    assert!(
+        matches!(&result, Err(QueryError::ResourceLimit(_))),
+        "{result:?}"
+    );
+    assert!(
+        counts.rows.load(Ordering::SeqCst) < 100,
+        "source ignored its retained memory budget"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_simple_grammar_keeps_qualifiers_wildcard_modifiers_and_unicode_lower() -> TestResult
+{
+    let (engine, _) = fixture()?;
+    let result = engine
+        .execute("SELECT bogus.payload FROM bench WHERE bogus.category=1")
+        .await;
+    assert!(
+        result.is_err(),
+        "invalid qualifier returned data: {result:?}"
+    );
+    for sql in [
+        "SELECT * EXCLUDE (payload) FROM bench WHERE category=1",
+        "SELECT * REPLACE (0 AS value) FROM bench WHERE category=1",
+        "SELECT id FROM bench AS b(renamed,c,v,p) WHERE category=1",
+    ] {
+        let result = engine.execute(sql).await;
+        assert!(
+            result.is_err(),
+            "unsupported or unresolved projection returned data: {sql}: {result:?}"
+        );
+    }
+
+    engine
+        .execute(
+            "INSERT INTO bench (id,category,value,payload) VALUES (2001,1,0,'É'),(2002,1,0,'ADA')",
+        )
+        .await?;
+    assert_eq!(
+        ids(&engine, "SELECT id FROM bench WHERE lower(payload)='é'").await?,
+        vec![2001]
+    );
+    assert_eq!(
+        ids(&engine, "SELECT id FROM bench WHERE lower(payload)='ADA'").await?,
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        ids(&engine, "SELECT b.id FROM bench AS b WHERE b.id=2001").await?,
+        vec![2001]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_batches_and_legacy_simple_reads_obey_current_statement_memory_limit() -> TestResult
+{
+    let (mut engine, counts) = fixture()?;
+    engine.execute("SELECT SUM(value) FROM bench").await?;
+    counts.reset();
+    engine.performance.query.memory_limit_bytes = 8_192;
+    let result = engine.execute("SELECT SUM(value) FROM bench").await;
+    assert!(
+        matches!(&result, Err(QueryError::ResourceLimit(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        counts.rows.load(Ordering::SeqCst),
+        0,
+        "expected warmed raw cache hit"
+    );
+    let result = engine
+        .execute("SELECT payload FROM bench WHERE category=1")
+        .await;
+    assert!(
+        matches!(&result, Err(QueryError::ResourceLimit(_))),
+        "{result:?}"
+    );
     Ok(())
 }

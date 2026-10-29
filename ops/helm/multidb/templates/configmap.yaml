@@ -11,6 +11,12 @@ data:
   MULTIDB_BIND: {{ .Values.runtime.adminBind | quote }}
   MULTIDB_PG_BIND: {{ .Values.runtime.pgBind | quote }}
   MULTIDB_STUDIO_DIR: {{ .Values.runtime.studioDir | quote }}
+  MULTIDB_PG_USER: {{ .Values.runtime.pgUser | quote }}
+  MULTIDB_MAX_CONCURRENT_QUERIES: {{ .Values.config.maxConcurrentQueries | quote }}
+  MULTIDB_QUERY_QUEUE_TIMEOUT_MS: {{ .Values.config.queryQueueTimeoutMs | quote }}
+  {{- if .Values.config.historyRetainLsns }}
+  MULTIDB_HISTORY_RETAIN_LSNS: {{ .Values.config.historyRetainLsns | quote }}
+  {{- end }}
   {{- if .Values.spec.enabled }}
   MULTIDB_SPEC_PATH: {{ printf "%s/%s" .Values.spec.mountPath .Values.spec.key | quote }}
   MULTIDB_SPEC_APPLY: {{ .Values.spec.apply | quote }}
@@ -20,7 +26,7 @@ data:
   MULTIDB_REPLICATION: ""
   {{- else }}
   MULTIDB_PROFILE: {{ .Values.config.profile | quote }}
-  MULTIDB_REPLICATION: {{ .Values.config.replication | quote }}
+  # MULTIDB_REPLICATION is absent: flat serve is single-node.
   {{- end }}
   MULTIDB_AUDIT_JSONL_PATH: {{ .Values.config.auditJsonlPath | quote }}
   MULTIDB_BACKUP_TARGET: {{ .Values.config.backupTarget | quote }}

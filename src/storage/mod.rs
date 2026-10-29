@@ -27,4 +27,6 @@ pub use memory::MemEngine;
 pub use redb::RedbEngine;
 pub(crate) use redb::{ExistingRedbOpen, RedbReadOnly};
 pub use sim::{Fault, FaultPlan, FaultPoint, ScheduledFault, SimReadTxn, SimStorage, SimWriteTxn};
-pub use traits::{RangeIter, ReadTransaction, StorageEngine, WriteTransaction};
+pub use traits::{
+    RangeIter, ReadBudget, ReadReservation, ReadTransaction, StorageEngine, WriteTransaction,
+};

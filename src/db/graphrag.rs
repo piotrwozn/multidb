@@ -1,5 +1,7 @@
 //! Database authorization and policy boundaries for bounded graph-assisted retrieval.
 
+use std::time::Duration;
+
 use super::{ConfigError, Database, DbError, policy_has_row_or_masking};
 use crate::{
     graph::GraphNodeId,
@@ -7,6 +9,7 @@ use crate::{
     model::Value,
     query::QueryError,
     security::{AuditEvent, AuditOutcome, Permission, Principal, Resource},
+    vector::{VectorError, execution::ExecutionLimits},
 };
 
 impl Database {
@@ -18,14 +21,14 @@ impl Database {
         request.validate()?;
         self.ensure_graph_rag_backend()?;
         let _permit = self.try_graph_rag_permit()?;
-        let vectors = self.vector_collection(&request.vector_collection)?;
-        let graph = self.graph(&request.graph)?;
-        Ok(graphrag::retrieve(
-            &vectors,
-            &graph,
-            request,
-            |_, metadata| Ok(Some(metadata)),
-        )?)
+        let limits = self.graph_rag_limits()?;
+        limits.check()?;
+        let vectors = self
+            .vector_collection(&request.vector_collection)?
+            .with_execution_limits(limits);
+        let graph = self.graph(&request.graph)?.with_execution_limits(limits);
+        graphrag::retrieve(&vectors, &graph, request, |_, metadata| Ok(Some(metadata)))
+            .map_err(graph_rag_execution_error)
     }
 
     /// Retrieves graph context after authorizing both the vector collection and graph.
@@ -46,6 +49,7 @@ impl Database {
         self.authorize_or_audit(principal, &graph_resource, Permission::Read, "graph_rag")?;
         self.ensure_graph_rag_backend()?;
         let _permit = self.try_graph_rag_permit()?;
+        let limits = self.graph_rag_limits()?;
         let policy = self.policy_config()?;
         let result: Result<GraphRagResult, DbError> =
             if policy_has_row_or_masking(&policy, &graph_resource) {
@@ -55,15 +59,18 @@ impl Database {
                 .into())
             } else {
                 (|| {
-                    let vectors = self.vector_collection(&request.vector_collection)?;
-                    let graph = self.graph(&request.graph)?;
+                    limits.check()?;
+                    let vectors = self
+                        .vector_collection(&request.vector_collection)?
+                        .with_execution_limits(limits);
+                    let graph = self.graph(&request.graph)?.with_execution_limits(limits);
                     graphrag::retrieve(&vectors, &graph, request, |_, metadata| {
                         if !policy.row_visible(principal, &vectors_resource, &metadata) {
                             return Ok(None);
                         }
                         Ok(Some(policy.mask_value(&vectors_resource, &metadata)))
                     })
-                    .map_err(DbError::from)
+                    .map_err(graph_rag_execution_error)
                 })()
             };
         self.record_audit(&AuditEvent::new(
@@ -81,7 +88,10 @@ impl Database {
     }
 
     fn ensure_graph_rag_backend(&self) -> Result<(), DbError> {
-        if !self.replication_ref().supports_bounded_scans() {
+        if self.repl.is_ap()
+            || self.repl.is_sharded()
+            || !self.replication_ref().supports_bounded_scans()
+        {
             return Err(ConfigError::Unsupported(
                 "GraphRAG requires bounded storage scans; AP and sharded backends are outside this preview"
                     .to_owned(),
@@ -96,6 +106,13 @@ impl Database {
             .clone()
             .try_acquire_owned()
             .map_err(|_| QueryError::Busy("GraphRAG concurrent query limit reached".to_owned()))
+    }
+
+    fn graph_rag_limits(&self) -> Result<ExecutionLimits, QueryError> {
+        ExecutionLimits::new(
+            Duration::from_millis(self.performance.query.timeout_ms),
+            self.performance.query.memory_limit_bytes,
+        )
     }
 
     /// Adds or replaces a graph edge after checking Write on the named graph.
@@ -127,6 +144,15 @@ impl Database {
     }
 }
 
+fn graph_rag_execution_error(error: GraphRagError) -> DbError {
+    match error {
+        GraphRagError::ConcurrentMutation => DbError::Repl(crate::repl::ReplError::Conflict),
+        GraphRagError::Vector(VectorError::Execution(error))
+        | GraphRagError::Graph(crate::graph::GraphError::Execution(error)) => DbError::Query(error),
+        other => DbError::GraphRag(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -149,6 +175,30 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn graph_rag_honors_the_model_deadline_and_memory_governor() -> TestResult {
+        let (mut database, _) = fixture()?;
+        database.performance.query.timeout_ms = 0;
+        assert!(matches!(
+            database.graph_rag_as(&reader(), &request()),
+            Err(DbError::Query(QueryError::Timeout(_)))
+        ));
+        database.performance.query.timeout_ms = 5_000;
+        database.performance.query.memory_limit_bytes = 1_024;
+        assert!(matches!(
+            database.graph_rag_as(&reader(), &request()),
+            Err(DbError::Query(QueryError::ResourceLimit(_)))
+        ));
+        assert!(database.query_permits.available_permits() > 0);
+        assert!(
+            database
+                .audit_events()?
+                .iter()
+                .any(|event| event.action == "graph_rag" && event.outcome == AuditOutcome::Failed)
+        );
+        Ok(())
+    }
 
     fn authz() -> AuthzPolicy {
         AuthzPolicy::new([

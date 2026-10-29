@@ -51,7 +51,10 @@ use crate::{
     query::{Row, SqlOutput, SqlRows},
 };
 
+mod frame;
+mod parameters;
 mod session;
+mod session_state;
 
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
 const DEFAULT_BLOCKING_TASKS: usize = 32;
@@ -103,7 +106,7 @@ pub struct AuthConfig {
     users: Arc<BTreeMap<String, ScramCredential>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScramCredential {
     salt: Vec<u8>,
     salted_password: Vec<u8>,
@@ -156,11 +159,13 @@ struct DbPgFactory {
 }
 
 struct DbStartupHandler {
+    auth: AuthConfig,
     inner: Option<SASLAuthStartupHandler<DefaultServerParameterProvider>>,
     startup_error: Option<String>,
     tls_required: bool,
     auth_limiter: AuthRateLimiter,
     pending_auth: StdMutex<Option<AuthAttempt>>,
+    sasl_started: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -399,6 +404,16 @@ impl AuthConfig {
 
     fn credential(&self, user: &str) -> Option<&ScramCredential> {
         self.users.get(user)
+    }
+}
+
+impl Debug for ScramCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScramCredential")
+            .field("salt", &self.salt)
+            .field("salted_password", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -775,6 +790,24 @@ impl PgWireServerHandlers for DbPgFactory {
 }
 
 impl DbStartupHandler {
+    fn reserve_auth_attempt(
+        &self,
+        ip: std::net::IpAddr,
+        user: &str,
+    ) -> Result<Option<AuthAttempt>, NetworkError> {
+        if user.len() > MAX_AUTH_USERNAME_BYTES {
+            return Err(NetworkError::Auth(
+                "authentication username is too long".to_owned(),
+            ));
+        }
+        // Unknown names cannot authenticate. Let SCRAM return its ordinary failure,
+        // without allowing random names to exhaust the shared known-user limiter.
+        self.auth
+            .contains_user(user)
+            .then(|| self.auth_limiter.reserve_attempt(ip, user))
+            .transpose()
+    }
+
     fn new(
         auth: &AuthConfig,
         certificate_pem: Option<&[u8]>,
@@ -800,11 +833,13 @@ impl DbStartupHandler {
         );
 
         Self {
+            auth: auth.clone(),
             inner,
             startup_error,
             tls_required,
             auth_limiter,
             pending_auth: StdMutex::new(None),
+            sasl_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -839,8 +874,7 @@ impl StartupHandler for DbStartupHandler {
                 .get("user")
                 .map_or("unknown", String::as_str);
             let attempt = self
-                .auth_limiter
-                .reserve_attempt(client.socket_addr().ip(), user)
+                .reserve_auth_attempt(client.socket_addr().ip(), user)
                 .map_err(|error| pg_error("FATAL", "28000", error.to_string()))?;
             let mut pending = self
                 .pending_auth
@@ -853,12 +887,22 @@ impl StartupHandler for DbStartupHandler {
                     "authentication is already in progress",
                 ));
             }
-            *pending = Some(attempt);
+            *pending = attempt;
         }
 
         let Some(inner) = &self.inner else {
             return Err(pg_error("FATAL", "08006", "startup handler is unavailable"));
         };
+
+        if let PgWireFrontendMessage::PasswordMessageFamily(
+            pgwire::messages::startup::PasswordMessageFamily::Raw(body),
+        ) = &message
+            && !self
+                .sasl_started
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            frame::validate_sasl_initial(body)?;
+        }
 
         let result = inner.on_startup(client, message).await;
         if result.is_err() || matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
@@ -966,10 +1010,13 @@ impl ExtendedQueryHandler for DbPgHandler {
             .describe_sql_as_user(client_user(client), sql)
             .await?;
         match schema {
-            Some(schema) => Ok(DescribePortalResponse::new(fields_for_schema(
-                &schema,
-                Some(&target.result_column_format),
-            ))),
+            Some(schema) => {
+                validate_result_format(&target.result_column_format, schema.fields().len())?;
+                Ok(DescribePortalResponse::new(fields_for_schema(
+                    &schema,
+                    Some(&target.result_column_format),
+                )))
+            }
             None => Ok(DescribePortalResponse::no_data()),
         }
     }
@@ -978,7 +1025,7 @@ impl ExtendedQueryHandler for DbPgHandler {
         &self,
         client: &mut C,
         portal: &Portal<Self::Statement>,
-        _max_rows: usize,
+        max_rows: usize,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -987,11 +1034,42 @@ impl ExtendedQueryHandler for DbPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = substitute_portal_params(portal)?;
+        if matches!(portal.result_column_format, Format::Individual(_)) {
+            let schema = self
+                .executor
+                .describe_sql_as_user(client_user(client), sql.clone())
+                .await?;
+            validate_result_format(
+                &portal.result_column_format,
+                schema.as_ref().map_or(0, |schema| schema.fields().len()),
+            )?;
+        }
         let output = self
             .executor
             .execute_sql_as_user(client_user(client), sql.clone(), true)
             .await
             .map_err(network_to_pg)?;
+        if let SqlOutput::Rows(rows) = &output {
+            validate_result_format(&portal.result_column_format, rows.columns.len())?;
+            if max_rows > 0 {
+                let available = client
+                    .metadata()
+                    .get(session_state::AVAILABLE_RESULT_BYTES)
+                    .and_then(|bytes| bytes.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let retained = session_state::result_bytes(rows, available).map_err(|_| {
+                    pg_error(
+                        "ERROR",
+                        "53200",
+                        "portal result exceeds retained session memory budget",
+                    )
+                })?;
+                client.metadata_mut().insert(
+                    session_state::NEW_RESULT_BYTES.to_owned(),
+                    retained.to_string(),
+                );
+            }
+        }
         Ok(sql_output_to_response(
             output,
             &sql,
@@ -1152,6 +1230,13 @@ fn fields_for_schema(schema: &SchemaRef, result_format: Option<&Format>) -> Vec<
 }
 
 fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
+    if parameters::count(&portal.statement.statement)? != portal.parameter_len() {
+        return Err(pg_error(
+            "ERROR",
+            "08P01",
+            "bind parameter count does not match statement",
+        ));
+    }
     let literals = (0..portal.parameter_len())
         .map(|index| portal_param_literal(portal, index))
         .collect::<PgWireResult<Vec<_>>>()?;
@@ -1160,7 +1245,7 @@ fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
 }
 
 fn describe_sql_for_statement(statement: &StoredStatement<String>) -> PgWireResult<Option<String>> {
-    if !contains_dollar_param(&statement.statement) {
+    if !parameters::contains(&statement.statement)? {
         return Ok(Some(statement.statement.clone()));
     }
 
@@ -1182,6 +1267,7 @@ fn dummy_literal_for_type(ty: Option<&Type>) -> PgWireResult<String> {
         Some(&Type::INT2 | &Type::INT4 | &Type::INT8) => Ok("0".to_owned()),
         Some(&Type::FLOAT4 | &Type::FLOAT8) => Ok("0.0".to_owned()),
         Some(&Type::BOOL) => Ok("false".to_owned()),
+        Some(&Type::BYTEA) => Ok("X''".to_owned()),
         Some(&Type::TEXT | &Type::VARCHAR | &Type::BPCHAR | &Type::NAME | &Type::UNKNOWN) => {
             Ok("''".to_owned())
         }
@@ -1225,6 +1311,9 @@ fn portal_param_literal(portal: &Portal<String>, index: usize) -> PgWireResult<S
         Type::BOOL => Ok(portal
             .parameter::<bool>(index, &Type::BOOL)?
             .map_or_else(|| "NULL".to_owned(), |value| value.to_string())),
+        Type::BYTEA => Ok(portal
+            .parameter::<Vec<u8>>(index, &Type::BYTEA)?
+            .map_or_else(|| "NULL".to_owned(), |value| binary_sql_literal(&value))),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => Ok(portal
             .parameter::<String>(index, &ty)?
             .map_or_else(|| "NULL".to_owned(), |value| escape_sql_literal(&value))),
@@ -1249,55 +1338,23 @@ fn float_literal(value: Option<impl Into<f64>>) -> PgWireResult<String> {
 }
 
 fn substitute_params(sql: &str, literals: &[String]) -> PgWireResult<String> {
-    let mut output = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            output.push(ch);
-            copy_quoted_string(&mut chars, &mut output);
-        } else if ch == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
-            let mut raw_index = String::new();
-            while let Some(next) = chars.peek() {
-                if next.is_ascii_digit() {
-                    raw_index.push(*next);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            let index = raw_index
-                .parse::<usize>()
-                .map_err(|error| pg_error("ERROR", "22023", error.to_string()))?;
-            let literal = literals
-                .get(index.saturating_sub(1))
-                .ok_or_else(|| PgWireError::ParameterIndexOutOfBound(index))?;
-            output.push_str(literal);
-        } else {
-            output.push(ch);
-        }
-    }
-
-    Ok(output)
-}
-
-fn copy_quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, output: &mut String) {
-    while let Some(ch) = chars.next() {
-        output.push(ch);
-        if ch == '\'' {
-            if chars.peek() == Some(&'\'') {
-                output.push('\'');
-                chars.next();
-            } else {
-                break;
-            }
-        }
-    }
+    parameters::substitute(sql, literals)
 }
 
 fn escape_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn binary_sql_literal(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut literal = String::with_capacity(value.len().saturating_mul(2).saturating_add(3));
+    literal.push_str("X'");
+    for &byte in value {
+        literal.push(char::from(HEX[usize::from(byte >> 4)]));
+        literal.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    literal.push('\'');
+    literal
 }
 
 fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
@@ -1306,19 +1363,17 @@ fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
 }
 
-fn contains_dollar_param(sql: &str) -> bool {
-    let mut chars = sql.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            let mut sink = String::new();
-            copy_quoted_string(&mut chars, &mut sink);
-        } else if ch == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
-            return true;
-        }
+fn validate_result_format(format: &Format, columns: usize) -> PgWireResult<()> {
+    if let Format::Individual(codes) = format
+        && (codes.len() != columns || codes.iter().any(|code| !matches!(code, 0 | 1)))
+    {
+        return Err(pg_error(
+            "ERROR",
+            "08P01",
+            "result format count does not match output columns",
+        ));
     }
-
-    false
+    Ok(())
 }
 
 fn network_to_pg(error: NetworkError) -> PgWireError {
@@ -1407,10 +1462,53 @@ mod tests {
         assert!(auth.contains_user("alice"));
         assert_ne!(credential.salted_password(), b"secret");
         assert_eq!(credential.salt(), b"fixed-test-salt");
+        let verifier = format!("{:?}", credential.salted_password());
+        assert!(!format!("{credential:?}").contains(&verifier));
+        assert!(!format!("{auth:?}").contains(&verifier));
+        assert!(format!("{auth:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn unknown_startup_names_cannot_fill_known_user_authentication_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = super::AuthRateLimiter::new(2, 60_000);
+        let handler = super::DbStartupHandler::new(&test_auth(), None, false, limiter.clone());
+        let ip = "127.0.0.1".parse()?;
+        for index in 0..=super::MAX_AUTH_RATE_KEYS {
+            assert!(
+                handler
+                    .reserve_auth_attempt(ip, &format!("unknown-{index}"))?
+                    .is_none()
+            );
+        }
+        assert_eq!(limiter.state.lock().map_err(|_| "limiter lock")?.len(), 0);
+        let known = handler
+            .reserve_auth_attempt(ip, "alice")?
+            .ok_or("known user was not reserved")?;
+        known.succeed();
+        assert_eq!(limiter.state.lock().map_err(|_| "limiter lock")?.len(), 0);
+        Ok(())
     }
 
     #[test]
     fn database_errors_map_to_sqlstate() {
+        for error in [
+            crate::tensor::TensorError::Storage(StorageError::Conflict),
+            crate::tensor::TensorError::Repl(crate::repl::ReplError::Conflict),
+            crate::tensor::TensorError::Repl(crate::repl::ReplError::Storage(
+                StorageError::Conflict,
+            )),
+        ] {
+            let error = DbError::Tensor(error);
+            assert!(error.is_conflict());
+            assert_eq!(db_error_sqlstate(&error), "40001");
+        }
+        assert_eq!(
+            db_error_sqlstate(&DbError::Tensor(crate::tensor::TensorError::Timeout(
+                "budget".to_owned()
+            ))),
+            "57014"
+        );
         assert_eq!(
             db_error_sqlstate(&DbError::Query(QueryError::Parse("bad".to_owned()))),
             "42601"
@@ -1423,6 +1521,14 @@ mod tests {
             db_error_sqlstate(&DbError::Storage(StorageError::Conflict)),
             "40001"
         );
+    }
+
+    #[test]
+    fn invalid_individual_result_formats_are_errors_instead_of_indexing_panics() {
+        use pgwire::api::portal::Format;
+        assert!(super::validate_result_format(&Format::Individual(vec![0, 1]), 3).is_err());
+        assert!(super::validate_result_format(&Format::Individual(vec![0, 2]), 2).is_err());
+        assert!(super::validate_result_format(&Format::Individual(vec![0, 1]), 2).is_ok());
     }
 
     #[test]
@@ -1487,6 +1593,34 @@ mod tests {
             let _ = connection.await;
         });
         Ok(client)
+    }
+
+    #[tokio::test]
+    async fn named_prepared_statement_storm_is_bounded_per_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth());
+        let server = start_session_test_server(config).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        let mut retained = Vec::new();
+        for _ in 0..128 {
+            retained.push(
+                client
+                    .prepare("select name from users where age = 37")
+                    .await?,
+            );
+        }
+        assert!(
+            client
+                .prepare("select name from users where age = 37")
+                .await
+                .is_err()
+        );
+        // One over-budget session does not prevent another authenticated client.
+        let healthy = plain_client(server.addr, "secret").await?;
+        assert!(healthy.simple_query("select name from users").await.is_ok());
+        drop(retained);
+        server.shutdown().await?;
+        Ok(())
     }
 
     async fn start_session_test_server(
@@ -1786,6 +1920,41 @@ mod tests {
             Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
         );
 
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_bytea_bind_matches_binary_data_without_text_coercion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = shared_users_database()?;
+        {
+            let blobs = database.create_table(
+                "blobs",
+                Some(TableSchema::new(
+                    vec![
+                        ColumnDef::new("id", ColumnType::Int, false),
+                        ColumnDef::new("payload", ColumnType::Bytes, true),
+                    ],
+                    0,
+                )),
+                Vec::new(),
+            )?;
+            blobs.insert(vec![Value::Int(1), Value::Bytes(vec![0, 255, 39, 92])])?;
+            blobs.insert(vec![Value::Int(2), Value::Bytes(b"00ff275c".to_vec())])?;
+        }
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("user").grant(Resource::Table("blobs".to_owned()), Permission::Read)
+        ]));
+        let database = Arc::new(RwLock::new(database));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        let statement = client
+            .prepare_typed("SELECT id FROM blobs WHERE payload = $1", &[Type::BYTEA])
+            .await?;
+        let rows = client.query(&statement, &[&vec![0u8, 255, 39, 92]]).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<_, i64>(0)?, 1);
         server.shutdown().await?;
         Ok(())
     }

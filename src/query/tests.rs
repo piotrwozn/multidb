@@ -1379,7 +1379,7 @@ async fn partial_index_is_used_only_when_query_implies_predicate()
 }
 
 #[tokio::test]
-async fn expression_covering_index_supports_index_only_scan()
+async fn expression_covering_index_keeps_explicit_ascii_semantics()
 -> Result<(), Box<dyn std::error::Error>> {
     let repl = memory_repl()?;
     let mut engine = SqlEngine::new(repl);
@@ -1401,10 +1401,20 @@ async fn expression_covering_index_supports_index_only_scan()
             rows: vec![vec![Value::Int(1)]],
         })
     );
+    // SQL LOWER has Unicode semantics. The explicitly ASCII index remains usable
+    // through the relational API, while SQL goes through its full function planner.
+    let table = engine.tables.get("users").ok_or("missing users")?;
+    let filter = super::RelPredicate::Eq {
+        expression: super::RelIndexExpression::LowerAscii(1),
+        value: Value::Str("ada".to_owned()),
+    };
+    let result = table.query_filter_index_only(1, &filter, &[0])?;
+    assert_eq!(result.plan, super::RelPlanKind::IndexOnlyScan(1));
+    assert_eq!(result.rows.len(), 1);
     let explain = engine.explain(sql, ExplainOptions::default())?;
     assert!(matches!(
         explain.nodes[0].access_path,
-        AccessPath::IndexOnly { index_id: 1, .. }
+        AccessPath::DataFusionPlan
     ));
     Ok(())
 }

@@ -25,8 +25,9 @@ use crate::config_spec::{
 use crate::performance::{CompressionConfig, PerformanceConfig};
 use crate::query::TableLayout;
 use crate::storage::{
-    AnyEngine, Bytes, ConfiguredKeyProvider, EncryptedReadTxn, EngineKind, ExistingRedbOpen,
-    ReadTransaction, RedbEngine, RedbReadOnly, StorageEngine, StorageError, WriteTransaction,
+    AnyEngine, Bytes, ConfiguredKeyProvider, EncryptedEngine, EncryptedReadTxn, EngineKind,
+    ExistingRedbOpen, ReadTransaction, RedbEngine, RedbReadOnly, StorageEngine, StorageError,
+    WriteTransaction,
 };
 
 /// The only `PersistedProfileManifest.manifest_version` this build reads and writes.
@@ -367,8 +368,8 @@ fn stored_audit_enabled(raw: Option<Bytes>) -> Result<bool, ConfigError> {
 /// transaction. Without one, it is what `create_database` creates on an empty target. The
 /// restored `__meta` records overwrite this metadata afterwards. Unlike
 /// `create_database_with_profile`, it does not check the manifest floors: like every restore
-/// target, the engine is not encrypted, also when the manifest sets `floors.encryption_at_rest`,
-/// so restore checks the floors before it calls this and refuses unless the caller allows
+/// target, the default engine is not encrypted, so restore checks the floors before it calls
+/// this and refuses unless the caller allows
 /// unmet floors (docs/profiles.md, "Backup and restore").
 /// # Errors
 /// Fails with `ProfileManifestInvalid` when the manifest does not describe `config.profile`,
@@ -378,10 +379,30 @@ pub(crate) fn create_restore_target(
     config: DbConfig,
     manifest: Option<&PersistedProfileManifest>,
 ) -> Result<Database, ConfigError> {
+    create_restore_target_with_keys(config, manifest, None)
+}
+
+/// Creates a restore target with an already authenticated key provider. Opening keys is the
+/// caller's responsibility: this routine never creates a replacement envelope keyring.
+pub(crate) fn create_restore_target_with_keys(
+    config: DbConfig,
+    manifest: Option<&PersistedProfileManifest>,
+    keys: Option<ConfiguredKeyProvider>,
+) -> Result<Database, ConfigError> {
     if let Some(manifest) = manifest {
         validate_manifest(manifest, config.profile)?;
     }
     let mut engine = engine_for(&config)?;
+    if let Some(keys) = keys {
+        engine = match engine {
+            AnyEngine::Redb(inner) => AnyEngine::EncryptedRedb(EncryptedEngine::new(inner, keys)),
+            _ => {
+                return Err(ConfigError::Unsupported(
+                    "encrypted restore requires a persistent redb target".to_owned(),
+                ));
+            }
+        };
+    }
     if let Some(storage_format) = manifest
         .map(|manifest| &manifest.storage_format)
         .filter(|storage_format| storage_format.value_framing)

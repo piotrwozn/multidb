@@ -174,3 +174,33 @@ func TestBlockedProvisionPlanKeepsThePlanInTheError(t *testing.T) {
 		t.Fatalf("the error body does not carry the plan: %s", apiErr.Body)
 	}
 }
+
+func TestDefaultClientRefusesRedirectAndRawHTTPFailure(t *testing.T) {
+	visits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		visits++
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"ok":true,"status":"alive"}`))
+			return
+		}
+		http.Redirect(w, r, "/stolen", http.StatusFound)
+	}))
+	defer server.Close()
+	client := NewClient(WithBaseURL(server.URL), WithToken("secret"))
+	if client.httpClient.Timeout <= 0 {
+		t.Fatal("default client has no deadline")
+	}
+	_, err := client.Status(context.Background())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 302 {
+		t.Fatalf("expected refused302, got %v", err)
+	}
+	if visits != 1 {
+		t.Fatalf("credentials replayed in %d requests", visits)
+	}
+	_, err = client.Health(context.Background())
+	if !errors.As(err, &apiErr) || apiErr.Status != 503 {
+		t.Fatalf("accepted failedhealth: %v", err)
+	}
+}

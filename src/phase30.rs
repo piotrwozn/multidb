@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -52,11 +53,27 @@ pub enum InternalTransportSecurity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InternalTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub ca_cert_path: PathBuf,
+    /// Identity of the certificate in `cert_path`; must match the local cluster node.
+    pub local_node: NodeId,
+    /// Explicitly admitted peers. Each leaf certificate may identify only one node.
+    pub peers: BTreeMap<NodeId, InternalPeerTlsConfig>,
+    /// Optional PEM CRLs. When supplied, unknown or expired revocation status fails closed.
+    #[serde(default)]
+    pub crl_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InternalPeerTlsConfig {
+    /// DNS name or IP SAN checked by rustls when connecting to this peer.
     pub server_name: String,
+    /// PEM leaf certificate pinned to this node, in addition to CA verification.
+    pub cert_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

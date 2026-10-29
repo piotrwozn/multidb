@@ -10,14 +10,13 @@ use crate::{
         DistTxnConfig, FlowControlConfig, HlcConfig, HlcTimestamp, InternalTransportConfig,
         RaftRuntimeConfig, RegionConfig,
     },
-    storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
+    storage::{Bytes, ReadBudget, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
     txn::{self, TxnId, WriteSet},
 };
 
 use super::{
-    ConditionalBatch, DIST_TXN_COORDINATOR_TABLE, DIST_TXN_FINISHED_TABLE,
-    DIST_TXN_PARTICIPANT_TABLE, Decision, DistTxnId, FinishedTxnRecord, Op, PreparedTxnRecord,
-    ReadConsistency, ReplError, Replication, Vote, condition_matches,
+    ConditionalBatch, DIST_TXN_COORDINATOR_TABLE, DIST_TXN_PARTICIPANT_TABLE, Decision, DistTxnId,
+    Op, PreparedTxnRecord, ReadConsistency, ReplError, Replication, Vote, condition_matches,
     cp_live::{LiveCpHandle, LiveCpRuntime},
     dist_txn,
 };
@@ -897,6 +896,14 @@ impl<S: StorageEngine> CpRaft<S> {
     }
 
     fn apply_conditional_batch(&self, batch: ConditionalBatch) -> Result<TxnId, StorageError> {
+        self.apply_conditional_batch_authorized(batch, txn::system_write_authorization())
+    }
+
+    fn apply_conditional_batch_authorized(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<TxnId, StorageError> {
         let _guard = self
             .commit_lock
             .lock()
@@ -933,11 +940,13 @@ impl<S: StorageEngine> CpRaft<S> {
         let log_index = next_log_index(&write)?;
         let command_bytes = serialize_command(&command)?;
 
-        txn::commit_write_set_in_txn_with_extra(
+        txn::commit_write_set_in_txn_with_extra_authorized(
             write,
             snapshot_id,
             write_set,
+            |_| Ok(()),
             |txn, next_txn_id| write_raft_metadata(txn, log_index, &command_bytes, next_txn_id),
+            authorization,
         )
     }
 
@@ -997,9 +1006,127 @@ impl<S: StorageEngine> CpRaft<S> {
 }
 
 impl<S: StorageEngine> Replication for CpRaft<S> {
+    fn supports_guarded_reads(&self) -> bool {
+        self.storage.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        budget.check()?;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_key_guarded(&txn, table, key, budget)?;
+        let mut callback_error = None;
+        txn.visit_get(table, key, budget, &mut |value| {
+            Ok(super::visit_keep_going(visitor(value), &mut callback_error))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        budget.check()?;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_keys_guarded(&txn, table, keys, budget)?;
+        let mut callback_error = None;
+        txn.visit_many(table, keys, budget, &mut |index, value| {
+            Ok(super::visit_keep_going(
+                visitor(index, value),
+                &mut callback_error,
+            ))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        if consistency == ReadConsistency::Strong {
+            if let Some(live) = &self.live {
+                live.strong_read_barrier()?;
+            } else {
+                self.ensure_strong_read()?;
+            }
+        }
+        budget.check()?;
+        let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_range_guarded(&txn, table, start, end, budget)?;
+        let mut callback_error = None;
+        txn.visit_range(table, start, end, budget, &mut |key, value| {
+            Ok(super::visit_keep_going(
+                visitor(key, value),
+                &mut callback_error,
+            ))
+        })?;
+        callback_error.map_or(Ok(()), Err)
+    }
+
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        super::registered_public_keyspaces(self)
+    }
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        if let Some(live) = &self.live {
+            live.propose(ReplCommand::Conditional {
+                conditions: batch.conditions,
+                ops: batch.ops,
+                hlc: Some(HlcTimestamp::now()),
+            })?;
+            return Ok(());
+        }
+        self.ensure_write_quorum()?;
+        match self.apply_conditional_batch_authorized(batch, authorization) {
+            Ok(_) => Ok(()),
+            Err(StorageError::Conflict) => Err(ReplError::Conflict),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn table_data_version(&self, table: &str) -> Result<Option<u64>, ReplError> {
-        // `read` retains CP's strong-read barrier before observing the token.
-        txn::read_table_data_version(self, table)
+        if let Some(live) = &self.live {
+            live.strong_read_barrier()?;
+        } else {
+            self.ensure_strong_read()?;
+        }
+        let read = self.storage.begin_read()?;
+        txn::read_table_data_version_from(&read, table).map_err(Into::into)
     }
 
     fn supports_bounded_scans(&self) -> bool {
@@ -1071,21 +1198,6 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
 
     fn prepare_dist_txn(&self, txn_id: DistTxnId, ops: Vec<Op>) -> Result<Vote, ReplError> {
         txn::validate_public_ops(&ops)?;
-        let key = dist_txn::txn_key(txn_id);
-        {
-            let read = self.storage.begin_read()?;
-            if read.get(DIST_TXN_FINISHED_TABLE, &key)?.is_some() {
-                return Ok(Vote::Yes);
-            }
-            if let Some(existing) = read.get(DIST_TXN_PARTICIPANT_TABLE, &key)? {
-                let existing = dist_txn::decode_prepared(&existing)?;
-                return Ok(if existing.ops == ops {
-                    Vote::Yes
-                } else {
-                    Vote::No
-                });
-            }
-        }
 
         if let Some(live) = &self.live {
             match live.propose(ReplCommand::DistTxnPrepare {
@@ -1101,7 +1213,7 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
         }
 
         self.ensure_write_quorum()?;
-        self.apply_authorized_command(
+        match self.apply_authorized_command(
             &ReplCommand::DistTxnPrepare {
                 txn_id,
                 ops,
@@ -1109,28 +1221,22 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
                 hlc: Some(HlcTimestamp::now()),
             },
             txn::system_write_authorization(),
-        )?;
-        Ok(Vote::Yes)
+        ) {
+            Ok(_) => Ok(Vote::Yes),
+            Err(StorageError::Conflict) => Ok(Vote::No),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn finish_dist_txn(&self, txn_id: DistTxnId, decision: Decision) -> Result<(), ReplError> {
-        let key = dist_txn::txn_key(txn_id);
-        {
-            let read = self.storage.begin_read()?;
-            if read.get(DIST_TXN_FINISHED_TABLE, &key)?.is_some() {
-                return Ok(());
-            }
-        }
-
         self.mark_dist_txn_finished(txn_id, decision)
     }
 
     fn recover_dist_txns(&self) -> Result<(), ReplError> {
         for record in self.local_prepared_dist_txns()? {
-            let decision = self
-                .load_dist_txn_decision(record.txn_id)?
-                .unwrap_or(Decision::Abort);
-            self.finish_dist_txn(record.txn_id, decision)?;
+            if let Some(decision) = self.load_dist_txn_decision(record.txn_id)? {
+                self.finish_dist_txn(record.txn_id, decision)?;
+            }
         }
         Ok(())
     }
@@ -1150,6 +1256,7 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
         }
 
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_key(&txn, table, key)?;
         Ok(txn.get(table, key)?)
     }
 
@@ -1170,6 +1277,7 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
             }
         }
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_keys(&txn, table, keys)?;
         keys.iter()
             .map(|key| txn.get(table, key).map_err(Into::into))
             .collect()
@@ -1191,6 +1299,7 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
         }
 
         let txn = self.storage.begin_read()?;
+        dist_txn::locks::validate_read_range(&txn, table, start, end)?;
         txn.range(table, start, end)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -1206,6 +1315,9 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
         cancelled: &dyn Fn() -> bool,
         on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
     ) -> Result<(), ReplError> {
+        if cancelled() {
+            return Ok(());
+        }
         if consistency == ReadConsistency::Strong {
             if let Some(live) = &self.live {
                 live.strong_read_barrier()?;
@@ -1214,14 +1326,20 @@ impl<S: StorageEngine> Replication for CpRaft<S> {
             }
         }
 
+        if cancelled() {
+            return Ok(());
+        }
         let txn = self.storage.begin_read()?;
-        let mut batch = Vec::with_capacity(batch_rows.max(1));
-        for entry in txn.range(table, start, end)? {
-            if cancelled() {
+        dist_txn::locks::validate_read_range(&txn, table, start, end)?;
+        let batch_rows = batch_rows.clamp(1, 1_024);
+        let mut batch = Vec::new();
+        let mut entries = txn.range(table, start, end)?;
+        while !cancelled() {
+            let Some(entry) = entries.next() else {
                 break;
-            }
+            };
             batch.push(entry?);
-            if batch.len() >= batch_rows.max(1) {
+            if batch.len() >= batch_rows {
                 if !on_batch(&batch)? {
                     return Ok(());
                 }
@@ -1395,56 +1513,25 @@ pub(super) fn command_write_set(
             txn_id,
             ops,
             deadline_ms,
-            ..
-        } => {
-            let record = PreparedTxnRecord::new(*txn_id, ops.clone(), *deadline_ms);
-            BTreeMap::from([(
-                (
-                    DIST_TXN_PARTICIPANT_TABLE.to_owned(),
-                    dist_txn::txn_key(*txn_id).to_vec(),
-                ),
-                Some(dist_txn::encode_prepared(&record)?),
-            )])
-        }
+            hlc,
+        } => dist_txn::locks::prepare_write_set(
+            read,
+            *txn_id,
+            ops,
+            *deadline_ms,
+            hlc.map_or(0, |timestamp| timestamp.physical_ms),
+        )?,
         ReplCommand::DistTxnFinish {
-            txn_id, decision, ..
-        } => dist_txn_finish_write_set(read, *txn_id, *decision)?,
+            txn_id,
+            decision,
+            hlc,
+        } => dist_txn::locks::finish_write_set(
+            read,
+            *txn_id,
+            *decision,
+            hlc.map_or(0, |timestamp| timestamp.physical_ms),
+        )?,
     })
-}
-
-fn dist_txn_finish_write_set(
-    read: &impl ReadTransaction,
-    txn_id: DistTxnId,
-    decision: Decision,
-) -> Result<WriteSet, StorageError> {
-    let key = dist_txn::txn_key(txn_id);
-    let mut write_set = if decision == Decision::Commit {
-        read.get(DIST_TXN_PARTICIPANT_TABLE, &key)?
-            .map(|bytes| dist_txn::decode_prepared(&bytes))
-            .transpose()?
-            .map(|record| txn::ops_to_write_set(record.ops))
-            .unwrap_or_default()
-    } else {
-        WriteSet::new()
-    };
-
-    write_set.insert(
-        (
-            DIST_TXN_FINISHED_TABLE.to_owned(),
-            dist_txn::txn_key(txn_id).to_vec(),
-        ),
-        Some(dist_txn::encode_finished(&FinishedTxnRecord::new(
-            txn_id, decision,
-        ))?),
-    );
-    write_set.insert(
-        (
-            DIST_TXN_PARTICIPANT_TABLE.to_owned(),
-            dist_txn::txn_key(txn_id).to_vec(),
-        ),
-        None,
-    );
-    Ok(write_set)
 }
 
 fn next_log_index(txn: &impl ReadTransaction) -> Result<u64, StorageError> {

@@ -4,7 +4,7 @@ use super::TensorGpuEngine;
 use crate::{
     repl::Replication,
     tensor::{
-        TensorDType, TensorData, TensorDataset, TensorDatasetConfig, TensorError,
+        TensorDType, TensorData, TensorDataset, TensorDatasetConfig, TensorDeadline, TensorError,
         TensorReadRequest, TensorSearchHit, TensorSearchRequest, TensorSearchResult,
     },
     vector::VectorMetric,
@@ -17,17 +17,30 @@ pub(crate) fn search_dataset<R: Replication + ?Sized>(
     dataset: &TensorDataset<'_, R>,
     request: &TensorSearchRequest,
 ) -> Result<TensorSearchResult, TensorError> {
+    let deadline = dataset.execution_deadline()?;
+    let query = validated_query(dataset.config(), request)?;
+    deadline.check()?;
     let engine = TensorGpuEngine::shared()?;
-    search_dataset_with_engine(dataset, request, &engine)
+    search_dataset_until(dataset, request, &engine, &query, deadline)
 }
 
+#[cfg(test)]
 pub(super) fn search_dataset_with_engine<R: Replication + ?Sized>(
     dataset: &TensorDataset<'_, R>,
     request: &TensorSearchRequest,
     engine: &TensorGpuEngine,
 ) -> Result<TensorSearchResult, TensorError> {
+    let deadline = dataset.execution_deadline()?;
+    let query = validated_query(dataset.config(), request)?;
+    search_dataset_until(dataset, request, engine, &query, deadline)
+}
+
+fn validated_query(
+    config: &TensorDatasetConfig,
+    request: &TensorSearchRequest,
+) -> Result<Vec<f32>, TensorError> {
     request.validate()?;
-    let dim = gpu_search_dimension(dataset.config(), request)?;
+    gpu_search_dimension(config, request)?;
     let query = request
         .query
         .iter()
@@ -38,23 +51,58 @@ pub(super) fn search_dataset_with_engine<R: Replication + ?Sized>(
             "cosine query must not be zero".to_owned(),
         ));
     }
+    Ok(query)
+}
+
+fn search_dataset_until<R: Replication + ?Sized>(
+    dataset: &TensorDataset<'_, R>,
+    request: &TensorSearchRequest,
+    engine: &TensorGpuEngine,
+    query: &[f32],
+    deadline: TensorDeadline,
+) -> Result<TensorSearchResult, TensorError> {
+    deadline.check()?;
+    let dim = query.len();
     let info = dataset.info(request.revision)?;
     let end = execution_end(request.start, request.max_samples, info.samples)?;
     let mut hits = Vec::new();
     let mut position = request.start;
     let mut skipped_samples = 0;
-    let batch_size = MAX_GPU_BATCH_ROWS.min(MAX_GPU_BATCH_FLOATS / dim).max(1);
+    let working_bytes = query
+        .len()
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_add(
+            request
+                .k
+                .saturating_mul(std::mem::size_of::<TensorSearchHit>()),
+        )
+        .saturating_add(4_096);
+    let available_floats = dataset
+        .memory_limit()
+        .checked_sub(working_bytes)
+        .map_or(0, |bytes| bytes / 16)
+        .min(MAX_GPU_BATCH_FLOATS);
+    if available_floats < dim {
+        return Err(TensorError::InvalidValue(
+            "GPU search input exceeds the configured memory budget".to_owned(),
+        ));
+    }
+    let batch_size = MAX_GPU_BATCH_ROWS.min(available_floats / dim);
     while position < end {
+        deadline.check()?;
         let limit = batch_size.min(
             usize::try_from(end - position)
                 .map_err(|error| TensorError::InvalidValue(error.to_string()))?,
         );
-        let mut batch = dataset.read(&TensorReadRequest {
-            start: position,
-            limit,
-            columns: Some(vec![request.tensor.clone()]),
-            revision: Some(info.revision),
-        })?;
+        let mut batch = dataset.read_with_deadline(
+            &TensorReadRequest {
+                start: position,
+                limit,
+                columns: Some(vec![request.tensor.clone()]),
+                revision: Some(info.revision),
+            },
+            deadline,
+        )?;
         let tensors = batch.tensors.remove(&request.tensor).ok_or_else(|| {
             TensorError::Corruption("search tensor missing from selected batch".to_owned())
         })?;
@@ -78,7 +126,8 @@ pub(super) fn search_dataset_with_engine<R: Replication + ?Sized>(
             rows.push(values);
         }
         if !rows.is_empty() {
-            let distances = engine.compute_distances(&rows, &query, request.metric)?;
+            let distances =
+                engine.compute_distances_until(&rows, query, request.metric, deadline)?;
             for (index, distance) in indices.into_iter().zip(distances) {
                 hits.push(TensorSearchHit {
                     index,
@@ -99,6 +148,7 @@ pub(super) fn search_dataset_with_engine<R: Replication + ?Sized>(
         }
         position = batch.end;
     }
+    deadline.check()?;
     Ok(TensorSearchResult {
         hits,
         scanned_samples: end - request.start,
@@ -152,9 +202,14 @@ fn execution_end(start: u64, limit: usize, samples: u64) -> Result<u64, TensorEr
 #[allow(clippy::cast_possible_truncation)]
 fn checked_f32(value: f64) -> Result<f32, TensorError> {
     let converted = value as f32;
-    if !value.is_finite() || !converted.is_finite() {
+    if !value.is_finite() || !converted.is_finite() || value != 0.0 && converted == 0.0 {
         return Err(TensorError::InvalidValue(
             "tensor value is not a finite representable F32".to_owned(),
+        ));
+    }
+    if converted.is_subnormal() {
+        return Err(TensorError::GpuUnsupported(
+            "subnormal GPU queries are not portable across native adapters".to_owned(),
         ));
     }
     Ok(converted)

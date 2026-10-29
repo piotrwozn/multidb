@@ -1,9 +1,15 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError},
 };
 
-use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
+pub(crate) mod execution;
+use execution::{ExecutionLimits, ExecutionReadBudget};
+
+#[cfg(test)]
+mod execution_tests;
+
+use hnsw_rs::prelude::{Distance, Hnsw};
 
 use crate::{
     keyenc,
@@ -12,7 +18,7 @@ use crate::{
     },
     observability,
     repl::{Op, ReadConsistency, ReplError, Replication},
-    storage::{Bytes, StorageError},
+    storage::{Bytes, ReadBudget, StorageError},
 };
 
 pub const VECTOR_TABLE: &str = "vectors";
@@ -24,6 +30,9 @@ const HNSW_MAX_LAYER: usize = 16;
 const MIN_HNSW_M: usize = 1;
 const MAX_HNSW_M: usize = 255;
 const TOMBSTONE_COMPACT_PERCENT: usize = 20;
+const MAX_VECTOR_DIMENSION: usize = 16_384;
+const MAX_SEARCH_RESULTS: usize = 10_000;
+const MAX_HNSW_EF: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum VectorMetric {
@@ -93,12 +102,15 @@ pub struct VectorCollection<'repl, R: Replication + ?Sized> {
     metadata: DocumentCollection<'repl, R>,
     config: VectorCollectionConfig,
     state: SharedVectorIndex,
+    execution: ExecutionLimits,
 }
 
 pub(crate) type SharedVectorIndex = Arc<RwLock<VectorIndexState>>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum VectorError {
+    #[error("execution: {0}")]
+    Execution(#[from] crate::query::QueryError),
     #[error("replication: {0}")]
     Repl(#[from] ReplError),
 
@@ -250,6 +262,7 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
             metadata: DocumentCollection::new(repl, config.collection_id),
             config,
             state,
+            execution: ExecutionLimits::default(),
         };
         collection.rebuild_index()?;
         Ok(collection)
@@ -269,9 +282,43 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
             metadata: DocumentCollection::new(repl, config.collection_id),
             config,
             state,
+            execution: ExecutionLimits::default(),
         };
-        collection.ensure_index_loaded()?;
         Ok(collection)
+    }
+
+    /// Defers shared-index loading until a bounded operation actually needs it.
+    pub(crate) fn with_execution_limits(mut self, execution: ExecutionLimits) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    pub(crate) fn check_execution(&self) -> Result<(), VectorError> {
+        self.execution.check()?;
+        Ok(())
+    }
+
+    pub(crate) fn check_temporary_memory(&self, bytes: usize) -> Result<(), VectorError> {
+        let state = self.read_state()?;
+        self.check_index_memory(&state, bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn with_reserved_memory(&self, bytes: usize) -> Result<Self, VectorError> {
+        Ok(Self {
+            repl: self.repl,
+            metadata: DocumentCollection::new(self.repl, self.config.collection_id),
+            config: self.config.clone(),
+            state: Arc::clone(&self.state),
+            execution: self.execution.reserve(bytes)?,
+        })
+    }
+
+    pub(crate) fn content_versions(&self) -> Result<[Option<u64>; 2], VectorError> {
+        Ok([
+            self.repl.table_data_version(VECTOR_TABLE)?,
+            self.repl.table_data_version(crate::model::DOCUMENT_TABLE)?,
+        ])
     }
 
     #[must_use]
@@ -293,6 +340,7 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         vector: Vec<f32>,
     ) -> Result<DocumentId, VectorError> {
         validate_vector(&self.config, &vector)?;
+        self.ensure_index_loaded_for_write()?;
 
         let id = DocumentId::generate();
         let mut ops = self.metadata.put_ops_for_id(id, metadata)?;
@@ -306,7 +354,66 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
     /// # Errors
     /// Fails when replication, storage, or metadata decoding fails.
     pub fn get_metadata(&self, id: DocumentId) -> Result<Option<Value>, VectorError> {
-        Ok(self.metadata.get(id)?)
+        self.execution.check()?;
+        if self.repl.supports_guarded_reads() {
+            let budget = ExecutionReadBudget::new(self.execution);
+            let index_bytes = {
+                let state = self.read_state()?;
+                estimated_index_bytes(state.hnsw_to_doc.len(), self.config.dim, self.config.hnsw)
+            };
+            let _index = budget.reserve(index_bytes).map_err(vector_storage_error)?;
+            let mut metadata = None;
+            self.repl
+                .visit_get(
+                    crate::model::DOCUMENT_TABLE,
+                    &self.metadata.document_key(id),
+                    ReadConsistency::Strong,
+                    &budget,
+                    &mut |bytes| {
+                        let Some(bytes) = bytes else {
+                            return Ok(false);
+                        };
+                        // Native pages are borrowed; escaped legacy JSON may still
+                        // need an input-sized temporary unescape buffer.
+                        let _scratch = budget.reserve(bytes.len())?;
+                        let decoded = crate::model::value_decode_memory_bound(
+                            bytes,
+                            budget.remaining_bytes() / 2,
+                        )?;
+                        let _decoded = budget.reserve(decoded.saturating_mul(2))?;
+                        metadata = Some(crate::model::decode_value(bytes)?);
+                        Ok(false)
+                    },
+                )
+                .map_err(vector_read_error)?;
+            self.execution.check()?;
+            return Ok(metadata);
+        }
+        let Some(bytes) = self.repl.read(
+            crate::model::DOCUMENT_TABLE,
+            &self.metadata.document_key(id),
+            ReadConsistency::Strong,
+        )?
+        else {
+            return Ok(None);
+        };
+        if self.execution.bounded() {
+            let index_bytes = {
+                let state = self.read_state()?;
+                estimated_index_bytes(state.hnsw_to_doc.len(), self.config.dim, self.config.hnsw)
+            };
+            // Include the input/unescape scratch and the decoded Value plus
+            // a possible policy-masked clone. Preflight arrays/maps before
+            // allocating them without penalizing large string payloads.
+            let encoded = bytes.len().saturating_mul(2);
+            let remaining = self
+                .execution
+                .remaining_memory(index_bytes.saturating_add(encoded))?;
+            let decoded = crate::model::value_decode_memory_bound(&bytes, remaining / 2)?;
+            self.check_temporary_memory(encoded.saturating_add(decoded.saturating_mul(2)))?;
+        }
+        self.execution.check()?;
+        Ok(Some(crate::model::decode_value(&bytes)?))
     }
 
     /// Searches nearest vectors using the configured `ef_search`.
@@ -332,9 +439,10 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         )
     }
 
-    /// HNSW-only candidates for bounded graph retrieval. Never scans the full vector map
-    /// as a fallback or expands the candidate set to include every tombstone. Deleted
-    /// candidates can therefore make this approximate search return fewer than requested.
+    /// Bounded candidates for graph retrieval. An index that fits entirely within
+    /// the explicit candidate budget is searched exactly in memory. Larger indexes
+    /// use HNSW without a full-map fallback or tombstone expansion; deleted candidates
+    /// can therefore make approximate search return fewer than requested.
     pub(crate) fn knn_bounded(
         &self,
         query: &[f32],
@@ -346,28 +454,20 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
             ));
         }
         validate_query(&self.config, query)?;
-        let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
+        self.ensure_index_loaded()?;
+        let state = self.read_state()?;
+        self.check_index_memory(&state, 0)?;
+        if state.hnsw_to_doc.len() <= max_candidates {
+            return state.exact_hits_until(query, self.execution);
+        }
         let requested = max_candidates.min(state.hnsw_to_doc.len());
         if requested == 0 {
             return Ok(Vec::new());
         }
-        // The dependency multiplies f32 cosine components before accumulating
-        // in f64. A finite but huge query can otherwise create inf/inf and panic.
-        // Normalization also prevents tiny nonzero queries underflowing to zero.
-        let normalized_query = (self.config.metric == VectorMetric::Cosine).then(|| {
-            let norm = query
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            query
-                .iter()
-                .map(|value| normalized_cosine_component(*value, norm))
-                .collect::<Vec<_>>()
-        });
-        let index_query = normalized_query.as_deref().unwrap_or(query);
         let mut hits = BTreeMap::new();
-        for (hnsw_id, _) in state.hnsw.search(index_query, requested, max_candidates) {
+        let _scope = self.execution.distance_scope();
+        for (hnsw_id, _) in state.hnsw.search(query, requested, max_candidates) {
+            self.execution.check()?;
             let Some(id) = state.hnsw_to_doc.get(&hnsw_id) else {
                 continue;
             };
@@ -391,6 +491,7 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         let mut hits = hits.into_values().collect::<Vec<_>>();
         sort_hits(&mut hits);
         hits.truncate(max_candidates);
+        self.execution.check()?;
         Ok(hits)
     }
 
@@ -404,20 +505,30 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         k: usize,
         options: VectorSearchOptions,
     ) -> Result<Vec<VectorHit>, VectorError> {
+        validate_search_options(k, &options)?;
         if k == 0 {
             return Ok(Vec::new());
         }
 
         validate_query(&self.config, query)?;
+        self.ensure_index_loaded()?;
         let ef_search = options.ef_search.unwrap_or(self.config.hnsw.ef_search);
-        if let Some(filter) = &options.filter {
-            return self.filtered_exact_knn(query, k, filter);
+        let hits = if let Some(filter) = &options.filter {
+            self.filtered_exact_knn(query, k, filter)?
+        } else if self.config.disk_ann.enabled {
+            self.disk_ann_style_knn(query, k, ef_search, options.rerank)?
+        } else {
+            let state = self.read_state()?;
+            self.check_index_memory(&state, 0)?;
+            state.search(query, k, ef_search, self.execution)?
+        };
+        self.execution.check()?;
+        if hits.iter().any(|hit| !hit.distance.is_finite()) {
+            return Err(VectorError::InvalidIndexConfig(
+                "query produces a distance outside the finite f32 range".to_owned(),
+            ));
         }
-        if self.config.disk_ann.enabled {
-            return self.disk_ann_style_knn(query, k, ef_search, options.rerank);
-        }
-        let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
-        Ok(state.search(query, k, ef_search))
+        Ok(hits)
     }
 
     /// Deletes a vector and its metadata document atomically.
@@ -435,8 +546,17 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         state.delete(id);
         let should_compact = state.should_compact();
         drop(state);
-        if should_compact {
-            self.rebuild_index()?;
+        if should_compact && let Err(error) = self.rebuild_index() {
+            if matches!(error, VectorError::Repl(ReplError::Conflict)) {
+                // The deletion already committed. Defer this optional
+                // compaction when another durable writer races its scan.
+                self.state
+                    .write()
+                    .map_err(|_| VectorError::LockPoisoned)?
+                    .loaded = false;
+            } else {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -445,7 +565,7 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
     /// # Errors
     /// Fails when storage reads or vector decoding fails.
     pub fn rebuild_index(&self) -> Result<(), VectorError> {
-        let mut state = self.state.write().map_err(|_| VectorError::LockPoisoned)?;
+        let mut state = self.write_state()?;
         self.rebuild_locked(&mut state)
     }
 
@@ -455,42 +575,223 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
     /// shared index, so a concurrent `insert_vector` is either part of the read
     /// or applied after the install, and is never dropped from the in-memory index.
     fn rebuild_locked(&self, state: &mut VectorIndexState) -> Result<(), VectorError> {
-        let items = self.read_persisted_vectors()?;
+        self.execution.check()?;
+        let version = self.repl.table_data_version(VECTOR_TABLE)?;
+        let old_bytes =
+            estimated_index_bytes(state.hnsw_to_doc.len(), self.config.dim, self.config.hnsw);
+        let items = self.read_persisted_vectors(old_bytes)?;
+        self.execution.check_memory(
+            estimated_index_bytes(items.len(), self.config.dim, self.config.hnsw)
+                .saturating_add(old_bytes),
+            "vector index rebuild",
+        )?;
         let mut rebuilt = VectorIndexState::new(self.config.metric, self.config.hnsw, items.len());
-        rebuilt.rebuild(items)?;
+        rebuilt.rebuild_until(items, self.execution)?;
+        self.execution.check()?;
+        if self.repl.table_data_version(VECTOR_TABLE)? != version {
+            return Err(ReplError::Conflict.into());
+        }
+        rebuilt.source_version = version;
         *state = rebuilt;
         state.loaded = true;
         Ok(())
     }
 
     fn ensure_index_loaded(&self) -> Result<(), VectorError> {
-        if self
-            .state
-            .read()
-            .map_err(|_| VectorError::LockPoisoned)?
-            .loaded
+        self.execution.check()?;
+        let version = self.repl.table_data_version(VECTOR_TABLE)?;
         {
-            return Ok(());
+            let state = self.read_state()?;
+            if state.loaded && version.is_some() && state.source_version == version {
+                return Ok(());
+            }
         }
-        let mut state = self.state.write().map_err(|_| VectorError::LockPoisoned)?;
-        if state.loaded {
+        let mut state = self.write_state()?;
+        let version = self.repl.table_data_version(VECTOR_TABLE)?;
+        if state.loaded && version.is_some() && state.source_version == version {
             return Ok(());
         }
         self.rebuild_locked(&mut state)
     }
 
-    fn read_persisted_vectors(&self) -> Result<Vec<(DocumentId, Vec<f32>)>, VectorError> {
+    // A cache can accept local inserts while its durable generation advances.
+    // Only reads require a generation-validated complete index. Deferring that
+    // validation avoids rebuilding on every insert of an ingestion batch.
+    fn ensure_index_loaded_for_write(&self) -> Result<(), VectorError> {
+        if self.read_state()?.loaded {
+            return Ok(());
+        }
+        let mut state = self.write_state()?;
+        if state.loaded {
+            return Ok(());
+        }
+        match self.rebuild_locked(&mut state) {
+            Err(VectorError::Repl(ReplError::Conflict)) => {
+                // Another durable writer invalidated this optional cache fill.
+                // A write need not wait for a complete read index; keep the
+                // cache invalid until a later read validates its generation.
+                state.loaded = false;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep native guarded and legacy streamed loading together with their shared error and allocation accounting."
+    )]
+    fn read_persisted_vectors(
+        &self,
+        old_bytes: usize,
+    ) -> Result<Vec<(DocumentId, Vec<f32>)>, VectorError> {
         let (start, end) = vector_range_bounds(self.config.collection_id);
-        self.repl
-            .range(VECTOR_TABLE, &start, &end, ReadConsistency::Strong)?
-            .into_iter()
-            .map(|(key, value)| {
-                Ok((
-                    document_id_from_vector_key(&key)?,
-                    decode_vector(&value, self.config.dim)?,
-                ))
-            })
-            .collect()
+        if self.repl.supports_guarded_reads() {
+            let budget = ExecutionReadBudget::new(self.execution);
+            let _old = budget.reserve(old_bytes).map_err(vector_storage_error)?;
+            let mut reservations = Vec::new();
+            let mut items = Vec::new();
+            let mut estimate = 0_usize;
+            let mut callback_error = None;
+            let scanned = self.repl.visit_range(
+                VECTOR_TABLE,
+                &start,
+                &end,
+                ReadConsistency::Strong,
+                &budget,
+                &mut |key, value| {
+                    let loaded = (|| -> Result<(), VectorError> {
+                        self.execution.check()?;
+                        let next = estimated_index_bytes(
+                            items.len().saturating_add(1),
+                            self.config.dim,
+                            self.config.hnsw,
+                        );
+                        reservations.push(
+                            budget
+                                .reserve(next.saturating_sub(estimate))
+                                .map_err(vector_storage_error)?,
+                        );
+                        estimate = next;
+                        let vector = decode_vector(value, self.config.dim)?;
+                        validate_vector(&self.config, &vector)?;
+                        items.push((document_id_from_vector_key(key)?, vector));
+                        Ok(())
+                    })();
+                    if let Err(error) = loaded {
+                        callback_error = Some(error);
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
+            );
+            self.execution.check()?;
+            if let Some(error) = callback_error {
+                return Err(error);
+            }
+            scanned.map_err(vector_read_error)?;
+            return Ok(items);
+        }
+        if self.execution.bounded() && !self.repl.supports_bounded_scans() {
+            return Err(crate::query::QueryError::Unsupported(
+                "bounded vector index loading is unavailable on this backend".to_owned(),
+            )
+            .into());
+        }
+        let mut items = Vec::new();
+        let mut callback_error = None;
+        let result = self.repl.scan_range_batches(
+            VECTOR_TABLE,
+            &start,
+            &end,
+            ReadConsistency::Strong,
+            64,
+            &|| self.execution.expired(),
+            &mut |batch| {
+                let decoded = (|| -> Result<(), VectorError> {
+                    self.execution.check()?;
+                    let batch_bytes = batch.iter().fold(0_usize, |bytes, (key, value)| {
+                        bytes
+                            .saturating_add(key.capacity())
+                            .saturating_add(value.capacity())
+                    });
+                    for (key, value) in batch {
+                        self.execution.check_memory(
+                            estimated_index_bytes(
+                                items.len().saturating_add(1),
+                                self.config.dim,
+                                self.config.hnsw,
+                            )
+                            .saturating_add(old_bytes)
+                            .saturating_add(batch_bytes),
+                            "cold vector index",
+                        )?;
+                        let vector = decode_vector(value, self.config.dim)?;
+                        validate_vector(&self.config, &vector)?;
+                        items.push((document_id_from_vector_key(key)?, vector));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = decoded {
+                    callback_error = Some(error);
+                    return Err(ReplError::Rejected(
+                        "vector index scan interrupted".to_owned(),
+                    ));
+                }
+                Ok(true)
+            },
+        );
+        self.execution.check()?;
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        result?;
+        Ok(items)
+    }
+
+    fn read_state(&self) -> Result<RwLockReadGuard<'_, VectorIndexState>, VectorError> {
+        if !self.execution.bounded() {
+            return self.state.read().map_err(|_| VectorError::LockPoisoned);
+        }
+        loop {
+            self.execution.check()?;
+            match self.state.try_read() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => return Err(VectorError::LockPoisoned),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    fn write_state(&self) -> Result<RwLockWriteGuard<'_, VectorIndexState>, VectorError> {
+        if !self.execution.bounded() {
+            return self.state.write().map_err(|_| VectorError::LockPoisoned);
+        }
+        loop {
+            self.execution.check()?;
+            match self.state.try_write() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => return Err(VectorError::LockPoisoned),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    fn check_index_memory(
+        &self,
+        state: &VectorIndexState,
+        extra: usize,
+    ) -> Result<(), VectorError> {
+        self.execution.check_memory(
+            estimated_index_bytes(state.hnsw_to_doc.len(), self.config.dim, self.config.hnsw)
+                .saturating_add(extra),
+            "vector index and working data",
+        )?;
+        Ok(())
     }
 
     fn insert_in_memory(&self, id: DocumentId, vector: Vec<f32>) -> Result<(), VectorError> {
@@ -501,7 +802,16 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         }
         if state.needs_resize_after_insert() {
             // The vector is already durable, so the rebuild picks it up.
-            return self.rebuild_locked(&mut state);
+            return match self.rebuild_locked(&mut state) {
+                Err(VectorError::Repl(ReplError::Conflict)) => {
+                    // A concurrent durable writer invalidated this optional
+                    // cache refresh. Acknowledge the committed id and rebuild
+                    // on the next read rather than report a failed user write.
+                    state.loaded = false;
+                    Ok(())
+                }
+                result => result,
+            };
         }
         state.insert(id, vector)
     }
@@ -513,11 +823,19 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
         filter: &VectorFilter,
     ) -> Result<Vec<VectorHit>, VectorError> {
         let hits = {
-            let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
-            state.exact_hits(query)
+            let state = self.read_state()?;
+            self.check_index_memory(
+                &state,
+                state
+                    .vectors
+                    .len()
+                    .saturating_mul(std::mem::size_of::<VectorHit>()),
+            )?;
+            state.exact_hits_until(query, self.execution)?
         };
         let mut filtered = Vec::new();
         for hit in hits {
+            self.execution.check()?;
             if self
                 .get_metadata(hit.id)?
                 .as_ref()
@@ -541,12 +859,36 @@ impl<'repl, R: Replication + ?Sized> VectorCollection<'repl, R> {
     ) -> Result<Vec<VectorHit>, VectorError> {
         let candidate_count = k.max(rerank).max(ef_search);
         let mut candidates = {
-            let state = self.state.read().map_err(|_| VectorError::LockPoisoned)?;
-            state.search(query, candidate_count, ef_search.max(candidate_count))
+            let state = self.read_state()?;
+            self.check_index_memory(&state, 0)?;
+            state.search(
+                query,
+                candidate_count,
+                ef_search.max(candidate_count),
+                self.execution,
+            )?
         };
         sort_hits(&mut candidates);
         candidates.truncate(k);
         Ok(candidates)
+    }
+}
+
+fn vector_storage_error(error: StorageError) -> VectorError {
+    match error {
+        StorageError::ResourceLimit(reason) => {
+            crate::query::QueryError::ResourceLimit(reason).into()
+        }
+        StorageError::Timeout(reason) => crate::query::QueryError::Timeout(reason).into(),
+        StorageError::Cancelled(reason) => crate::query::QueryError::Cancelled(reason).into(),
+        other => VectorError::Storage(other),
+    }
+}
+
+fn vector_read_error(error: ReplError) -> VectorError {
+    match error {
+        ReplError::Storage(error) => vector_storage_error(error),
+        other => VectorError::Repl(other),
     }
 }
 
@@ -618,6 +960,11 @@ fn validate_config(config: &VectorCollectionConfig) -> Result<(), VectorError> {
     if config.dim == 0 {
         return Err(VectorError::EmptyDimension);
     }
+    if config.dim > MAX_VECTOR_DIMENSION {
+        return Err(VectorError::InvalidIndexConfig(
+            "vector dimension cannot exceed 16384".to_owned(),
+        ));
+    }
 
     if !(MIN_HNSW_M..=MAX_HNSW_M).contains(&config.hnsw.m) {
         return Err(VectorError::InvalidHnswParams(
@@ -625,15 +972,15 @@ fn validate_config(config: &VectorCollectionConfig) -> Result<(), VectorError> {
         ));
     }
 
-    if config.hnsw.ef_construction < config.hnsw.m {
+    if config.hnsw.ef_construction < config.hnsw.m || config.hnsw.ef_construction > MAX_HNSW_EF {
         return Err(VectorError::InvalidHnswParams(
-            "ef_construction must be at least m".to_owned(),
+            "ef_construction must be at least m and no greater than 10000".to_owned(),
         ));
     }
 
-    if config.hnsw.ef_search == 0 {
+    if config.hnsw.ef_search == 0 || config.hnsw.ef_search > MAX_HNSW_EF {
         return Err(VectorError::InvalidHnswParams(
-            "ef_search must be greater than zero".to_owned(),
+            "ef_search must be between 1 and 10000".to_owned(),
         ));
     }
 
@@ -666,6 +1013,31 @@ fn validate_config(config: &VectorCollectionConfig) -> Result<(), VectorError> {
         ));
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_search_options(
+    k: usize,
+    options: &VectorSearchOptions,
+) -> Result<(), VectorError> {
+    if k > MAX_SEARCH_RESULTS {
+        return Err(VectorError::InvalidIndexConfig(
+            "k cannot exceed 10000".to_owned(),
+        ));
+    }
+    if options
+        .ef_search
+        .is_some_and(|ef| !(1..=MAX_HNSW_EF).contains(&ef))
+    {
+        return Err(VectorError::InvalidHnswParams(
+            "ef_search must be between 1 and 10000".to_owned(),
+        ));
+    }
+    if options.rerank > MAX_SEARCH_RESULTS {
+        return Err(VectorError::InvalidIndexConfig(
+            "rerank cannot exceed 10000".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -755,6 +1127,7 @@ pub(crate) struct VectorIndexState {
     vectors: BTreeMap<DocumentId, Vec<f32>>,
     deleted: BTreeSet<DocumentId>,
     loaded: bool,
+    source_version: Option<u64>,
 }
 
 impl VectorIndexState {
@@ -771,10 +1144,20 @@ impl VectorIndexState {
             vectors: BTreeMap::new(),
             deleted: BTreeSet::new(),
             loaded: false,
+            source_version: None,
         }
     }
 
     fn rebuild(&mut self, items: Vec<(DocumentId, Vec<f32>)>) -> Result<(), VectorError> {
+        self.rebuild_until(items, ExecutionLimits::default())
+    }
+
+    fn rebuild_until(
+        &mut self,
+        items: Vec<(DocumentId, Vec<f32>)>,
+        execution: ExecutionLimits,
+    ) -> Result<(), VectorError> {
+        execution.check()?;
         self.capacity = hnsw_capacity(items.len());
         self.hnsw = HnswIndex::new(self.metric, self.hnsw_params, self.capacity);
         self.next_hnsw_id = 0;
@@ -783,8 +1166,11 @@ impl VectorIndexState {
         self.vectors.clear();
         self.deleted.clear();
 
+        let _scope = execution.distance_scope();
         for (id, vector) in items {
+            execution.check()?;
             self.insert_without_resize(id, vector)?;
+            execution.check()?;
         }
         self.loaded = true;
 
@@ -839,9 +1225,16 @@ impl VectorIndexState {
         self.deleted.len().saturating_mul(100) > indexed.saturating_mul(TOMBSTONE_COMPACT_PERCENT)
     }
 
-    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<VectorHit> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        execution: ExecutionLimits,
+    ) -> Result<Vec<VectorHit>, VectorError> {
+        execution.check()?;
         if self.vectors.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let wanted = k.min(self.vectors.len());
@@ -849,7 +1242,9 @@ impl VectorIndexState {
         let ef = ef_search.max(requested.saturating_add(1));
         let mut hits = BTreeMap::new();
 
+        let _scope = execution.distance_scope();
         for (hnsw_id, _) in self.hnsw.search(query, requested, ef) {
+            execution.check()?;
             if let Some(id) = self.hnsw_to_doc.get(&hnsw_id) {
                 if self.deleted.contains(id) {
                     continue;
@@ -870,13 +1265,14 @@ impl VectorIndexState {
         let mut ordered = hits.into_values().collect::<Vec<_>>();
         if ordered.len() < wanted {
             observability::record_vector_bruteforce_fallback();
-            ordered = self.exact_hits(query);
+            ordered = self.exact_top_hits(query, wanted, execution)?;
         } else {
             sort_hits(&mut ordered);
         }
 
         ordered.truncate(wanted);
-        ordered
+        execution.check()?;
+        Ok(ordered)
     }
 
     fn search_candidate_count(&self, wanted: usize, ef_search: usize) -> usize {
@@ -885,23 +1281,76 @@ impl VectorIndexState {
         total_indexed.min(wanted.max(ef_search).max(with_deleted))
     }
 
-    fn exact_hits(&self, query: &[f32]) -> Vec<VectorHit> {
-        let mut hits = self
-            .vectors
-            .iter()
-            .map(|(id, vector)| VectorHit {
+    fn exact_hits_until(
+        &self,
+        query: &[f32],
+        execution: ExecutionLimits,
+    ) -> Result<Vec<VectorHit>, VectorError> {
+        let mut hits = Vec::with_capacity(self.vectors.len());
+        for (id, vector) in &self.vectors {
+            execution.check()?;
+            hits.push(VectorHit {
                 id: *id,
                 distance: distance(self.metric, query, vector),
-            })
-            .collect::<Vec<_>>();
+            });
+        }
         sort_hits(&mut hits);
-        hits
+        execution.check()?;
+        Ok(hits)
+    }
+
+    fn exact_top_hits(
+        &self,
+        query: &[f32],
+        k: usize,
+        execution: ExecutionLimits,
+    ) -> Result<Vec<VectorHit>, VectorError> {
+        let mut heap = BinaryHeap::with_capacity(k);
+        for (id, vector) in &self.vectors {
+            execution.check()?;
+            let hit = OrderedHit(VectorHit {
+                id: *id,
+                distance: distance(self.metric, query, vector),
+            });
+            if heap.len() < k {
+                heap.push(hit);
+            } else if let Some(mut worst) = heap.peek_mut()
+                && hit < *worst
+            {
+                *worst = hit;
+            }
+        }
+        let mut hits = heap.into_iter().map(|hit| hit.0).collect::<Vec<_>>();
+        sort_hits(&mut hits);
+        Ok(hits)
+    }
+}
+
+struct OrderedHit(VectorHit);
+
+impl PartialEq for OrderedHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for OrderedHit {}
+impl PartialOrd for OrderedHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .distance
+            .total_cmp(&other.0.distance)
+            .then_with(|| self.0.id.cmp(&other.0.id))
     }
 }
 
 enum HnswIndex {
-    Cosine(Hnsw<'static, f32, DistCosine>),
-    L2(Hnsw<'static, f32, DistL2>),
+    Cosine(Hnsw<'static, f32, StableCosine>),
+    L2(Hnsw<'static, f32, StableL2>),
 }
 
 impl HnswIndex {
@@ -912,14 +1361,14 @@ impl HnswIndex {
                 capacity,
                 HNSW_MAX_LAYER,
                 params.ef_construction,
-                DistCosine,
+                StableCosine,
             )),
             VectorMetric::L2 => Self::L2(Hnsw::new(
                 params.m,
                 capacity,
                 HNSW_MAX_LAYER,
                 params.ef_construction,
-                DistL2,
+                StableL2,
             )),
         }
     }
@@ -947,6 +1396,34 @@ impl HnswIndex {
     }
 }
 
+// The dependency's cosine metric multiplies f32 components before converting
+// to f64 and asserts on NaN. Valid finite inputs can therefore panic during
+// insertion, including after their durable commit. Use the same stable metric
+// for index construction, search, reranking and exact filtering.
+#[derive(Clone, Copy, Default)]
+struct StableCosine;
+
+impl Distance<f32> for StableCosine {
+    fn eval(&self, left: &[f32], right: &[f32]) -> f32 {
+        if execution::distance_expired() {
+            return f32::MAX;
+        }
+        bounded_cosine_distance(left, right)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StableL2;
+
+impl Distance<f32> for StableL2 {
+    fn eval(&self, left: &[f32], right: &[f32]) -> f32 {
+        if execution::distance_expired() {
+            return f32::MAX;
+        }
+        l2_distance(left, right)
+    }
+}
+
 fn hnsw_capacity(len: usize) -> usize {
     match len.max(1).checked_next_power_of_two() {
         Some(capacity) => capacity,
@@ -954,18 +1431,32 @@ fn hnsw_capacity(len: usize) -> usize {
     }
 }
 
+// Include both durable-vector staging and the dependency's cloned point data,
+// all 16 possible neighbor layers, link allocations, maps and reserved slots.
+// This is deliberately a conservative acceptance bound, not an RSS estimate.
+fn estimated_index_bytes(len: usize, dim: usize, params: HnswParams) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let point = dim
+        .saturating_mul(F32_BYTES)
+        .saturating_mul(3)
+        .saturating_add(
+            params
+                .m
+                .saturating_mul(HNSW_MAX_LAYER + 1)
+                .saturating_mul(48),
+        )
+        .saturating_add(1_024);
+    len.saturating_mul(point)
+        .saturating_add(hnsw_capacity(len).saturating_mul(32))
+}
+
 fn distance(metric: VectorMetric, left: &[f32], right: &[f32]) -> f32 {
     match metric {
         VectorMetric::Cosine => cosine_distance(left, right),
-        VectorMetric::L2 => squared_l2_distance(left, right).sqrt(),
+        VectorMetric::L2 => l2_distance(left, right),
     }
-}
-
-// Dividing by the positive f64 norm bounds each component to [-1, 1].
-// Rounding to f32 is intentional because the HNSW index stores f32 vectors.
-#[allow(clippy::cast_possible_truncation)]
-fn normalized_cosine_component(value: f32, norm: f64) -> f32 {
-    (f64::from(value) / norm) as f32
 }
 
 // The result is clamped to [0, 2], so narrowing only rounds its precision.
@@ -987,27 +1478,22 @@ fn bounded_cosine_distance(left: &[f32], right: &[f32]) -> f32 {
 }
 
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
-    let mut dot = 0.0;
-    let mut left_norm = 0.0;
-    let mut right_norm = 0.0;
-
-    for (left_value, right_value) in left.iter().zip(right) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
-    }
-
-    1.0 - dot / (left_norm.sqrt() * right_norm.sqrt())
+    bounded_cosine_distance(left, right)
 }
 
-fn squared_l2_distance(left: &[f32], right: &[f32]) -> f32 {
+// A representable Euclidean distance can have an unrepresentable f32 square.
+// Accumulate and take the root in f64, narrowing only the final result. The
+// caller rejects genuinely unrepresentable distances before exposing any hits.
+#[allow(clippy::cast_possible_truncation)]
+fn l2_distance(left: &[f32], right: &[f32]) -> f32 {
     left.iter()
         .zip(right)
         .map(|(left_value, right_value)| {
-            let delta = left_value - right_value;
+            let delta = f64::from(*left_value) - f64::from(*right_value);
             delta * delta
         })
-        .sum()
+        .sum::<f64>()
+        .sqrt() as f32
 }
 
 fn sort_hits(hits: &mut [VectorHit]) {
@@ -1212,6 +1698,15 @@ mod tests {
         // One deletion is below the automatic compaction threshold. Its HNSW
         // entry remains nearest but must not expand the bounded candidate set.
         vectors.delete_vector(ids[0])?;
+        // All fixture writes were applied through this handle. Certify its
+        // complete local cache so the test exercises tombstones themselves;
+        // production generation invalidation would otherwise rebuild them away.
+        vectors
+            .state
+            .write()
+            .map_err(|_| VectorError::LockPoisoned)?
+            .source_version =
+            crate::repl::Replication::table_data_version(&database, super::VECTOR_TABLE)?;
         assert_eq!(vectors.knn_bounded(&[0.0, 0.0], 1)?, Vec::new());
         assert_eq!(vectors.knn(&[0.0, 0.0], 1)?[0].id, ids[1]);
         assert!(matches!(
@@ -1243,6 +1738,138 @@ mod tests {
             assert!(hits.iter().all(|hit| hit.distance.is_finite()));
             assert_eq!(hits.len(), 3);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cosine_insert_search_filter_and_reopen_handle_all_finite_magnitudes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("extreme-vectors.redb");
+        let config = VectorCollectionConfig::new(CollectionId::new(21), 2);
+        {
+            let database = create_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+            let vectors = VectorCollection::new(&database, config.clone())?;
+            for magnitude in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                vectors.insert_vector(&tagged_metadata("along", "keep"), vec![magnitude, 0.0])?;
+                vectors
+                    .insert_vector(&tagged_metadata("opposite", "omit"), vec![-magnitude, 0.0])?;
+            }
+            for magnitude in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                let hits = vectors.knn(&[magnitude, 0.0], 6)?;
+                assert_eq!(hits.len(), 6);
+                assert!(hits.iter().all(|hit| hit.distance.is_finite()));
+                assert_eq!(
+                    hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+                    vec![0.0, 0.0, 0.0, 2.0, 2.0, 2.0]
+                );
+                let filtered = vectors.knn_with_options(
+                    &[magnitude, 0.0],
+                    6,
+                    VectorSearchOptions::default().with_filter(VectorFilter::Eq {
+                        path: FieldPath::new(["tag"]),
+                        value: Value::Str("keep".to_owned()),
+                    }),
+                )?;
+                assert_eq!(filtered.len(), 3);
+                assert!(filtered.iter().all(|hit| hit.distance == 0.0));
+            }
+        }
+        let database = open_database(DbConfig::on_disk(Profile::Balanced, &path))?;
+        let vectors = VectorCollection::new(&database, config)?;
+        assert_eq!(vectors.knn(&[f32::MAX, 0.0], 6)?.len(), 6);
+        assert!(
+            vectors
+                .knn_bounded(&[f32::from_bits(1), 0.0], 6)?
+                .iter()
+                .all(|hit| hit.distance.is_finite())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malicious_search_limits_and_config_fail_before_hnsw_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let config = VectorCollectionConfig::new(CollectionId::new(22), 2);
+        let vectors = VectorCollection::new(&database, config.clone())?;
+        assert!(matches!(
+            vectors.knn(&[1.0, 0.0], usize::MAX),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        for ef in [0, usize::MAX] {
+            assert!(matches!(
+                vectors.knn_with_ef(&[1.0, 0.0], 1, ef),
+                Err(VectorError::InvalidHnswParams(_))
+            ));
+        }
+        assert!(matches!(
+            vectors.knn_with_options(
+                &[1.0, 0.0],
+                1,
+                VectorSearchOptions::default().with_rerank(usize::MAX)
+            ),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        assert!(matches!(
+            VectorCollection::new(
+                &database,
+                config
+                    .clone()
+                    .with_hnsw(HnswParams::new(16, usize::MAX, 48))
+            ),
+            Err(VectorError::InvalidHnswParams(_))
+        ));
+        assert!(matches!(
+            VectorCollection::new(
+                &database,
+                config.with_hnsw(HnswParams::new(16, 200, usize::MAX))
+            ),
+            Err(VectorError::InvalidHnswParams(_))
+        ));
+        assert!(matches!(
+            VectorCollection::new(
+                &database,
+                VectorCollectionConfig::new(CollectionId::new(23), usize::MAX)
+            ),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn l2_keeps_large_representable_distances_and_rejects_true_f32_overflow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let vectors = VectorCollection::new(
+            &database,
+            VectorCollectionConfig::new(CollectionId::new(24), 2).with_metric(VectorMetric::L2),
+        )?;
+        let close = vectors.insert_vector(&metadata("close"), vec![1.0e20, 0.0])?;
+        vectors.insert_vector(&metadata("farther"), vec![3.0e20, 4.0e20])?;
+        let hits = vectors.knn(&[0.0, 0.0], 2)?;
+        assert_eq!(hits[0].id, close);
+        assert_eq!(hits[0].distance, 1.0e20);
+        assert_eq!(hits[1].distance, 5.0e20);
+        let extreme = VectorCollection::new(
+            &database,
+            VectorCollectionConfig::new(CollectionId::new(25), 2).with_metric(VectorMetric::L2),
+        )?;
+        extreme.insert_vector(&metadata("extreme"), vec![f32::MAX, f32::MAX])?;
+        assert!(
+            matches!(extreme.knn(&[0.0, 0.0], 1), Err(VectorError::InvalidIndexConfig(message)) if message.contains("finite f32 range"))
+        );
+        assert!(matches!(
+            extreme.knn_with_options(
+                &[0.0, 0.0],
+                1,
+                VectorSearchOptions::default().with_filter(VectorFilter::Eq {
+                    path: FieldPath::new(["label"]),
+                    value: Value::Str("extreme".to_owned())
+                })
+            ),
+            Err(VectorError::InvalidIndexConfig(_))
+        ));
         Ok(())
     }
 

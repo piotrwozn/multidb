@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -382,6 +382,12 @@ impl LocalObjectStore {
         &self.uri
     }
 
+    /// Opens a local object without materializing its payload. The file handle
+    /// pins the selected inode while a foreign scan reads bounded portions.
+    pub(crate) fn open_file(&self, path: &str) -> Result<File, CloudError> {
+        Ok(File::open(self.full_path(path)?)?)
+    }
+
     fn full_path(&self, path: &str) -> Result<PathBuf, CloudError> {
         Ok(self.uri.local_root()?.join(path))
     }
@@ -725,14 +731,10 @@ impl CloudLease {
         let path = format!("leases/{}.lease", sanitize_object_component(&name.into()));
         let lease_id = Uuid::now_v7().to_string();
         let owner = options.owner.unwrap_or_else(|| lease_id.clone());
-        let expires_at = SystemTime::now()
-            .checked_add(options.ttl.max(Duration::from_millis(1)))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         let root = uri.local_root()?;
         let full_path = root.join(&path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let _guard = lock_lease_file(&full_path)?;
+        let expires_at = lease_expiration(options.ttl)?;
         if let Some(existing) = read_lease_file(&full_path)?
             && existing.expires_at > SystemTime::now()
         {
@@ -786,18 +788,20 @@ impl CloudLease {
     /// # Errors
     /// Fails when the backing object cannot be read/written or ownership changed.
     pub fn heartbeat(&mut self, ttl: Duration) -> Result<(), CloudError> {
+        let full_path = self.uri.local_root()?.join(&self.path);
+        let _guard = lock_lease_file(&full_path)?;
         self.ensure_owner()?;
-        self.expires_at = SystemTime::now()
-            .checked_add(ttl.max(Duration::from_millis(1)))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let expires_at = lease_expiration(ttl)?;
         write_lease_file(
-            &self.uri.local_root()?.join(&self.path),
+            &full_path,
             &CloudLeaseFile {
                 lease_id: self.lease_id.clone(),
                 owner: self.owner.clone(),
-                expires_at: self.expires_at,
+                expires_at,
             },
-        )
+        )?;
+        self.expires_at = expires_at;
+        Ok(())
     }
 
     /// Validates that a fencing token still owns the named lease.
@@ -810,6 +814,7 @@ impl CloudLease {
     ) -> Result<(), CloudError> {
         let path = format!("leases/{}.lease", sanitize_object_component(&name.into()));
         let full_path = uri.local_root()?.join(&path);
+        let _guard = lock_lease_file(&full_path)?;
         let Some(record) = read_lease_file(&full_path)? else {
             return Err(CloudError::LeaseOwnerMismatch(path));
         };
@@ -825,6 +830,7 @@ impl CloudLease {
     pub fn break_lease(uri: &ObjectStoreUri, name: impl Into<String>) -> Result<(), CloudError> {
         let path = format!("leases/{}.lease", sanitize_object_component(&name.into()));
         let full_path = uri.local_root()?.join(path);
+        let _guard = lock_lease_file(&full_path)?;
         if full_path.exists() {
             fs::remove_file(full_path)?;
         }
@@ -836,8 +842,11 @@ impl CloudLease {
     /// Fails when the object store URI is unsupported, ownership changed, or the lease file cannot be removed.
     pub fn release(&self) -> Result<(), CloudError> {
         let path = self.uri.local_root()?.join(&self.path);
-        self.ensure_owner()?;
-        if path.exists() {
+        let _guard = lock_lease_file(&path)?;
+        if let Some(record) = read_lease_file(&path)? {
+            if record.lease_id != self.lease_id || record.owner != self.owner {
+                return Err(CloudError::LeaseOwnerMismatch(self.path.clone()));
+            }
             fs::remove_file(path)?;
         }
         Ok(())
@@ -846,13 +855,41 @@ impl CloudLease {
     fn ensure_owner(&self) -> Result<(), CloudError> {
         let path = self.uri.local_root()?.join(&self.path);
         let Some(record) = read_lease_file(&path)? else {
-            return Ok(());
+            return Err(CloudError::LeaseOwnerMismatch(self.path.clone()));
         };
-        if record.lease_id != self.lease_id || record.owner != self.owner {
+        if record.lease_id != self.lease_id
+            || record.owner != self.owner
+            || record.expires_at <= SystemTime::now()
+        {
             return Err(CloudError::LeaseOwnerMismatch(self.path.clone()));
         }
         Ok(())
     }
+}
+
+fn lease_expiration(ttl: Duration) -> Result<SystemTime, CloudError> {
+    SystemTime::now()
+        .checked_add(ttl.max(Duration::from_millis(1)))
+        .ok_or_else(|| {
+            CloudError::Unsupported("lease TTL exceeds the system clock range".to_owned())
+        })
+}
+
+/// The sibling lock inode is never removed: locking the replaceable lease file
+/// itself would let a successor open another inode and bypass the old owner.
+fn lock_lease_file(path: &Path) -> Result<File, CloudError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lease.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 impl GuardedResumeSession {
@@ -994,6 +1031,99 @@ pub fn resolve_tiered_segment_payload(bytes: &[u8]) -> Result<Bytes, StorageErro
     }
     observability::record_cloud_tier_read("remote", pointer.bytes);
     Ok(loaded)
+}
+
+/// An owned segment and its live statement reservation. Field order matters:
+/// the allocation is destroyed before its memory is returned to the pool.
+pub(crate) struct GuardedSegmentPayload {
+    bytes: Bytes,
+    _reservation: Box<dyn crate::storage::ReadReservation>,
+}
+
+impl AsRef<[u8]> for GuardedSegmentPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Resolves a segment without allocating a remote object before admission.
+/// Local and remote buffers retain their reservations for their entire lifetime.
+pub(crate) fn resolve_tiered_segment_payload_guarded(
+    bytes: &[u8],
+    budget: &dyn crate::storage::ReadBudget,
+) -> Result<GuardedSegmentPayload, StorageError> {
+    use std::io::Read;
+
+    budget.check()?;
+    if !bytes.starts_with(TIERED_SEGMENT_MAGIC) {
+        let reservation = budget.reserve(bytes.len().saturating_add(128))?;
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(bytes.len()).map_err(|_| {
+            StorageError::ResourceLimit("cannot allocate local segment payload".to_owned())
+        })?;
+        owned.extend_from_slice(bytes);
+        observability::record_cloud_tier_read("local", bytes.len() as u64);
+        return Ok(GuardedSegmentPayload {
+            bytes: owned,
+            _reservation: reservation,
+        });
+    }
+
+    // A pointer has fixed fields and two strings. Reserve their decoded storage
+    // before serde; never use untrusted metadata as an allocation instruction.
+    let pointer_bytes = bytes
+        .len()
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(2048))
+        .ok_or_else(|| StorageError::ResourceLimit("tiered pointer is too large".to_owned()))?;
+    let pointer_reservation = budget.reserve(pointer_bytes)?;
+    let pointer = decode_tiered_segment_pointer(bytes)?
+        .ok_or_else(|| StorageError::Corruption("missing tiered segment pointer".to_owned()))?;
+    budget.check()?;
+    let mut file = LocalObjectStore::new(pointer.uri.clone())
+        .open_file(&pointer.path)
+        .map_err(|error| match error {
+            CloudError::Io(error) => StorageError::Io(error),
+            error => StorageError::Backend(format!("remote segment open failed: {error}")),
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != pointer.bytes {
+        return Err(StorageError::Corruption(
+            "remote segment size/type differs from its pointer".to_owned(),
+        ));
+    }
+    let size = usize::try_from(pointer.bytes).map_err(|_| {
+        StorageError::ResourceLimit("remote segment exceeds address space".to_owned())
+    })?;
+    let allocation = size
+        .checked_add(128)
+        .ok_or_else(|| StorageError::ResourceLimit("remote segment size overflow".to_owned()))?;
+    let reservation = budget.reserve(allocation)?;
+    let mut loaded = Vec::new();
+    loaded.try_reserve_exact(size).map_err(|_| {
+        StorageError::ResourceLimit("cannot allocate remote segment payload".to_owned())
+    })?;
+    loaded.resize(size, 0);
+    for chunk in loaded.chunks_mut(8192) {
+        budget.check()?;
+        file.read_exact(chunk)?;
+    }
+    budget.check()?;
+    let mut trailing = [0; 1];
+    if file.read(&mut trailing)? != 0 || crc32fast::hash(&loaded) != pointer.checksum {
+        return Err(StorageError::Corruption(
+            "remote segment changed or its checksum differs".to_owned(),
+        ));
+    }
+    budget.check()?;
+    observability::record_cloud_tier_read("remote", pointer.bytes);
+    // Explicitly destroy pointer strings before returning their temporary lease.
+    drop(pointer);
+    drop(pointer_reservation);
+    Ok(GuardedSegmentPayload {
+        bytes: loaded,
+        _reservation: reservation,
+    })
 }
 
 /// Tiers columnar segments into the configured object store.
@@ -1793,6 +1923,9 @@ fn throttle(limit: Option<u64>, bytes: u64, started: Instant) {
         std::thread::sleep(delay);
     }
 }
+
+#[cfg(test)]
+mod lease_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2963,7 +3096,11 @@ mod tests {
             engine_version: "test".to_owned(),
             files: Vec::new(),
             keyspace_counts: BTreeMap::new(),
+            end_commit_hash: None,
             encryption: None,
         }
     }
 }
+
+#[cfg(test)]
+mod guarded_segment_tests;

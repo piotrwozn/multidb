@@ -4,7 +4,10 @@ use std::{
     marker::PhantomData,
     net::TcpStream,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -17,7 +20,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     fileio,
-    storage::{Bytes, RangeIter, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
+    storage::{
+        Bytes, RangeIter, ReadBudget, ReadTransaction, StorageEngine, StorageError,
+        WriteTransaction,
+    },
 };
 
 const MAGIC_V1: &[u8; 5] = b"MDBE1";
@@ -128,13 +134,26 @@ pub struct LocalFileKms {
     provider: FileKeyProvider,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VaultKekProvider {
     address: Arc<String>,
     token: Arc<String>,
     secret_path: Arc<String>,
     key_field: Arc<String>,
     timeout_ms: u64,
+}
+
+impl std::fmt::Debug for VaultKekProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VaultKekProvider")
+            .field("address", &self.address)
+            .field("token", &"<redacted>")
+            .field("secret_path", &self.secret_path)
+            .field("key_field", &self.key_field)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 /// Envelope keyring of KEK-wrapped DEKs persisted as JSON.
@@ -148,6 +167,7 @@ pub struct EnvelopeKeyProvider<K> {
     kek_type: PhantomData<fn() -> K>,
     keyring: Arc<RwLock<EnvelopeKeyring>>,
     cache: Arc<Mutex<BTreeMap<u64, ProtectedKey>>>,
+    maintenance_failed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -207,14 +227,14 @@ pub struct EncryptedWriteTxn<T, K> {
     key_provider: Arc<K>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct EnvelopeKeyring {
     format_version: u32,
     current_key_id: u64,
     keys: Vec<WrappedDataKey>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct WrappedDataKey {
     key_id: u64,
     algorithm: String,
@@ -428,6 +448,20 @@ where
             return Self::open(keyring_path, kek_provider);
         }
 
+        match Self::create(&keyring_path, kek_provider.clone()) {
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::open(keyring_path, kek_provider)
+            }
+            result => result,
+        }
+    }
+
+    /// Creates a new keyring exclusively. An existing file, directory or symlink is never
+    /// replaced. The KEK must already exist and remain available for recovery.
+    /// # Errors
+    /// Fails when the destination exists or the KEK/keyring cannot be read or persisted.
+    pub fn create(keyring_path: impl Into<PathBuf>, kek_provider: K) -> Result<Self, StorageError> {
+        let keyring_path = keyring_path.into();
         let key = ProtectedKey::with_id(LEGACY_KEY_ID, random_key()?);
         let wrapped = wrap_dek(&kek_provider.kek()?, &key)?;
         let keyring = EnvelopeKeyring {
@@ -435,7 +469,9 @@ where
             current_key_id: key.id(),
             keys: vec![wrapped],
         };
-        write_keyring(&keyring_path, &keyring)?;
+        let bytes = serde_json::to_vec_pretty(&keyring)
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        fileio::atomic_create(&keyring_path, &bytes)?;
         Self::from_keyring(keyring_path, kek_provider, keyring)
     }
 
@@ -451,6 +487,7 @@ where
             kek_type: PhantomData,
             keyring: Arc::new(RwLock::new(keyring)),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
+            maintenance_failed: Arc::new(AtomicBool::new(false)),
         };
         // Authenticates the current DEK with the KEK and warms the cache.
         let _ = provider.current_key()?;
@@ -471,10 +508,12 @@ where
     where
         N: KekProvider,
     {
+        self.ensure_usable()?;
         let mut keyring = self
             .keyring
             .write()
             .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+        self.ensure_usable()?;
         let mut kek_slot = self
             .kek_provider
             .write()
@@ -486,11 +525,43 @@ where
             let key = unwrap_dek(&old_kek, wrapped)?;
             *wrapped = wrap_dek(&new_kek, &key)?;
         }
-        write_keyring(self.keyring_path.as_ref(), &next)?;
+        self.persist_keyring(&keyring, &next)?;
 
         let next_source: Arc<dyn KekSource> = Arc::new(new_kek_provider.clone());
         *keyring = next;
         *kek_slot = next_source;
+        Ok(())
+    }
+
+    fn ensure_usable(&self) -> Result<(), StorageError> {
+        if self.maintenance_failed.load(Ordering::Acquire) {
+            return Err(StorageError::Backend(
+                "keyring maintenance failed; its publication/durability may be uncertain; reopen the provider and verify the keyring before further encryption operations".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist_keyring(
+        &self,
+        expected: &EnvelopeKeyring,
+        next: &EnvelopeKeyring,
+    ) -> Result<(), StorageError> {
+        self.persist_keyring_with(expected, next, write_keyring_checked)
+    }
+
+    fn persist_keyring_with(
+        &self,
+        expected: &EnvelopeKeyring,
+        next: &EnvelopeKeyring,
+        persist: impl FnOnce(&Path, &EnvelopeKeyring, &EnvelopeKeyring) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        if let Err(error) = persist(self.keyring_path.as_ref(), expected, next) {
+            // rename may have succeeded before a directory fsync failed. Cached state
+            // must not keep issuing keys after an ambiguous persistent update.
+            self.maintenance_failed.store(true, Ordering::Release);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -514,6 +585,7 @@ where
     K: KekProvider,
 {
     fn current_key(&self) -> Result<ProtectedKey, StorageError> {
+        self.ensure_usable()?;
         let current_key_id = self
             .keyring
             .read()
@@ -523,21 +595,22 @@ where
     }
 
     fn key_by_id(&self, key_id: u64) -> Result<ProtectedKey, StorageError> {
-        if let Some(key) = self
-            .cache
-            .lock()
-            .map_err(|_| StorageError::Backend("key cache lock poisoned".to_owned()))?
-            .get(&key_id)
-            .cloned()
-        {
-            return Ok(key);
-        }
-
+        self.ensure_usable()?;
         let (wrapped, kek_source) = {
             let keyring = self
                 .keyring
                 .read()
                 .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+            self.ensure_usable()?;
+            if let Some(key) = self
+                .cache
+                .lock()
+                .map_err(|_| StorageError::Backend("key cache lock poisoned".to_owned()))?
+                .get(&key_id)
+                .cloned()
+            {
+                return Ok(key);
+            }
             let wrapped = keyring
                 .keys
                 .iter()
@@ -557,6 +630,7 @@ where
             .keyring
             .read()
             .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+        self.ensure_usable()?;
         if !keyring
             .keys
             .iter()
@@ -572,10 +646,12 @@ where
     }
 
     fn rotate_dek(&self) -> Result<u64, StorageError> {
+        self.ensure_usable()?;
         let mut keyring = self
             .keyring
             .write()
             .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+        self.ensure_usable()?;
         let next_id = keyring
             .keys
             .iter()
@@ -589,7 +665,7 @@ where
         let mut next = keyring.clone();
         next.current_key_id = next_id;
         next.keys.push(wrapped);
-        write_keyring(self.keyring_path.as_ref(), &next)?;
+        self.persist_keyring(&keyring, &next)?;
         *keyring = next;
         self.cache_key(key)?;
         drop(keyring);
@@ -597,10 +673,12 @@ where
     }
 
     fn destroy_dek(&self, key_id: u64) -> Result<(), StorageError> {
+        self.ensure_usable()?;
         let mut keyring = self
             .keyring
             .write()
             .map_err(|_| StorageError::Backend("keyring lock poisoned".to_owned()))?;
+        self.ensure_usable()?;
         if !keyring.keys.iter().any(|key| key.key_id == key_id) {
             return Err(StorageError::Corruption(format!(
                 "unknown encryption key id {key_id}"
@@ -634,7 +712,7 @@ where
             key.ciphertext.clear();
             key.nonce.clear();
         }
-        write_keyring(self.keyring_path.as_ref(), &next)?;
+        self.persist_keyring(&keyring, &next)?;
         *keyring = next;
         self.cache
             .lock()
@@ -645,6 +723,7 @@ where
     }
 
     fn list_deks(&self) -> Result<Vec<u64>, StorageError> {
+        self.ensure_usable()?;
         Ok(self
             .keyring
             .read()
@@ -690,6 +769,19 @@ impl ConfiguredKeyProvider {
         kek_path: impl Into<PathBuf>,
     ) -> Result<Self, StorageError> {
         Ok(Self::Envelope(EnvelopeKeyProvider::open(
+            keyring_path,
+            LocalFileKms::new(kek_path),
+        )?))
+    }
+
+    /// Creates a new local envelope keyring without replacing any existing path.
+    /// # Errors
+    /// Fails when the keyring exists or the existing KEK cannot be loaded.
+    pub fn create_local_envelope(
+        keyring_path: impl Into<PathBuf>,
+        kek_path: impl Into<PathBuf>,
+    ) -> Result<Self, StorageError> {
+        Ok(Self::Envelope(EnvelopeKeyProvider::create(
             keyring_path,
             LocalFileKms::new(kek_path),
         )?))
@@ -964,6 +1056,10 @@ where
     S: StorageEngine,
     K: KeyProvider,
 {
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
     type ReadTxn<'a>
         = EncryptedReadTxn<S::ReadTxn<'a>, K>
     where
@@ -996,6 +1092,76 @@ where
     T: ReadTransaction,
     K: KeyProvider,
 {
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_get(table, key, budget, &mut |value| match value {
+                Some(value) => visit_decrypted_value(
+                    &self.inner,
+                    self.key_provider.as_ref(),
+                    table,
+                    key,
+                    value,
+                    budget,
+                    &mut |value| visitor(Some(value)),
+                ),
+                None => visitor(None),
+            })
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_many(table, keys, budget, &mut |index, value| match value {
+                Some(value) => visit_decrypted_value(
+                    &self.inner,
+                    self.key_provider.as_ref(),
+                    table,
+                    &keys[index],
+                    value,
+                    budget,
+                    &mut |value| visitor(index, Some(value)),
+                ),
+                None => visitor(index, None),
+            })
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_range(table, start, end, budget, &mut |key, value| {
+                visit_decrypted_value(
+                    &self.inner,
+                    self.key_provider.as_ref(),
+                    table,
+                    key,
+                    value,
+                    budget,
+                    &mut |value| visitor(key, value),
+                )
+            })
+    }
+
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
         self.inner
             .get(table, key)?
@@ -1012,18 +1178,14 @@ where
         start: &[u8],
         end: &[u8],
     ) -> Result<RangeIter<'txn>, StorageError> {
-        let rows = self
-            .inner
-            .range(table, start, end)?
-            .map(|item| {
-                let (key, value) = item?;
-                let version = encryption_version_from(&self.inner, table, &key)?;
-                let value =
-                    decrypt_value(self.key_provider.as_ref(), table, &key, version, &value)?;
-                Ok((key, value))
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        Ok(Box::new(rows.into_iter().map(Ok)))
+        let rows = self.inner.range(table, start, end)?;
+        let table = table.to_owned();
+        Ok(Box::new(rows.map(move |item| {
+            let (key, value) = item?;
+            let version = encryption_version_from(&self.inner, &table, &key)?;
+            let value = decrypt_value(self.key_provider.as_ref(), &table, &key, version, &value)?;
+            Ok((key, value))
+        })))
     }
 }
 
@@ -1032,6 +1194,76 @@ where
     T: WriteTransaction,
     K: KeyProvider,
 {
+    fn supports_guarded_reads(&self) -> bool {
+        self.inner.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_get(table, key, budget, &mut |value| match value {
+                Some(value) => visit_decrypted_value(
+                    &self.inner,
+                    self.key_provider.as_ref(),
+                    table,
+                    key,
+                    value,
+                    budget,
+                    &mut |value| visitor(Some(value)),
+                ),
+                None => visitor(None),
+            })
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_many(table, keys, budget, &mut |index, value| match value {
+                Some(value) => visit_decrypted_value(
+                    &self.inner,
+                    self.key_provider.as_ref(),
+                    table,
+                    &keys[index],
+                    value,
+                    budget,
+                    &mut |value| visitor(index, Some(value)),
+                ),
+                None => visitor(index, None),
+            })
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        budget: &dyn ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, StorageError>,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .visit_range(table, start, end, budget, &mut |key, value| {
+                visit_decrypted_value(
+                    &self.inner,
+                    self.key_provider.as_ref(),
+                    table,
+                    key,
+                    value,
+                    budget,
+                    &mut |value| visitor(key, value),
+                )
+            })
+    }
+
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>, StorageError> {
         self.inner
             .get(table, key)?
@@ -1048,18 +1280,14 @@ where
         start: &[u8],
         end: &[u8],
     ) -> Result<RangeIter<'txn>, StorageError> {
-        let rows = self
-            .inner
-            .range(table, start, end)?
-            .map(|item| {
-                let (key, value) = item?;
-                let version = encryption_version_from(&self.inner, table, &key)?;
-                let value =
-                    decrypt_value(self.key_provider.as_ref(), table, &key, version, &value)?;
-                Ok((key, value))
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        Ok(Box::new(rows.into_iter().map(Ok)))
+        let rows = self.inner.range(table, start, end)?;
+        let table = table.to_owned();
+        Ok(Box::new(rows.map(move |item| {
+            let (key, value) = item?;
+            let version = encryption_version_from(&self.inner, &table, &key)?;
+            let value = decrypt_value(self.key_provider.as_ref(), &table, &key, version, &value)?;
+            Ok((key, value))
+        })))
     }
 }
 
@@ -1108,6 +1336,49 @@ where
     fn rollback(self) {
         self.inner.rollback();
     }
+}
+
+fn visit_decrypted_value(
+    inner: &impl ReadTransaction,
+    provider: &impl KeyProvider,
+    table: &str,
+    key: &[u8],
+    value: &[u8],
+    budget: &dyn ReadBudget,
+    visitor: &mut dyn FnMut(&[u8]) -> Result<bool, StorageError>,
+) -> Result<bool, StorageError> {
+    budget.check()?;
+    // AEAD allocates at most the ciphertext size. Include the AAD and version lookup
+    // key before either is allocated; the inner visitor retains its own reservation.
+    let working_bytes = table
+        .len()
+        .checked_add(key.len())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(value.len()))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| StorageError::ResourceLimit("encrypted read size overflow".to_owned()))?;
+    let _reservation = budget.reserve(working_bytes)?;
+    let version = if table == ENCRYPTION_VERSIONS_TABLE {
+        None
+    } else {
+        let mut version = None;
+        let version_key = encryption_version_key(table, key)?;
+        inner.visit_get(
+            ENCRYPTION_VERSIONS_TABLE,
+            &version_key,
+            budget,
+            &mut |value| {
+                version = value
+                    .map(|value| decode_u64(value, "encryption version"))
+                    .transpose()?;
+                Ok(false)
+            },
+        )?;
+        version
+    };
+    let plaintext = Zeroizing::new(decrypt_value(provider, table, key, version, value)?);
+    budget.check()?;
+    visitor(&plaintext)
 }
 
 fn encrypt_value(
@@ -1428,7 +1699,9 @@ fn aad_for_v1_v2(table: &str, row_key: &[u8]) -> Bytes {
 
 fn aad_for_v3(table: &str, row_key: &[u8], key_id: u64, version: u64) -> Bytes {
     let table_bytes = table.as_bytes();
-    let mut aad = Vec::with_capacity(33 + table_bytes.len() + row_key.len());
+    let mut aad = Vec::with_capacity(
+        b"multidb encrypted storage v3".len() + 1 + 8 + 8 + 8 + table_bytes.len() + row_key.len(),
+    );
     aad.extend_from_slice(b"multidb encrypted storage v3");
     aad.push(ALG_XCHACHA20_POLY1305);
     aad.extend_from_slice(&key_id.to_be_bytes());
@@ -1574,6 +1847,33 @@ fn write_keyring(path: &Path, keyring: &EnvelopeKeyring) -> Result<(), StorageEr
     fileio::atomic_write(path, &bytes).map_err(Into::into)
 }
 
+/// Independent providers/processes must never overwrite a newer keyring with a
+/// stale copy (which could reuse a DEK id or resurrect a destroyed key). The lock
+/// lives beside the atomically replaced file, so its inode remains stable.
+fn write_keyring_checked(
+    path: &Path,
+    expected: &EnvelopeKeyring,
+    next: &EnvelopeKeyring,
+) -> Result<(), StorageError> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(Path::new(&lock_path))?;
+    lock.lock()?;
+    if read_keyring(path)? != *expected {
+        return Err(StorageError::Backend(
+            "keyring changed through another provider; reopen it before key maintenance".to_owned(),
+        ));
+    }
+    write_keyring(path, next)
+}
+
 fn wrap_dek(kek: &ProtectedKey, dek: &ProtectedKey) -> Result<WrappedDataKey, StorageError> {
     let nonce = random_nonce_v3()?;
     let aad = envelope_aad(dek.id());
@@ -1714,6 +2014,112 @@ mod tests {
     }
 
     #[test]
+    fn vault_debug_redacts_the_access_token() {
+        let provider = VaultKekProvider::new(
+            "http://127.0.0.1:8200",
+            "very-sensitive-vault-token",
+            "secret/key",
+        );
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("very-sensitive-vault-token"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn stale_independent_keyring_provider_cannot_reuse_a_dek_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("keyring");
+        let kek = temp.path().join("kek");
+        std::fs::write(&kek, [7; 32])?;
+        let first = EnvelopeKeyProvider::open_or_create(&path, LocalFileKms::new(&kek))?;
+        let stale = EnvelopeKeyProvider::open(&path, LocalFileKms::new(&kek))?;
+        let next_id = first.rotate_dek()?;
+        let next_key = first.key_by_id(next_id)?;
+        assert!(
+            matches!(stale.rotate_dek(), Err(StorageError::Backend(message)) if message.contains("another provider"))
+        );
+        let reopened = EnvelopeKeyProvider::open(&path, LocalFileKms::new(&kek))?;
+        assert_eq!(reopened.current_key()?.id(), next_id);
+        assert_eq!(reopened.key_by_id(next_id)?.as_slice(), next_key.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_keyring_publication_disables_cached_keys_until_provider_is_reopened()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("keyring");
+        let kek = temp.path().join("kek");
+        std::fs::write(&kek, [7; 32])?;
+        let provider = EnvelopeKeyProvider::create(&path, LocalFileKms::new(&kek))?;
+        let clone = provider.clone();
+        let old_key = provider.current_key()?;
+        let expected = provider
+            .keyring
+            .read()
+            .map_err(|_| "keyring poisoned")?
+            .clone();
+        let mut next = expected.clone();
+        let next_key = ProtectedKey::with_id(2, [9; 32]);
+        next.current_key_id = next_key.id();
+        next.keys
+            .push(super::wrap_dek(&LocalFileKms::new(&kek).kek()?, &next_key)?);
+        let result = provider.persist_keyring_with(&expected, &next, |path, _, next| {
+            super::write_keyring(path, next)?;
+            // The complete replacement is visible but the following directory sync
+            // reports EIO. The old in-memory state is now unsafe to keep issuing.
+            Err(std::io::Error::from_raw_os_error(5).into())
+        });
+        assert!(result.is_err());
+        assert!(provider.current_key().is_err());
+        assert!(clone.key_by_id(old_key.id()).is_err());
+        assert!(clone.rotate_dek().is_err());
+        let reopened = EnvelopeKeyProvider::open(&path, LocalFileKms::new(&kek))?;
+        assert_eq!(reopened.current_key()?.id(), 2);
+        assert_eq!(
+            reopened.key_by_id(old_key.id())?.as_slice(),
+            old_key.as_slice()
+        );
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct CreationBarrierKek(Arc<std::sync::Barrier>);
+
+    impl KekProvider for CreationBarrierKek {
+        fn kek(&self) -> Result<ProtectedKey, StorageError> {
+            self.0.wait();
+            Ok(ProtectedKey::new([3; 32]))
+        }
+    }
+
+    #[test]
+    fn concurrent_keyring_creation_never_replaces_another_initial_dek()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("keyring");
+        let gate = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    let provider =
+                        EnvelopeKeyProvider::open_or_create(path, CreationBarrierKek(gate))?;
+                    Ok::<_, StorageError>(provider.current_key()?.as_slice().to_vec())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        for handle in handles {
+            keys.push(handle.join().map_err(|_| "keyring creator panicked")??);
+        }
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        Ok(())
+    }
+
+    #[test]
     fn encrypted_rewrites_use_random_v3_nonces() -> Result<(), Box<dyn std::error::Error>> {
         let engine = EncryptedEngine::new(MemEngine::new(), StaticKeyProvider::new([7; 32]));
         let mut write = engine.begin_write()?;
@@ -1737,6 +2143,47 @@ mod tests {
         assert!(first.starts_with(super::MAGIC_V3));
         assert!(second.starts_with(super::MAGIC_V3));
         assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_ranges_decrypt_only_consumed_entries_in_read_and_write_transactions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let engine = EncryptedEngine::new(MemEngine::new(), StaticKeyProvider::new([7; 32]));
+        let mut write = engine.begin_write()?;
+        write.put("t", b"a", b"first")?;
+        write.put("t", b"b", b"second")?;
+        write.commit()?;
+        let mut raw = engine.inner().begin_write()?;
+        raw.put("t", b"b", b"MDBE3-invalid-authenticated-value")?;
+        raw.commit()?;
+        let read = engine.begin_read()?;
+        // Constructing or stopping the iterator after the first result must not
+        // decrypt an unconsumed corrupt value or allocate the whole plaintext range.
+        let mut range = read.range("t", b"a", b"z")?;
+        assert_eq!(
+            range.next().transpose()?,
+            Some((b"a".to_vec(), b"first".to_vec()))
+        );
+        drop(range);
+        let mut range = read.range("t", b"a", b"z")?;
+        assert!(range.next().transpose()?.is_some());
+        assert!(matches!(
+            range.next(),
+            Some(Err(StorageError::Corruption(_)))
+        ));
+        drop(range);
+        drop(read);
+        let write = engine.begin_write()?;
+        let mut range = write.range("t", b"a", b"z")?;
+        assert_eq!(
+            range.next().transpose()?,
+            Some((b"a".to_vec(), b"first".to_vec()))
+        );
+        assert!(matches!(
+            range.next(),
+            Some(Err(StorageError::Corruption(_)))
+        ));
         Ok(())
     }
 
@@ -1974,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_key_provider_failed_persist_leaves_state_unchanged()
+    fn envelope_key_provider_failed_persist_requires_reopen_without_advancing_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let kek_path = dir.path().join("kek.bin");
@@ -1983,18 +2430,31 @@ mod tests {
         let provider =
             EnvelopeKeyProvider::open_or_create(&keyring_path, LocalFileKms::new(&kek_path))?;
         assert_eq!(provider.rotate_dek()?, 2);
+        let saved = std::fs::read(&keyring_path)?;
 
         // A directory at the keyring path makes the atomic rename fail.
         std::fs::remove_file(&keyring_path)?;
         std::fs::create_dir(&keyring_path)?;
 
         assert!(provider.rotate_dek().is_err());
-        assert_eq!(provider.list_deks()?, vec![1, 2]);
-        assert_eq!(provider.current_key()?.id(), 2);
-
+        assert!(provider.list_deks().is_err());
+        assert!(provider.current_key().is_err());
         assert!(provider.destroy_dek(1).is_err());
-        assert_eq!(provider.list_deks()?, vec![1, 2]);
-        assert_eq!(provider.key_by_id(1)?.id(), 1);
+        assert!(provider.key_by_id(1).is_err());
+        assert_eq!(
+            provider
+                .keyring
+                .read()
+                .map_err(|_| "keyring poisoned")?
+                .current_key_id,
+            2
+        );
+        std::fs::remove_dir(&keyring_path)?;
+        std::fs::write(&keyring_path, &saved)?;
+        let reopened = EnvelopeKeyProvider::open(&keyring_path, LocalFileKms::new(&kek_path))?;
+        assert_eq!(reopened.list_deks()?, vec![1, 2]);
+        assert_eq!(reopened.current_key()?.id(), 2);
+        assert_eq!(reopened.key_by_id(1)?.id(), 1);
         Ok(())
     }
 

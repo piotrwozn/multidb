@@ -1391,9 +1391,10 @@ export class ControlPlaneClient {
       });
     }
     if (!response.payload.ok) {
-      throw new ControlPlaneError(response.payload.error.message, {
+      const error = response.payload.error;
+      throw new ControlPlaneError(isObject(error) && typeof error.message === "string" ? error.message : "Control Plane request failed", {
         status: response.status,
-        code: response.payload.error.code,
+        code: isObject(error) && typeof error.code === "string" ? error.code : "unknown_error",
         body: response.payload,
       });
     }
@@ -1410,8 +1411,14 @@ export class ControlPlaneClient {
   private async textRequest(path: string): Promise<string> {
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method: "GET",
+      redirect: "error",
       headers: this.headers(undefined, true),
     });
+    if (!response.ok) {
+      throw new ControlPlaneError(`Control Plane returned HTTP ${response.status}`, {
+        status: response.status, code: `http_${response.status}`,
+      });
+    }
     return response.text();
   }
 
@@ -1421,6 +1428,7 @@ export class ControlPlaneClient {
   ): Promise<{ status: number; payload: unknown }> {
     const init: RequestInit = {
       method: options.method ?? "GET",
+      redirect: "error",
       headers: this.headers(options.body, options.auth !== false),
     };
     if (options.body !== undefined) {
@@ -1428,8 +1436,16 @@ export class ControlPlaneClient {
     }
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, init);
     try {
-      return { status: response.status, payload: await response.json() };
-    } catch {
+      const payload: unknown = await response.json();
+      if (!response.ok && !(isEnvelope(payload) && !payload.ok) &&
+          !(response.status === 422 && ["/config/validate", "/config/plan", "/config/apply"].includes(path))) {
+        throw new ControlPlaneError(`Control Plane returned HTTP ${response.status}`, {
+          status: response.status, code: `http_${response.status}`, body: payload,
+        });
+      }
+      return { status: response.status, payload };
+    } catch (error) {
+      if (error instanceof ControlPlaneError) throw error;
       throw new ControlPlaneError("Control Plane did not return JSON", {
         status: response.status,
         code: "invalid_json",

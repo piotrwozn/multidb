@@ -1,0 +1,42 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "multidb.fullname" . }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "multidb.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress, Egress]
+  {{- if or .Values.networkPolicy.clientPeers .Values.networkPolicy.proxyPeers .Values.networkPolicy.metricsPeers }}
+  ingress:
+    {{- if .Values.networkPolicy.clientPeers }}
+    - from:
+        {{- toYaml .Values.networkPolicy.clientPeers | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: pgwire
+        - protocol: TCP
+          port: admin
+    {{- end }}
+    {{- if .Values.networkPolicy.proxyPeers }}
+    - from:
+        {{- toYaml .Values.networkPolicy.proxyPeers | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: admin
+    {{- end }}
+    {{- if .Values.networkPolicy.metricsPeers }}
+    - from:
+        {{- toYaml .Values.networkPolicy.metricsPeers | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: admin
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  egress:
+    {{- toYaml .Values.networkPolicy.egress | nindent 4 }}
+{{- end }}

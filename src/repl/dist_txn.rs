@@ -7,6 +7,8 @@ use crate::storage::{Bytes, StorageError};
 
 use super::{Op, ReplError};
 
+pub(crate) mod locks;
+
 pub type DistTxnId = u64;
 
 pub const DIST_TXN_PARTICIPANT_TABLE: &str = "__dist_txn_participants";
@@ -93,21 +95,41 @@ pub fn two_phase_commit<L>(
 where
     L: CoordinatorLog,
 {
-    let mut decision = Decision::Commit;
-
+    let mut prepare_error = None;
+    let decision = if let Some(decision) = log.decision(txn_id) {
+        decision
+    } else {
+        let mut decision = Decision::Commit;
+        for participant in participants {
+            match participant.prepare(txn_id) {
+                Ok(Vote::Yes) => {}
+                Ok(Vote::No) => {
+                    decision = Decision::Abort;
+                    break;
+                }
+                Err(error) => {
+                    prepare_error = Some(error);
+                    decision = Decision::Abort;
+                    break;
+                }
+            }
+        }
+        // A failed prepare still needs a durable Abort decision and cleanup of
+        // every participant that might have persisted its prepare before failing.
+        log.record_decision(txn_id, decision)?;
+        decision
+    };
+    let mut finish_error = None;
     for participant in participants {
-        if participant.prepare(txn_id)? != Vote::Yes {
-            decision = Decision::Abort;
-            break;
+        if let Err(error) = participant.finish(txn_id, decision)
+            && finish_error.is_none()
+        {
+            finish_error = Some(error);
         }
     }
-
-    log.record_decision(txn_id, decision)?;
-
-    for participant in participants {
-        participant.finish(txn_id, decision)?;
+    if let Some(error) = prepare_error.or(finish_error) {
+        return Err(error);
     }
-
     Ok(decision)
 }
 
@@ -184,8 +206,13 @@ pub fn encode_prepared(record: &PreparedTxnRecord) -> Result<Bytes, StorageError
 /// # Errors
 /// Fails when the record bytes are corrupt or use an unsupported shape.
 pub fn decode_prepared(bytes: &[u8]) -> Result<PreparedTxnRecord, StorageError> {
-    serde_json::from_slice(bytes)
-        .map_err(|error| StorageError::Corruption(format!("dist txn prepared record: {error}")))
+    let record: PreparedTxnRecord = serde_json::from_slice(bytes)
+        .map_err(|error| StorageError::Corruption(format!("dist txn prepared record: {error}")))?;
+    validate_record_version(record.version)?;
+    crate::txn::validate_public_ops(&record.ops).map_err(|error| {
+        StorageError::Corruption(format!("invalid prepared transaction operations: {error}"))
+    })?;
+    Ok(record)
 }
 
 /// Encodes a durable coordinator decision record.
@@ -199,8 +226,26 @@ pub fn encode_decision(record: &CoordinatorDecisionRecord) -> Result<Bytes, Stor
 /// # Errors
 /// Fails when the record bytes are corrupt or use an unsupported shape.
 pub fn decode_decision(bytes: &[u8]) -> Result<CoordinatorDecisionRecord, StorageError> {
-    serde_json::from_slice(bytes)
-        .map_err(|error| StorageError::Corruption(format!("dist txn decision record: {error}")))
+    let record: CoordinatorDecisionRecord = serde_json::from_slice(bytes)
+        .map_err(|error| StorageError::Corruption(format!("dist txn decision record: {error}")))?;
+    validate_record_version(record.version)?;
+    Ok(record)
+}
+
+pub(crate) fn decode_finished(bytes: &[u8]) -> Result<FinishedTxnRecord, StorageError> {
+    let record: FinishedTxnRecord = serde_json::from_slice(bytes)
+        .map_err(|error| StorageError::Corruption(format!("dist txn finished record: {error}")))?;
+    validate_record_version(record.version)?;
+    Ok(record)
+}
+
+fn validate_record_version(version: u16) -> Result<(), StorageError> {
+    if version != DIST_TXN_RECORD_VERSION {
+        return Err(StorageError::Corruption(format!(
+            "unsupported dist txn record version {version}"
+        )));
+    }
+    Ok(())
 }
 
 /// Encodes a durable finished participant record.
@@ -212,6 +257,13 @@ pub fn encode_finished(record: &FinishedTxnRecord) -> Result<Bytes, StorageError
 
 impl CoordinatorLog for InMemoryCoordinatorLog {
     fn record_decision(&mut self, txn_id: DistTxnId, decision: Decision) -> Result<(), ReplError> {
+        if self
+            .decisions
+            .get(&txn_id)
+            .is_some_and(|existing| *existing != decision)
+        {
+            return Err(ReplError::Conflict);
+        }
         self.decisions.insert(txn_id, decision);
         Ok(())
     }
@@ -220,6 +272,9 @@ impl CoordinatorLog for InMemoryCoordinatorLog {
         self.decisions.get(&txn_id).copied()
     }
 }
+
+#[cfg(test)]
+mod audit_tests;
 
 #[cfg(test)]
 mod tests {

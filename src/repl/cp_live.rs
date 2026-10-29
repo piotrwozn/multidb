@@ -33,7 +33,7 @@ use crate::{
     },
     repl::{
         ApTransport, CpClusterRole, CpClusterStatus, NodeId, ReplError, VersionedBytes,
-        VersionedRecord, VersionedWrite, ap::ApReplicaEndpoint, condition_matches, dist_txn,
+        VersionedRecord, VersionedWrite, ap::ApReplicaEndpoint, condition_matches,
     },
     storage::{Bytes, ReadTransaction, StorageEngine, StorageError, WriteTransaction},
     txn::{self, TxnId, WriteSet},
@@ -43,7 +43,6 @@ use super::cp::{
     ClusterBootstrap, CpClusterConfig, CpOpenRaftTypeConfig, RAFT_LOG_TABLE, RAFT_SNAPSHOT_TABLE,
     RAFT_STATE_TABLE, RAFT_VOTE_TABLE, RaftNode, ReplApplyResponse, ReplCommand, command_write_set,
 };
-use super::{DIST_TXN_FINISHED_TABLE, DIST_TXN_PARTICIPANT_TABLE};
 
 const LAST_APPLIED_KEY: &[u8] = b"last_applied";
 const LAST_COMMITTED_KEY: &[u8] = b"last_committed";
@@ -94,10 +93,12 @@ pub(crate) struct CpSnapshotBuilder<S: StorageEngine> {
 
 #[derive(Clone)]
 struct CpNetworkFactory {
+    local_node: NodeId,
     config: crate::phase30::InternalTransportConfig,
 }
 
 struct CpNetwork {
+    local_node: NodeId,
     config: crate::phase30::InternalTransportConfig,
     target: NodeId,
     addr: String,
@@ -149,6 +150,10 @@ impl<S: StorageEngine> Clone for CpStateMachine<S> {
 
 impl<S: StorageEngine> LiveCpRuntime<S> {
     pub(super) fn start(storage: S, config: CpClusterConfig) -> Result<LiveCpHandle<S>, ReplError> {
+        if let Some(transport) = &config.transport {
+            crate::internal_transport::validate_node_config(transport, config.node_id)
+                .map_err(|error| ReplError::Transport(error.to_string()))?;
+        }
         let storage = Arc::new(storage);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -193,7 +198,10 @@ impl<S: StorageEngine> LiveCpRuntime<S> {
             io_lock: Arc::clone(&io_lock),
         };
         let state_machine = CpStateMachine { storage, io_lock };
-        let network = CpNetworkFactory { config: transport };
+        let network = CpNetworkFactory {
+            local_node: config.node_id,
+            config: transport,
+        };
 
         openraft::Raft::new(
             config.node_id,
@@ -523,11 +531,32 @@ impl<S: StorageEngine> InternalRaftEndpoint for WeakCpEndpoint<S> {
     }
 }
 
+// Check the identity in the opaque OpenRaft JSON as well as the authenticated
+// outer frame. A member cannot submit a vote or append claiming another member.
+fn validate_raft_sender(
+    from: NodeId,
+    term: u64,
+    vote: &VoteOf<CpOpenRaftTypeConfig>,
+) -> Result<(), ReplError> {
+    if from != vote.leader_id.node_id || term != vote.leader_id.term {
+        return Err(ReplError::Transport(
+            "Raft payload leader identity/term differs from authenticated sender envelope"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl<S: StorageEngine> InternalRaftEndpoint for LiveCpRuntime<S> {
     fn handle_raft(&self, request: RaftRequest) -> Result<RaftResponse, ReplError> {
         match request {
-            RaftRequest::AppendEntries { payload, .. } => {
+            RaftRequest::AppendEntries {
+                from,
+                term,
+                payload,
+            } => {
                 let rpc: AppendEntriesRequest<CpOpenRaftTypeConfig> = decode(&payload)?;
+                validate_raft_sender(from, term, &rpc.vote)?;
                 let raft = self.raft.clone();
                 let response = self.block_on(async move {
                     raft.append_entries(rpc)
@@ -539,8 +568,13 @@ impl<S: StorageEngine> InternalRaftEndpoint for LiveCpRuntime<S> {
                     payload: encode(&response)?,
                 })
             }
-            RaftRequest::Vote { payload, .. } => {
+            RaftRequest::Vote {
+                from,
+                term,
+                payload,
+            } => {
                 let rpc: VoteRequest<CpOpenRaftTypeConfig> = decode(&payload)?;
+                validate_raft_sender(from, term, &rpc.vote)?;
                 let raft = self.raft.clone();
                 let response = self.block_on(async move {
                     raft.vote(rpc)
@@ -552,8 +586,13 @@ impl<S: StorageEngine> InternalRaftEndpoint for LiveCpRuntime<S> {
                     payload: encode(&response)?,
                 })
             }
-            RaftRequest::PreVote { payload, .. } => {
+            RaftRequest::PreVote {
+                from,
+                term,
+                payload,
+            } => {
                 let rpc: VoteRequest<CpOpenRaftTypeConfig> = decode(&payload)?;
+                validate_raft_sender(from, term, &rpc.vote)?;
                 let raft = self.raft.clone();
                 let response = self.block_on(async move {
                     raft.pre_vote(rpc)
@@ -565,8 +604,21 @@ impl<S: StorageEngine> InternalRaftEndpoint for LiveCpRuntime<S> {
                     payload: encode(&response)?,
                 })
             }
-            RaftRequest::InstallSnapshot { chunk, .. } => {
+            RaftRequest::InstallSnapshot {
+                from,
+                term,
+                snapshot_id,
+                offset,
+                done,
+                chunk,
+            } => {
                 let wire: CpSnapshotWire = decode(&chunk)?;
+                validate_raft_sender(from, term, &wire.vote)?;
+                if offset != 0 || !done || snapshot_id != wire.meta.snapshot_id {
+                    return Err(ReplError::Transport(
+                        "invalid complete Raft snapshot envelope".to_owned(),
+                    ));
+                }
                 let snapshot = Snapshot {
                     meta: wire.meta,
                     snapshot: Cursor::new(wire.data),
@@ -899,28 +951,6 @@ impl<S: StorageEngine> CpStateMachine<S> {
         command: &ReplCommand,
     ) -> Result<ReplApplyResponse, StorageError> {
         let mut write = self.storage.begin_write()?;
-        if let ReplCommand::DistTxnPrepare { txn_id, ops, .. } = command {
-            let key = dist_txn::txn_key(*txn_id);
-            if write.get(DIST_TXN_FINISHED_TABLE, &key)?.is_some() {
-                let txn_id = txn::current_txn_id_from(&write)?;
-                write_apply_metadata(&mut write, log_id, None, txn_id)?;
-                write.commit()?;
-                return Ok(ReplApplyResponse {
-                    txn_id,
-                    conflict: false,
-                });
-            }
-            if let Some(existing) = write.get(DIST_TXN_PARTICIPANT_TABLE, &key)? {
-                let existing = dist_txn::decode_prepared(&existing)?;
-                let txn_id = txn::current_txn_id_from(&write)?;
-                write_apply_metadata(&mut write, log_id, None, txn_id)?;
-                write.commit()?;
-                return Ok(ReplApplyResponse {
-                    txn_id,
-                    conflict: existing.ops != *ops,
-                });
-            }
-        }
         if let ReplCommand::Conditional { conditions, .. } = command {
             for condition in conditions {
                 if !condition_matches(&write, condition)? {
@@ -935,7 +965,19 @@ impl<S: StorageEngine> CpStateMachine<S> {
             }
         }
 
-        let write_set = command_write_set(command, &write)?;
+        let write_set = match command_write_set(command, &write) {
+            Ok(writes) => writes,
+            Err(StorageError::Conflict) => {
+                let txn_id = txn::current_txn_id_from(&write)?;
+                write_apply_metadata(&mut write, log_id, None, txn_id)?;
+                write.commit()?;
+                return Ok(ReplApplyResponse {
+                    txn_id,
+                    conflict: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let snapshot_id = match command {
             ReplCommand::TxnCommit { snapshot_id, .. } => *snapshot_id,
             _ => txn::current_txn_id_from(&write)?,
@@ -1030,6 +1072,7 @@ impl RaftNetworkFactory<CpOpenRaftTypeConfig> for CpNetworkFactory {
 
     async fn new_client(&mut self, target: NodeId, node: &openraft::BasicNode) -> Self::Network {
         CpNetwork {
+            local_node: self.local_node,
             config: self.config.clone(),
             target,
             addr: node.addr.clone(),
@@ -1044,8 +1087,8 @@ impl RaftNetworkV2<CpOpenRaftTypeConfig> for CpNetwork {
         _option: openraft::network::RPCOption,
     ) -> Result<AppendEntriesResponse<CpOpenRaftTypeConfig>, RPCError<CpOpenRaftTypeConfig>> {
         self.raft_rpc(RaftRequest::AppendEntries {
-            from: 0,
-            term: 0,
+            from: self.local_node,
+            term: rpc.vote.leader_id.term,
             payload: encode_rpc(&rpc)?,
         })
         .await
@@ -1057,8 +1100,8 @@ impl RaftNetworkV2<CpOpenRaftTypeConfig> for CpNetwork {
         _option: openraft::network::RPCOption,
     ) -> Result<VoteResponse<CpOpenRaftTypeConfig>, RPCError<CpOpenRaftTypeConfig>> {
         self.raft_rpc(RaftRequest::Vote {
-            from: 0,
-            term: 0,
+            from: self.local_node,
+            term: rpc.vote.leader_id.term,
             payload: encode_rpc(&rpc)?,
         })
         .await
@@ -1070,8 +1113,8 @@ impl RaftNetworkV2<CpOpenRaftTypeConfig> for CpNetwork {
         _option: openraft::network::RPCOption,
     ) -> Result<VoteResponse<CpOpenRaftTypeConfig>, RPCError<CpOpenRaftTypeConfig>> {
         self.raft_rpc(RaftRequest::PreVote {
-            from: 0,
-            term: 0,
+            from: self.local_node,
+            term: rpc.vote.leader_id.term,
             payload: encode_rpc(&rpc)?,
         })
         .await
@@ -1096,8 +1139,8 @@ impl RaftNetworkV2<CpOpenRaftTypeConfig> for CpNetwork {
             data,
         };
         self.raft_rpc(RaftRequest::InstallSnapshot {
-            from: 0,
-            term: 0,
+            from: self.local_node,
+            term: wire.vote.leader_id.term,
             snapshot_id: wire.meta.snapshot_id.clone(),
             offset: 0,
             done: true,
@@ -1449,4 +1492,18 @@ fn operation_timed_out(operation: &str, timeout: Duration) -> ReplError {
 fn lock_io(lock: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, io::Error> {
     lock.lock()
         .map_err(|_| io::Error::other("CP live storage lock poisoned"))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{CpOpenRaftTypeConfig, VoteOf, validate_raft_sender};
+
+    #[test]
+    fn raft_payload_cannot_impersonate_another_node_or_term() {
+        let vote = VoteOf::<CpOpenRaftTypeConfig>::new(7, 2);
+        assert!(validate_raft_sender(2, 7, &vote).is_ok());
+        assert!(validate_raft_sender(3, 7, &vote).is_err());
+        assert!(validate_raft_sender(2, 8, &vote).is_err());
+        assert!(validate_raft_sender(0, 7, &vote).is_err());
+    }
 }

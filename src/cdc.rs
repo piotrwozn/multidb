@@ -10,6 +10,18 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod guarded;
+mod guarded_decode;
+pub(crate) use guarded::read_materialized_view_guarded;
+
+#[cfg(test)]
+#[path = "cdc_metadata_race_tests.rs"]
+mod metadata_race_tests;
+
+#[cfg(test)]
+#[path = "cdc_view_integrity_tests.rs"]
+mod view_integrity_tests;
+
 use crate::{
     backup::{Lsn, TimelineId},
     db::{CatalogEntry, ConfigError, Database, DbError, read_catalog_entry_from_repl},
@@ -19,7 +31,10 @@ use crate::{
     observability,
     phase30::{CdcWorkerConfig, HlcTimestamp},
     query::{REL_COLUMNAR_SEGMENTS_TABLE, REL_INDEX_TABLE, REL_ROWS_TABLE, Row, decode_row_bytes},
-    repl::{Op, ReadConsistency, ReplError, Replication, propose_system, propose_system_batch},
+    repl::{
+        ConditionalBatch, Op, ReadConsistency, ReplError, Replication, WriteCondition,
+        propose_system, propose_system_batch, propose_system_conditional_batch,
+    },
     security::{AuthzError, AuthzPolicy, Permission, Principal, Resource},
     storage::{Bytes, StorageError},
     text::{FULL_TEXT_DOCS_TABLE, FULL_TEXT_META_TABLE, FULL_TEXT_POSTINGS_TABLE},
@@ -277,6 +292,10 @@ pub struct MaterializedViewState {
 pub struct GroupState {
     pub group_value: Value,
     pub aggregates: Vec<AggregateValue>,
+    /// Counts matching source rows independently of aggregate kinds. Older stored
+    /// views omit this field and are migrated from their retained source rows.
+    #[serde(default)]
+    pub row_count: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -589,6 +608,19 @@ pub fn poll_changefeed_page<R: Replication + ?Sized>(
     options: &ChangefeedOptions,
     max: usize,
 ) -> Result<ChangefeedPage, FeedError> {
+    poll_changefeed_page_through(repl, catalog, from, filter, options, max, u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_changefeed_page_through<R: Replication + ?Sized>(
+    repl: &R,
+    catalog: &BTreeMap<String, CatalogEntry>,
+    from: &ResumeToken,
+    filter: &ChangefeedFilter,
+    options: &ChangefeedOptions,
+    max: usize,
+    through: Lsn,
+) -> Result<ChangefeedPage, FeedError> {
     ensure_commit_log(repl)?;
     let timeline_id = timeline_id(repl)?;
     let from = map_resume_token_to_current_timeline(repl, from, &timeline_id)?;
@@ -607,7 +639,7 @@ pub fn poll_changefeed_page<R: Replication + ?Sized>(
         }
     }
 
-    let current = current_lsn(repl)?;
+    let current = current_lsn(repl)?.min(through);
     let page = txn::history::commit_records_after(repl, from.lsn, current, max.max(1))?;
     ensure_no_truncated_prefix(repl, &from, current, &page)?;
     let has_more = page.has_more;
@@ -687,12 +719,13 @@ pub fn create_subscription(
     principal: &Principal,
     config: SubscriptionConfig,
 ) -> Result<SubscriptionState, SubscriptionError> {
+    ensure_commit_log(repl)?;
     authorize_filter_access(authz, principal, &config.filter)?;
-    if let Some(existing) = read_subscription(repl, &config.name)? {
-        require_subscription_owner(&existing, principal)?;
+    let previous = subscription_snapshot(repl, &config.name)?;
+    if let Some((existing, _)) = &previous {
+        require_subscription_owner(existing, principal)?;
     }
     let now = SystemTime::now();
-    ensure_commit_log(repl)?;
     let state = SubscriptionState {
         principal: Some(principal.clone()),
         trusted: false,
@@ -701,7 +734,7 @@ pub fn create_subscription(
         created_at: now,
         updated_at: now,
     };
-    write_subscription(repl, &state)?;
+    write_subscription_if_unchanged(repl, &state, previous.map(|(_, bytes)| bytes))?;
     Ok(state)
 }
 
@@ -715,6 +748,7 @@ pub fn create_subscription_trusted(
 ) -> Result<SubscriptionState, SubscriptionError> {
     let now = SystemTime::now();
     ensure_commit_log(repl)?;
+    let previous = subscription_snapshot(repl, &config.name)?;
     let state = SubscriptionState {
         principal: None,
         trusted: true,
@@ -723,7 +757,7 @@ pub fn create_subscription_trusted(
         created_at: now,
         updated_at: now,
     };
-    write_subscription(repl, &state)?;
+    write_subscription_if_unchanged(repl, &state, previous.map(|(_, bytes)| bytes))?;
     Ok(state)
 }
 
@@ -739,15 +773,53 @@ pub fn ack_subscription(
     name: &str,
     token: ResumeToken,
 ) -> Result<SubscriptionState, SubscriptionError> {
-    let mut state = read_subscription(repl, name)?
+    let (state, expected) = subscription_snapshot(repl, name)?
         .ok_or_else(|| SubscriptionError::MissingSubscription(name.to_owned()))?;
+    ack_subscription_snapshot(repl, state, expected, token)
+}
+
+/// Acknowledges only the owner/filter state that was authorized, without a second
+/// unchecked read or an unconditional overwrite of a concurrent metadata change.
+pub(crate) fn ack_subscription_as(
+    repl: &dyn Replication,
+    authz: &AuthzPolicy,
+    principal: &Principal,
+    name: &str,
+    token: ResumeToken,
+) -> Result<SubscriptionState, SubscriptionError> {
+    let (state, expected) = subscription_snapshot(repl, name)?
+        .ok_or_else(|| SubscriptionError::MissingSubscription(name.to_owned()))?;
+    require_subscription_owner(&state, principal)?;
+    authorize_filter_access(authz, principal, &state.config.filter)?;
+    ack_subscription_snapshot(repl, state, expected, token)
+}
+
+fn ack_subscription_snapshot(
+    repl: &dyn Replication,
+    mut state: SubscriptionState,
+    expected: Bytes,
+    token: ResumeToken,
+) -> Result<SubscriptionState, SubscriptionError> {
+    validate_ack_advance(&state.last_ack, &token)?;
     if state.last_ack == token {
         return Ok(state);
     }
     state.last_ack = token;
     state.updated_at = SystemTime::now();
-    write_subscription(repl, &state)?;
+    write_subscription_if_unchanged(repl, &state, Some(expected))?;
     Ok(state)
+}
+
+pub(crate) fn validate_ack_advance(
+    previous: &ResumeToken,
+    token: &ResumeToken,
+) -> Result<(), SubscriptionError> {
+    if previous.timeline_id == token.timeline_id && token.lsn < previous.lsn {
+        return Err(SubscriptionError::Policy(
+            "acknowledgement cannot move a durable cursor backwards".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reads subscription state.
@@ -825,7 +897,9 @@ pub async fn push_subscription_once_as(
             .map_err(|_| SubscriptionError::BackpressureTimeout)?
             .map_err(|_| SubscriptionError::BufferClosed)?;
     }
-    ack_subscription(database, name, token.clone())?;
+    database
+        .ack_subscription_as(principal, name, token.clone())
+        .map_err(subscription_policy_error)?;
     observability::record_subscription_push(name, token.lsn);
     Ok(token)
 }
@@ -864,12 +938,13 @@ pub fn adopt_subscription_as(
 ) -> Result<SubscriptionState, SubscriptionError> {
     ensure_commit_log(repl)?;
     authz.authorize(operator, &Resource::System, Permission::Admin)?;
-    let mut state = subscription_state(repl, name)?;
+    let (mut state, expected) = subscription_snapshot(repl, name)?
+        .ok_or_else(|| SubscriptionError::MissingSubscription(name.to_owned()))?;
     authorize_filter_access(authz, owner, &state.config.filter)?;
     state.principal = Some(owner.clone());
     state.trusted = false;
     state.updated_at = SystemTime::now();
-    write_subscription(repl, &state)?;
+    write_subscription_if_unchanged(repl, &state, Some(expected))?;
     Ok(state)
 }
 
@@ -1049,7 +1124,10 @@ async fn run_principal_subscription_worker(
             let database = database
                 .read()
                 .map_err(|_| SubscriptionError::Policy("database lock poisoned".to_owned()))?;
-            ack_subscription(&*database, &name, last.clone())?;
+            let principal = identity.resolve(&database);
+            database
+                .ack_subscription_as(&principal, &name, last.clone())
+                .map_err(subscription_policy_error)?;
         }
         observability::record_subscription_push(&name, last.lsn);
         if !page.has_more {
@@ -1127,9 +1205,20 @@ pub fn create_materialized_view(
 ) -> Result<MaterializedViewRows, MaterializedViewError> {
     ensure_view_commit_log(database)?;
     validate_view_spec(spec)?;
-    let _table = database
+    let table = database
         .table(&spec.source_table)
         .map_err(|error| MaterializedViewError::Unsupported(error.to_string()))?;
+    ensure_view_source_layout(&table)?;
+    let previous_spec = database.read(
+        MATERIALIZED_VIEWS_TABLE,
+        spec.name.as_bytes(),
+        ReadConsistency::Strong,
+    )?;
+    let previous_state = database.read(
+        MATERIALIZED_VIEW_STATE_TABLE,
+        spec.name.as_bytes(),
+        ReadConsistency::Strong,
+    )?;
     let mut state = MaterializedViewState {
         fresh_to_lsn: 0,
         source_rows: BTreeMap::new(),
@@ -1148,7 +1237,7 @@ pub fn create_materialized_view(
     };
     let next = apply_view_changefeed(database, spec, &mut state, token, &filter)?;
     state.fresh_to_lsn = next.lsn;
-    write_view(database, spec, &state)?;
+    write_view(database, spec, &state, previous_spec, previous_state)?;
     Ok(state_to_rows(spec, &state))
 }
 
@@ -1162,15 +1251,40 @@ pub fn refresh_materialized_view(
     name: &str,
 ) -> Result<MaterializedViewRows, MaterializedViewError> {
     ensure_view_commit_log(database)?;
-    let spec = read_view_spec(database, name)?;
-    let mut state = read_view_state(database, name)?;
+    let previous_spec = database
+        .read(
+            MATERIALIZED_VIEWS_TABLE,
+            name.as_bytes(),
+            ReadConsistency::Strong,
+        )?
+        .ok_or_else(|| MaterializedViewError::MissingView(name.to_owned()))?;
+    let spec: MaterializedViewSpec = serde_json::from_slice(&previous_spec)
+        .map_err(|error| MaterializedViewError::Serde(error.to_string()))?;
+    let table = database
+        .table(&spec.source_table)
+        .map_err(|error| MaterializedViewError::Unsupported(error.to_string()))?;
+    ensure_view_source_layout(&table)?;
+    let previous_state = database
+        .read(
+            MATERIALIZED_VIEW_STATE_TABLE,
+            name.as_bytes(),
+            ReadConsistency::Strong,
+        )?
+        .ok_or_else(|| MaterializedViewError::MissingView(name.to_owned()))?;
+    let mut state = decode_view_state(&previous_state, &spec)?;
     let token = ResumeToken::new(timeline_id(database)?, state.fresh_to_lsn);
     let filter = ChangefeedFilter {
         target: ChangefeedTarget::Table(spec.source_table.clone()),
     };
     let next = apply_view_changefeed(database, &spec, &mut state, token, &filter)?;
     state.fresh_to_lsn = next.lsn;
-    write_view(database, &spec, &state)?;
+    write_view(
+        database,
+        &spec,
+        &state,
+        Some(previous_spec),
+        Some(previous_state),
+    )?;
     observability::record_materialized_view_refresh(name, state.fresh_to_lsn);
     Ok(state_to_rows(&spec, &state))
 }
@@ -1186,6 +1300,15 @@ fn ensure_view_commit_log(database: &crate::db::Database) -> Result<(), Material
     Ok(())
 }
 
+fn ensure_view_source_layout(table: &crate::query::RelTable) -> Result<(), MaterializedViewError> {
+    if table.layout() == crate::query::TableLayout::Columnar {
+        return Err(MaterializedViewError::Unsupported(
+            "incremental materialized views currently require a row-layout source table".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reads materialized view rows.
 ///
 /// # Errors
@@ -1195,7 +1318,7 @@ pub fn read_materialized_view(
     name: &str,
 ) -> Result<MaterializedViewRows, MaterializedViewError> {
     let spec = read_view_spec_from_repl(repl, name)?;
-    let state = read_view_state_from_repl(repl, name)?;
+    let state = read_view_state_from_repl(repl, name, &spec)?;
     Ok(state_to_rows(&spec, &state))
 }
 
@@ -1738,6 +1861,7 @@ fn authorize_filter(
     }
 }
 
+#[cfg(test)]
 fn write_subscription(
     repl: &dyn Replication,
     state: &SubscriptionState,
@@ -1759,6 +1883,13 @@ fn read_subscription(
     repl: &dyn Replication,
     name: &str,
 ) -> Result<Option<SubscriptionState>, SubscriptionError> {
+    Ok(subscription_snapshot(repl, name)?.map(|(state, _)| state))
+}
+
+pub(crate) fn subscription_snapshot(
+    repl: &dyn Replication,
+    name: &str,
+) -> Result<Option<(SubscriptionState, Bytes)>, SubscriptionError> {
     let Some(bytes) = repl.read(
         CDC_SUBSCRIPTIONS_TABLE,
         name.as_bytes(),
@@ -1767,9 +1898,33 @@ fn read_subscription(
     else {
         return Ok(None);
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| SubscriptionError::Serde(error.to_string()))
+    let state = serde_json::from_slice(&bytes)
+        .map_err(|error| SubscriptionError::Serde(error.to_string()))?;
+    Ok(Some((state, bytes)))
+}
+
+pub(crate) fn write_subscription_if_unchanged(
+    repl: &dyn Replication,
+    state: &SubscriptionState,
+    expected: Option<Bytes>,
+) -> Result<(), SubscriptionError> {
+    propose_system_conditional_batch(
+        repl,
+        ConditionalBatch::new(
+            vec![WriteCondition::ValueEquals {
+                table: CDC_SUBSCRIPTIONS_TABLE.to_owned(),
+                key: state.config.name.as_bytes().to_vec(),
+                expected,
+            }],
+            vec![Op::Put {
+                table: CDC_SUBSCRIPTIONS_TABLE.to_owned(),
+                key: state.config.name.as_bytes().to_vec(),
+                value: serde_json::to_vec(state)
+                    .map_err(|error| SubscriptionError::Serde(error.to_string()))?,
+            }],
+        ),
+    )?;
+    Ok(())
 }
 
 /// Reads the id of the last committed transaction; every commit advances it.
@@ -1953,23 +2108,39 @@ fn write_view(
     repl: &dyn Replication,
     spec: &MaterializedViewSpec,
     state: &MaterializedViewState,
+    previous_spec: Option<Bytes>,
+    previous_state: Option<Bytes>,
 ) -> Result<(), MaterializedViewError> {
-    propose_system_batch(
+    propose_system_conditional_batch(
         repl,
-        vec![
-            Op::Put {
-                table: MATERIALIZED_VIEWS_TABLE.to_owned(),
-                key: spec.name.as_bytes().to_vec(),
-                value: serde_json::to_vec(spec)
-                    .map_err(|error| MaterializedViewError::Serde(error.to_string()))?,
-            },
-            Op::Put {
-                table: MATERIALIZED_VIEW_STATE_TABLE.to_owned(),
-                key: spec.name.as_bytes().to_vec(),
-                value: serde_json::to_vec(state)
-                    .map_err(|error| MaterializedViewError::Serde(error.to_string()))?,
-            },
-        ],
+        ConditionalBatch::new(
+            vec![
+                WriteCondition::ValueEquals {
+                    table: MATERIALIZED_VIEWS_TABLE.to_owned(),
+                    key: spec.name.as_bytes().to_vec(),
+                    expected: previous_spec,
+                },
+                WriteCondition::ValueEquals {
+                    table: MATERIALIZED_VIEW_STATE_TABLE.to_owned(),
+                    key: spec.name.as_bytes().to_vec(),
+                    expected: previous_state,
+                },
+            ],
+            vec![
+                Op::Put {
+                    table: MATERIALIZED_VIEWS_TABLE.to_owned(),
+                    key: spec.name.as_bytes().to_vec(),
+                    value: serde_json::to_vec(spec)
+                        .map_err(|error| MaterializedViewError::Serde(error.to_string()))?,
+                },
+                Op::Put {
+                    table: MATERIALIZED_VIEW_STATE_TABLE.to_owned(),
+                    key: spec.name.as_bytes().to_vec(),
+                    value: serde_json::to_vec(state)
+                        .map_err(|error| MaterializedViewError::Serde(error.to_string()))?,
+                },
+            ],
+        ),
     )?;
     Ok(())
 }
@@ -1992,6 +2163,7 @@ fn read_view_spec_from_repl(
 fn read_view_state_from_repl(
     repl: &dyn Replication,
     name: &str,
+    spec: &MaterializedViewSpec,
 ) -> Result<MaterializedViewState, MaterializedViewError> {
     let Some(bytes) = repl.read(
         MATERIALIZED_VIEW_STATE_TABLE,
@@ -2001,21 +2173,63 @@ fn read_view_state_from_repl(
     else {
         return Err(MaterializedViewError::MissingView(name.to_owned()));
     };
-    serde_json::from_slice(&bytes).map_err(|error| MaterializedViewError::Serde(error.to_string()))
+    decode_view_state(&bytes, spec)
 }
 
-fn read_view_spec(
-    database: &crate::db::Database,
-    name: &str,
-) -> Result<MaterializedViewSpec, MaterializedViewError> {
-    read_view_spec_from_repl(database, name)
-}
-
-fn read_view_state(
-    database: &crate::db::Database,
-    name: &str,
+fn decode_view_state(
+    bytes: &[u8],
+    spec: &MaterializedViewSpec,
 ) -> Result<MaterializedViewState, MaterializedViewError> {
-    read_view_state_from_repl(database, name)
+    let mut state: MaterializedViewState = serde_json::from_slice(bytes)
+        .map_err(|error| MaterializedViewError::Serde(error.to_string()))?;
+    upgrade_legacy_view_counts(spec, &mut state, None)?;
+    Ok(state)
+}
+
+fn upgrade_legacy_view_counts(
+    spec: &MaterializedViewSpec,
+    state: &mut MaterializedViewState,
+    budget: Option<&dyn crate::storage::ReadBudget>,
+) -> Result<(), MaterializedViewError> {
+    if state.groups.values().any(|group| group.row_count.is_none()) {
+        for group in state.groups.values_mut() {
+            if let Some(budget) = budget {
+                budget.check()?;
+            }
+            group.row_count = Some(0);
+        }
+        for row in state.source_rows.values() {
+            if let Some(budget) = budget {
+                budget.check()?;
+            }
+            if !row_matches(spec, row) {
+                continue;
+            }
+            let value = row.get(spec.group_by).ok_or_else(|| {
+                MaterializedViewError::Unsupported("group_by column is out of range".to_owned())
+            })?;
+            let _key = budget
+                .map(|budget| {
+                    budget.reserve(
+                        crate::query::json_value_upper_bytes(value)
+                            .saturating_mul(4)
+                            .saturating_add(256),
+                    )
+                })
+                .transpose()?;
+            let key = group_key(value)?;
+            if let Some(group) = state.groups.get_mut(&key) {
+                let count = group.row_count.get_or_insert(0);
+                *count = count.checked_add(1).ok_or_else(|| {
+                    MaterializedViewError::Unsupported(
+                        "materialized group row count overflow".to_owned(),
+                    )
+                })?;
+            }
+        }
+        state.groups.retain(|_, group| !group_is_empty(group));
+    }
+    Ok(())
 }
 
 fn apply_view_changefeed(
@@ -2025,14 +2239,17 @@ fn apply_view_changefeed(
     mut token: ResumeToken,
     filter: &ChangefeedFilter,
 ) -> Result<ResumeToken, MaterializedViewError> {
+    // New writes must not keep extending an in-flight refresh indefinitely.
+    let through = current_lsn(database)?;
     loop {
-        let page = poll_changefeed_page(
+        let page = poll_changefeed_page_through(
             database,
             database.catalog(),
             &token,
             filter,
             &ChangefeedOptions::default(),
             MATERIALIZED_VIEW_CDC_WINDOW,
+            through,
         )?;
         for event in page.events {
             apply_view_event(spec, state, &event)?;
@@ -2108,7 +2325,12 @@ fn add_row_to_groups(
     let group = state.groups.entry(key).or_insert_with(|| GroupState {
         group_value,
         aggregates: initial_aggregates(&spec.aggregates),
+        row_count: Some(0),
     });
+    let count = group.row_count.get_or_insert(0);
+    *count = count.checked_add(1).ok_or_else(|| {
+        MaterializedViewError::Unsupported("materialized group row count overflow".to_owned())
+    })?;
     apply_aggregate_delta(&spec.aggregates, &mut group.aggregates, row, 1.0, 1)
 }
 
@@ -2126,6 +2348,10 @@ fn remove_row_from_groups(
     let key = group_key(group_value)?;
     if let Some(group) = state.groups.get_mut(&key) {
         apply_aggregate_delta(&spec.aggregates, &mut group.aggregates, row, -1.0, -1)?;
+        let count = group.row_count.get_or_insert(0);
+        *count = count.checked_sub(1).ok_or_else(|| {
+            MaterializedViewError::Unsupported("materialized group row count underflow".to_owned())
+        })?;
     }
     if state.groups.get(&key).is_some_and(group_is_empty) {
         state.groups.remove(&key);
@@ -2164,10 +2390,22 @@ fn apply_aggregate_delta(
                 *count = count.saturating_add(count_sign);
             }
             (AggregateKind::Sum, AggregateValue::Sum(sum)) => {
-                *sum += numeric_value(row, spec.column)? * numeric_sign;
+                let updated = *sum + numeric_value(row, spec.column)? * numeric_sign;
+                if !updated.is_finite() {
+                    return Err(MaterializedViewError::Unsupported(
+                        "aggregate sum exceeds the finite f64 range".to_owned(),
+                    ));
+                }
+                *sum = updated;
             }
             (AggregateKind::Avg, AggregateValue::Avg { sum, count }) => {
-                *sum += numeric_value(row, spec.column)? * numeric_sign;
+                let updated = *sum + numeric_value(row, spec.column)? * numeric_sign;
+                if !updated.is_finite() {
+                    return Err(MaterializedViewError::Unsupported(
+                        "aggregate sum exceeds the finite f64 range".to_owned(),
+                    ));
+                }
+                *sum = updated;
                 *count = count.saturating_add(count_sign);
             }
             _ => {
@@ -2206,10 +2444,7 @@ fn group_key(value: &Value) -> Result<String, MaterializedViewError> {
 }
 
 fn group_is_empty(group: &GroupState) -> bool {
-    group.aggregates.iter().all(|value| match value {
-        AggregateValue::Count(count) | AggregateValue::Avg { count, .. } => *count <= 0,
-        AggregateValue::Sum(_) => false,
-    })
+    group.row_count == Some(0)
 }
 
 fn state_to_rows(

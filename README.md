@@ -11,7 +11,7 @@ testing and operational ownership.
 
 ## Status
 
-- Current package version: `0.1.0`
+- Current package version: `1.0.0-rc.1` (release candidate; production qualification in progress)
 - Rust MSRV: `1.89`
 - License: `MIT`
 - Crate publishing: disabled with `publish = false`

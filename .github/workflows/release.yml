@@ -6,19 +6,36 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux-release:
+  release-policy:
     runs-on: ubuntu-latest
+    outputs:
+      qualification_required: ${{ steps.policy.outputs.qualification_required }}
+      prerelease: ${{ steps.policy.outputs.prerelease }}
+      make_latest: ${{ steps.policy.outputs.make_latest }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: python3 scripts/check-release-version.py "$GITHUB_REF_NAME"
+      - id: policy
+        run: python3 scripts/check-production-readiness.py --policy --github-output "$GITHUB_OUTPUT"
+
+  linux-release:
+    needs: release-policy
+    # Match Dockerfile.prebuilt's glibc baseline for the shipped native binary.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: ${{ needs.release-policy.outputs.qualification_required == 'true' }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
@@ -30,20 +47,45 @@ jobs:
           cache-dependency-path: |
             studio/package-lock.json
             sdk/typescript/package-lock.json
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: sdk/go/go.mod
+          go-version: "1.27.3"
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Validate release version
+        run: python3 scripts/check-release-version.py "$GITHUB_REF_NAME"
+
+      - name: Test release configuration
+        run: cargo test --locked -- --test-threads=1
 
       - name: Build reproducible Linux artifact
         run: |
           repro_dir="$(mktemp -d)"
-          cargo build --locked --release --all-features
+          cargo build --locked --release
           cp target/release/multidb "$repro_dir/multidb.first"
           cargo clean -p multidb
-          cargo build --locked --release --all-features
+          cargo build --locked --release
           cmp "$repro_dir/multidb.first" target/release/multidb
           cp target/release/multidb target/release/multidb-linux-x86_64
+
+      - name: Require exact-artifact production qualification
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        run: >-
+          python3 scripts/check-production-readiness.py
+          --evidence-root .
+          --manifest "qualification/releases/${GITHUB_REF_NAME#v}/manifest.json"
+          --target linux-x86_64 --binary target/release/multidb-linux-x86_64
+          --output target/release/production-qualification-linux.json
+          --stage-image "$RUNNER_TEMP/multidb-qualified-image"
+
+      - name: Transfer the exact qualified OCI without rebuilding
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-qualified-image
+          path: ${{ runner.temp }}/multidb-qualified-image
+          if-no-files-found: error
+          compression-level: 0
 
       - name: Public preview smoke
         shell: pwsh
@@ -82,26 +124,13 @@ jobs:
           test -n "$sbom"
           cp "$sbom" target/release/multidb.cdx.json
 
-      - name: Publish signed GHCR image
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
-          metadata_file="target/release/image-metadata.json"
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker buildx create --use --name multidb-release-builder
-          docker buildx inspect --bootstrap
-          docker buildx build \
-            --platform linux/amd64 \
-            --file Dockerfile.prebuilt \
-            --tag "$image" \
-            --sbom=true \
-            --provenance=true \
-            --metadata-file "$metadata_file" \
-            --push target/docker-smoke-context
-          digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
-          test -n "$digest"
-          test "$digest" != "null"
-          cosign sign --yes "$image@$digest"
-          printf '%s@%s\n' "$image" "$digest" > target/release/image-digest.txt
+      - name: Preserve tested image context without publication
+        if: needs.release-policy.outputs.qualification_required == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: multidb-container-context
+          path: target/docker-smoke-context
+          if-no-files-found: error
 
       - name: Stage release evidence
         run: |
@@ -116,17 +145,21 @@ jobs:
           path: |
             target/release/multidb-linux-x86_64
             target/release/multidb.cdx.json
-            target/release/image-digest.txt
-            target/release/image-metadata.json
             target/release/preview-smoke-summary.json
             target/release/release-candidate.json
             target/release/release-gate-summary.json
             target/release/release-trend.json
+            target/release/production-qualification-linux.json
 
   windows-release:
+    needs: release-policy
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: ${{ needs.release-policy.outputs.qualification_required == 'true' }}
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
@@ -135,25 +168,137 @@ jobs:
       - name: Build Windows artifact
         shell: pwsh
         run: |
-          cargo build --locked --release --all-features
+          python scripts/check-release-version.py "$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw "release version mismatch" }
+          cargo test --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "release configuration tests failed" }
+          cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { throw "release build failed" }
           Copy-Item target/release/multidb.exe target/release/multidb-windows-x86_64.exe
+
+      - name: Require exact-artifact production qualification
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        shell: pwsh
+        run: |
+          $qualifiedVersion = $env:GITHUB_REF_NAME.Substring(1)
+          python scripts/check-production-readiness.py --evidence-root . --manifest "qualification/releases/$qualifiedVersion/manifest.json" --target windows-x86_64 --binary target/release/multidb-windows-x86_64.exe --output target/release/production-qualification-windows.json
+          if ($LASTEXITCODE -ne 0) { throw "production qualification blocked" }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: multidb-windows-release
-          path: target/release/multidb-windows-x86_64.exe
+          path: |
+            target/release/multidb-windows-x86_64.exe
+            target/release/production-qualification-windows.json
 
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      packages: write
     needs:
+      - release-policy
       - linux-release
       - windows-release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: ${{ needs.release-policy.outputs.qualification_required == 'true' }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: multidb-*-release
           path: target/release
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: multidb-container-context
+          path: target/docker-smoke-context
+        if: needs.release-policy.outputs.qualification_required == 'false'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        with:
+          name: multidb-qualified-image
+          path: ${{ runner.temp }}/multidb-qualified-image
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Recheck downloaded production artifacts before publication
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        run: |
+          python3 scripts/check-production-readiness.py --evidence-root . --manifest "qualification/releases/${GITHUB_REF_NAME#v}/manifest.json" --target linux-x86_64 --binary target/release/multidb-linux-x86_64
+          python3 scripts/check-production-readiness.py --evidence-root . --manifest "qualification/releases/${GITHUB_REF_NAME#v}/manifest.json" --target windows-x86_64 --binary target/release/multidb-windows-x86_64.exe
+
+      - name: Set the validated image reference and registry authentication
+        id: image-context
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          image="$(python3 scripts/qualification/publish_qualified_image.py --reference-only)"
+          printf 'reference=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Install the pinned digest-preserving OCI copy tool
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        run: python3 scripts/qualification/install_release_tools.py --output "$RUNNER_TEMP/multidb-release-tools"
+
+      - name: Publish the exact qualified stable OCI image
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        run: >-
+          python3 scripts/qualification/publish_qualified_image.py
+          --evidence-root .
+          --manifest "qualification/releases/${GITHUB_REF_NAME#v}/manifest.json"
+          --binary target/release/multidb-linux-x86_64
+          --bundle "$RUNNER_TEMP/multidb-qualified-image"
+          --oras "$RUNNER_TEMP/multidb-release-tools/oras"
+          --output target/release/image-metadata.json
+
+      - name: Publish the preview GHCR image
+        if: needs.release-policy.outputs.qualification_required == 'false'
+        env:
+          IMAGE_REFERENCE: ${{ steps.image-context.outputs.reference }}
+        run: |
+          cmp target/docker-smoke-context/multidb target/release/multidb-linux-x86_64
+          docker buildx create --use --name multidb-release-builder
+          docker buildx inspect --bootstrap
+          docker buildx build \
+            --platform linux/amd64 \
+            --file Dockerfile.prebuilt \
+            --tag "$IMAGE_REFERENCE" \
+            --sbom=true \
+            --provenance=true \
+            --metadata-file target/release/image-metadata.json \
+            --push target/docker-smoke-context
+
+      - name: Sign the verified image digest
+        id: image
+        env:
+          IMAGE_REFERENCE: ${{ steps.image-context.outputs.reference }}
+        run: |
+          digest="$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' target/release/image-metadata.json)"
+          cosign sign --yes "$IMAGE_REFERENCE@$digest"
+          printf '%s@%s\n' "$IMAGE_REFERENCE" "$digest" > target/release/image-digest.txt
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attach stable dependency SBOM and publication provenance
+        if: needs.release-policy.outputs.qualification_required == 'true'
+        env:
+          IMAGE_REFERENCE: ${{ steps.image-context.outputs.reference }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign attest --yes --type cyclonedx --predicate target/release/multidb.cdx.json "$IMAGE_REFERENCE@$IMAGE_DIGEST"
+          cosign attest --yes \
+            --type "https://github.com/${GITHUB_REPOSITORY}/attestations/qualified-image-publication/v1" \
+            --predicate target/release/image-metadata.json "$IMAGE_REFERENCE@$IMAGE_DIGEST"
+          python3 scripts/qualification/publish_qualified_image.py \
+            --evidence-root . \
+            --manifest "qualification/releases/${GITHUB_REF_NAME#v}/manifest.json" \
+            --binary target/release/multidb-linux-x86_64 \
+            --bundle "$RUNNER_TEMP/multidb-qualified-image" \
+            --oras "$RUNNER_TEMP/multidb-release-tools/oras" \
+            --verify-only --output target/release/image-postsign-verification.json
 
       - name: Checksums and signatures
         run: |
@@ -179,6 +324,8 @@ jobs:
 
       - uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836
         with:
+          prerelease: ${{ needs.release-policy.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.release-policy.outputs.make_latest }}
           files: |
             target/release/multidb-linux-x86_64
             target/release/multidb-linux-x86_64.pem
@@ -190,7 +337,10 @@ jobs:
             target/release/multidb.cdx.json
             target/release/image-digest.txt
             target/release/image-metadata.json
+            target/release/image-postsign-verification.json
             target/release/preview-smoke-summary.json
             target/release/release-candidate.json
             target/release/release-gate-summary.json
             target/release/release-trend.json
+            target/release/production-qualification-linux.json
+            target/release/production-qualification-windows.json

@@ -10,12 +10,19 @@ use crate::{
     txn,
 };
 
-use super::{NodeId, Op, ReadConsistency, ReplError, Replication};
+use super::{ConditionalBatch, NodeId, Op, ReadConsistency, ReplError, Replication};
+
+mod conditional;
+mod guarded;
+mod transport_scan;
+
+pub use guarded::GuardedApPage;
 
 pub const AP_VERSIONS_TABLE: &str = "__ap_versions";
 pub const AP_HINTS_TABLE: &str = "__ap_hints";
 pub const AP_MERKLE_TABLE: &str = "__ap_merkle";
 pub const AP_HINT_SEQ_TABLE: &str = "__ap_hint_seq";
+pub const AP_NODE_CLOCK_TABLE: &str = "__ap_node_clock";
 
 const DEFAULT_HINT_TTL_MS: u64 = 60 * 60 * 1_000;
 const MAX_HINT_WRITES: usize = 1_024;
@@ -105,6 +112,43 @@ impl Hint {
 }
 
 pub trait ApTransport: Send + Sync {
+    /// Whether pages reserve decoded buffers before allocation.
+    fn supports_guarded_range_pages(&self) -> bool {
+        false
+    }
+
+    /// Best-effort repair with guarded request/response ownership.
+    /// # Errors
+    /// Fails when unsupported, unavailable, or over budget.
+    fn send_batch_guarded(
+        &self,
+        _target: NodeId,
+        _writes: &[VersionedWrite],
+        _budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<(), ReplError> {
+        Err(ReplError::Unsupported(
+            "guarded AP repairs are not supported".to_owned(),
+        ))
+    }
+
+    /// Fetches a page whose owned buffers retain read-budget reservations.
+    /// # Errors
+    /// Fails when guarded pages are unsupported, a replica is unavailable, or a budget is exhausted.
+    #[allow(clippy::too_many_arguments)]
+    fn read_range_page_guarded(
+        &self,
+        _target: NodeId,
+        _table: &str,
+        _start: &[u8],
+        _end: &[u8],
+        _limit: usize,
+        _budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<GuardedApPage, ReplError> {
+        Err(ReplError::Unsupported(
+            "guarded AP pages are not supported".to_owned(),
+        ))
+    }
+
     /// Sends one AP batch to a replica.
     /// # Errors
     /// Fails when the target is unavailable or rejects the batch.
@@ -124,6 +168,29 @@ pub trait ApTransport: Send + Sync {
     /// # Errors
     /// Fails when the target is unavailable or rejects the scan.
     fn read_all_versions(&self, target: NodeId) -> Result<Vec<VersionedRecord>, ReplError>;
+
+    /// Whether range pages are implemented without materializing the full range.
+    fn supports_range_pages(&self) -> bool {
+        false
+    }
+
+    /// Reads at most `limit` records in ascending, unique key order from `[start, end)`.
+    /// An empty `end` is unbounded. Implementations must bound storage/transport work
+    /// before materializing the result; the compatibility default reports unsupported.
+    /// # Errors
+    /// Fails when bounded paging is unsupported, unavailable, or rejected.
+    fn read_range_page(
+        &self,
+        _target: NodeId,
+        _table: &str,
+        _start: &[u8],
+        _end: &[u8],
+        _limit: usize,
+    ) -> Result<Vec<VersionedRecord>, ReplError> {
+        Err(ReplError::Unsupported(
+            "bounded AP range pages are not supported".to_owned(),
+        ))
+    }
 
     /// Reads Merkle leaf hashes keyed by AP version key.
     /// # Errors
@@ -281,7 +348,8 @@ impl VectorClock {
     }
 
     pub fn increment(&mut self, node_id: NodeId) {
-        *self.0.entry(node_id).or_insert(0) += 1;
+        let value = self.0.entry(node_id).or_insert(0);
+        *value = value.saturating_add(1);
     }
 
     pub fn merge_from(&mut self, other: &Self) {
@@ -385,6 +453,10 @@ impl<S: StorageEngine> ApDynamo<S> {
     /// Fails when cluster topology is invalid.
     pub fn new(storage: S, cluster: ApClusterConfig) -> Result<Self, ReplError> {
         validate_ap_cluster_config(&cluster).map_err(ReplError::Transport)?;
+        if let Some(transport) = &cluster.transport {
+            crate::internal_transport::validate_node_config(transport, cluster.node_id)
+                .map_err(|error| ReplError::Transport(error.to_string()))?;
+        }
         Ok(Self::new_unchecked(storage, cluster))
     }
 
@@ -478,8 +550,7 @@ impl<S: StorageEngine> ApDynamo<S> {
         for parent in parents {
             clock.merge_from(&parent);
         }
-        clock.increment(self.cluster.node_id);
-        let write = VersionedWrite {
+        let mut writes = [VersionedWrite {
             table: table.to_owned(),
             key: key.to_vec(),
             version: VersionedBytes {
@@ -487,8 +558,17 @@ impl<S: StorageEngine> ApDynamo<S> {
                 clock,
                 origin: self.cluster.node_id,
             },
-        };
-        self.write_versioned_batch(&[write], self.cluster.default_write)
+        }];
+        {
+            let _guard = self
+                .commit_lock
+                .lock()
+                .map_err(|_| StorageError::Backend("AP commit lock poisoned".to_owned()))?;
+            let mut txn = self.storage.begin_write()?;
+            self.reserve_write_clocks(&mut txn, &mut writes)?;
+            txn.commit()?;
+        }
+        self.write_versioned_batch(&writes, self.cluster.default_write)
     }
 
     /// Attempts to deliver all currently stored hinted handoff records.
@@ -624,6 +704,24 @@ impl<S: StorageEngine> ApDynamo<S> {
     }
 
     fn build_writes(&self, ops: Vec<Op>) -> Result<Vec<VersionedWrite>, StorageError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| StorageError::Backend("AP commit lock poisoned".to_owned()))?;
+        let mut txn = self.storage.begin_write()?;
+        let writes = self.build_writes_in_txn(&mut txn, ops)?;
+        txn.commit()?;
+        Ok(writes)
+    }
+
+    fn build_writes_in_txn<T: WriteTransaction>(
+        &self,
+        txn: &mut T,
+        ops: Vec<Op>,
+    ) -> Result<Vec<VersionedWrite>, StorageError> {
         let mut collapsed = BTreeMap::new();
         for op in ops {
             match op {
@@ -636,12 +734,11 @@ impl<S: StorageEngine> ApDynamo<S> {
             }
         }
 
-        collapsed
+        let mut writes = collapsed
             .into_iter()
             .map(|((table, key), value)| {
-                let existing = self.local_versions(&table, &key)?;
-                let mut clock = VectorClock::merged(existing.iter().map(|version| &version.clock));
-                clock.increment(self.cluster.node_id);
+                let existing = read_versions_from_txn(txn, &version_key(&table, &key)?)?;
+                let clock = VectorClock::merged(existing.iter().map(|version| &version.clock));
                 Ok(VersionedWrite {
                     table,
                     key,
@@ -652,7 +749,45 @@ impl<S: StorageEngine> ApDynamo<S> {
                     },
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        if !writes.is_empty() {
+            self.reserve_write_clocks(txn, &mut writes)?;
+        }
+        Ok(writes)
+    }
+
+    fn reserve_write_clocks<T: WriteTransaction>(
+        &self,
+        txn: &mut T,
+        writes: &mut [VersionedWrite],
+    ) -> Result<(), StorageError> {
+        let key = self.cluster.node_id.to_be_bytes();
+        let stored = txn
+            .get(AP_NODE_CLOCK_TABLE, &key)?
+            .as_deref()
+            .map(decode_u64)
+            .transpose()?
+            .unwrap_or(0);
+        let maximum = writes
+            .iter()
+            .filter_map(|write| write.version.clock.0.get(&self.cluster.node_id).copied())
+            .fold(stored, u64::max);
+        let next = maximum
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Corruption("AP vector clock exhausted".to_owned()))?;
+        // The coordinator need not itself be a replica for these keys. Persist
+        // its counter before publication so later writes cannot reuse a clock,
+        // even after a failed send, restart, or reordered replica delivery.
+        txn.put(AP_NODE_CLOCK_TABLE, &key, &next.to_be_bytes())?;
+        txn.put(
+            txn::KEYSPACE_REGISTRY_TABLE,
+            AP_NODE_CLOCK_TABLE.as_bytes(),
+            b"1",
+        )?;
+        for write in writes {
+            write.version.clock.0.insert(self.cluster.node_id, next);
+        }
+        Ok(())
     }
 
     fn write_versioned_batch(
@@ -773,6 +908,172 @@ impl<S: StorageEngine> ApDynamo<S> {
         }
     }
 
+    fn range_head(
+        &self,
+        node: NodeId,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Option<VersionedRecord>, ReplError> {
+        let mut page = if node == self.cluster.node_id {
+            self.local_range_page(table, start, end, 1)?
+        } else {
+            self.transport_arc()?
+                .read_range_page(node, table, start, end, 1)?
+        };
+        if page.len() > 1
+            || page.iter().any(|record| {
+                record.table != table
+                    || record.key.as_slice() < start
+                    || (!end.is_empty() && record.key.as_slice() >= end)
+            })
+        {
+            return Err(ReplError::Transport("invalid AP range page".to_owned()));
+        }
+        Ok(page.pop())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn scan_local_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        batch_rows: usize,
+        cancelled: &dyn Fn() -> bool,
+        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        if cancelled() || (!end.is_empty() && start >= end) {
+            return Ok(());
+        }
+        let txn = self.storage.begin_read()?;
+        let (start, end) = version_range_bounds(table, start, end)?;
+        let mut batch = Vec::new();
+        let mut entries = txn.range(AP_VERSIONS_TABLE, &start, &end)?;
+        while !cancelled() {
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let (key, value) = entry?;
+            let (_, key) = decode_version_key(&key)?;
+            let versions = decode_versions(&value)?;
+            match versions.as_slice() {
+                [version] => {
+                    if let Some(value) = &version.value {
+                        batch.push((key, value.clone()));
+                    }
+                }
+                [] => {}
+                _ => return Err(ReplError::Conflict),
+            }
+            if batch.len() >= batch_rows && !batch.is_empty() {
+                if !on_batch(&batch)? {
+                    return Ok(());
+                }
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() && !cancelled() {
+            let _ = on_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn scan_quorum_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        batch_rows: usize,
+        cancelled: &dyn Fn() -> bool,
+        on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        self.ensure_transport_for_multi_node()?;
+        let required = self.cluster.nodes.len() - self.cluster.replication_factor
+            + self
+                .read_level_for(ReadConsistency::Strong)
+                .required(self.cluster.replication_factor);
+        // Retain one record per responding replica, never complete replica ranges.
+        let mut heads = Vec::new();
+        for node in &self.cluster.nodes {
+            if cancelled() {
+                return Ok(());
+            }
+            if self.is_available(node.id)?
+                && let Ok(record) = self.range_head(node.id, table, start, end)
+            {
+                heads.push((node.id, record));
+            }
+        }
+        if heads.len() < required {
+            return Err(ReplError::NoQuorum);
+        }
+        let mut batch = Vec::new();
+        loop {
+            if cancelled() {
+                return Ok(());
+            }
+            let Some(key) = heads
+                .iter()
+                .filter_map(|(_, head)| head.as_ref())
+                .map(|record| &record.key)
+                .min()
+                .cloned()
+            else {
+                break;
+            };
+            let replicas = self.preference_list(table, &key);
+            let replies = heads
+                .iter()
+                .filter(|(node, _)| replicas.contains(node))
+                .map(|(node, head)| {
+                    (
+                        *node,
+                        head.as_ref()
+                            .filter(|record| record.key == key)
+                            .map_or_else(Vec::new, |record| record.versions.clone()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let merged = merge_reply_versions(&replies);
+            self.read_repair(table, &key, &replies, &merged);
+            match merged.as_slice() {
+                [version] => {
+                    if let Some(value) = &version.value {
+                        batch.push((key.clone(), value.clone()));
+                    }
+                }
+                [] => {}
+                _ => return Err(ReplError::Conflict),
+            }
+            if batch.len() >= batch_rows && !batch.is_empty() {
+                if cancelled() || !on_batch(&batch)? {
+                    return Ok(());
+                }
+                batch.clear();
+            }
+            // Append a zero byte for the exact lexicographic successor boundary;
+            // incrementing/truncating would skip valid keys extending this prefix.
+            let mut next = key.clone();
+            next.push(0);
+            for (node, head) in &mut heads {
+                if head.as_ref().is_some_and(|record| record.key == key) {
+                    if cancelled() {
+                        return Ok(());
+                    }
+                    // A selected quorum cannot silently lose a participant halfway
+                    // through the range and return an incomplete successful result.
+                    *head = self.range_head(*node, table, &next, end)?;
+                }
+            }
+        }
+        if !batch.is_empty() && !cancelled() {
+            let _ = on_batch(&batch)?;
+        }
+        Ok(())
+    }
+
     fn range_records_from_replicas(
         &self,
         table: &str,
@@ -780,9 +1081,10 @@ impl<S: StorageEngine> ApDynamo<S> {
         end: &[u8],
     ) -> Result<Vec<(NodeId, Vec<VersionedRecord>)>, ReplError> {
         self.ensure_transport_for_multi_node()?;
-        let required = self
-            .read_level_for(ReadConsistency::Strong)
-            .required(self.cluster.replication_factor);
+        let required = self.cluster.nodes.len() - self.cluster.replication_factor
+            + self
+                .read_level_for(ReadConsistency::Strong)
+                .required(self.cluster.replication_factor);
         let mut replies = Vec::new();
 
         for target in self.cluster.nodes.iter().map(|node| node.id) {
@@ -840,30 +1142,6 @@ impl<S: StorageEngine> ApDynamo<S> {
         }
     }
 
-    fn repair_range_replicas(
-        &self,
-        replies: &[(NodeId, Vec<VersionedRecord>)],
-        merged: &[VersionedRecord],
-    ) {
-        if merged.is_empty() {
-            return;
-        }
-
-        let writes = records_to_writes(merged);
-        for (node_id, records) in replies {
-            let local_view = merge_many_record_sets(std::iter::once(records.clone()));
-            if local_view == merged {
-                continue;
-            }
-
-            let _ = if *node_id == self.cluster.node_id {
-                self.apply_records(merged)
-            } else {
-                self.send_to_node(*node_id, &writes)
-            };
-        }
-    }
-
     fn local_versions(&self, table: &str, key: &[u8]) -> Result<Vec<VersionedBytes>, StorageError> {
         let txn = self.storage.begin_read()?;
         read_versions_from_txn(&txn, &version_key(table, key)?)
@@ -902,6 +1180,32 @@ impl<S: StorageEngine> ApDynamo<S> {
                     key,
                     versions,
                 })
+            })
+            .collect()
+    }
+
+    fn local_range_page(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<VersionedRecord>, ReplError> {
+        if !(1..=1_024).contains(&limit) {
+            return Err(ReplError::Rejected(
+                "AP range page limit must be 1..=1024".to_owned(),
+            ));
+        }
+        if !end.is_empty() && start >= end {
+            return Ok(Vec::new());
+        }
+        let txn = self.storage.begin_read()?;
+        let (start, end) = version_range_bounds(table, start, end)?;
+        txn.range(AP_VERSIONS_TABLE, &start, &end)?
+            .take(limit)
+            .map(|entry| {
+                let (key, value) = entry?;
+                read_record_from_encoded_key(&key, &value).map_err(Into::into)
             })
             .collect()
     }
@@ -1034,6 +1338,119 @@ impl<S: StorageEngine> ApDynamo<S> {
 }
 
 impl<S: StorageEngine> Replication for ApDynamo<S> {
+    fn supports_guarded_reads(&self) -> bool {
+        self.storage.supports_guarded_reads()
+            && (self.is_single_local_node()
+                || self.transport.lock().is_ok_and(|transport| {
+                    transport
+                        .as_ref()
+                        .is_some_and(|transport| transport.supports_guarded_range_pages())
+                }))
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        if !self.supports_guarded_reads() {
+            budget.check()?;
+            // Compatibility for external storage/transports: their established
+            // read may own buffers first, so the capability remains false.
+            let value = self.read(table, key, consistency)?;
+            let _input = value
+                .as_ref()
+                .map(|value| budget.reserve(value.len()))
+                .transpose()?;
+            let _ = visitor(value.as_deref())?;
+            return budget.check().map_err(Into::into);
+        }
+        self.guarded_get(table, key, consistency, budget, visitor)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        for (index, key) in keys.iter().enumerate() {
+            let mut keep_going = true;
+            self.visit_get(table, key, consistency, budget, &mut |value| {
+                keep_going = visitor(index, value)?;
+                Ok(keep_going)
+            })?;
+            if !keep_going {
+                break;
+            }
+        }
+        budget.check().map_err(Into::into)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        if !self.supports_guarded_reads() {
+            budget.check()?;
+            self.scan_range_batches(
+                table,
+                start,
+                end,
+                consistency,
+                1,
+                &|| budget.check().is_err(),
+                &mut |batch| {
+                    for (key, value) in batch {
+                        budget.check()?;
+                        let _input = budget.reserve(key.len().saturating_add(value.len()))?;
+                        if !visitor(key, value)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                },
+            )?;
+            return budget.check().map_err(Into::into);
+        }
+        self.guarded_range(table, start, end, consistency, budget, visitor)
+    }
+
+    fn supports_bounded_scans(&self) -> bool {
+        self.is_single_local_node()
+            || self.transport.lock().is_ok_and(|transport| {
+                transport
+                    .as_ref()
+                    .is_some_and(|transport| transport.supports_range_pages())
+            })
+    }
+
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        let (table, key) = match &op {
+            Op::Put { table, key, .. } | Op::Delete { table, key } => (table, key),
+        };
+        if table != crate::model::DOCUMENT_TABLE
+            || key.len() != 20
+            || !key.starts_with(&collection_id.to_be_bytes())
+        {
+            return Err(ReplError::Rejected(
+                "AP plain document write must target exactly its collection document key"
+                    .to_owned(),
+            ));
+        }
+        self.propose_batch(vec![op])
+    }
+
     fn supports_commit_log(&self) -> bool {
         false
     }
@@ -1044,6 +1461,9 @@ impl<S: StorageEngine> Replication for ApDynamo<S> {
 
     fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
         txn::validate_public_ops(&ops)?;
+        if self.is_single_local_node() {
+            return self.commit_local_conditional(ConditionalBatch::new(Vec::new(), ops));
+        }
         let writes = self.build_writes(ops)?;
         self.write_versioned_batch(&writes, self.cluster.default_write)
     }
@@ -1053,8 +1473,31 @@ impl<S: StorageEngine> Replication for ApDynamo<S> {
         ops: Vec<Op>,
         _authorization: txn::WriteAuthorization,
     ) -> Result<(), ReplError> {
+        if self.is_single_local_node() {
+            return self.commit_local_conditional(ConditionalBatch::new(Vec::new(), ops));
+        }
         let writes = self.build_writes(ops)?;
         self.write_versioned_batch(&writes, self.cluster.default_write)
+    }
+
+    fn propose_conditional_batch(&self, batch: ConditionalBatch) -> Result<(), ReplError> {
+        txn::validate_public_conditions(&batch.conditions)?;
+        txn::validate_public_ops(&batch.ops)?;
+        if batch.conditions.is_empty() {
+            return self.propose_batch(batch.ops);
+        }
+        self.commit_local_conditional(batch)
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        if batch.conditions.is_empty() {
+            return self.propose_authorized_batch(batch.ops, authorization);
+        }
+        self.commit_local_conditional(batch)
     }
 
     fn read(
@@ -1084,14 +1527,50 @@ impl<S: StorageEngine> Replication for ApDynamo<S> {
     ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
         if matches!(consistency, ReadConsistency::Strong) {
             let replies = self.range_records_from_replicas(table, start, end)?;
-            let merged = merge_many_record_sets(replies.iter().map(|(_, records)| records.clone()));
-            self.repair_range_replicas(&replies, &merged);
+            let mut owned = BTreeMap::<Bytes, Vec<VersionedBytes>>::new();
+            for (node, records) in &replies {
+                for record in records {
+                    if record.table == table
+                        && self.preference_list(table, &record.key).contains(node)
+                    {
+                        let versions = owned.entry(record.key.clone()).or_default();
+                        for version in &record.versions {
+                            *versions =
+                                merge_one_version(std::mem::take(versions), version.clone());
+                        }
+                    }
+                }
+            }
+            let merged = owned
+                .into_iter()
+                .map(|(key, versions)| VersionedRecord {
+                    table: table.to_owned(),
+                    key,
+                    versions,
+                })
+                .collect::<Vec<_>>();
+            for record in &merged {
+                let replicas = self.preference_list(table, &record.key);
+                let per_key = replies
+                    .iter()
+                    .filter(|(node, _)| replicas.contains(node))
+                    .map(|(node, records)| {
+                        (
+                            *node,
+                            records
+                                .iter()
+                                .find(|reply| reply.table == table && reply.key == record.key)
+                                .map_or_else(Vec::new, |record| record.versions.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.read_repair(table, &record.key, &per_key, &record.versions);
+            }
             return rows_from_records(merged, table, start, end);
         }
 
         let txn = self.storage.begin_read()?;
-        let start_key = version_key(table, start)?;
-        let end_key = version_key(table, end)?;
+        let (start_key, end_key) = version_range_bounds(table, start, end)?;
         txn.range(AP_VERSIONS_TABLE, &start_key, &end_key)?
             .map(|entry| {
                 let (encoded_key, value) = entry?;
@@ -1121,17 +1600,25 @@ impl<S: StorageEngine> Replication for ApDynamo<S> {
         cancelled: &dyn Fn() -> bool,
         on_batch: &mut dyn FnMut(&[(Bytes, Bytes)]) -> Result<bool, ReplError>,
     ) -> Result<(), ReplError> {
-        let rows = self.range(table, start, end, consistency)?;
-        let batch_rows = batch_rows.max(1);
-        for chunk in rows.chunks(batch_rows) {
-            if cancelled() {
-                break;
-            }
-            if !on_batch(chunk)? {
-                break;
-            }
+        if cancelled() || (!end.is_empty() && start >= end) {
+            return Ok(());
         }
-        Ok(())
+        let batch_rows = batch_rows.clamp(1, 1_024);
+        if self.is_single_local_node() || !matches!(consistency, ReadConsistency::Strong) {
+            self.scan_local_range(table, start, end, batch_rows, cancelled, on_batch)
+        } else if self.supports_bounded_scans() {
+            self.scan_quorum_range(table, start, end, batch_rows, cancelled, on_batch)
+        } else {
+            // Source-compatible custom transports may implement only whole-range
+            // reads. Retain that established behavior, without advertising bounds.
+            let rows = self.range(table, start, end, consistency)?;
+            for batch in rows.chunks(batch_rows) {
+                if cancelled() || !on_batch(batch)? {
+                    break;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1143,6 +1630,19 @@ fn rendezvous_score(table: &str, key: &[u8], node_id: NodeId) -> u64 {
     hasher.update(&node_id.to_be_bytes());
     let hash = hasher.finalize();
     u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap_or([0; 8]))
+}
+
+fn version_range_bounds(
+    table: &str,
+    start: &[u8],
+    end: &[u8],
+) -> Result<(Bytes, Bytes), StorageError> {
+    let upper = if end.is_empty() {
+        crate::keyenc::range_end(&version_key(table, &[])?)
+    } else {
+        version_key(table, end)?
+    };
+    Ok((version_key(table, start)?, upper))
 }
 
 fn version_key(table: &str, key: &[u8]) -> Result<Bytes, StorageError> {
@@ -1301,12 +1801,6 @@ fn merge_record_sets(
         .collect()
 }
 
-fn merge_many_record_sets(
-    sets: impl IntoIterator<Item = Vec<VersionedRecord>>,
-) -> Vec<VersionedRecord> {
-    sets.into_iter().fold(Vec::new(), merge_record_sets)
-}
-
 fn records_to_writes(records: &[VersionedRecord]) -> Vec<VersionedWrite> {
     records
         .iter()
@@ -1430,6 +1924,27 @@ pub struct InProcessApTransport {
 }
 
 pub trait ApReplicaEndpoint: Send + Sync {
+    /// Whether local page reads reserve before decoding/copying.
+    fn supports_guarded_range_pages(&self) -> bool {
+        false
+    }
+
+    /// Fetches a local page after reserving all owned decode/output buffers.
+    /// # Errors
+    /// Fails when guarded pages are unsupported or a read/budget check fails.
+    fn read_range_page_guarded(
+        &self,
+        _table: &str,
+        _start: &[u8],
+        _end: &[u8],
+        _limit: usize,
+        _budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<GuardedApPage, ReplError> {
+        Err(ReplError::Unsupported(
+            "guarded AP pages are not supported".to_owned(),
+        ))
+    }
+
     /// Receives one AP batch.
     /// # Errors
     /// Fails when the replica rejects the batch.
@@ -1444,6 +1959,56 @@ pub trait ApReplicaEndpoint: Send + Sync {
     /// # Errors
     /// Fails when the replica rejects the scan.
     fn read_all_versions(&self) -> Result<Vec<VersionedRecord>, ReplError>;
+
+    /// Visits AP records until the callback returns false. Native replicas
+    /// stream storage rows; legacy custom endpoints retain their existing eager
+    /// implementation unless they override this method.
+    /// # Errors
+    /// Fails when scanning or the callback fails.
+    fn visit_all_versions(
+        &self,
+        visitor: &mut dyn FnMut(VersionedRecord) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        for record in self.read_all_versions()? {
+            if !visitor(record)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Visits ordered Merkle entries until the limit or callback stops the scan.
+    /// Native replicas stream; the default preserves legacy custom endpoints.
+    /// # Errors
+    /// Fails when scanning or the callback fails.
+    fn visit_merkle_range(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        visitor: &mut dyn FnMut(Bytes, Bytes) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        for (key, value) in self.read_merkle_range(prefix, limit)? {
+            if !visitor(key, value)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a bounded, ordered range page. An empty `end` is unbounded.
+    /// # Errors
+    /// Fails when paging is unsupported or the replica rejects the scan.
+    fn read_range_page(
+        &self,
+        _table: &str,
+        _start: &[u8],
+        _end: &[u8],
+        _limit: usize,
+    ) -> Result<Vec<VersionedRecord>, ReplError> {
+        Err(ReplError::Unsupported(
+            "bounded AP range pages are not supported".to_owned(),
+        ))
+    }
 
     /// Reads AP records identified by encoded AP version keys.
     /// # Errors
@@ -1488,6 +2053,47 @@ impl Default for InProcessApTransport {
 
 #[cfg(test)]
 impl ApTransport for InProcessApTransport {
+    fn supports_guarded_range_pages(&self) -> bool {
+        self.nodes.lock().is_ok_and(|nodes| {
+            nodes
+                .values()
+                .all(|node| node.supports_guarded_range_pages())
+        })
+    }
+
+    fn send_batch_guarded(
+        &self,
+        target: NodeId,
+        writes: &[VersionedWrite],
+        budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        self.send_batch(target, writes)
+    }
+
+    fn read_range_page_guarded(
+        &self,
+        target: NodeId,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<GuardedApPage, ReplError> {
+        let endpoint = self
+            .nodes
+            .lock()
+            .map_err(|_| ReplError::Transport("AP transport nodes lock poisoned".to_owned()))?
+            .get(&target)
+            .cloned()
+            .ok_or_else(|| ReplError::Transport(format!("unknown AP target {target}")))?;
+        endpoint.read_range_page_guarded(table, start, end, limit, budget)
+    }
+
+    fn supports_range_pages(&self) -> bool {
+        true
+    }
+
     fn send_batch(&self, target: NodeId, writes: &[VersionedWrite]) -> Result<(), ReplError> {
         self.nodes
             .lock()
@@ -1520,6 +2126,22 @@ impl ApTransport for InProcessApTransport {
             .read_all_versions()
     }
 
+    fn read_range_page(
+        &self,
+        target: NodeId,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<VersionedRecord>, ReplError> {
+        self.nodes
+            .lock()
+            .map_err(|_| ReplError::Transport("test AP transport lock poisoned".to_owned()))?
+            .get(&target)
+            .ok_or_else(|| ReplError::Transport(format!("missing AP node {target}")))?
+            .read_range_page(table, start, end, limit)
+    }
+
     fn read_merkle_range(
         &self,
         target: NodeId,
@@ -1549,6 +2171,21 @@ impl ApTransport for InProcessApTransport {
 }
 
 impl<S: StorageEngine> ApReplicaEndpoint for ApDynamo<S> {
+    fn supports_guarded_range_pages(&self) -> bool {
+        self.storage.supports_guarded_reads()
+    }
+
+    fn read_range_page_guarded(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        budget: &dyn crate::storage::ReadBudget,
+    ) -> Result<GuardedApPage, ReplError> {
+        self.guarded_local_page(table, start, end, limit, budget)
+    }
+
     fn receive_batch(&self, writes: &[VersionedWrite]) -> Result<(), ReplError> {
         self.apply_versioned_writes(writes)?;
         Ok(())
@@ -1560,6 +2197,32 @@ impl<S: StorageEngine> ApReplicaEndpoint for ApDynamo<S> {
 
     fn read_all_versions(&self) -> Result<Vec<VersionedRecord>, ReplError> {
         Ok(self.local_all_versions()?)
+    }
+
+    fn visit_all_versions(
+        &self,
+        visitor: &mut dyn FnMut(VersionedRecord) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        self.visit_local_versions(visitor)
+    }
+
+    fn visit_merkle_range(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+        visitor: &mut dyn FnMut(Bytes, Bytes) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        self.visit_local_merkle(prefix, limit, visitor)
+    }
+
+    fn read_range_page(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<VersionedRecord>, ReplError> {
+        self.local_range_page(table, start, end, limit)
     }
 
     fn read_records_by_version_keys(

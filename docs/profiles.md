@@ -190,7 +190,7 @@ profile.
 | `floors.audit` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.audit.enabled`); at runtime `create_database_with_profile` refuses audit off (`ProfileFloorNotMet`), `set_audit_enabled_as` keeps audit on, and restore refuses a backup with audit off unless `RestoreConfig.allow_unmet_profile_floors` (`restore --allow-unmet-floors`) | enforced | not applicable |
 | `floors.backup` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR`, or `PRODUCTION_BACKUP_DISABLED` for production_cp (`guarantees.backup.enabled`) | enforced | not applicable |
 | `floors.pitr` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.backup.pitr`) | enforced | not applicable |
-| `floors.encryption_at_rest` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.encryption.at_rest`); at runtime `create_database_with_profile` refuses a database without `OperationalConfig.encryption` (`ProfileFloorNotMet`), and restore, whose target is never encrypted, refuses unless `RestoreConfig.allow_unmet_profile_floors` (`restore --allow-unmet-floors`); it covers the database file and is never checked on backup, whose files are encrypted by backup encryption, by default the database's own encryption config (see [Backup and restore](#backup-and-restore)) | enforced | not applicable |
+| `floors.encryption_at_rest` | true \| false, may only be raised | validation | `GUARANTEE_BELOW_PROFILE_FLOOR` (`guarantees.encryption.at_rest`); at runtime `create_database_with_profile` refuses a database without `OperationalConfig.encryption` (`ProfileFloorNotMet`), and restore defaults to plaintext but accepts an explicitly encrypted target through `RestoreConfig.target_encryption`; a plaintext target refuses this floor unless `RestoreConfig.allow_unmet_profile_floors` (`restore --allow-unmet-floors`); it covers the database file and is never checked on backup, whose files are encrypted by backup encryption, by default the database's own encryption config (see [Backup and restore](#backup-and-restore)) | enforced | not applicable |
 | `compatible_roles` | a set of collection roles, changed with `add` / `remove` | validation | `ROLE_OUTSIDE_PROFILE_CERTIFICATION` | enforced | not applicable |
 
 `auto` keeps the storage profile default; `null` retention keeps data forever.
@@ -643,7 +643,9 @@ incremental payload in memory:
   (`schema_version`, the manifest) are copied verbatim, as before.
 - Restore refuses, with `BackupError::ProfileFloorsNotMet { floors }`, a
   backup whose restored database would not meet a manifest floor, and leaves
-  the target absent or empty. Like every restore target in this build, the
+  the target absent. Restore requires a new path; existing files (including
+  empty files) and symlinks are refused. See [restore safety and compatibility](backup-and-restore.md).
+  Like every restore target in this build, the
   target is not encrypted at rest, so `floors.encryption_at_rest` is never
   met; audit is restored as backed up, so `floors.audit` is missed when the
   audit flag of the restored state (the last write at or below the restore

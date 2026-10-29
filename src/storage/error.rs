@@ -12,6 +12,15 @@ pub enum StorageError {
     #[error("write conflict")]
     Conflict,
 
+    #[error("read resource limit: {0}")]
+    ResourceLimit(String),
+
+    #[error("read timeout: {0}")]
+    Timeout(String),
+
+    #[error("read cancelled: {0}")]
+    Cancelled(String),
+
     #[error("storage backend error: {0}")]
     Backend(String),
 }

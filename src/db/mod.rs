@@ -100,6 +100,9 @@ use crate::vector::{
 };
 
 mod audit_batch;
+mod audit_startup;
+mod runtime_health;
+pub(crate) use runtime_health::{RuntimeHealth, RuntimeHealthCondition};
 mod changefeed_policy;
 mod graphrag;
 mod history;
@@ -110,10 +113,11 @@ mod review_fixes;
 mod runtime;
 mod sql_cache;
 mod tensor;
+mod vector_search;
 
 pub(crate) use profile_binding::{
-    MANIFEST_VERSION, create_restore_target, decode_profile_manifest, performance_for_manifest,
-    unmet_profile_floors, validate_manifest,
+    MANIFEST_VERSION, create_restore_target, create_restore_target_with_keys,
+    decode_profile_manifest, performance_for_manifest, unmet_profile_floors, validate_manifest,
 };
 pub use profile_binding::{
     MetadataProbe, PersistedProfileManifest, ProbedMetadata, RuntimeProfileBinding, StorageFormat,
@@ -1011,6 +1015,84 @@ impl HealingBackend for DatabaseHealingBackend {
 }
 
 impl Replication for DatabaseRepl {
+    fn supports_guarded_reads(&self) -> bool {
+        self.replication_ref().supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let result = self
+            .replication_ref()
+            .visit_get(table, key, consistency, budget, visitor);
+        observability::record_replication_operation(
+            "read",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(error) = &result {
+            observability::record_replication_error(error.metric_kind());
+        }
+        result
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let result = self
+            .replication_ref()
+            .visit_many(table, keys, consistency, budget, visitor);
+        observability::record_replication_operation(
+            "read_many",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(error) = &result {
+            observability::record_replication_error(error.metric_kind());
+        }
+        result
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let result =
+            self.replication_ref()
+                .visit_range(table, start, end, consistency, budget, visitor);
+        observability::record_replication_operation(
+            "range",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(error) = &result {
+            observability::record_replication_error(error.metric_kind());
+        }
+        result
+    }
+
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        self.replication_ref()
+            .propose_plain_document_lww(collection_id, op)
+    }
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        self.replication_ref().registered_keyspaces()
+    }
     fn read_many(
         &self,
         table: &str,
@@ -1098,6 +1180,15 @@ impl Replication for DatabaseRepl {
             observability::record_replication_error(error.metric_kind());
         }
         result
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        self.replication_ref()
+            .propose_authorized_conditional_batch(batch, authorization)
     }
 
     fn read(
@@ -1500,6 +1591,48 @@ impl Database {
                 key: credential.username.as_bytes().to_vec(),
                 value,
             }],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces a credential only while the verified credential is still current.
+    /// `None` creates an account only if no other initializer has created it.
+    /// # Errors
+    /// Fails with a conflict on concurrent rotation, or on metadata/storage errors.
+    pub fn compare_and_set_admin_credential(
+        &self,
+        expected: Option<&AdminCredentialRecord>,
+        credential: &AdminCredentialRecord,
+    ) -> Result<(), DbError> {
+        let key = credential.username.as_bytes().to_vec();
+        let current_bytes =
+            self.replication_ref()
+                .read(ADMIN_AUTH_TABLE, &key, ReadConsistency::Strong)?;
+        let current: Option<AdminCredentialRecord> = current_bytes
+            .as_ref()
+            .map(|bytes| {
+                serde_json::from_slice(bytes).map_err(|error| DbError::Serde(error.to_string()))
+            })
+            .transpose()?;
+        if current.as_ref() != expected {
+            return Err(ReplError::Conflict.into());
+        }
+        let value =
+            serde_json::to_vec(credential).map_err(|error| DbError::Serde(error.to_string()))?;
+        crate::repl::propose_system_conditional_batch(
+            self.replication_ref(),
+            ConditionalBatch::new(
+                vec![WriteCondition::ValueEquals {
+                    table: ADMIN_AUTH_TABLE.to_owned(),
+                    key: key.clone(),
+                    expected: current_bytes,
+                }],
+                vec![Op::Put {
+                    table: ADMIN_AUTH_TABLE.to_owned(),
+                    key,
+                    value,
+                }],
+            ),
         )?;
         Ok(())
     }
@@ -3157,10 +3290,13 @@ impl Database {
         name: &str,
         token: ResumeToken,
     ) -> Result<SubscriptionState, DbError> {
-        let state = cdc::subscription_state(self.replication_ref(), name)?;
-        cdc::require_subscription_owner(&state, principal)?;
-        cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
-        Ok(cdc::ack_subscription(self.replication_ref(), name, token)?)
+        Ok(cdc::ack_subscription_as(
+            self.replication_ref(),
+            &self.authz,
+            principal,
+            name,
+            token,
+        )?)
     }
 
     /// Reads a named CDC subscription state.
@@ -3224,9 +3360,11 @@ impl Database {
         name: &str,
         token: ResumeToken,
     ) -> Result<ContinuousQueryState, DbError> {
-        let state = continuous::ack_continuous_query(self.replication_ref(), name, token.clone())?;
-        cdc::ack_subscription(self.replication_ref(), name, token)?;
-        Ok(state)
+        Ok(continuous::ack_continuous_query_and_subscription(
+            self.replication_ref(),
+            name,
+            token,
+        )?)
     }
 
     /// Acknowledges a continuous query after checking RBAC on its subscription filter.
@@ -3238,10 +3376,13 @@ impl Database {
         name: &str,
         token: ResumeToken,
     ) -> Result<ContinuousQueryState, DbError> {
-        let state = cdc::subscription_state(self.replication_ref(), name)?;
-        cdc::require_subscription_owner(&state, principal)?;
-        cdc::authorize_filter_access(&self.authz, principal, &state.config.filter)?;
-        self.ack_continuous_query(name, token)
+        Ok(continuous::ack_continuous_query_and_subscription_as(
+            self.replication_ref(),
+            &self.authz,
+            principal,
+            name,
+            token,
+        )?)
     }
 
     /// Registers an outbox connector in durable metadata.
@@ -3682,6 +3823,7 @@ impl Database {
         sql: &str,
         guard: Option<&mut dyn SqlReadGuard>,
     ) -> Result<SqlOutput, DbError> {
+        validate_sql_text_size(sql, &self.performance.query)?;
         let started = Instant::now();
         let _query_permit = self.acquire_query_permit().await.map_err(DbError::from)?;
         if let Some((rewritten, point)) = parse_as_of_query(sql)? {
@@ -3747,6 +3889,7 @@ impl Database {
     /// # Errors
     /// Fails when the temporal point is outside retention, unsupported, or execution fails.
     pub async fn query_as_of(&self, sql: &str, point: TemporalPoint) -> Result<SqlOutput, DbError> {
+        let _query_permit = self.acquire_query_permit().await.map_err(DbError::from)?;
         self.query_as_of_with_read_guard(sql, point, None).await
     }
 
@@ -3756,6 +3899,7 @@ impl Database {
         point: TemporalPoint,
         guard: Option<&mut dyn SqlReadGuard>,
     ) -> Result<SqlOutput, DbError> {
+        validate_sql_text_size(sql, &self.performance.query)?;
         if self.repl.is_ap() {
             return Err(TemporalError::Unsupported(
                 "AP replication does not support temporal AS OF".to_owned(),
@@ -3768,10 +3912,30 @@ impl Database {
             )
             .into());
         }
-        let lsn = crate::temporal::resolve_temporal_point(self.replication_ref(), point)?;
+        let temporal_started = Instant::now();
+        let lsn = crate::query::resolve_temporal_point_with_budget(
+            self.replication_ref(),
+            point,
+            &self.performance.query,
+        )?;
         self.validate_temporal_retention_for_sql(sql, lsn)?;
         let _history_pin = self.pin_history_lsn(lsn)?;
         let engine = self.sql_engine()?.as_ref().clone().with_snapshot_lsn(lsn);
+        let elapsed = temporal_started.elapsed();
+        let timeout = Duration::from_millis(self.performance.query.timeout_ms);
+        if elapsed >= timeout {
+            return Err(QueryError::Timeout(format!(
+                "query exceeded {} ms",
+                self.performance.query.timeout_ms
+            ))
+            .into());
+        }
+        let remaining_ms = self
+            .performance
+            .query
+            .timeout_ms
+            .saturating_sub(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        let engine = engine.with_query_timeout_ms(remaining_ms);
         Ok(engine.execute_with_read_guard(sql, guard).await?)
     }
 
@@ -3828,6 +3992,10 @@ impl Database {
         }))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the built-in dispatch and bounded graph SQL conversion in one operation."
+    )]
     fn execute_phase19_sql(&self, sql: &str) -> Result<Option<SqlOutput>, DbError> {
         let Some(call) = parse_phase19_call(sql)? else {
             return Ok(None);
@@ -3898,36 +4066,59 @@ impl Database {
                     rows,
                 })))
             }
-            "graph_neighbors" => {
-                if call.args.len() != 4 {
-                    return Err(QueryError::Unsupported(sql.to_owned()).into());
-                }
-                let graph = self.graph(call.args[0].as_str()?)?;
-                let start = GraphNodeId::from_str_id(call.args[1].as_str()?);
-                let depth = call.args[3].as_usize()?;
-                let rows = graph
-                    .k_hop(
-                        &start,
-                        call.args[2].as_str()?,
-                        TraversalOptions {
-                            max_depth: depth,
-                            max_expansion: 10_000,
-                        },
-                    )?
-                    .into_iter()
-                    .map(|node| {
-                        vec![Value::Str(
-                            String::from_utf8_lossy(node.as_bytes()).into_owned(),
-                        )]
-                    })
-                    .collect();
-                Ok(Some(SqlOutput::Rows(crate::query::SqlRows {
-                    columns: vec!["node".to_owned()],
-                    rows,
-                })))
-            }
+            "graph_neighbors" => Ok(Some(self.execute_graph_neighbors_sql(&call, sql)?)),
             _ => Ok(None),
         }
+    }
+
+    fn execute_graph_neighbors_sql(
+        &self,
+        call: &Phase19Call,
+        sql: &str,
+    ) -> Result<SqlOutput, DbError> {
+        if call.args.len() != 4 {
+            return Err(QueryError::Unsupported(sql.to_owned()).into());
+        }
+        let limits = crate::vector::execution::ExecutionLimits::new(
+            Duration::from_millis(self.performance.query.timeout_ms),
+            self.performance.query.memory_limit_bytes,
+        )?;
+        limits.check()?;
+        let budget = crate::vector::execution::ExecutionReadBudget::new(limits);
+        let graph = self.graph(call.args[0].as_str()?)?;
+        let start = GraphNodeId::from_str_id(call.args[1].as_str()?);
+        let depth = call.args[3].as_usize()?;
+        let (nodes, _reservations) = graph
+            .k_hop_guarded(
+                &start,
+                call.args[2].as_str()?,
+                TraversalOptions {
+                    max_depth: depth,
+                    max_expansion: 10_000,
+                },
+                &budget,
+            )
+            .map_err(|error| match error {
+                GraphError::Execution(error) => DbError::Query(error),
+                GraphError::Storage(error) | GraphError::Repl(ReplError::Storage(error)) => {
+                    DbError::Query(QueryError::from(error))
+                }
+                other => DbError::Graph(other),
+            })?;
+        let rows = nodes
+            .into_iter()
+            .map(|node| {
+                limits.check()?;
+                Ok(vec![Value::Str(
+                    String::from_utf8_lossy(node.as_bytes()).into_owned(),
+                )])
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        limits.check()?;
+        Ok(SqlOutput::Rows(crate::query::SqlRows {
+            columns: vec!["node".to_owned()],
+            rows,
+        }))
     }
 
     /// Runs SQL after checking RBAC for the referenced resources.
@@ -3972,13 +4163,17 @@ impl Database {
             self.authorize_or_audit(principal, resource, *permission, "query_as_of")?;
         }
 
-        let result = match self.sql_read_authorizer(principal, "query_as_of", &requirements) {
-            Ok(mut authorizer) => {
-                self.query_as_of_with_read_guard(sql, point, Some(&mut authorizer))
-                    .await
+        let result = async {
+            let _query_permit = self.acquire_query_permit().await.map_err(DbError::from)?;
+            match self.sql_read_authorizer(principal, "query_as_of", &requirements) {
+                Ok(mut authorizer) => {
+                    self.query_as_of_with_read_guard(sql, point, Some(&mut authorizer))
+                        .await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        };
+        }
+        .await;
         let detail = format!("statements: {}", requirements.len());
         self.record_audit(&AuditEvent::new(
             Some(principal),
@@ -4005,6 +4200,16 @@ impl Database {
         requirements: &[(Resource, Permission)],
     ) -> Result<SqlReadAuthorizer<'a>, DbError> {
         let policy = self.policy_config()?;
+        if requirements.iter().any(|(resource, permission)| {
+            *permission == Permission::Read
+                && matches!(resource, Resource::Graph(_))
+                && policy_has_row_or_masking(&policy, resource)
+        }) {
+            return Err(ExtensionError::PolicyDenied(
+                "graph traversals with row or masking policies are not supported".to_owned(),
+            )
+            .into());
+        }
         let searches_index = requirements.iter().any(|(resource, _)| {
             matches!(resource, Resource::FullTextIndex(_) | Resource::GeoIndex(_))
         });
@@ -4165,11 +4370,31 @@ impl Database {
     /// # Errors
     /// Fails when an audit row is missing integrity metadata, has been changed, or the chain is broken.
     pub fn verify_audit_chain(&self) -> Result<(), DbError> {
+        let result = self.verify_audit_chain_unsealed();
+        if matches!(
+            &result,
+            Err(DbError::AuditIntegrity(_)
+                | DbError::Serde(_)
+                | DbError::Storage(StorageError::Corruption(_))
+                | DbError::Repl(ReplError::Storage(StorageError::Corruption(_))))
+        ) {
+            self.audit_batch.mark_failed();
+        }
+        result
+    }
+
+    fn verify_audit_chain_unsealed(&self) -> Result<(), DbError> {
         let _audit_guard = self
             .audit_lock
             .lock()
             .map_err(|_| DbError::AuditIntegrity("audit lock poisoned".to_owned()))?;
-        let key = self.audit_key()?;
+        // Read-only forensic verification remains available after the append sink seals.
+        // It never clears the admission/fatal state or re-signs any record.
+        let key = audit_startup::configured_key(&self.audit_config)?;
+        self.check_audit_key_binding(&key)?;
+        if self.verify_local_audit_chain(&key)? {
+            return Ok(());
+        }
         let mut events = self.audit_events()?;
         events.sort_by_key(|event| {
             event
@@ -4700,6 +4925,12 @@ impl Database {
         permission: Permission,
         action: &str,
     ) -> Result<(), DbError> {
+        if self.audit_config.key_path.is_some() {
+            // A key change already visible at admission must not reach a mutating API.
+            // A later sink failure still has the documented uncertain-commit outcome.
+            self.audit_batch.check_admission()?;
+            let _ = self.audit_key()?;
+        }
         self.authorize_with_audit(principal, resource, permission, action)
             .map_err(DbError::AuthzDenied)
     }
@@ -4750,14 +4981,15 @@ impl Database {
     }
 
     fn audit_key(&self) -> Result<[u8; 32], DbError> {
-        let Some(path) = &self.audit_config.key_path else {
-            return Ok(blake3::derive_key(
-                "multidb default audit integrity key",
-                b"development default audit key",
-            ));
-        };
-        let bytes = std::fs::read(path).map_err(StorageError::Io)?;
-        parse_audit_key_file(&bytes).map_err(DbError::AuditIntegrity)
+        self.audit_batch.check_admission()?;
+        let result = audit_startup::configured_key(&self.audit_config).and_then(|key| {
+            self.check_audit_key_binding(&key)?;
+            Ok(key)
+        });
+        if result.is_err() {
+            self.audit_batch.mark_failed();
+        }
+        result
     }
 
     fn persist_security_state(&self) -> Result<(), DbError> {
@@ -5484,6 +5716,43 @@ struct WritePipeline {
     sql_schema_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
+fn plain_document_catalog_allowed(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    collection_id: u32,
+) -> bool {
+    let mut source = false;
+    for entry in catalog.values() {
+        match entry {
+            CatalogEntry::Collection {
+                collection_id: id,
+                indexes,
+                ..
+            } if id.as_u32() == collection_id => {
+                if source || !indexes.is_empty() {
+                    return false;
+                }
+                source = true;
+            }
+            CatalogEntry::Vector {
+                collection_id: id, ..
+            } if id.as_u32() == collection_id => return false,
+            CatalogEntry::FullTextIndex { config } => {
+                let TextSource::Collection {
+                    collection_id: id, ..
+                } = &config.source;
+                if id.as_u32() == collection_id {
+                    return false;
+                }
+            }
+            CatalogEntry::GeoIndex { config } if config.collection_id.as_u32() == collection_id => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    source
+}
+
 /// Maps rejections raised before the commit into the caller's error type.
 trait PipelineError: From<ReplError> {
     fn trigger(error: DbError) -> Self;
@@ -6015,6 +6284,113 @@ impl WritePipeline {
 }
 
 impl Replication for WritePipeline {
+    fn supports_guarded_reads(&self) -> bool {
+        self.backend.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend
+            .visit_get(table, key, consistency, budget, visitor)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend
+            .visit_many(table, keys, consistency, budget, visitor)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.backend
+            .visit_range(table, start, end, consistency, budget, visitor)
+    }
+
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        let catalog = read_catalog_from_repl(self.backend.as_ref())
+            .map_err(|error| db_trigger_to_repl(&DbError::Config(error)))?;
+        if !plain_document_catalog_allowed(&catalog, collection_id) {
+            return Err(ReplError::Unsupported(
+                "plain AP document LWW requires a known collection without indexes".to_owned(),
+            ));
+        }
+        let source_key = match &op {
+            Op::Put { table, key, .. } | Op::Delete { table, key }
+                if table == DOCUMENT_TABLE
+                    && key.len() == 20
+                    && key.starts_with(&collection_id.to_be_bytes()) =>
+            {
+                key.clone()
+            }
+            _ => {
+                return Err(ReplError::Unsupported(
+                    "plain AP document LWW requires one source document".to_owned(),
+                ));
+            }
+        };
+        self.execute(
+            ConditionalBatch::new(Vec::new(), vec![op]),
+            None,
+            |mut batch| {
+                if !batch.conditions.is_empty() || batch.ops.len() != 1 {
+                    return Err(ReplError::Unsupported(
+                        "plain AP document LWW cannot include index or trigger deltas".to_owned(),
+                    ));
+                }
+                let op = batch.ops.pop().ok_or_else(|| {
+                    ReplError::Unsupported("missing plain document write".to_owned())
+                })?;
+                if !matches!(&op, Op::Put { table, key, .. } | Op::Delete { table, key }
+                if table == DOCUMENT_TABLE && *key == source_key)
+                {
+                    return Err(ReplError::Unsupported(
+                        "plain AP document LWW changed its source identity".to_owned(),
+                    ));
+                }
+                self.backend.propose_plain_document_lww(collection_id, op)
+            },
+        )
+    }
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        self.backend.registered_keyspaces()
+    }
     fn read_many(
         &self,
         table: &str,
@@ -6058,6 +6434,21 @@ impl Replication for WritePipeline {
     ) -> Result<(), ReplError> {
         let schema_changed = sql_cache::schema_changed(&ops);
         self.backend.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        let schema_changed = sql_cache::schema_changed(&batch.ops);
+        self.backend
+            .propose_authorized_conditional_batch(batch, authorization)?;
         if schema_changed {
             self.sql_schema_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -6358,6 +6749,72 @@ impl Drop for Database {
 }
 
 impl Replication for Database {
+    fn supports_guarded_reads(&self) -> bool {
+        self.repl.supports_guarded_reads()
+    }
+
+    fn visit_get(
+        &self,
+        table: &str,
+        key: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.repl
+            .visit_get(table, key, consistency, budget, visitor)
+    }
+
+    fn visit_many(
+        &self,
+        table: &str,
+        keys: &[Bytes],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(usize, Option<&[u8]>) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.repl
+            .visit_many(table, keys, consistency, budget, visitor)
+    }
+
+    fn visit_range(
+        &self,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        consistency: ReadConsistency,
+        budget: &dyn crate::storage::ReadBudget,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool, ReplError>,
+    ) -> Result<(), ReplError> {
+        budget.check()?;
+        let _query_permit = self
+            .tenant
+            .as_ref()
+            .map(|tenant| tenant.try_begin_query().map_err(repl_quota_error))
+            .transpose()?;
+        self.repl
+            .visit_range(table, start, end, consistency, budget, visitor)
+    }
+
+    fn propose_plain_document_lww(&self, collection_id: u32, op: Op) -> Result<(), ReplError> {
+        self.write_pipeline()
+            .propose_plain_document_lww(collection_id, op)
+    }
+    fn registered_keyspaces(&self) -> Result<Vec<String>, ReplError> {
+        self.repl.registered_keyspaces()
+    }
     fn read_many(
         &self,
         table: &str,
@@ -6402,6 +6859,20 @@ impl Replication for Database {
     ) -> Result<(), ReplError> {
         let schema_changed = sql_cache::schema_changed(&ops);
         self.repl.propose_authorized_batch(ops, authorization)?;
+        if schema_changed {
+            self.sql_catalog_cache.invalidate();
+        }
+        Ok(())
+    }
+
+    fn propose_authorized_conditional_batch(
+        &self,
+        batch: ConditionalBatch,
+        authorization: txn::WriteAuthorization,
+    ) -> Result<(), ReplError> {
+        let schema_changed = sql_cache::schema_changed(&batch.ops);
+        self.repl
+            .propose_authorized_conditional_batch(batch, authorization)?;
         if schema_changed {
             self.sql_catalog_cache.invalidate();
         }
@@ -6614,6 +7085,11 @@ pub fn open_database_with_ops(
     security.audit.clone_from(&ops.security.audit);
     database.apply_tenant_config(ops.tenant.clone());
     database.apply_security_config(security);
+    if ops.security.audit.key_path.is_some() || ops.security.audit.anchor_path.is_some() {
+        database
+            .apply_audit_config(ops.security.audit.clone())
+            .map_err(|error| ConfigError::Unsupported(error.to_string()))?;
+    }
     profile_binding::warn_unmet_profile_floors(read.manifest.as_ref(), &database);
     Ok(database)
 }
@@ -7299,6 +7775,10 @@ pub fn validate(config: &DbConfig) -> Result<(), ConfigError> {
 /// Fails when operational settings contradict the selected profile.
 pub fn validate_operational(config: &DbConfig, ops: &OperationalConfig) -> Result<(), ConfigError> {
     validate(config)?;
+    if ops.security.audit.key_path.is_some() {
+        audit_startup::configured_key(&ops.security.audit)
+            .map_err(|error| ConfigError::Unsupported(error.to_string()))?;
+    }
 
     if !ops.security.audit_enabled {
         return Err(ConfigError::Unsupported(
@@ -7578,6 +8058,14 @@ fn sql_requirements(
     catalog: &BTreeMap<String, CatalogEntry>,
     limits: &QueryExecutionConfig,
 ) -> Result<Vec<(Resource, Permission)>, DbError> {
+    validate_sql_text_size(sql, limits)?;
+    // Execution intercepts the temporal suffix before the SQL parser. Extract
+    // permissions from exactly that same statement, retaining the original
+    // input-size check and all nested relation/policy checks.
+    let temporal = parse_as_of_query(sql)?;
+    let sql = temporal
+        .as_ref()
+        .map_or(sql, |(statement, _)| statement.as_str());
     if compat::compat_sql_requirements(sql, limits)? {
         return Ok(vec![(Resource::Database, Permission::Read)]);
     }
@@ -7659,6 +8147,17 @@ fn sql_requirements(
     requirements.sort();
     requirements.dedup();
     Ok(requirements)
+}
+
+fn validate_sql_text_size(sql: &str, limits: &QueryExecutionConfig) -> Result<(), QueryError> {
+    if sql.len() > limits.max_sql_bytes {
+        return Err(QueryError::InputLimit(format!(
+            "SQL text is {} bytes, limit is {} bytes",
+            sql.len(),
+            limits.max_sql_bytes
+        )));
+    }
+    Ok(())
 }
 
 fn phase19_requirements(

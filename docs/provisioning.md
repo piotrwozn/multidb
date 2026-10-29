@@ -504,7 +504,7 @@ the change (`set_authz_policy_as`, `set_principal_registry_as`,
 | `backup.enabled`, `backup.pitr` | `operator_managed` with the `multidb backup`, `verify` and `restore` runbook and the Warning `GUARANTEE_OPERATOR_MANAGED`, when requested; there is no scheduler |
 | `encryption.at_rest` | `enforced` for a new database with an explicit `ProvisionEnvironment.encryption` config on the Rust API, CLI or serve surface, or for an open database that is encrypted. CLI and `serve` obtain a file-key config from `MULTIDB_ENCRYPTION_KEY_PATH`; without a key config the guarantee is `not_enforceable` (`GUARANTEE_NOT_ENFORCEABLE`, blocks). An existing database whose encryption differs from the spec is `PROVISION_ENCRYPTION_MISMATCH` (blocks): provisioning cannot encrypt or decrypt an existing database (`Database::reencrypt_existing_values` only rewrites the values of an encrypted database under its current key). A new encrypted database whose spec says `at_rest: false` is also refused before anything is created |
 | `sensitive_data` | follows `encryption.at_rest`; the development audit key warns but never blocks it |
-| `audit.enabled` | `enforced` with a configured runtime audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one. The CLI and `multidb serve` currently have no audit-key selector and use the development key; embedders can pass `OperationalConfig.security.audit` when opening the database or `ProvisionEnvironment.audit` to `open_from_spec`. A plan with steps against an existing database whose newest audit event does not verify under the handle's key is `PROVISION_AUDIT_KEY_MISMATCH` (blocks), since the events the apply appends would break `verify_audit_chain`; a noop is not blocked, since it writes nothing. The check reads the whole audit log |
+| `audit.enabled` | `enforced` with a configured runtime audit key; `enforced_with_development_key` and the Warning `AUDIT_DEVELOPMENT_KEY` without one. The CLI and `multidb serve` read `MULTIDB_AUDIT_KEY_PATH` and `MULTIDB_AUDIT_ANCHOR_PATH`; production `serve` requires a private key and, for durable profiles, an anchor. Embedders pass `OperationalConfig.security.audit` when opening the database or `ProvisionEnvironment.audit` to `open_from_spec`. A plan with steps against an existing database whose newest audit event does not verify under the handle's key is `PROVISION_AUDIT_KEY_MISMATCH` (blocks), since the events the apply appends would break `verify_audit_chain`; a noop is not blocked by this plan check. A configured opener separately verifies the complete signed prefix before startup or new audit events |
 | `cache` TTL and eviction, `event_log` append-only | `not_enforced`, the Warning `ROLE_CONSTRAINT_NOT_ENFORCED` |
 
 A guarantee the spec does not ask for is `not_requested`.
@@ -917,15 +917,17 @@ provisioning applied survive any restart, with or without spec mode: every
 opener loads the persisted RBAC state, and the bootstrap only adds the
 reserved `admin` role and principal when they are missing.
 
-**Known limit:** `MULTIDB_ENCRYPTION_KEY_PATH` selects the data-encryption
-key, not an audit key. Audit in `multidb serve` still uses the development
-key (`enforced_with_development_key` and `AUDIT_DEVELOPMENT_KEY`), because
-the binary has no audit-key selector. A database whose audit chain uses an
-operator-configured key is refused with `PROVISION_AUDIT_KEY_MISMATCH` when
-a startup plan would change it. A noop can start, but subsequent admin audit
-events would use the development key. To preserve a keyed chain, serve
-through an embedder that opens the database with its matching runtime audit
-key and anchor; encryption alone does not configure them.
+**Audit keys:** `MULTIDB_ENCRYPTION_KEY_PATH` selects the data-encryption key;
+audit signing uses the separate `MULTIDB_AUDIT_KEY_PATH` and
+`MULTIDB_AUDIT_ANCHOR_PATH` settings in both flat and spec mode. Production
+`serve` requires an existing private key and a durable anchor for durable
+profiles. Local development without an audit key keeps the explicit development
+key status (`enforced_with_development_key` and `AUDIT_DEVELOPMENT_KEY`). The
+configured opener verifies the existing signed prefix before bootstrap,
+provisioning or new audit events, including noop starts. Use the original key
+for an existing chain: changing a file or Secret does not re-sign historical
+records and a mismatch fails closed. See [audit key and anchor setup](docker.md#audit-signing-and-restart)
+for permissions, restart recovery and migration from development history.
 
 **Embedded apps** use `open_from_spec(spec, path, mode, options, environment)`
 with the same decision table on the `rust_api` surface, as `local:embedded`.
@@ -983,6 +985,18 @@ principal needs the permissions: `serve` grants them only to the `admin` of
 the admin password bootstrap, or a spec grants them to a principal of its
 own.
 
+Password sessions are tied to the current durable admin credential. A successful
+`POST /auth/change-password` revokes all password sessions, including the token
+that made the request; sign in again with the new password. The same check rejects
+old sessions after another server state or a trusted embedded caller changes the
+credential. A password verified before a concurrent rotation cannot overwrite
+the newer credential; a conflicting change returns HTTP 409.
+
+Static operator bearer tokens (`MULTIDB_ADMIN_TOKEN`) keep their separate
+configured lifetime when the password changes. Password login also bounds the
+number of active sessions; HTTP 503 `session_error` means capacity is exhausted,
+so sign out an existing session or wait for expiry.
+
 **The flow** is plan, review, confirm:
 
 1. `POST /provision/plan` returns the plan with 200 when it is `ready`, a
@@ -1029,9 +1043,10 @@ creates a database and never opens a path from a request: a spec
 config or encrypt a plaintext database in place. An already-encrypted served
 database reports `encryption.at_rest: enforced`; a plaintext one cannot
 enforce an `at_rest: true` spec (`PROVISION_ENCRYPTION_MISMATCH`). Audit uses
-the runtime configuration of the served handle: the `multidb serve` binary
-uses the development key (`enforced_with_development_key`), while an embedder
-can supply its audit key and anchor when opening the database.
+the runtime configuration of the served handle: `multidb serve` reads
+`MULTIDB_AUDIT_KEY_PATH` and `MULTIDB_AUDIT_ANCHOR_PATH`, and an embedder supplies
+its audit key and anchor when opening the database. The HTTP API cannot replace
+these process-local settings or rekey an existing audit chain.
 
 **Known limits:**
 

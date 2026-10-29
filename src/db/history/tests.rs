@@ -818,7 +818,15 @@ fn incremental_backup_fails_closed_after_commit_log_truncation() -> TestResult {
         ),
         "{result:?}"
     );
-    assert_eq!(std::fs::read_dir(&root)?.count(), 1);
+    assert_eq!(crate::backup::list_backups(&root)?, vec![full.manifest]);
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            directories.push(entry.path());
+        }
+    }
+    assert_eq!(directories, vec![full.path]);
     Ok(())
 }
 

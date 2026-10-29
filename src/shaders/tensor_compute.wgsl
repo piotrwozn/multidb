@@ -20,16 +20,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let start = offsets[row];
     let end = offsets[row + 1u];
     let count = end - start;
-    // Mode 0: L2 distance. Scaling avoids overflowing intermediate differences/squares.
+    // Mode 0: L2 distance. Scale differences, so equal large coordinates cannot
+    // erase smaller differences in other dimensions before they are squared.
     if params.mode == 0u {
         var scale = 0.0;
         for (var i = 0u; i < params.dimension; i += 1u) {
-            scale = max(scale, max(abs(values[start + i]), abs(query[i])));
+            let a = values[start + i];
+            let b = query[i];
+            if ((a < 0.0 && b > 0.0) || (a > 0.0 && b < 0.0)) &&
+                abs(a) > 3.4028234663852886e38 - abs(b) {
+                output[row] = bitcast<f32>(0x7f800000u);
+                return;
+            }
+            scale = max(scale, abs(a - b));
         }
         var squared = 0.0;
         if scale > 0.0 {
             for (var i = 0u; i < params.dimension; i += 1u) {
-                let delta = values[start + i] / scale - query[i] / scale;
+                let delta = (values[start + i] - query[i]) / scale;
                 squared += delta * delta;
             }
         }

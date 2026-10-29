@@ -2,17 +2,19 @@
 
 FROM ubuntu:24.04 AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 multidb \
     && useradd --system --uid 10001 --gid multidb --home-dir /var/lib/multidb multidb \
-    && mkdir -p /var/lib/multidb /usr/share/multidb/studio \
-    && chown -R multidb:multidb /var/lib/multidb /usr/share/multidb
+    && mkdir -p /var/lib/multidb /usr/share/multidb/studio /tmp/multidb-runtime \
+    && chmod 0700 /tmp/multidb-runtime \
+    && chown -R multidb:multidb /var/lib/multidb /usr/share/multidb /tmp/multidb-runtime
 
 COPY --chmod=0755 multidb /usr/local/bin/multidb
 COPY studio/ /usr/share/multidb/studio/
 
-ENV MULTIDB_BIND=0.0.0.0:8080 \
+ENV XDG_RUNTIME_DIR=/tmp/multidb-runtime \
+    MULTIDB_BIND=0.0.0.0:8080 \
     MULTIDB_PG_BIND=0.0.0.0:5432 \
     MULTIDB_DB_PATH=/var/lib/multidb/multidb.redb \
     MULTIDB_PROFILE=transactional \

@@ -576,13 +576,15 @@ fn decode_gorilla_chunk(bytes: &[u8]) -> Result<TimeChunk, TimeSeriesError> {
         let timestamp_millis = previous_ts
             .checked_add(delta)
             .ok_or_else(|| TimeSeriesError::Corruption("timestamp overflows i64".to_owned()))?;
-        points.push(TimePoint {
-            timestamp_millis,
-            value: f64::from_bits(bits),
-        });
+        points.push(decoded_point(timestamp_millis, bits)?);
         previous_ts = timestamp_millis;
         previous_delta = delta;
         previous_bits = bits;
+    }
+    if cursor != bytes.len() {
+        return Err(TimeSeriesError::Corruption(
+            "trailing bytes in Gorilla chunk".to_owned(),
+        ));
     }
     Ok(TimeChunk {
         series,
@@ -606,12 +608,14 @@ fn decode_legacy_chunk(bytes: &[u8]) -> Result<TimeChunk, TimeSeriesError> {
             .checked_add(delta)
             .ok_or_else(|| TimeSeriesError::Corruption("timestamp overflows i64".to_owned()))?;
         let bits = previous_bits ^ xor;
-        points.push(TimePoint {
-            timestamp_millis,
-            value: f64::from_bits(bits),
-        });
+        points.push(decoded_point(timestamp_millis, bits)?);
         previous_ts = timestamp_millis;
         previous_bits = bits;
+    }
+    if cursor != bytes.len() {
+        return Err(TimeSeriesError::Corruption(
+            "trailing bytes in legacy chunk".to_owned(),
+        ));
     }
     Ok(TimeChunk {
         series,
@@ -775,9 +779,19 @@ fn decode_point(bytes: &[u8]) -> Result<TimePoint, TimeSeriesError> {
     ts.copy_from_slice(&bytes[..8]);
     let mut value = [0_u8; 8];
     value.copy_from_slice(&bytes[8..]);
+    decoded_point(i64::from_be_bytes(ts), u64::from_be_bytes(value))
+}
+
+fn decoded_point(timestamp_millis: i64, bits: u64) -> Result<TimePoint, TimeSeriesError> {
+    let value = f64::from_bits(bits);
+    if !value.is_finite() {
+        return Err(TimeSeriesError::Corruption(
+            "non-finite stored point value".to_owned(),
+        ));
+    }
     Ok(TimePoint {
-        timestamp_millis: i64::from_be_bytes(ts),
-        value: f64::from_bits(u64::from_be_bytes(value)),
+        timestamp_millis,
+        value,
     })
 }
 
@@ -815,6 +829,11 @@ fn read_var_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, TimeSeriesError
     let mut shift = 0_u32;
     loop {
         let byte = read_u8(bytes, cursor)?;
+        if shift == 63 && byte > 1 {
+            return Err(TimeSeriesError::Corruption(
+                "varint is too large".to_owned(),
+            ));
+        }
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
@@ -1428,6 +1447,103 @@ mod tests {
             decode_chunk(&legacy),
             Err(TimeSeriesError::Corruption(_))
         ));
+        Ok(())
+    }
+
+    fn legacy_codec_bytes(chunk: &TimeChunk) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut bytes = Vec::new();
+        crate::keyenc::push_len_bytes(&mut bytes, chunk.series.as_bytes());
+        bytes.extend_from_slice(&chunk.bucket_start.to_be_bytes());
+        bytes.extend_from_slice(&u64::try_from(chunk.points.len())?.to_be_bytes());
+        let mut timestamp = chunk.bucket_start;
+        let mut bits = 0;
+        for point in &chunk.points {
+            let delta = point
+                .timestamp_millis
+                .checked_sub(timestamp)
+                .ok_or("legacy delta overflow")?;
+            bytes.extend_from_slice(&delta.to_be_bytes());
+            bytes.extend_from_slice(&(bits ^ point.value.to_bits()).to_be_bytes());
+            timestamp = point.timestamp_millis;
+            bits = point.value.to_bits();
+        }
+        Ok(bytes)
+    }
+
+    #[test]
+    fn both_chunk_formats_preserve_finite_values_and_reject_trailing_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = TimeChunk {
+            series: "cpu".to_owned(),
+            bucket_start: 0,
+            points: vec![
+                point(-100, -0.0),
+                point(0, f64::MAX),
+                point(2_000, -f64::MIN_POSITIVE),
+                point(3_000, f64::from_bits(1)),
+            ],
+        };
+        for mut bytes in [encode_chunk(&chunk)?, legacy_codec_bytes(&chunk)?] {
+            let decoded = decode_chunk(&bytes)?;
+            assert_eq!(decoded, chunk);
+            for (actual, expected) in decoded.points.iter().zip(&chunk.points) {
+                assert_eq!(actual.value.to_bits(), expected.value.to_bits());
+            }
+            bytes.push(0);
+            assert!(matches!(
+                decode_chunk(&bytes),
+                Err(TimeSeriesError::Corruption(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overflowing_gorilla_varints_cannot_alias_valid_counts_deltas_or_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut prefix = super::GORILLA_CHUNK_MAGIC.to_vec();
+        crate::keyenc::push_len_bytes(&mut prefix, b"cpu");
+        prefix.extend_from_slice(&0_i64.to_be_bytes());
+        let mut overflow = vec![0x80; 9];
+        overflow.push(2); // 2^64 must not truncate to zero at shift 63.
+        let count = [prefix.clone(), overflow.clone()].concat();
+        let delta = [prefix.clone(), vec![1, 1], overflow.clone(), vec![0]].concat();
+        let value = [prefix, vec![1, 1, 0, 1], overflow].concat();
+        for bytes in [count, delta, value] {
+            assert!(matches!(
+                decode_chunk(&bytes),
+                Err(TimeSeriesError::Corruption(_))
+            ));
+        }
+        let mut largest = Vec::new();
+        super::write_var_u64(&mut largest, u64::MAX);
+        let mut cursor = 0;
+        assert_eq!(super::read_var_u64(&largest, &mut cursor)?, u64::MAX);
+        assert_eq!(cursor, largest.len());
+        Ok(())
+    }
+
+    #[test]
+    fn all_stored_point_formats_reject_nonfinite_values() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let stored = point(0, value);
+            let chunk = TimeChunk {
+                series: "cpu".to_owned(),
+                bucket_start: 0,
+                points: vec![stored],
+            };
+            for bytes in [encode_chunk(&chunk)?, legacy_codec_bytes(&chunk)?] {
+                assert!(matches!(
+                    decode_chunk(&bytes),
+                    Err(TimeSeriesError::Corruption(_))
+                ));
+            }
+            assert!(matches!(
+                super::decode_point(&super::encode_point(stored)),
+                Err(TimeSeriesError::Corruption(_))
+            ));
+        }
         Ok(())
     }
 

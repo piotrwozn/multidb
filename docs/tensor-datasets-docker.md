@@ -83,6 +83,13 @@ also reports its execution device. GPU unavailability returns
 returns `422 tensor_gpu_unsupported`. The SDKs surface those errors without
 retrying on the CPU.
 
+GPU inputs must be zero or normal finite `f32` values; subnormal values and
+subnormal L2 differences are unsupported across native adapters. Queries use
+the database's `query.timeout_ms` budget, including the GPU queue wait. A timeout
+after GPU submission stops the device; restart the server before retrying GPU
+operations. A timeout while waiting for the dispatch lock leaves the current
+dispatch running.
+
 The shared HTTP request-body limit remains **1 MiB**, including JSON encoding.
 Larger binary storage chunk limits do not enlarge that transport limit. Tensor
 values use typed arrays, not arbitrary JSON document blobs. Search and reductions

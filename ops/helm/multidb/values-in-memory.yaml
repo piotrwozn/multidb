@@ -1,0 +1,12 @@
+# Deliberately volatile. Data, schema and durable credential state disappear on
+# process/pod restart; never use as a durable system of record.
+config:
+  profile: in_memory
+runtime:
+  allowVolatile: true
+persistence:
+  enabled: false
+  devEmptyDir: true
+  existingClaim: ""
+encryption:
+  enabled: false

@@ -271,6 +271,18 @@ async fn rbac_enforces_analyze_and_explain_permissions() -> Result<(), Box<dyn s
         database.query_as(&reader, "ANALYZE users").await,
         Err(DbError::AuthzDenied(_))
     ));
+    // ANALYZE returns raw counts/distributions, so table administration alone
+    // cannot authorize reading them. Both independent permissions are required.
+    assert!(matches!(
+        database.query_as(&admin, "ANALYZE users").await,
+        Err(DbError::AuthzDenied(_))
+    ));
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("users".to_owned()), Permission::Read),
+        Role::new("table_admin")
+            .grant(Resource::Table("users".to_owned()), Permission::Admin)
+            .grant(Resource::Table("users".to_owned()), Permission::Read),
+    ]));
     assert!(matches!(
         database.query_as(&admin, "ANALYZE users").await?,
         SqlOutput::Rows(_)
@@ -1405,7 +1417,7 @@ async fn sql_policies_with_non_scalar_values_refuse_only_their_table()
     assert!(
         matches!(
             &result,
-            Err(DbError::Query(QueryError::DataFusion(message))) if message.contains("not a scalar")
+            Err(DbError::Query(QueryError::Unsupported(message))) if message.contains("not a scalar")
         ),
         "{result:?}"
     );
@@ -5799,6 +5811,77 @@ async fn query_governor_limits_are_settable_and_a_full_queue_is_busy()
 
     drop(slot);
     database.query("SELECT id FROM counters").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_as_of_queries_share_the_governor_and_authorize_before_queueing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+    database.create_table("counters", Some(counter_schema()), Vec::new())?;
+    database.set_authz_policy(AuthzPolicy::new([
+        Role::new("reader").grant(Resource::Table("counters".to_owned()), Permission::Read)
+    ]));
+    let reader = Principal::new("alice").with_role("reader");
+    let denied = Principal::new("mallory");
+    let lsn = latest_lsn(&database)?;
+    database.set_query_governor(1, 1)?;
+
+    let slot = Arc::clone(&database.query_permits).acquire_owned().await?;
+    let trusted = database
+        .query_as_of("SELECT id FROM counters", TemporalPoint::Lsn(lsn))
+        .await;
+    assert!(
+        matches!(&trusted, Err(DbError::Query(QueryError::Busy(_)))),
+        "{trusted:?}"
+    );
+    let authorized = database
+        .query_as_of_as(&reader, "SELECT id FROM counters", TemporalPoint::Lsn(lsn))
+        .await;
+    assert!(
+        matches!(&authorized, Err(DbError::Query(QueryError::Busy(_)))),
+        "{authorized:?}"
+    );
+    let authorized_suffix = database
+        .query_as(&reader, &format!("SELECT id FROM counters AS OF LSN {lsn}"))
+        .await;
+    assert!(
+        matches!(&authorized_suffix, Err(DbError::Query(QueryError::Busy(_)))),
+        "{authorized_suffix:?}"
+    );
+    let unauthorized = database
+        .query_as_of_as(&denied, "SELECT id FROM counters", TemporalPoint::Lsn(lsn))
+        .await;
+    assert!(
+        matches!(&unauthorized, Err(DbError::AuthzDenied(_))),
+        "{unauthorized:?}"
+    );
+    drop(slot);
+
+    let expected = SqlOutput::Rows(SqlRows {
+        columns: vec!["id".to_owned()],
+        rows: Vec::new(),
+    });
+    assert_eq!(
+        database
+            .query_as_of("SELECT id FROM counters", TemporalPoint::Lsn(lsn))
+            .await?,
+        expected
+    );
+    assert_eq!(
+        database
+            .query_as_of_as(&reader, "SELECT id FROM counters", TemporalPoint::Lsn(lsn))
+            .await?,
+        expected
+    );
+    // The SQL dispatch already owns the sole permit; the private AS OF path
+    // must not acquire it a second time.
+    assert_eq!(
+        database
+            .query(&format!("SELECT id FROM counters AS OF LSN {lsn}"))
+            .await?,
+        expected
+    );
     Ok(())
 }
 

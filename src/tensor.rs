@@ -3,7 +3,10 @@
 //! Dataset revisions are append snapshots. Sample indexes are immutable, so a selected
 //! column read opens only the chunks containing the requested sample positions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -24,6 +27,9 @@ const MAX_ELEMENTS: usize = 4_000_000;
 const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 const APPEND_RETRIES: usize = 8;
+// At most 64 schema columns, eight dimensions, 128-byte names and one index
+// value are retained around a CPU search's chunk. Include their working space.
+const CPU_SEARCH_WORKING_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -433,12 +439,30 @@ pub enum TensorError {
     GpuUnsupported(String),
     #[error("GPU computation failed: {0}")]
     Gpu(String),
+    #[error("tensor query timed out: {0}")]
+    Timeout(String),
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TensorDeadline(Option<Instant>);
+
+impl TensorDeadline {
+    pub(crate) fn check(self) -> Result<(), TensorError> {
+        if self.0.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TensorError::Timeout(
+                "execution deadline exceeded".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct TensorDataset<'a, R: Replication + ?Sized> {
     repl: &'a R,
     config: TensorDatasetConfig,
     require_gpu: bool,
+    execution_timeout: Option<Duration>,
+    execution_memory_bytes: usize,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -474,6 +498,8 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             repl,
             config,
             require_gpu: false,
+            execution_timeout: None,
+            execution_memory_bytes: MAX_DECODED_BYTES,
         })
     }
 
@@ -483,6 +509,48 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
     pub(crate) const fn with_gpu_required(mut self, required: bool) -> Self {
         self.require_gpu = required;
         self
+    }
+
+    pub(crate) const fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) const fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.execution_memory_bytes = if bytes < MAX_DECODED_BYTES {
+            bytes
+        } else {
+            MAX_DECODED_BYTES
+        };
+        self
+    }
+
+    pub(crate) const fn memory_limit(&self) -> usize {
+        self.execution_memory_bytes
+    }
+
+    fn checked_read_bytes(&self, total: usize, next: usize) -> Result<usize, TensorError> {
+        let total = checked_bytes(total, next)?;
+        if total > self.execution_memory_bytes {
+            return invalid("decoded tensor data exceeds the configured query memory budget");
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn execution_deadline(&self) -> Result<TensorDeadline, TensorError> {
+        let deadline = self
+            .execution_timeout
+            .map(|timeout| {
+                Instant::now().checked_add(timeout).ok_or_else(|| {
+                    TensorError::InvalidValue(
+                        "tensor timeout exceeds the monotonic clock range".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+        let deadline = TensorDeadline(deadline);
+        deadline.check()?;
+        Ok(deadline)
     }
 
     #[must_use]
@@ -609,6 +677,32 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
     /// # Errors
     /// Fails for invalid requests, missing or corrupt records, or more than 64 MiB decoded data.
     pub fn read(&self, request: &TensorReadRequest) -> Result<TensorReadBatch, TensorError> {
+        self.read_with_deadline(request, self.execution_deadline()?)
+    }
+
+    pub(crate) fn read_with_deadline(
+        &self,
+        request: &TensorReadRequest,
+        deadline: TensorDeadline,
+    ) -> Result<TensorReadBatch, TensorError> {
+        self.read_with_budget(request, deadline, self.execution_memory_bytes)
+    }
+
+    pub(crate) fn read_with_budget(
+        &self,
+        request: &TensorReadRequest,
+        deadline: TensorDeadline,
+        memory_bytes: usize,
+    ) -> Result<TensorReadBatch, TensorError> {
+        let memory_bytes = memory_bytes.min(self.execution_memory_bytes);
+        let checked = |current, extra| {
+            let total = checked_bytes(current, extra)?;
+            if total > memory_bytes {
+                return invalid("decoded tensor data exceeds the configured query memory budget");
+            }
+            Ok(total)
+        };
+        deadline.check()?;
         request.validate()?;
         let info = self.info(request.revision)?;
         if request.start > info.samples {
@@ -627,6 +721,7 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
         let mut decoded_bytes = 0_usize;
         let mut cached_decoded_bytes = 0_usize;
         for sample in request.start..end {
+            deadline.check()?;
             let raw = self
                 .repl
                 .read(
@@ -642,35 +737,14 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             for column in &columns {
                 let cache_key = (column.name.clone(), index.chunk_start);
                 if !chunks.contains_key(&cache_key) {
-                    let bytes = self
-                        .repl
-                        .read(
-                            TENSOR_CHUNKS_TABLE,
-                            &chunk_key(&self.config.name, &column.name, index.chunk_start),
-                            ReadConsistency::Strong,
-                        )?
-                        .ok_or_else(|| {
-                            TensorError::Corruption("tensor chunk is missing".to_owned())
-                        })?;
-                    if bytes.len() > self.config.max_chunk_bytes {
-                        return corrupt("chunk exceeds configured byte limit");
-                    }
-                    let chunk: StoredChunk = unframe(&bytes)?;
-                    if chunk.start != index.chunk_start
-                        || chunk.samples.is_empty()
-                        || chunk.samples.len() > self.config.chunk_samples
-                    {
-                        return corrupt("chunk header is invalid");
-                    }
-                    let mut chunk_bytes = 0_usize;
-                    for tensor in &chunk.samples {
-                        chunk_bytes = checked_bytes(
-                            chunk_bytes,
-                            validate_tensor(column, tensor)
-                                .map_err(|error| TensorError::Corruption(error.to_string()))?,
-                        )?;
-                    }
-                    cached_decoded_bytes = checked_bytes(cached_decoded_bytes, chunk_bytes)?;
+                    let retained = checked(cached_decoded_bytes, decoded_bytes)?;
+                    let (chunk, chunk_bytes) = self.read_chunk(
+                        column,
+                        index.chunk_start,
+                        info.samples,
+                        memory_bytes - retained,
+                    )?;
+                    cached_decoded_bytes = checked(cached_decoded_bytes, chunk_bytes)?;
                     chunks.insert(cache_key.clone(), chunk);
                 }
                 let chunk = chunks.get(&cache_key).ok_or_else(|| {
@@ -684,7 +758,9 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
                     .ok_or_else(|| {
                         TensorError::Corruption("chunk position is outside stored data".to_owned())
                     })?;
-                decoded_bytes = checked_bytes(decoded_bytes, tensor_decoded_bytes(tensor)?)?;
+                decoded_bytes = checked(decoded_bytes, tensor_decoded_bytes(tensor)?)?;
+                checked(cached_decoded_bytes, decoded_bytes)?;
+                deadline.check()?;
                 output
                     .get_mut(&column.name)
                     .ok_or_else(|| {
@@ -693,6 +769,7 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
                     .push(tensor.clone());
             }
         }
+        deadline.check()?;
         Ok(TensorReadBatch {
             start: request.start,
             end,
@@ -700,6 +777,47 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             revision: info.revision,
             tensors: output,
         })
+    }
+
+    fn read_chunk(
+        &self,
+        column: &TensorColumn,
+        start: u64,
+        snapshot_samples: u64,
+        remaining_bytes: usize,
+    ) -> Result<(StoredChunk, usize), TensorError> {
+        let bytes = self
+            .repl
+            .read(
+                TENSOR_CHUNKS_TABLE,
+                &chunk_key(&self.config.name, &column.name, start),
+                ReadConsistency::Strong,
+            )?
+            .ok_or_else(|| TensorError::Corruption("tensor chunk is missing".to_owned()))?;
+        if bytes.len() > self.config.max_chunk_bytes {
+            return corrupt("chunk exceeds configured byte limit");
+        }
+        let chunk: StoredChunk = unframe_with_limit(&bytes, remaining_bytes)?;
+        let count = u64::try_from(chunk.samples.len())
+            .map_err(|_| TensorError::Corruption("chunk sample count overflows u64".to_owned()))?;
+        if chunk.start != start
+            || chunk.samples.is_empty()
+            || chunk.samples.len() > self.config.chunk_samples
+            || start
+                .checked_add(count)
+                .is_none_or(|end| end > snapshot_samples)
+        {
+            return corrupt("chunk header is invalid");
+        }
+        let mut chunk_bytes = 0;
+        for tensor in &chunk.samples {
+            chunk_bytes = checked_bytes(
+                chunk_bytes,
+                validate_tensor(column, tensor)
+                    .map_err(|error| TensorError::Corruption(error.to_string()))?,
+            )?;
+        }
+        Ok((chunk, chunk_bytes))
     }
 
     /// Searches with the execution backend selected by the database profile.
@@ -720,22 +838,12 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
         &self,
         request: &TensorSearchRequest,
     ) -> Result<TensorSearchResult, TensorError> {
-        request.validate()?;
-        let column = self
-            .config
-            .tensors
-            .iter()
-            .find(|column| column.name == request.tensor)
-            .ok_or_else(|| TensorError::InvalidValue("search tensor does not exist".to_owned()))?;
-        if !matches!(column.dtype, TensorDType::F32 | TensorDType::F64)
-            || column.shape.len() != 1
-            || column.shape[0].is_none()
-            || column.shape[0] != Some(request.query.len())
-        {
-            return invalid(
-                "search requires a fixed-rank-1 F32/F64 tensor matching query dimension",
-            );
+        if self.require_gpu {
+            return Err(TensorError::GpuUnsupported("the Tensor profile requires GPU search; CPU reference search is available on other profiles".to_owned()));
         }
+        let deadline = self.execution_deadline()?;
+        request.validate()?;
+        let column = cpu_search_column(&self.config, request)?;
         let info = self.info(request.revision)?;
         if request.start > info.samples {
             return invalid("search start is beyond the revision");
@@ -744,50 +852,73 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             .start
             .saturating_add(u64::try_from(request.max_samples).unwrap_or(u64::MAX))
             .min(info.samples);
-        let mut hits = Vec::new();
+        let mut hits = Vec::with_capacity(request.k + 1);
+        let (working_bytes, chunk_budget) =
+            cpu_search_budget(request, hits.capacity(), self.execution_memory_bytes)?;
         let mut skipped = 0;
-        let mut cursor = request.start;
-        while cursor < end {
-            // A single sample can occupy most of the decoded-read budget. Keep
-            // reference execution streaming even for such large embeddings.
-            let limit = 1;
-            let batch = self.read(&TensorReadRequest {
-                start: cursor,
-                limit,
-                columns: Some(vec![request.tensor.clone()]),
-                revision: Some(info.revision),
-            })?;
-            let tensors = batch
-                .tensors
-                .get(&request.tensor)
-                .ok_or_else(|| TensorError::Corruption("search column missing".to_owned()))?;
-            for (offset, tensor) in tensors.iter().enumerate() {
-                let values = match &tensor.data {
-                    TensorData::F32(values) => values
-                        .iter()
-                        .map(|value| f64::from(*value))
-                        .collect::<Vec<_>>(),
-                    TensorData::F64(values) => values.clone(),
-                    _ => return corrupt("search tensor dtype changed"),
-                };
-                let Some(distance) = exact_distance(&request.query, &values, request.metric)?
-                else {
-                    skipped += 1;
-                    continue;
-                };
-                hits.push(TensorSearchHit {
-                    index: cursor + u64::try_from(offset).unwrap_or(u64::MAX),
-                    distance,
-                });
-                hits.sort_by(|left, right| {
-                    left.distance
-                        .total_cmp(&right.distance)
-                        .then_with(|| left.index.cmp(&right.index))
-                });
-                hits.truncate(request.k);
-            }
-            cursor = batch.end;
+        if request.start < end
+            && request.revision.is_none()
+            && self.info(Some(info.revision))? != info
+        {
+            return corrupt("current manifest differs from its immutable revision");
         }
+        let mut cached_chunk: Option<StoredChunk> = None;
+        for cursor in request.start..end {
+            deadline.check()?;
+            // Validate one immutable index immediately. Batching unchecked raw
+            // values could amplify allocations if the stored indexes are corrupt.
+            let raw = self
+                .repl
+                .read(
+                    TENSOR_SAMPLE_INDEX_TABLE,
+                    &sample_key(&self.config.name, cursor),
+                    ReadConsistency::Strong,
+                )?
+                .ok_or_else(|| TensorError::Corruption("sample index is missing".to_owned()))?;
+            let index: SampleIndex = unframe(&raw)?;
+            if index.chunk_start.checked_add(u64::from(index.position)) != Some(cursor) {
+                return corrupt("sample index points to another sample");
+            }
+            drop(raw);
+            if cached_chunk
+                .as_ref()
+                .is_none_or(|chunk| chunk.start != index.chunk_start)
+            {
+                // Never retain the previous chunk while allocating its successor.
+                drop(cached_chunk.take());
+                let (chunk, chunk_bytes) =
+                    self.read_chunk(column, index.chunk_start, info.samples, chunk_budget)?;
+                self.checked_read_bytes(working_bytes, chunk_bytes)?;
+                cached_chunk = Some(chunk);
+            }
+            deadline.check()?;
+            let tensor = cached_chunk
+                .as_ref()
+                .and_then(|chunk| {
+                    usize::try_from(index.position)
+                        .ok()
+                        .and_then(|position| chunk.samples.get(position))
+                })
+                .ok_or_else(|| {
+                    TensorError::Corruption("chunk position is outside stored data".to_owned())
+                })?;
+            let distance = exact_tensor_distance(&request.query, tensor, request.metric, deadline)?;
+            let Some(distance) = distance else {
+                skipped += 1;
+                continue;
+            };
+            hits.push(TensorSearchHit {
+                index: cursor,
+                distance,
+            });
+            hits.sort_by(|left, right| {
+                left.distance
+                    .total_cmp(&right.distance)
+                    .then_with(|| left.index.cmp(&right.index))
+            });
+            hits.truncate(request.k);
+        }
+        deadline.check()?;
         Ok(TensorSearchResult {
             hits,
             scanned_samples: end - request.start,
@@ -819,6 +950,12 @@ impl<'a, R: Replication + ?Sized> TensorDataset<'a, R> {
             .map_err(|error| TensorError::Corruption(error.to_string()))?;
         if info.config != self.config {
             return corrupt("persisted dataset schema differs from its catalog");
+        }
+        if info.revision > info.samples
+            || info.samples > info.revision.saturating_mul(1024)
+            || (info.revision == 0) != (info.samples == 0)
+        {
+            return corrupt("manifest sample count is inconsistent with its append revision");
         }
         Ok(())
     }
@@ -997,23 +1134,27 @@ fn validate_tensor(column: &TensorColumn, tensor: &Tensor) -> Result<usize, Tens
 
 fn tensor_decoded_bytes(tensor: &Tensor) -> Result<usize, TensorError> {
     let data = match &tensor.data {
-        TensorData::U8(values) => Some(values.len()),
-        TensorData::Bool(values) => Some(values.len()),
-        TensorData::I64(values) => values.len().checked_mul(8),
-        TensorData::F32(values) => values.len().checked_mul(4),
-        TensorData::F64(values) => values.len().checked_mul(8),
+        TensorData::U8(values) => Some(values.capacity()),
+        TensorData::Bool(values) => Some(values.capacity()),
+        TensorData::I64(values) => values.capacity().checked_mul(8),
+        TensorData::F32(values) => values.capacity().checked_mul(4),
+        TensorData::F64(values) => values.capacity().checked_mul(8),
         TensorData::Utf8(values) => values
-            .len()
+            .capacity()
             .checked_mul(std::mem::size_of::<String>())
             .and_then(|base| {
                 values
                     .iter()
-                    .try_fold(base, |total, value| total.checked_add(value.len()))
+                    .try_fold(base, |total, value| total.checked_add(value.capacity()))
             }),
     }
     .ok_or_else(|| TensorError::InvalidValue("decoded tensor size overflows usize".to_owned()))?;
     data.checked_add(
-        tensor.shape.len() * std::mem::size_of::<usize>() + std::mem::size_of::<Tensor>(),
+        tensor
+            .shape
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<Tensor>()),
     )
     .ok_or_else(|| TensorError::InvalidValue("decoded tensor size overflows usize".to_owned()))
 }
@@ -1057,6 +1198,13 @@ fn frame<T: Serialize>(value: &T) -> Result<Bytes, TensorError> {
 }
 
 fn unframe<T: DeserializeOwned + BinaryRecord>(bytes: &[u8]) -> Result<T, TensorError> {
+    unframe_with_limit(bytes, MAX_DECODED_BYTES)
+}
+
+fn unframe_with_limit<T: DeserializeOwned + BinaryRecord>(
+    bytes: &[u8],
+    decoded_limit: usize,
+) -> Result<T, TensorError> {
     if bytes.len() < FRAME_BYTES || &bytes[..5] != MAGIC || bytes.len() > MAX_ENCODED_BYTES {
         return corrupt("invalid binary tensor frame");
     }
@@ -1080,6 +1228,7 @@ fn unframe<T: DeserializeOwned + BinaryRecord>(bytes: &[u8]) -> Result<T, Tensor
         bytes: payload,
         offset: 0,
         decoded_bytes: 0,
+        decoded_limit,
     };
     T::preflight(&mut cursor)?;
     if cursor.offset != payload.len() {
@@ -1103,6 +1252,7 @@ struct WireCursor<'a> {
     bytes: &'a [u8],
     offset: usize,
     decoded_bytes: usize,
+    decoded_limit: usize,
 }
 
 impl<'a> WireCursor<'a> {
@@ -1155,11 +1305,27 @@ impl<'a> WireCursor<'a> {
             .checked_mul(width)
             .and_then(|bytes| self.decoded_bytes.checked_add(bytes))
             .ok_or_else(|| TensorError::Corruption("decoded binary size overflow".to_owned()))?;
-        if bytes > MAX_DECODED_BYTES {
-            return corrupt("decoded binary tensor footprint exceeds 64 MiB");
+        if bytes > self.decoded_limit.min(MAX_DECODED_BYTES) {
+            if self.decoded_limit < MAX_DECODED_BYTES {
+                return invalid(
+                    "retained tensor chunks and output exceed the available read budget",
+                );
+            }
+            return corrupt("decoded binary tensor footprint exceeds its byte budget");
         }
         self.decoded_bytes = bytes;
         Ok(())
+    }
+
+    fn charge_vec(&mut self, count: usize, width: usize) -> Result<(), TensorError> {
+        // Serde limits initial reservations to1MiB, then Vec grows geometrically.
+        // Charge up to twice the logical size before that growth can allocate.
+        let width = if count.saturating_mul(width) > 1024 * 1024 {
+            width.saturating_mul(2)
+        } else {
+            width
+        };
+        self.charge(count, width)
     }
 
     fn string(&mut self, max: usize) -> Result<&'a str, TensorError> {
@@ -1194,17 +1360,17 @@ impl<'a> WireCursor<'a> {
         }
         match dtype {
             0 => {
-                self.charge(count, 1)?;
+                self.charge_vec(count, 1)?;
                 self.take(count)?;
             }
             1 => {
-                self.charge(count, std::mem::size_of::<i64>())?;
+                self.charge_vec(count, std::mem::size_of::<i64>())?;
                 for _ in 0..count {
                     self.varint()?;
                 }
             }
             2 => {
-                self.charge(count, std::mem::size_of::<f32>())?;
+                self.charge_vec(count, std::mem::size_of::<f32>())?;
                 let bytes = self.take(count.checked_mul(4).ok_or_else(|| {
                     TensorError::Corruption("binary float count overflow".to_owned())
                 })?)?;
@@ -1218,7 +1384,7 @@ impl<'a> WireCursor<'a> {
                 }
             }
             3 => {
-                self.charge(count, std::mem::size_of::<f64>())?;
+                self.charge_vec(count, std::mem::size_of::<f64>())?;
                 let bytes = self.take(count.checked_mul(8).ok_or_else(|| {
                     TensorError::Corruption("binary float count overflow".to_owned())
                 })?)?;
@@ -1232,7 +1398,7 @@ impl<'a> WireCursor<'a> {
                 }
             }
             4 => {
-                self.charge(count, 1)?;
+                self.charge_vec(count, 1)?;
                 if self.take(count)?.iter().any(|byte| *byte > 1) {
                     return corrupt("invalid binary boolean");
                 }
@@ -1240,7 +1406,7 @@ impl<'a> WireCursor<'a> {
             5 => {
                 // Empty strings are still String objects. Check this multiplication
                 // before iterating or letting serde reserve the vector capacity.
-                self.charge(count, std::mem::size_of::<String>())?;
+                self.charge_vec(count, std::mem::size_of::<String>())?;
                 for _ in 0..count {
                     self.string(MAX_ENCODED_BYTES)?;
                 }
@@ -1351,43 +1517,115 @@ fn put(table: &str, key: Bytes, value: Bytes) -> Op {
     }
 }
 
-fn exact_distance(
+fn cpu_search_column<'a>(
+    config: &'a TensorDatasetConfig,
+    request: &TensorSearchRequest,
+) -> Result<&'a TensorColumn, TensorError> {
+    let column = config
+        .tensors
+        .iter()
+        .find(|column| column.name == request.tensor)
+        .ok_or_else(|| TensorError::InvalidValue("search tensor does not exist".to_owned()))?;
+    if !matches!(column.dtype, TensorDType::F32 | TensorDType::F64)
+        || column.shape.len() != 1
+        || column.shape[0].is_none()
+        || column.shape[0] != Some(request.query.len())
+    {
+        return invalid("search requires a fixed-rank-1 F32/F64 tensor matching query dimension");
+    }
+    Ok(column)
+}
+
+fn cpu_search_budget(
+    request: &TensorSearchRequest,
+    hit_capacity: usize,
+    memory_limit: usize,
+) -> Result<(usize, usize), TensorError> {
+    // Search borrows one decoded float chunk instead of cloning a batch of
+    // Tensor values. Keep the caller's logical query, top-k storage and
+    // bounded manifest/index working space inside the same decoded budget.
+    let working_bytes = request
+        .query
+        .len()
+        .checked_mul(std::mem::size_of::<f64>())
+        .and_then(|bytes| {
+            hit_capacity
+                .checked_mul(std::mem::size_of::<TensorSearchHit>())
+                .and_then(|hits| bytes.checked_add(hits))
+        })
+        .and_then(|bytes| bytes.checked_add(CPU_SEARCH_WORKING_BYTES))
+        .ok_or_else(|| {
+            TensorError::InvalidValue("search working size overflows usize".to_owned())
+        })?;
+    let chunk_budget = memory_limit.checked_sub(working_bytes).ok_or_else(|| {
+        TensorError::InvalidValue(
+            "search working data exceeds the configured memory budget".to_owned(),
+        )
+    })?;
+    Ok((working_bytes, chunk_budget))
+}
+
+fn exact_tensor_distance(
     query: &[f64],
-    values: &[f64],
+    tensor: &Tensor,
     metric: VectorMetric,
+    deadline: TensorDeadline,
 ) -> Result<Option<f64>, TensorError> {
+    match &tensor.data {
+        TensorData::F32(values) => exact_distance(query, values, metric, deadline),
+        TensorData::F64(values) => exact_distance(query, values, metric, deadline),
+        _ => corrupt("search tensor dtype changed"),
+    }
+}
+
+fn exact_distance<T: Copy + Into<f64>>(
+    query: &[f64],
+    values: &[T],
+    metric: VectorMetric,
+    deadline: TensorDeadline,
+) -> Result<Option<f64>, TensorError> {
+    deadline.check()?;
     let distance = match metric {
-        VectorMetric::L2 => query
-            .iter()
-            .zip(values)
-            .fold(0.0_f64, |distance, (left, right)| {
-                distance.hypot(left - right)
-            }),
+        VectorMetric::L2 => {
+            let mut distance = 0.0_f64;
+            for (query, values) in query.chunks(4096).zip(values.chunks(4096)) {
+                deadline.check()?;
+                for (left, right) in query.iter().zip(values) {
+                    distance = distance.hypot(*left - (*right).into());
+                }
+            }
+            distance
+        }
         VectorMetric::Cosine => {
-            let q_scale = query
-                .iter()
-                .fold(0.0_f64, |max, value| max.max(value.abs()));
-            let v_scale = values
-                .iter()
-                .fold(0.0_f64, |max, value| max.max(value.abs()));
+            let mut q_scale = 0.0_f64;
+            let mut v_scale = 0.0_f64;
+            for (query, values) in query.chunks(4096).zip(values.chunks(4096)) {
+                deadline.check()?;
+                for (left, right) in query.iter().zip(values) {
+                    q_scale = q_scale.max(left.abs());
+                    let right: f64 = (*right).into();
+                    v_scale = v_scale.max(right.abs());
+                }
+            }
             if v_scale == 0.0 {
                 return Ok(None);
             }
-            let (dot, q_norm, v_norm) = query.iter().zip(values).fold(
-                (0.0, 0.0, 0.0),
-                |(dot, q_norm, v_norm), (left, right)| {
+            let (mut dot, mut q_norm, mut v_norm) = (0.0, 0.0, 0.0);
+            for (query, values) in query.chunks(4096).zip(values.chunks(4096)) {
+                deadline.check()?;
+                for (left, right) in query.iter().zip(values) {
                     let left = left / q_scale;
+                    let right: f64 = (*right).into();
                     let right = right / v_scale;
-                    (
-                        dot + left * right,
-                        q_norm + left * left,
-                        v_norm + right * right,
-                    )
-                },
-            );
+                    dot += left * right;
+                    q_norm += left * left;
+                    v_norm += right * right;
+                }
+            }
             (1.0 - dot / (q_norm.sqrt() * v_norm.sqrt())).clamp(0.0, 2.0)
         }
     };
+    deadline.check()?;
     if !distance.is_finite() {
         return invalid("distance cannot be represented as a finite f64");
     }
@@ -1431,8 +1669,63 @@ const fn default_max_samples() -> usize {
 mod tests {
     use super::*;
     use crate::db::{Database, DbConfig, Profile, create_database, open_database};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    struct SearchReads<'a> {
+        inner: &'a Database,
+        chunks: AtomicUsize,
+        indexes: AtomicUsize,
+        manifests: AtomicUsize,
+        revisions: AtomicUsize,
+    }
+
+    impl Replication for SearchReads<'_> {
+        fn supports_bounded_scans(&self) -> bool {
+            self.inner.supports_bounded_scans()
+        }
+        fn propose(&self, op: Op) -> Result<(), ReplError> {
+            self.inner.propose(op)
+        }
+        fn propose_batch(&self, ops: Vec<Op>) -> Result<(), ReplError> {
+            self.inner.propose_batch(ops)
+        }
+        fn propose_authorized_batch(
+            &self,
+            ops: Vec<Op>,
+            authorization: crate::txn::WriteAuthorization,
+        ) -> Result<(), ReplError> {
+            self.inner.propose_authorized_batch(ops, authorization)
+        }
+        fn read(
+            &self,
+            table: &str,
+            key: &[u8],
+            consistency: ReadConsistency,
+        ) -> Result<Option<Bytes>, ReplError> {
+            let count = match table {
+                TENSOR_CHUNKS_TABLE => Some(&self.chunks),
+                TENSOR_SAMPLE_INDEX_TABLE => Some(&self.indexes),
+                TENSOR_META_TABLE => Some(&self.manifests),
+                TENSOR_REVISIONS_TABLE => Some(&self.revisions),
+                _ => None,
+            };
+            if let Some(count) = count {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.read(table, key, consistency)
+        }
+        fn range(
+            &self,
+            table: &str,
+            start: &[u8],
+            end: &[u8],
+            consistency: ReadConsistency,
+        ) -> Result<Vec<(Bytes, Bytes)>, ReplError> {
+            self.inner.range(table, start, end, consistency)
+        }
+    }
 
     fn config(name: &str) -> TensorDatasetConfig {
         let mut config = TensorDatasetConfig::new(
@@ -1813,6 +2106,162 @@ mod tests {
     }
 
     #[test]
+    fn valid_crc_manifests_reject_impossible_append_counts() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset = create(&database, config("broken_counts"))?;
+        for (samples, revision) in [(1, 0), (0, 1), (1, 2), (1025, 1)] {
+            let info = TensorDatasetInfo {
+                config: dataset.config().clone(),
+                samples,
+                revision,
+            };
+            database.propose(put(
+                TENSOR_META_TABLE,
+                b"broken_counts".to_vec(),
+                frame(&info)?,
+            ))?;
+            assert!(
+                matches!(dataset.info(None), Err(TensorError::Corruption(_))),
+                "accepted samples={samples}, revision={revision}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chunks_cannot_extend_beyond_the_selected_append_snapshot() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let config = TensorDatasetConfig::new(
+            "snapshot_bounds",
+            vec![TensorColumn::new("value", TensorDType::I64, Vec::new())],
+        );
+        let dataset = create(&database, config)?;
+        let value = tensor(&[], TensorData::I64(vec![7]));
+        dataset.append(&BTreeMap::from([("value".to_owned(), vec![value.clone()])]))?;
+        database.propose(put(
+            TENSOR_CHUNKS_TABLE,
+            chunk_key("snapshot_bounds", "value", 0),
+            frame(&ChunkWrite {
+                start: 0,
+                samples: &[value.clone(), value],
+            })?,
+        ))?;
+        assert!(matches!(
+            dataset.read(&TensorReadRequest::new(0, 1)),
+            Err(TensorError::Corruption(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_read_budget_includes_retained_chunks_and_cloned_output() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let mut config = TensorDatasetConfig::new(
+            "read_budget",
+            vec![TensorColumn::new(
+                "strings",
+                TensorDType::Utf8,
+                vec![Some(300_000)],
+            )],
+        );
+        config.chunk_samples = 1;
+        let dataset = create(&database, config)?;
+        let values = (0..5)
+            .map(|_| tensor(&[300_000], TensorData::Utf8(vec![String::new(); 300_000])))
+            .collect();
+        dataset.append(&BTreeMap::from([("strings".to_owned(), values)]))?;
+        // Both halves are individually below 64 MiB, but retaining chunks while
+        // cloning all their strings into output must share one allocation budget.
+        assert!(matches!(
+            dataset.read(&TensorReadRequest::default()),
+            Err(TensorError::InvalidValue(_))
+        ));
+        assert_eq!(
+            dataset.read(&TensorReadRequest::new(0, 2))?.tensors["strings"].len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_query_deadlines_are_checked_before_reads_and_cpu_searches() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset =
+            create(&database, config("deadlines"))?.with_execution_timeout(Duration::ZERO);
+        assert!(matches!(
+            dataset.read(&TensorReadRequest::default()),
+            Err(TensorError::Timeout(_))
+        ));
+        assert!(matches!(
+            dataset.search_cpu(&TensorSearchRequest::new("embedding", vec![1.0, 0.0])),
+            Err(TensorError::Timeout(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_tensor_memory_limits_reads_and_cpu_search_before_allocating_chunks() -> TestResult
+    {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset = create(
+            &database,
+            TensorDatasetConfig::new(
+                "configured_memory",
+                vec![TensorColumn::new(
+                    "embedding",
+                    TensorDType::F32,
+                    vec![Some(128)],
+                )],
+            ),
+        )?;
+        dataset.append(&BTreeMap::from([(
+            "embedding".to_owned(),
+            vec![tensor(&[128], TensorData::F32(vec![1.; 128]))],
+        )]))?;
+        let mut search = TensorSearchRequest::new("embedding", vec![1.; 128]);
+        search.metric = VectorMetric::L2;
+        let dataset = dataset.with_memory_limit(256);
+        assert!(matches!(
+            dataset.read(&TensorReadRequest::new(0, 1)),
+            Err(TensorError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            dataset.search_cpu(&search),
+            Err(TensorError::InvalidValue(_))
+        ));
+        let dataset = dataset.with_memory_limit(256 * 1024);
+        assert_eq!(
+            dataset.read(&TensorReadRequest::new(0, 1))?.tensors["embedding"].len(),
+            1
+        );
+        assert_eq!(dataset.search_cpu(&search)?.hits[0].distance, 0.);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_search_validates_inputs_before_initializing_a_device() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset = create(&database, config("gpu_preflight"))?.with_gpu_required(true);
+        assert!(matches!(
+            dataset.search(&TensorSearchRequest::new("embedding", Vec::new())),
+            Err(TensorError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            dataset.search(&TensorSearchRequest::new("embedding", vec![1.0])),
+            Err(TensorError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            dataset.search(&TensorSearchRequest::new("precise", vec![1.0])),
+            Err(TensorError::GpuUnsupported(_))
+        ));
+        assert!(matches!(
+            dataset.search(&TensorSearchRequest::new("embedding", vec![1.0e-100, 0.0])),
+            Err(TensorError::InvalidValue(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn exact_reference_search_is_bounded_and_reports_skipped_zero_vectors() -> TestResult {
         let database = create_database(DbConfig::new(Profile::InMemory))?;
         let dataset = create(
@@ -1861,17 +2310,245 @@ mod tests {
         request.metric = VectorMetric::L2;
         assert_eq!(dataset.search(&request)?.hits[0].index, 2);
         assert_eq!(
-            exact_distance(&[f64::MAX, 0.0], &[f64::MAX, 0.0], VectorMetric::Cosine)?,
+            exact_distance(
+                &[f64::MAX, 0.0],
+                &[f64::MAX, 0.0],
+                VectorMetric::Cosine,
+                TensorDeadline::default()
+            )?,
             Some(0.0)
         );
         assert_eq!(
             exact_distance(
                 &[f64::from_bits(1), 0.0],
                 &[10.0, 0.0],
-                VectorMetric::Cosine
+                VectorMetric::Cosine,
+                TensorDeadline::default()
             )?,
             Some(0.0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_search_reuses_chunks_and_pins_partial_revision_reads() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let config = TensorDatasetConfig::new(
+            "streamed_search",
+            vec![
+                TensorColumn::new("embedding", TensorDType::F32, vec![Some(2)]),
+                TensorColumn::new("precise", TensorDType::F64, vec![Some(2)]),
+            ],
+        );
+        let dataset = create(&database, config.clone())?;
+        dataset.append(&BTreeMap::from([
+            (
+                "embedding".to_owned(),
+                (0_u16..130)
+                    .map(|index| tensor(&[2], TensorData::F32(vec![f32::from(index), 0.0])))
+                    .collect(),
+            ),
+            (
+                "precise".to_owned(),
+                (0..130)
+                    .map(|index| tensor(&[2], TensorData::F64(vec![f64::from(index), 0.0])))
+                    .collect(),
+            ),
+        ]))?;
+        dataset.append(&BTreeMap::from([
+            (
+                "embedding".to_owned(),
+                vec![tensor(&[2], TensorData::F32(vec![130.0, 0.0]))],
+            ),
+            (
+                "precise".to_owned(),
+                vec![tensor(&[2], TensorData::F64(vec![130.0, 0.0]))],
+            ),
+        ]))?;
+
+        for (column, start, count, revision, query, expected, chunk_reads, total) in [
+            ("embedding", 63, 3, Some(1), 0.0, vec![63, 64, 65], 2, 130),
+            (
+                "precise",
+                62,
+                5,
+                Some(1),
+                64.0,
+                vec![64, 63, 65, 62, 66],
+                2,
+                130,
+            ),
+            ("embedding", 0, 131, None, 0.0, (0..10).collect(), 4, 131),
+        ] {
+            let reads = SearchReads {
+                inner: &database,
+                chunks: AtomicUsize::new(0),
+                indexes: AtomicUsize::new(0),
+                manifests: AtomicUsize::new(0),
+                revisions: AtomicUsize::new(0),
+            };
+            let handle = TensorDataset::new(&reads, config.clone())?;
+            let mut request = TensorSearchRequest::new(column, vec![query, 0.0]);
+            request.metric = VectorMetric::L2;
+            request.start = start;
+            request.max_samples = count;
+            request.revision = revision;
+            let result = handle.search_cpu(&request)?;
+            assert_eq!(result.total_samples, total);
+            assert_eq!(result.scanned_samples, count as u64);
+            assert_eq!(
+                result.hits.iter().map(|hit| hit.index).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(reads.chunks.load(Ordering::Relaxed), chunk_reads);
+            assert_eq!(reads.indexes.load(Ordering::Relaxed), count);
+            assert_eq!(reads.revisions.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                reads.manifests.load(Ordering::Relaxed),
+                if revision.is_some() { 1 } else { 2 }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_search_checks_every_index_even_while_reusing_a_chunk() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset = create(
+            &database,
+            TensorDatasetConfig::new(
+                "search_corruption",
+                vec![TensorColumn::new("value", TensorDType::F32, vec![Some(1)])],
+            ),
+        )?;
+        dataset.append(&BTreeMap::from([(
+            "value".to_owned(),
+            (0_u16..3)
+                .map(|index| tensor(&[1], TensorData::F32(vec![f32::from(index)])))
+                .collect(),
+        )]))?;
+        dataset.append(&BTreeMap::from([(
+            "value".to_owned(),
+            vec![tensor(&[1], TensorData::F32(vec![3.0]))],
+        )]))?;
+        let mut request = TensorSearchRequest::new("value", vec![0.0]);
+        request.metric = VectorMetric::L2;
+        let key = sample_key("search_corruption", 1);
+        let original = database
+            .read(TENSOR_SAMPLE_INDEX_TABLE, &key, ReadConsistency::Strong)?
+            .ok_or("missing index")?;
+        for corrupted in [
+            None,
+            Some(b"not a framed index".to_vec()),
+            Some(frame(&SampleIndex {
+                chunk_start: 0,
+                position: 0,
+            })?),
+        ] {
+            let op = corrupted.map_or_else(
+                || Op::Delete {
+                    table: TENSOR_SAMPLE_INDEX_TABLE.to_owned(),
+                    key: key.clone(),
+                },
+                |value| put(TENSOR_SAMPLE_INDEX_TABLE, key.clone(), value),
+            );
+            database.propose(op)?;
+            assert!(matches!(
+                dataset.search_cpu(&request),
+                Err(TensorError::Corruption(_))
+            ));
+        }
+        database.propose(put(TENSOR_SAMPLE_INDEX_TABLE, key, original))?;
+        let fourth = sample_key("search_corruption", 3);
+        let original = database
+            .read(TENSOR_SAMPLE_INDEX_TABLE, &fourth, ReadConsistency::Strong)?
+            .ok_or("missing fourth index")?;
+        database.propose(put(
+            TENSOR_SAMPLE_INDEX_TABLE,
+            fourth.clone(),
+            frame(&SampleIndex {
+                chunk_start: 0,
+                position: 3,
+            })?,
+        ))?;
+        assert!(matches!(
+            dataset.search_cpu(&request),
+            Err(TensorError::Corruption(_))
+        ));
+        database.propose(put(TENSOR_SAMPLE_INDEX_TABLE, fourth, original))?;
+        let key = chunk_key("search_corruption", "value", 0);
+        let mut bytes = database
+            .read(TENSOR_CHUNKS_TABLE, &key, ReadConsistency::Strong)?
+            .ok_or("missing chunk")?;
+        bytes[FRAME_BYTES] ^= 1;
+        database.propose(put(TENSOR_CHUNKS_TABLE, key, bytes))?;
+        assert!(matches!(
+            dataset.search_cpu(&request),
+            Err(TensorError::Corruption(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_search_requires_the_selected_immutable_revision_manifest() -> TestResult {
+        let database = create_database(DbConfig::new(Profile::InMemory))?;
+        let dataset = create(
+            &database,
+            TensorDatasetConfig::new(
+                "missing_search_revision",
+                vec![TensorColumn::new("value", TensorDType::F32, vec![Some(1)])],
+            ),
+        )?;
+        dataset.append(&BTreeMap::from([(
+            "value".to_owned(),
+            vec![tensor(&[1], TensorData::F32(vec![1.0]))],
+        )]))?;
+        database.propose(Op::Delete {
+            table: TENSOR_REVISIONS_TABLE.to_owned(),
+            key: revision_key("missing_search_revision", 1),
+        })?;
+        let request = TensorSearchRequest::new("value", vec![1.0]);
+        assert!(matches!(
+            dataset.search_cpu(&request),
+            Err(TensorError::MissingRevision(1))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_search_supports_near_encoded_limit_float_samples() -> TestResult {
+        for (dtype, dimension) in [
+            (TensorDType::F32, MAX_ELEMENTS),
+            (TensorDType::F64, MAX_ELEMENTS / 2),
+        ] {
+            let database = create_database(DbConfig::new(Profile::InMemory))?;
+            let mut config = TensorDatasetConfig::new(
+                "large_search_sample",
+                vec![TensorColumn::new("value", dtype, vec![Some(dimension)])],
+            );
+            config.chunk_samples = 1;
+            config.max_chunk_bytes = MAX_ENCODED_BYTES;
+            let dataset = create(&database, config)?;
+            let data = match dtype {
+                TensorDType::F32 => TensorData::F32(vec![1.0; dimension]),
+                TensorDType::F64 => TensorData::F64(vec![1.0; dimension]),
+                _ => return Err("expected floating dtype".into()),
+            };
+            dataset.append(&BTreeMap::from([(
+                "value".to_owned(),
+                vec![tensor(&[dimension], data)],
+            )]))?;
+            let mut request = TensorSearchRequest::new("value", vec![1.0; dimension]);
+            request.metric = VectorMetric::L2;
+            request.k = 1;
+            assert_eq!(
+                dataset.search_cpu(&request)?.hits,
+                vec![TensorSearchHit {
+                    index: 0,
+                    distance: 0.0
+                }]
+            );
+        }
         Ok(())
     }
 
