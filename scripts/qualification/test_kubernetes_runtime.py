@@ -105,6 +105,36 @@ class RuntimeSafety(unittest.TestCase):
             build.assert_not_called()
             self.assertTrue((matrix.public / "runtime.json").is_file())
 
+    def test_containerd_import_selects_qualified_platform_and_checks_manifest(self):
+        for actual_digest in ("sha256:" + "1" * 64, "sha256:" + "2" * 64):
+            with self.subTest(actual_digest=actual_digest), tempfile.TemporaryDirectory() as directory:
+                fixture = runtime.Fixture(Path(directory), Path(directory), "multidb-qualification")
+                fixture.private.mkdir()
+                fixture.public.mkdir()
+                with patch.object(fixture, "verify_runtime_owner"):
+                    matrix = runtime.RuntimeMatrix(fixture, Path(directory), Path(directory) / "binary", "source")
+                evidence = {"reference": "qualified:tag", "manifest_digest": "sha256:" + "1" * 64}
+                calls = []
+                def run(name, command, **_kwargs):
+                    calls.append((name, command))
+                    if name == "image-imported-list":
+                        return "docker.io/library/qualified:tag type " + actual_digest
+                    if name == "image-pinned-list":
+                        return "docker.io/library/qualified@" + evidence["manifest_digest"] + " type " + actual_digest
+                    return "ok"
+                with patch.object(fixture, "verify_runtime_owner", return_value={"owned_container_ids": ["owned"]}), \
+                        patch.object(matrix, "run", side_effect=run):
+                    if actual_digest == evidence["manifest_digest"]:
+                        self.assertEqual(matrix.import_image(Path(directory) / "verified.oci.tar", evidence), "docker.io/library/qualified")
+                    else:
+                        with self.assertRaises(AssertionError):
+                            matrix.import_image(Path(directory) / "verified.oci.tar", evidence)
+                        self.assertNotIn("image-pin", [name for name, _command in calls])
+                command = next(command for name, command in calls if name == "image-import")
+                self.assertEqual(command[command.index("--platform") + 1], "linux/amd64")
+                self.assertEqual(command[command.index("--snapshotter") + 1], "native")
+                self.assertIn("--local", command)
+
     def test_stale_clean_exit_cannot_satisfy_the_new_sigterm(self):
         def pod(count, running, ended, code=0, uid="one"):
             return {"metadata": {"uid": uid}, "status": {"containerStatuses": [{"name": "multidb", "ready": True,

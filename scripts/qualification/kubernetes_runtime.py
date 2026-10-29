@@ -357,7 +357,10 @@ class RuntimeMatrix:
             raise Blocked("runtime image import requires the owned single node")
         remote = "/kind/multidb-qualification-" + self.run_id + ".oci.tar"
         self.run("image-copy", self.fixture.docker("cp", str(archive), node[0] + ":" + remote), timeout=300)
-        self.run("image-import", self.fixture.docker("exec", node[0], "ctr", "--namespace=k8s.io", "images", "import", "--snapshotter", "native", "--digests", remote), timeout=300)
+        # The converter only accepts linux/amd64. Use ctr's local importer:
+        # containerd 2's transfer service cannot initialize this native unpacker,
+        # even with an explicit platform. Digest verification still follows.
+        self.run("image-import", self.fixture.docker("exec", node[0], "ctr", "--namespace=k8s.io", "images", "import", "--local", "--snapshotter", "native", "--platform", "linux/amd64", "--digests", remote), timeout=300)
         self.run("image-copy-cleanup", self.fixture.docker("exec", node[0], "rm", remote))
         repository = evidence["reference"].rsplit(":", 1)[0]
         if "/" not in repository:
