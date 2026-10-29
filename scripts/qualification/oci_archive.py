@@ -90,7 +90,7 @@ def _path(name, directory=False, layer=False):
     _require(isinstance(name, str) and 0 < len(name) <= 4096,
              "invalid archive member name")
     _require(not any(ord(char) < 32 or ord(char) == 127 for char in name)
-             and "\\" not in name and ":" not in name and not name.startswith("/"),
+             and "\\" not in name and (layer or ":" not in name) and not name.startswith("/"),
              f"unsafe archive member path: {name!r}")
     try:
         name.encode("utf-8", "strict")

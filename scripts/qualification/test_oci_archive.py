@@ -175,6 +175,23 @@ class OciArchiveTests(unittest.TestCase):
                 entries, _, _, _ = docker_entries(layer=raw)
                 self.reject(entries)
 
+    def test_ubuntu_package_colon_filename_is_preserved_inside_the_layer(self):
+        name = "var/lib/dpkg/info/gcc-14-base:amd64.list"
+        raw = layer_tar((name,))
+        entries, _, _, _ = docker_entries(layer=raw)
+        save(self.source, entries)
+        result = oci_archive.convert(self.source, self.destination, REFERENCE)
+        self.assertEqual(result["layer_digests"], [sha(raw)])
+        self.assertEqual(oci_archive.verify_oci_archive(self.destination, result), result)
+        with tarfile.open(self.destination, mode="r:") as archive:
+            with archive.extractfile("blobs/" + sha(raw).replace(":", "/")) as stream:
+                with tarfile.open(fileobj=io.BytesIO(stream.read()), mode="r:") as layer:
+                    self.assertEqual(layer.getnames(), [name])
+
+    def test_colon_remains_forbidden_in_outer_archive_members(self):
+        entries, _, _, _ = docker_entries()
+        self.reject([*entries, ("var/lib/dpkg/info/gcc-14-base:amd64.list", b"outer")], "path")
+
     def test_hidden_trailing_outer_archive_content_is_rejected(self):
         entries, _, _, _ = docker_entries()
         save(self.source, entries)
