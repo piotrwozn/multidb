@@ -198,6 +198,43 @@ class OwnedServer(unittest.TestCase):
                           "--plan", "--functional-calibration", "--profile", "local-15m"])
 
 
+class OfflineResourceSampling(unittest.TestCase):
+    def test_exiting_child_proc_permission_race_preserves_exit_status(self):
+        for returncode in (0, 7):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                server = Mock(binary=root / "binary", functional_calibration=False)
+                server.environment.return_value = {}
+                process = Mock(pid=12345, returncode=returncode)
+                process.poll.side_effect = [None, returncode]
+                process.wait.return_value = returncode
+                with patch("qualify.require_scope_idle"), patch("qualify.subprocess.Popen", return_value=process), \
+                        patch("qualify.process_resources", side_effect=PermissionError("exiting child /proc/io")), \
+                        patch("qualify.os.killpg"):
+                    if returncode:
+                        with self.assertRaises(subprocess.CalledProcessError) as error:
+                            qualify.offline_command(server, root, "backup", ["backup", "full"])
+                        self.assertEqual(error.exception.returncode, returncode)
+                    else:
+                        self.assertEqual(qualify.offline_command(server, root, "backup", ["backup", "full"]), root / "backup.log")
+                self.assertEqual((root / "backup-resources.jsonl").read_text(), "")
+
+    def test_live_child_proc_permission_error_remains_a_failure_and_stops_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = Mock(binary=root / "binary", functional_calibration=False)
+            server.environment.return_value = {}
+            process = Mock(pid=12345, returncode=0)
+            process.poll.side_effect = [None, None]
+            process.wait.return_value = 0
+            with patch("qualify.require_scope_idle"), patch("qualify.subprocess.Popen", return_value=process), \
+                    patch("qualify.process_resources", side_effect=PermissionError("live child access denied")), \
+                    patch("qualify.os.killpg") as kill:
+                with self.assertRaisesRegex(PermissionError, "live child access denied"):
+                    qualify.offline_command(server, root, "backup", ["backup", "full"])
+            kill.assert_called_once_with(process.pid, qualify.signal.SIGTERM)
+
+
 class ExternalEvidence(unittest.TestCase):
     def example(self, directory, gate="physical_gpu"):
         binary = Path(directory) / "binary"

@@ -561,7 +561,10 @@ def offline_command(server, output, name, arguments):
                     raise TimeoutError(f"offline operation exceeded300s:{name}")
                 try:
                     sample = process_resources(process.pid, output)
-                except (FileNotFoundError, ProcessLookupError, KeyError):
+                except (FileNotFoundError, ProcessLookupError, PermissionError, KeyError):
+                    # Linux may revoke access to /proc/<pid>/io while an owned
+                    # child exits. Only a confirmed exit can end sampling;
+                    # denied access to a live process remains a failure.
                     if process.poll() is None:
                         raise
                     break

@@ -14,3 +14,9 @@ fuzz/corpus/** -text -diff
 
 # Preserve generated CSV bytes for evidence checksums and exact regeneration.
 docs/performance/*-production-audit.csv -text
+
+# Stable qualification requires actual reviewed OCI bytes, not a Git pointer.
+# Release checkouts hydrate only these large evidence objects through Git LFS.
+qualification/evidence/**/runtime-image.oci.tar filter=lfs diff=lfs merge=lfs -text
+qualification/releases/**/runtime-image.oci.tar filter=lfs diff=lfs merge=lfs -text
+docs/release-evidence/**/runtime-image.oci.tar filter=lfs diff=lfs merge=lfs -text

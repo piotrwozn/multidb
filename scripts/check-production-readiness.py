@@ -17,6 +17,8 @@ import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import shutil
+import tempfile
 import subprocess
 import sys
 import tomllib
@@ -293,7 +295,9 @@ def kubernetes_proof(repo, root, facts, proofs, binding, linux_artifact_sha256):
         if not HEX.fullmatch(str(expected)) or not isinstance(name, str) or PurePosixPath(name).name != name:
             raise ValueError("kubernetes:runtime command filename must be a basename")
         proof((PurePosixPath(runtime_name).parent.parent / name).as_posix(), expected)
-    if (image.get("binary_sha256") != linux_artifact_sha256 or image.get("runtime_source_revision") != binding["runtime_source_revision"]
+    if (set(image) != {"manifest_digest", "archive_sha256", "config_digest", "layer_digests", "reference",
+                       "binary_sha256", "runtime_source_revision", "dockerfile_sha256", "converter_sha256"}
+            or image.get("binary_sha256") != linux_artifact_sha256 or image.get("runtime_source_revision") != binding["runtime_source_revision"]
             or image.get("dockerfile_sha256") != sha(repo / "Dockerfile.prebuilt")
             or image.get("converter_sha256") != sha(repo / "scripts/qualification/oci_archive.py")
             or image.get("manifest_digest") == image.get("config_digest")
@@ -308,7 +312,9 @@ def kubernetes_proof(repo, root, facts, proofs, binding, linux_artifact_sha256):
     spec = importlib.util.spec_from_file_location("readiness_oci_archive", helper)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.verify_oci_archive(archive, image)
+    verified = module.verify_oci_archive(archive, image)
+    return {"archive": {"path": archive.relative_to(root).as_posix(), "sha256": image["archive_sha256"]},
+            "image_report": {"path": image_name, "sha256": proofs[image_name]}, "oci": verified}
 
 
 def gate_report(root, gate, entry, binding, repo=None, linux_artifact_sha256=None):
@@ -353,10 +359,11 @@ def gate_report(root, gate, entry, binding, repo=None, linux_artifact_sha256=Non
     facts = report["facts"]
     if not isinstance(facts, dict):
         raise ValueError(f"{gate}:facts missing")
+    qualified_image = None
     if gate == "kubernetes":
         if repo is None or not HEX.fullmatch(str(linux_artifact_sha256)):
             raise ValueError("kubernetes:exact Linux artifact binding unavailable")
-        kubernetes_proof(repo, root, facts, proofs, binding, linux_artifact_sha256)
+        qualified_image = kubernetes_proof(repo, root, facts, proofs, binding, linux_artifact_sha256)
     if gate == "core_ci":
         if (facts.get("ci_head_sha") != binding["runtime_source_revision"] or facts.get("required_ci_conclusion") != "success"
                 or facts.get("jobs") != {key: "success" for key in REQUIRED_CI_JOBS}
@@ -390,7 +397,10 @@ def gate_report(root, gate, entry, binding, repo=None, linux_artifact_sha256=Non
     if gate == "cluster" and (not isinstance(facts.get("host_ids"), list) or any(not isinstance(h, str) or not h.strip() for h in facts["host_ids"])
                              or len(set(facts["host_ids"])) < 3 or facts.get("certificate_identity_bound") is not True):
         raise ValueError("cluster:three independent hosts required")
-    return {"status": "accepted", "report_sha256": entry["report"]["sha256"], "raw_files_checked": len(proofs)}
+    result = {"status": "accepted", "report_sha256": entry["report"]["sha256"], "raw_files_checked": len(proofs)}
+    if qualified_image is not None:
+        result["qualified_image"] = qualified_image
+    return result
 
 
 def verify(repo, root, manifest_path, target, binary, version):
@@ -447,6 +457,63 @@ def verify(repo, root, manifest_path, target, binary, version):
     return result
 
 
+
+def image_binding(result):
+    """Only a successful complete Linux verification can authorize image staging."""
+    if (result.get("status") != "accepted" or result.get("target") != "linux-x86_64"
+            or set(result.get("gates", {})) != set(CHECKS)
+            or any(check.get("status") != "accepted" for check in result["gates"].values())):
+        raise ValueError("complete accepted Linux qualification required for the image")
+    image = result["gates"]["kubernetes"]["qualified_image"]
+    return {"schema_version": 1, "kind": "qualified_container_image", "status": "accepted",
+            "version": result["version"], "source": result["source"],
+            "artifact_sha256": result["artifact_sha256"], "oci": image["oci"],
+            "image_report_sha256": image["image_report"]["sha256"]}
+
+
+def verify_image_bundle(root, result, bundle):
+    """Compare downloaded bytes to the freshly verified gate; never trust its receipt alone."""
+    expected = image_binding(result)
+    bundle = Path(bundle).absolute()
+    if (not bundle.is_dir() or bundle.is_symlink()
+            or {path.name for path in bundle.iterdir()} != {"runtime-image.oci.tar", "image.json", "binding.json"}
+            or any(not path.is_file() or path.is_symlink() for path in bundle.iterdir())):
+        raise ValueError("qualified image bundle must contain exactly the three staged regular files")
+    binding = local_file(bundle, {"path": "binding.json", "sha256": sha(bundle / "binding.json")})
+    if strict_json(binding) != expected:
+        raise ValueError("staged image binding differs from fresh production verification")
+    archive = local_file(bundle, {"path": "runtime-image.oci.tar", "sha256": expected["oci"]["archive_sha256"]})
+    report = local_file(bundle, {"path": "image.json", "sha256": expected["image_report_sha256"]})
+    if strict_json(report) != strict_json(local_file(root, result["gates"]["kubernetes"]["qualified_image"]["image_report"])):
+        raise ValueError("staged image report differs from accepted proof")
+    # Full OCI verification already ran against the identical archive checksum in
+    # the fresh gate. No registry import, repack, media conversion or build occurs.
+    return {"archive": str(archive), "manifest_digest": expected["oci"]["manifest_digest"],
+            "archive_sha256": expected["oci"]["archive_sha256"], "config_digest": expected["oci"]["config_digest"]}
+
+
+def stage_image(root, result, destination):
+    expected = image_binding(result)
+    destination = Path(destination).absolute()
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("qualified image staging requires a fresh directory")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image = result["gates"]["kubernetes"]["qualified_image"]
+    with tempfile.TemporaryDirectory(prefix=".qualified-image-", dir=destination.parent) as temporary:
+        staged = Path(temporary) / "bundle"
+        staged.mkdir(mode=0o700)
+        for reference, name in ((image["archive"], "runtime-image.oci.tar"), (image["image_report"], "image.json")):
+            source = local_file(root, reference)
+            with source.open("rb") as reader, (staged / name).open("xb") as writer:
+                shutil.copyfileobj(reader, writer, 1024 * 1024)
+        (staged / "binding.json").write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
+        verify_image_bundle(root, result, staged)
+        if destination.exists() or destination.is_symlink():
+            raise ValueError("qualified image staging destination appeared during verification")
+        os.rename(staged, destination)
+    return verify_image_bundle(root, result, destination)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
@@ -461,11 +528,17 @@ def main(argv=None):
     parser.add_argument("--target", choices=TARGETS)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--output", type=Path)
+    image_action = parser.add_mutually_exclusive_group()
+    image_action.add_argument("--stage-image", type=Path, help="stage the exact verified Linux OCI for workflow transfer")
+    image_action.add_argument("--image-bundle", type=Path, help="recheck a transferred OCI bundle against fresh full qualification")
     args = parser.parse_args(argv)
     try:
         repo = args.repo.resolve()
         version = args.version or tomllib.loads((repo / "Cargo.toml").read_text())["package"]["version"]
         policy = version_policy(version)
+        if (args.stage_image or args.image_bundle) and (args.policy or args.fingerprint or args.requirements
+                or args.target != "linux-x86_64" or not policy["qualification_required"]):
+            raise ValueError("image staging/rechecking requires stable full Linux verification")
         if args.fingerprint:
             value = source_fingerprint(repo, args.source_revision)
         elif args.policy:
@@ -480,6 +553,10 @@ def main(argv=None):
             if not args.evidence_root or not args.manifest or not args.target or not args.binary:
                 raise ValueError("verification requires local --evidence-root, --manifest, --target and actual --binary")
             value = verify(repo, args.evidence_root.resolve(), args.manifest, args.target, args.binary.resolve(), version)
+            if args.stage_image:
+                value["qualified_image_bundle"] = stage_image(args.evidence_root.resolve(), value, args.stage_image)
+            elif args.image_bundle:
+                value["qualified_image_bundle"] = verify_image_bundle(args.evidence_root.resolve(), value, args.image_bundle)
         print(json.dumps(value, indent=2, allow_nan=False))
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -10,12 +10,15 @@ Tagged releases build:
 - binary cosign certificates and signatures
 - `multidb.cdx.json`
 - GHCR image `ghcr.io/<owner>/<repo>:<git-tag>`
-- image digest and build metadata
+- image digest and build/publication metadata
 - preview smoke and release performance reports
 - production qualification reports for stable versions at or above 1.0.0
 
 The release workflow signs binary blobs and the pushed image digest with
-keyless Sigstore. It does not publish a `latest` image tag.
+keyless Sigstore. It does not publish a `latest` image tag. SemVer build metadata
+is preserved in the Git tag and qualification version; its `+` is encoded as `_`
+in the OCI tag because registry tags do not support `+`. Image tags exceeding
+128 characters are refused before publication.
 
 ## Version Policy
 
@@ -46,10 +49,30 @@ unrun, blocked, failed, duplicate, unknown, conflicting, nonfinite or changed
 evidence cannot become a stable release through this workflow.
 
 The workflow checks the **actual final** Linux and Windows executables after
-their release builds. All publication waits for both platform jobs. The publish
-job rechecks both downloaded executables and the tested image-context binary
-before the GHCR push and binary signing/publication. These checks
-are distinct from source CI and from checking a manifest without a local binary.
+their release builds. All publication waits for both platform jobs. Build/test
+jobs have read-only repository permissions and do not persist Git credentials;
+only the publish job receives registry/release/OIDC write permissions.
+
+Stable Linux qualification stages the exact verified OCI archive, original image
+report and deterministic binding receipt as a separate workflow artifact. The
+fresh publish runner downloads that bundle outside checkout, reruns both
+platform gates and compares every transferred byte to fresh Linux qualification.
+The repository-pinned ORAS tool copies the qualified application manifest and
+its existing blobs by digest, verifies the remote raw manifest bytes, and only
+then creates and verifies the release tag. Stable publication never rebuilds
+`Dockerfile.prebuilt`, recompresses layers or converts OCI media types. A change
+to the base image or installed packages therefore requires a newly built image
+and new accepted qualification instead of entering publication implicitly.
+
+Image signing and the Cargo dependency SBOM/publication-provenance attestations
+refer to that verified digest. Attestations are separate referrers; a final raw
+manifest check ensures they did not alter the application image. The publication
+predicate identifies the source, exact executable, reviewed manifest and OCI
+archive; it describes promotion of a previously qualified image, not a new
+Buildx build or a full operating-system SBOM. RC images retain their explicit
+preview-only Buildx path. Missing/unexpected policy output selects neither path.
+These checks are distinct from source CI and from checking a manifest without a
+local binary.
 RC builds can proceed while production gates are blocked, but remain prereleases.
 No tag or release is created by the local checker.
 
@@ -59,6 +82,16 @@ operator can use another reviewed local root through `--evidence-root`; remote
 URLs, symlink paths, paths escaping that root and hash mismatches are refused.
 Both `linux-x86_64` and `windows-x86_64` must be listed with exact SHA256 values.
 Each target's gates are checked against that target's actual executable.
+
+Large `runtime-image.oci.tar` files under the reserved evidence trees are narrowly
+tracked with Git LFS. Stable Linux, Windows and publish checkouts explicitly
+hydrate these objects; preview and ordinary CI jobs do not. A maintainer must
+push the actual reviewed LFS object, manifest and bound raw reports before a
+stable tag. The workflow does not fabricate or download arbitrary evidence from
+URLs. Missing/unavailable objects, an unhydrated LFS pointer, changed bytes or
+insufficient LFS storage/bandwidth block the existing hash/OCI gate. Budget the
+LFS transfer and workflow-artifact storage for each release runner. No stable
+image/archive or tag is published by adding these tracking rules alone.
 
 ```sh
 python3 scripts/check-production-readiness.py --policy

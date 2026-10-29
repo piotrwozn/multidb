@@ -222,6 +222,73 @@ class ReadinessTests(unittest.TestCase):
         self.binaries["linux-x86_64"].write_bytes(b"different-build")
         self.assertEqual(self.verify()["status"], "blocked")
 
+    def test_only_fully_accepted_linux_gate_can_stage_the_exact_image(self):
+        result = self.verify()
+        output = self.base / "staged-image"
+        bundle = gate.stage_image(self.repo, result, output)
+        self.assertEqual(bundle["manifest_digest"], result["gates"]["kubernetes"]["qualified_image"]["oci"]["manifest_digest"])
+        self.assertEqual(gate.sha(output / "runtime-image.oci.tar"), bundle["archive_sha256"])
+        self.assertEqual(gate.verify_image_bundle(self.repo, self.verify(), output), bundle)
+        with self.assertRaises(ValueError):
+            gate.stage_image(self.repo, result, output)
+        self.replace_report("security", lambda report: report.update(status="blocked"))
+        with self.assertRaises(ValueError):
+            gate.stage_image(self.repo, self.verify(), self.base / "blocked-image")
+        windows = gate.verify(self.repo, self.repo, self.path, "windows-x86_64", self.binaries["windows-x86_64"], "1.0.0")
+        with self.assertRaises(ValueError):
+            gate.stage_image(self.repo, windows, self.base / "windows-image")
+
+    def test_transferred_image_tampering_extra_files_and_links_are_rejected(self):
+        result = self.verify()
+        output = self.base / "staged-image"
+        gate.stage_image(self.repo, result, output)
+        for name in ("runtime-image.oci.tar", "image.json", "binding.json"):
+            path = output / name
+            original = path.read_bytes()
+            path.write_bytes(b"changed")
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                gate.verify_image_bundle(self.repo, result, output)
+            path.write_bytes(original)
+        extra = output / "unexpected"
+        extra.write_text("not reviewed")
+        with self.assertRaises(ValueError):
+            gate.verify_image_bundle(self.repo, result, output)
+        extra.unlink()
+        report = output / "image.json"
+        original = report.read_bytes()
+        report.unlink()
+        report.symlink_to(self.path)
+        with self.assertRaises(ValueError):
+            gate.verify_image_bundle(self.repo, result, output)
+        report.unlink()
+        report.write_bytes(original)
+        self.assertEqual(gate.verify_image_bundle(self.repo, result, output)["archive_sha256"], gate.sha(output / "runtime-image.oci.tar"))
+
+    def test_unreviewed_image_report_fields_cannot_enter_the_transfer_bundle(self):
+        self.replace_kubernetes_raw("image_report", lambda report: report.update(unreviewed_extra="unexpected data"))
+        result = self.verify()
+        self.assertEqual(result["gates"]["kubernetes"]["status"], "blocked")
+        with self.assertRaises(ValueError):
+            gate.stage_image(self.repo, result, self.base / "unreviewed-image")
+
+    def test_lfs_pointer_does_not_substitute_for_actual_oci_even_with_matching_outer_hash(self):
+        entry = self.manifest["artifacts"]["linux-x86_64"]["gates"]["kubernetes"]
+        report_path = self.repo / entry["report"]["path"]
+        normalized = gate.strict_json(report_path)
+        image_name = normalized["facts"]["image_report"]
+        archive = (self.repo / image_name).with_name("runtime-image.oci.tar")
+        archive.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:" + "0" * 64 + "\nsize 12345\n")
+        name = archive.relative_to(self.repo).as_posix()
+        normalized["raw_proofs"][name] = gate.sha(archive)
+        for reference in entry["raw_proofs"]:
+            if reference["path"] == name:
+                reference["sha256"] = gate.sha(archive)
+        write(report_path, normalized)
+        entry["report"]["sha256"] = gate.sha(report_path)
+        write(self.path, self.manifest)
+        self.replace_kubernetes_raw("image_report", lambda report: report.update(archive_sha256=gate.sha(archive)))
+        self.assertEqual(self.verify()["gates"]["kubernetes"]["status"], "blocked")
+
     def test_secure_default_and_kubernetes_jobs_cannot_be_omitted_or_skipped(self):
         required = ("secure-default", "kubernetes-tooling", "kubernetes-runtime")
         self.assertTrue(set(required) <= set(gate.requirements("core_ci")["required_jobs"]))
@@ -408,6 +475,22 @@ class ReadinessTests(unittest.TestCase):
         self.assertIn("cmp target/docker-smoke-context/multidb target/release/multidb-linux-x86_64", publisher)
         self.assertIn("prerelease: ${{ needs.release-policy.outputs.prerelease == 'true' }}", publisher)
         self.assertIn("make_latest: ${{ needs.release-policy.outputs.make_latest }}", publisher)
+        stable = publisher.split("      - name: Publish the exact qualified stable OCI image", 1)[1].split("      - name:", 1)[0]
+        preview = publisher.split("      - name: Publish the preview GHCR image", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("qualification_required == 'true'", stable)
+        self.assertNotIn("buildx", stable)
+        self.assertIn("publish_qualified_image.py", stable)
+        self.assertIn("qualification_required == 'false'", preview)
+        self.assertIn("--push target/docker-smoke-context", preview)
+        self.assertEqual(workflow.count("lfs: ${{ needs.release-policy.outputs.qualification_required == 'true' }}"), 3)
+        self.assertEqual(workflow.count("persist-credentials: false"), 4)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        for permission in ("packages: write", "contents: write", "id-token: write", "attestations: write"):
+            self.assertNotIn(permission, builders)
+        self.assertIn("packages: write", publisher)
+        self.assertIn("multidb-qualified-image", publisher)
+        self.assertIn("--verify-only --output target/release/image-postsign-verification.json", publisher)
+        self.assertLess(publisher.index("--verify-only"), publisher.index("      - name: Checksums and signatures"))
 
 
 if __name__ == "__main__":
