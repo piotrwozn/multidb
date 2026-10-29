@@ -159,6 +159,11 @@ def require_idle():
             continue
 
 
+def require_scope_idle(functional_calibration=False):
+    if not functional_calibration:
+        require_idle()
+
+
 def free_ports(ports):
     with contextlib.ExitStack() as stack:
         for port in ports:
@@ -249,11 +254,12 @@ def upsert(identifier, version, size):
 
 
 class Server:
-    def __init__(self, binary, database, output, profile, port, pg_port):
+    def __init__(self, binary, database, output, profile, port, pg_port, functional_calibration=False):
         self.binary, self.database, self.output, self.profile = binary, database, output, profile
         self.port, self.pg_port, self.process, self.log = port, pg_port, None, None
         self.pg_password = os.urandom(32).hex()
         self.shutdowns = []
+        self.functional_calibration = functional_calibration
 
     def environment(self):
         env = {key: value for key, value in os.environ.items() if not key.startswith("MULTIDB_")}
@@ -543,7 +549,7 @@ def cold_evict(path, ceiling):
 
 
 def offline_command(server, output, name, arguments):
-    require_idle()
+    require_scope_idle(server.functional_calibration)
     command = [str(server.binary), *map(str, arguments)]
     with (output / (name + ".log")).open("xb") as stream, (output / (name + "-resources.jsonl")).open("x") as resources:
         process = subprocess.Popen(command, env=server.environment(), cwd=output,
@@ -585,7 +591,8 @@ def artifact_manifest(output):
 
 def execute(args, profile, report):
     output, binary = args.output, args.binary
-    require_idle()
+    functional_calibration = getattr(args, "functional_calibration", False)
+    require_scope_idle(functional_calibration)
     free_ports((args.http_port, args.pg_port))
     report["host"] = host_resources()
     report["active_section"] = "preflight"
@@ -594,7 +601,7 @@ def execute(args, profile, report):
     shutil.copy2(binary, snapshot)
     if digest(snapshot) != report["artifact"]["sha256"]:
         raise AssertionError("binary changed while snapshotting")
-    server = Server(snapshot, output / "source.redb", output, profile, args.http_port, args.pg_port)
+    server = Server(snapshot, output / "source.redb", output, profile, args.http_port, args.pg_port, functional_calibration)
     versions, measurements, api = {}, None, None
     stop = threading.Event()
     threads = []
@@ -634,7 +641,7 @@ def execute(args, profile, report):
             try:
                 with (output / "resources.jsonl").open("x") as stream:
                     while not stop.is_set():
-                        require_idle()
+                        require_scope_idle(functional_calibration)
                         sample = resource_sample(server, output)
                         enforce_resources(sample, profile)
                         stream.write(json.dumps(sample) + "\n")
@@ -766,6 +773,7 @@ def main(argv=None):
               "started_at_utc": utc_now(), "artifact": {"path": str(args.binary), "sha256": digest(args.binary), "revision": args.revision},
               "runner_sha256": source_hashes, "scope": {"local_owned_database": True, "production_release_approved": False,
                   "functional_calibration": args.functional_calibration, "performance_qualified": False,
+                  "compiler_interference_guard_applied": not args.functional_calibration,
                   "physical_gpu_measured": False, "power_loss_certified": False, "authenticated_pgwire_load": False},
               "sections": {name: {"status": "unrun"} for name in ("preflight", "fixture", "sustained_http", "resources", "reconnect",
                   "slow_and_disconnected_clients", "readback_after_load", "online_gc", "offline_gc", "offline_backup_restore")}}

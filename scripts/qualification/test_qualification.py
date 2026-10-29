@@ -187,6 +187,15 @@ class OwnedServer(unittest.TestCase):
             self.assertTrue(report["scope"]["functional_calibration"])
             self.assertFalse(report["scope"]["performance_qualified"])
             self.assertFalse(report["scope"]["production_release_approved"])
+            self.assertFalse(report["scope"]["compiler_interference_guard_applied"])
+        with patch("qualify.require_idle", side_effect=qualify.Blocked("active compiler")) as guard:
+            qualify.require_scope_idle(True)
+            guard.assert_not_called()
+            with self.assertRaises(qualify.Blocked):
+                qualify.require_scope_idle(False)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, "smoke profile"):
+            qualify.main(["--binary", sys.executable, "--revision", "calibration-only", "--output", str(Path(directory) / "fresh"),
+                          "--plan", "--functional-calibration", "--profile", "local-15m"])
 
 
 class ExternalEvidence(unittest.TestCase):
