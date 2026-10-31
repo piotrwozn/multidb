@@ -9,4 +9,12 @@ ignore = [
     # Present in Cargo.lock as an inactive transitive proc-macro dependency.
     # The advisory is informational/unmaintained with no patched version.
     "RUSTSEC-2026-0173",
+    # zstd 0.13.4 is the local compat/zstd re-export facade patched in for
+    # Arrow/Parquet 58, not the registry crate (mirrors the zstd@0.13.4 skip in
+    # deny.toml). It has no codec implementation: their calls execute the
+    # same patched registry zstd 0.14.3 used directly by MultiDB. No parquet
+    # 58/59 release accepts zstd 0.14 and no patched zstd 0.13.x exists.
+    # cargo-deny still checks the registry zstd versions. Remove this entry
+    # with compat/zstd once Arrow/Parquet accept zstd 0.14.
+    "RUSTSEC-2026-0391",
 ]
