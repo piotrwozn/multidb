@@ -227,6 +227,16 @@ pub(super) async fn reject_at_capacity(
         .map_err(|_| timed_out("capacity rejection"))?
 }
 
+/// Whether the session ends once `message` is processed. pgwire answers a cancel
+/// request and closes only the write half; it ignores Terminate, after which
+/// `PostgreSQL` closes the connection.
+fn closes_connection(message: &PgWireFrontendMessage) -> bool {
+    matches!(
+        message,
+        PgWireFrontendMessage::CancelRequest(_) | PgWireFrontendMessage::Terminate(_)
+    )
+}
+
 /// Sends an error response and returns whether the error was FATAL.
 async fn report_error(
     socket: &mut Framed<MaybeTls, PgWireMessageServerCodec<String>>,
@@ -309,7 +319,7 @@ pub(super) async fn process_socket(
             PgWireConnectionState::CopyInProgress(is_extended) => is_extended,
             _ => message.is_extended_query(),
         };
-        let is_cancel = matches!(message, PgWireFrontendMessage::CancelRequest(_));
+        let close_after = closes_connection(&message);
         let request_deadline = deadline(limits.request)?;
         let request_deadline = if authenticating {
             request_deadline.min(handshake_deadline)
@@ -338,8 +348,7 @@ pub(super) async fn process_socket(
             if let Some(update) = state_update {
                 state_budget.commit(update);
             }
-            // pgwire answers a cancel request and closes only the write half.
-            Ok(is_cancel)
+            Ok(close_after)
         };
         let close = tokio::time::timeout_at(request_deadline, processing)
             .await

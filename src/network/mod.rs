@@ -2307,6 +2307,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn terminate_before_login_closes_the_connection() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // A long handshake deadline: a server that ignored Terminate would keep the
+        // connection open past read_until_closed's limit.
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_handshake_timeout_ms(30_000);
+        let server = start_session_test_server(config).await?;
+        let mut client = TcpStream::connect(server.addr).await?;
+        client.write_all(&startup_message("alice")?).await?;
+        read_until(&mut client, b'R').await?;
+        client.write_all(&typed_message(b'X', &[])?).await?;
+        assert_eq!(
+            read_until_closed(&mut client).await?,
+            Vec::<(u8, Vec<u8>)>::new()
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
     async fn executor_uses_the_existing_runtime() -> Result<(), Box<dyn std::error::Error>> {
         let database = Arc::new(RwLock::new(shared_users_database()?));
         let executor = super::BlockingDbExecutor::new(super::DatabaseHandle::Shared(database), 2);

@@ -33,8 +33,8 @@ All notable public changes will be recorded here.
   with no roles: authorization refused it, but it was still parsed and planned
   for a client that never logged in. Such connections also held a session slot
   until the idle or handshake deadline. A connection now closes after any error
-  during authentication, after any FATAL error and after a cancel request, and
-  only a completed login lets a session run statements.
+  during authentication, after any FATAL error, after a cancel request and after
+  a Terminate message, and only a completed login lets a session run statements.
 - Fixed listeners that stopped after one failed `accept()`. An accept error,
   such as running out of file descriptors, stopped the PostgreSQL wire listener,
   which ended `multidb serve`, and stopped the internal transport listener,
