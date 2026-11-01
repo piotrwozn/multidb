@@ -2543,7 +2543,34 @@ impl SqlEngine {
         guard
             .authorize_reads(&planned_read_targets(&plan, &providers)?)
             .map_err(QueryError::AuthzDenied)?;
-        Ok(Some(Arc::clone(plan.schema().inner())))
+        // Running the query would fail where it scans a relation whose
+        // policies SQL cannot apply, so Describe refuses it too.
+        if let Some(reason) = unappliable_policy_scan(&plan)? {
+            return Err(QueryError::Unsupported(reason));
+        }
+        // The SQL planner leaves type coercion to the analyzer, which runs
+        // when the plan executes: until then a UNION has its first input's
+        // types and a CASE its first branch's type. Result batches have the
+        // analyzed types and the planned column names.
+        let state = ctx.state();
+        let analyzed = state
+            .analyzer()
+            .execute_and_check(plan.clone(), state.config_options(), |_, _| {})
+            .map_err(|error| datafusion_to_query_error(&error))?;
+        let names = plan.schema().fields();
+        let fields = analyzed.schema().fields();
+        if names.len() != fields.len() {
+            return Err(QueryError::DataFusion(
+                "analysis changed the number of result columns".to_owned(),
+            ));
+        }
+        Ok(Some(Arc::new(Schema::new(
+            names
+                .iter()
+                .zip(fields.iter())
+                .map(|(name, field)| field.as_ref().clone().with_name(name.name()))
+                .collect::<Vec<_>>(),
+        ))))
     }
 
     /// Plans one statement without running it. Returns the relations it reads,
@@ -5581,6 +5608,26 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, QueryError> {
         ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
         ObjectNamePart::Function(_) => Err(QueryError::Unsupported(name.to_string())),
     }
+}
+
+/// Why `plan` would fail where it scans a relation behind policies SQL cannot
+/// apply, as `PolicyTableProvider::scan` reports when the plan runs, or `None`.
+fn unappliable_policy_scan(plan: &LogicalPlan) -> Result<Option<String>, QueryError> {
+    let mut reason = None;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && let Some(PolicyTableProvider {
+                plan: Err(refusal), ..
+            }) = provider.downcast_ref::<PolicyTableProvider>()
+        {
+            reason = Some(refusal.clone());
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|error| datafusion_to_query_error(&error))?;
+    Ok(reason)
 }
 
 /// Collects every relation a `DataFusion` plan scans, including scans inside

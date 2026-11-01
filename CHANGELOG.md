@@ -71,6 +71,16 @@ All notable public changes will be recorded here.
   Placeholders run from `$1` to `$65535` (SQLSTATE 42P02), and a placeholder the
   client sent no type for is described as `TEXT` in `ParameterDescription`, so
   drivers that prepare without parameter types can bind it.
+- Pgwire Describe answers `NoData` for a statement that returns no rows
+  (`INSERT` without `RETURNING`, `CALL`, `CREATE FUNCTION`) instead of an empty
+  row description, and describes `CALL` and `CREATE FUNCTION` without running
+  them. It describes the built-in system views (`system.workload`,
+  `system.tuning_log`, `system.index_advice`, `system.reprofile_jobs`) and the
+  `match`, `time_bucket`, `within_radius` and `graph_neighbors` helpers, reports
+  `UNION` and `CASE` columns with the coerced types Execute returns (they had
+  their first input's type, so binary clients decoded floats as integers), and
+  refuses a WASM UDF call (SQLSTATE 0A000) and a query over a table whose
+  masking replacement SQL cannot return, which Execute refuses too.
 - Added a reproducible local before/after SQL benchmark runner with binary/source
   provenance, raw latency verification and all nine supplied workloads. See
   `docs/performance-local-benchmarks.md`.
@@ -435,10 +445,9 @@ All notable public changes will be recorded here.
   and a denial names the CTE. `INSERT ... RETURNING` returns stored rows (for
   `ON CONFLICT DO UPDATE`, the existing row), so it now needs `Read` on the
   table as well as `Write`; before, `Write` alone could read any row by key.
-  Not covered by this fix: extended-protocol Describe over PostgreSQL wire
-  still returns the column names and types of catalog tables (no rows)
-  without an RBAC check; the separate PostgreSQL wire extended-protocol fix
-  closes it.
+  Extended-protocol Describe over PostgreSQL wire, which returned the column
+  names and types of catalog tables (no rows) without an RBAC check, now
+  plans the statement under the same checks (see the pgwire Describe entry).
 - Fixed SQL bypasses of row and masking policies. SQL run as a principal applied
   them to the query result, matched to its columns by name, so a principal with
   `Read` on a policy-protected table could see the rows its row policies hide
@@ -997,7 +1006,8 @@ All notable public changes will be recorded here.
   the planner errors it builds from them) are now `QueryError::Parse`
   (SQLSTATE 42601) like the engine's, instead of `QueryError::DataFusion`
   (XX000). The pgwire
-  extended-protocol Describe still pre-parses with sqlparser's defaults.
+  extended-protocol Describe plans the statement through the same parse as
+  execution instead of pre-parsing it with sqlparser's defaults.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
   with `StorageFormatMismatch` (previously an opaque serde error). Every

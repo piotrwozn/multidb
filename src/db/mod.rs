@@ -3839,14 +3839,7 @@ impl Database {
             return self.finish_query(sql, started, result);
         }
         if let Some(kind) = phase32_declaration_kind(sql) {
-            return self.finish_query(
-                sql,
-                started,
-                Err(QueryError::Unsupported(format!(
-                    "{kind} SQL DDL is outside the current SQL support matrix; use the stable Database API"
-                ))
-                .into()),
-            );
+            return self.finish_query(sql, started, Err(phase32_unsupported(kind)));
         }
         if let Some(command) = extension::parse_create_wasm_function(sql)? {
             let result = self
@@ -8677,6 +8670,13 @@ fn parse_call_procedure_sql(sql: &str) -> Result<Option<(String, Vec<Value>)>, D
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(Some((name, values)))
+}
+
+fn phase32_unsupported(kind: &str) -> DbError {
+    QueryError::Unsupported(format!(
+        "{kind} SQL DDL is outside the current SQL support matrix; use the stable Database API"
+    ))
+    .into()
 }
 
 fn phase32_declaration_kind(sql: &str) -> Option<&'static str> {

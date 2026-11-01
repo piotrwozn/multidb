@@ -13,8 +13,8 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use futures::{Sink, stream};
 use pgwire::{
     api::{
-        ClientInfo, ClientPortalStore, METADATA_USER, PgWireConnectionState, PgWireServerHandlers,
-        Type,
+        ClientInfo, ClientPortalStore, DEFAULT_NAME, METADATA_USER, PgWireConnectionState,
+        PgWireServerHandlers, Type,
         auth::{
             AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
             sasl::{
@@ -23,7 +23,7 @@ use pgwire::{
             },
         },
         portal::{Format, Portal},
-        query::{ExtendedQueryHandler, SimpleQueryHandler},
+        query::{ExtendedQueryHandler, SimpleQueryHandler, send_describe_response},
         results::{
             DataRowEncoder, DescribePortalResponse, DescribeResponse, DescribeStatementResponse,
             FieldFormat, FieldInfo, QueryResponse, Response, Tag,
@@ -32,7 +32,10 @@ use pgwire::{
         store::PortalStore,
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
-    messages::{PgWireBackendMessage, PgWireFrontendMessage},
+    messages::{
+        PgWireBackendMessage, PgWireFrontendMessage,
+        extendedquery::{Describe, TARGET_TYPE_BYTE_STATEMENT},
+    },
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{
@@ -1049,6 +1052,42 @@ impl ExtendedQueryHandler for DbPgHandler {
         Arc::clone(&self.parser)
     }
 
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // pgwire answers a statement Describe with a RowDescription whenever the
+        // statement has parameters. A statement that returns no rows gets NoData
+        // instead, as in PostgreSQL, so drivers expect no result set.
+        if message.target_type == TARGET_TYPE_BYTE_STATEMENT {
+            let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+            let statement = client
+                .portal_store()
+                .get_statement(name)
+                .ok_or_else(|| PgWireError::StatementNotFound(name.to_owned()))?;
+            let (parameters, schema) = self
+                .describe_statement(client_user(client), &statement)
+                .await?;
+            return match schema {
+                Some(schema) => {
+                    send_describe_response(
+                        client,
+                        &DescribeStatementResponse::new(
+                            parameters,
+                            fields_for_schema(&schema, None),
+                        ),
+                    )
+                    .await
+                }
+                None => send_describe_response(client, &NoRowsStatement { parameters }).await,
+            };
+        }
+        self._on_describe(client, message).await
+    }
+
     async fn do_describe_statement<C>(
         &self,
         client: &mut C,
@@ -1428,6 +1467,32 @@ fn float_literal(value: Option<impl Into<f64>>) -> PgWireResult<String> {
     })
 }
 
+/// Describe Statement answer for a statement that returns no rows:
+/// `ParameterDescription` followed by `NoData`.
+struct NoRowsStatement {
+    parameters: Vec<Type>,
+}
+
+impl DescribeResponse for NoRowsStatement {
+    fn parameters(&self) -> Option<&[Type]> {
+        Some(&self.parameters)
+    }
+
+    fn fields(&self) -> &[FieldInfo] {
+        &[]
+    }
+
+    fn no_data() -> Self {
+        Self {
+            parameters: Vec::new(),
+        }
+    }
+
+    fn is_no_data(&self) -> bool {
+        true
+    }
+}
+
 fn substitute_params(sql: &str, literals: &[String]) -> PgWireResult<String> {
     parameters::substitute(sql, literals)
 }
@@ -1525,7 +1590,7 @@ mod tests {
         },
         messages::{
             PgWireBackendMessage, ProtocolVersion,
-            extendedquery::{Bind, Execute, Parse},
+            extendedquery::{Bind, Describe, Execute, Parse, TARGET_TYPE_BYTE_STATEMENT},
             response::TransactionStatus,
             startup::SecretKey,
         },
@@ -2871,5 +2936,77 @@ mod tests {
         fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn statements_without_rows_are_described_with_no_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let factory = super::DbPgFactory::new(
+            super::DatabaseHandle::Shared(database),
+            NetworkConfig::new(TlsMode::DisabledForTests, test_auth()),
+        );
+        let mut client = RecordingClient::for_user("alice");
+        for (name, sql) in [
+            (
+                "insert",
+                "insert into users (id, name, age, active) values ($1, 'x', 1, true)",
+            ),
+            ("select", "select age from users where id = $1"),
+        ] {
+            factory
+                .handler
+                .on_parse(
+                    &mut client,
+                    Parse::new(
+                        Some(name.to_owned()),
+                        sql.to_owned(),
+                        vec![Type::INT8.oid()],
+                    ),
+                )
+                .await?;
+        }
+        client.sent.clear();
+        let describe =
+            |name: &str| Describe::new(TARGET_TYPE_BYTE_STATEMENT, Some(name.to_owned()));
+
+        factory
+            .handler
+            .on_describe(&mut client, describe("insert"))
+            .await?;
+        match std::mem::take(&mut client.sent).as_slice() {
+            [
+                PgWireBackendMessage::ParameterDescription(parameters),
+                PgWireBackendMessage::NoData(_),
+            ] => assert_eq!(parameters.types, vec![Type::INT8.oid()]),
+            other => {
+                return Err(format!("expected ParameterDescription and NoData: {other:?}").into());
+            }
+        }
+
+        factory
+            .handler
+            .on_describe(&mut client, describe("select"))
+            .await?;
+        match client.sent.as_slice() {
+            [
+                PgWireBackendMessage::ParameterDescription(parameters),
+                PgWireBackendMessage::RowDescription(row),
+            ] => {
+                assert_eq!(parameters.types, vec![Type::INT8.oid()]);
+                let fields = row
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.as_str(), field.type_id))
+                    .collect::<Vec<_>>();
+                assert_eq!(fields, vec![("age", Type::INT8.oid())]);
+            }
+            other => {
+                return Err(
+                    format!("expected ParameterDescription and RowDescription: {other:?}").into(),
+                );
+            }
+        }
+        Ok(())
     }
 }

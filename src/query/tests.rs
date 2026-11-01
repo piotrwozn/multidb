@@ -2177,3 +2177,133 @@ async fn nested_negative_literals_are_values() -> Result<(), Box<dyn std::error:
     );
     Ok(())
 }
+
+/// The kind of value each column of `schema` holds, as `Value` reports it.
+fn described_kinds(schema: &datafusion::arrow::datatypes::Schema) -> Vec<(String, &'static str)> {
+    use datafusion::arrow::datatypes::DataType;
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let kind = match field.data_type() {
+                DataType::Boolean => "bool",
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => "int",
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => "float",
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes",
+                _ => "other",
+            };
+            (field.name().clone(), kind)
+        })
+        .collect()
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bytes(_) => "bytes",
+        _ => "other",
+    }
+}
+
+#[tokio::test]
+async fn describe_types_match_executed_values() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = guarded_engine().await?;
+    engine
+        .execute("insert into public_t (id, name, age, active) values (1, 'Ada', 37, true)")
+        .await?;
+    engine.create_table("events", Some(event_schema()), Vec::new())?;
+    engine
+        .execute("insert into events (id, category, price, active) values (1, 'a', 2.5, true)")
+        .await?;
+
+    for sql in [
+        "select id, name, age, active from public_t where id = 1",
+        "select age * 2 as doubled, age * 1.5 as weighted, age + 1 as next from public_t",
+        "select count(*), sum(age), avg(age), max(age) from public_t",
+        "select id, price, category from events",
+        // Mixed input types are coerced only when the plan is analyzed.
+        "select age from public_t union all select 2.5 as age",
+        "select 2.5 as v union all select age from public_t",
+        "select null as v union all select age from public_t",
+        "select case when id = 1 then age else 0.5 end as v from public_t",
+        "select case when id = 2 then null else age end as v from public_t",
+    ] {
+        let mut guard = RecordingReadGuard::allowing_all();
+        let schema = engine
+            .describe_with_read_guard(sql, &mut guard)
+            .await?
+            .ok_or_else(|| format!("{sql} has no result columns"))?;
+        let described = described_kinds(&schema);
+        let SqlOutput::Rows(rows) = engine.execute(sql).await? else {
+            return Err(format!("{sql} returned no rows").into());
+        };
+        // Every non-null value of a column has the described type.
+        let executed = rows
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut kinds = rows
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.get(index))
+                    .filter(|value| !matches!(value, Value::Null))
+                    .map(value_kind)
+                    .collect::<Vec<_>>();
+                kinds.dedup();
+                (name.clone(), kinds)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(described.len(), executed.len(), "{sql}");
+        for ((name, kind), (executed_name, kinds)) in described.iter().zip(&executed) {
+            assert_eq!(name, executed_name, "{sql}");
+            assert!(
+                kinds.iter().all(|executed| executed == kind),
+                "{sql}: {name} is described as {kind}, executed as {kinds:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn describe_refuses_scans_whose_policies_sql_cannot_apply()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    let mut guard = RecordingReadGuard::allowing_all();
+    guard.policies.insert(
+        "secrets".to_owned(),
+        super::SqlRelationPolicy {
+            masks: vec![(FieldPath::new(["name"]), Value::Array(Vec::new()))],
+            ..super::SqlRelationPolicy::default()
+        },
+    );
+    for sql in [
+        "select name from secrets",
+        "select id from public_t where id in (select id from secrets)",
+    ] {
+        let executed = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(executed.is_err(), "{sql}: {executed:?}");
+        let described = engine.describe_with_read_guard(sql, &mut guard).await;
+        assert!(
+            matches!(described, Err(QueryError::Unsupported(_))),
+            "{sql}: {described:?}"
+        );
+    }
+    assert!(
+        engine
+            .describe_with_read_guard("select name from public_t", &mut guard)
+            .await?
+            .is_some()
+    );
+    Ok(())
+}
