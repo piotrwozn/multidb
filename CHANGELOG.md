@@ -44,6 +44,9 @@ All notable public changes will be recorded here.
   same statement with the PostgreSQL dialect and split into the same tokens
   with DataFusion's generic dialect; otherwise it is refused with `Unsupported`
   (SQLSTATE 0A000), as is a quoted name holding a backslash before its quote.
+  So are statements whose printed text the two dialects split into different
+  tokens, such as numbers with underscores (`1_000`) and the `?` operator,
+  and a doubled unary minus, which prints as a `--` comment.
   This covers queries, `EXPLAIN`, Describe (`INSERT ... RETURNING` is now
   described from its parsed `RETURNING` items) and the permission check of
   `EXPLAIN`.

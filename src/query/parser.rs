@@ -85,8 +85,10 @@ pub(crate) fn parse_with_limits(
 /// and the generic dialect `DataFusion` parses it with must split it into the
 /// same tokens.
 /// # Errors
-/// Fails with `Unsupported` when no text passes that check, for example for a
-/// quoted name that holds a backslash before a quote.
+/// Fails with `Unsupported` when the text does not pass that check: for
+/// example for a quoted name that holds a backslash before a quote, a doubled
+/// unary minus (printed as `--`), or tokens the generic dialect reads
+/// differently, such as underscores in numbers.
 pub(crate) fn render_statement(
     mut statement: Statement,
     limits: &QueryExecutionConfig,
@@ -95,27 +97,35 @@ pub(crate) fn render_statement(
         return Err(error);
     }
     let sql = statement.to_string();
-    let reparsed = Tokenizer::new(&PostgreSqlDialect {}, &sql)
+    let not_printable = || {
+        QueryError::Unsupported(
+            "the statement cannot be planned: its SQL text does not parse back \
+             to the same statement"
+                .to_owned(),
+        )
+    };
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, &sql)
+        .tokenize_with_location()
+        .map_err(|_| not_printable())?;
+    if Tokenizer::new(&GenericDialect {}, &sql)
         .tokenize_with_location()
         .ok()
-        .filter(|tokens| {
-            Tokenizer::new(&GenericDialect {}, &sql)
-                .tokenize_with_location()
-                .is_ok_and(|generic| generic == *tokens)
-        })
-        .and_then(|tokens| {
-            Parser::new(&PostgreSqlDialect {})
-                .with_recursion_limit(limits.parser_recursion_limit)
-                .with_tokens_with_locations(tokens)
-                .parse_statements()
-                .ok()
-        });
-    if reparsed.as_deref() != Some(std::slice::from_ref(&statement)) {
+        .is_none_or(|generic| generic != tokens)
+    {
         return Err(QueryError::Unsupported(
-            "the statement cannot be planned from unambiguous SQL text; \
-             check quoted names and values for a backslash before a quote"
+            "the statement cannot be planned: DataFusion's SQL dialect splits its \
+             SQL text into other tokens, as it does underscores in numbers and \
+             some PostgreSQL operators"
                 .to_owned(),
         ));
+    }
+    let reparsed = Parser::new(&PostgreSqlDialect {})
+        .with_recursion_limit(limits.parser_recursion_limit)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|_| not_printable())?;
+    if reparsed.as_slice() != std::slice::from_ref(&statement) {
+        return Err(not_printable());
     }
     Ok(sql)
 }

@@ -2094,6 +2094,25 @@ fn render_statement_round_trips_string_values() -> Result<(), Box<dyn std::error
             "{sql}: {result:?}"
         );
     }
+
+    // Other text that does not read back the same is refused too, naming the
+    // check that failed.
+    for (sql, reason) in [
+        ("select - -1 as v", "does not parse back"),
+        ("select 1_000 as v", "DataFusion's SQL dialect"),
+        (
+            "select name ? 'a' from public_t",
+            "DataFusion's SQL dialect",
+        ),
+    ] {
+        let [statement] = <[Statement; 1]>::try_from(parse(sql)?)
+            .map_err(|_| std::io::Error::other("expected one statement"))?;
+        let result = render_statement(statement, &limits);
+        assert!(
+            matches!(&result, Err(QueryError::Unsupported(message)) if message.contains(reason)),
+            "{sql}: {result:?}"
+        );
+    }
     Ok(())
 }
 
