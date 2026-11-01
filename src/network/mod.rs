@@ -89,6 +89,7 @@ pub struct NetworkConfig {
     /// Deadline for receiving one next frame, never time spent executing a query.
     pub idle_timeout_ms: u64,
     /// Maximum declared frontend frame length; upstream type-specific limits also apply.
+    /// Before login, only startup and SASL frames of at most 10,000 bytes are accepted.
     pub max_frame_bytes: usize,
     pub auth_failure_limit: usize,
     pub auth_failure_window_ms: u64,
@@ -2194,6 +2195,29 @@ mod tests {
             .await
             .map_err(|error| format!("TLS required: {error}"))?;
         drop(plaintext);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_large_frames_close_the_connection_from_the_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A long handshake deadline: a server waiting for the declared body would
+        // keep the connection open past read_until_closed's limit.
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_handshake_timeout_ms(30_000);
+        let server = start_session_test_server(config).await?;
+        for tag in *b"Qp" {
+            let mut client = TcpStream::connect(server.addr).await?;
+            client.write_all(&startup_message("alice")?).await?;
+            read_until(&mut client, b'R').await?;
+            let mut header = vec![tag];
+            header.extend_from_slice(&(1_i32 << 20).to_be_bytes());
+            client.write_all(&header).await?;
+            read_until_closed(&mut client)
+                .await
+                .map_err(|error| format!("{}: {error}", char::from(tag)))?;
+        }
         server.shutdown().await?;
         Ok(())
     }

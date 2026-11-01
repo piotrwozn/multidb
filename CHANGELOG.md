@@ -43,6 +43,15 @@ All notable public changes will be recorded here.
   connections could trigger it without credentials. Failed accepts are now
   logged and retried: at once when the error concerns one connection, otherwise
   with a backoff of up to one second.
+- PostgreSQL wire checks messages sent before login from their header. A client
+  that had sent only a startup packet could declare a message of up to
+  `MULTIDB_PG_MAX_FRAME_BYTES` (16 MiB by default), and the server buffered all
+  of it before checking its type and size. Any client that could reach the
+  pgwire port could do this without credentials, on each of the 512 session
+  slots, to make the server hold several GiB of memory. Before login the server
+  now accepts only SCRAM authentication messages and Terminate, each of at most
+  10,000 bytes (pgwire's own limit for these messages), and closes the
+  connection on anything else as soon as its header arrives.
 - Pgwire reuses its Tokio runtime, applies separate handshake, idle and request
   deadlines instead of a total session lifetime, and checks frontend frame sizes
   before decoding. Successful logins release their authentication reservation

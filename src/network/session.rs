@@ -39,11 +39,17 @@ impl SessionLimits {
     }
 }
 
+/// pgwire's limit for startup and password messages, including the length field.
+const SMALL_PACKET_BYTES: usize = 10_000;
+
 /// Rejects oversized declared lengths before the upstream decoder can reserve body space.
 /// The upstream type-specific packet limits still apply, even if the configured cap is larger.
 struct BoundedCodec {
     inner: PgWireMessageServerCodec<String>,
     startup: bool,
+    /// Before login only SASL messages and Terminate are accepted, each within
+    /// [`SMALL_PACKET_BYTES`]; the configured cap applies to authenticated sessions.
+    authenticating: bool,
     frame_bytes: usize,
 }
 
@@ -70,8 +76,11 @@ impl Decoder for BoundedCodec {
         if length > self.frame_bytes {
             return Err(PgWireError::MessageTooLarge(length, self.frame_bytes));
         }
-        if self.startup && length > 10_000 {
-            return Err(PgWireError::MessageTooLarge(length, 10_000));
+        if self.authenticating && !self.startup && !matches!(bytes[0], b'p' | b'X') {
+            return Err(PgWireError::InvalidMessageType(bytes[0]));
+        }
+        if self.authenticating && length > SMALL_PACKET_BYTES {
+            return Err(PgWireError::MessageTooLarge(length, SMALL_PACKET_BYTES));
         }
         let total = length.checked_add(offset).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid pgwire frame length")
@@ -234,6 +243,7 @@ pub(super) async fn process_socket(
         let mut bounded = socket.map_codec(|inner| BoundedCodec {
             inner,
             startup: matches!(state, PgWireConnectionState::AwaitingStartup),
+            authenticating,
             frame_bytes: limits.frame_bytes,
         });
         let message = if authenticating {
@@ -317,6 +327,16 @@ mod tests {
     };
 
     fn make_codec(startup: bool, frame_bytes: usize) -> BoundedCodec {
+        let state = if startup {
+            PgWireConnectionState::AwaitingStartup
+        } else {
+            PgWireConnectionState::ReadyForQuery
+        };
+        make_codec_in(state, frame_bytes)
+    }
+
+    fn make_codec_in(state: PgWireConnectionState, frame_bytes: usize) -> BoundedCodec {
+        let startup = matches!(state, PgWireConnectionState::AwaitingStartup);
         let mut client = DefaultClient::<String>::new(([127, 0, 0, 1], 5432).into(), false);
         client.set_state(PgWireConnectionState::AwaitingStartup);
         let mut inner = PgWireMessageServerCodec::new(client);
@@ -330,13 +350,16 @@ mod tests {
                     Some(pgwire::messages::PgWireFrontendMessage::Startup(_))
                 )
             }));
-            inner
-                .client_info
-                .set_state(PgWireConnectionState::ReadyForQuery);
+            inner.client_info.set_state(state);
         }
         BoundedCodec {
             inner,
             startup,
+            authenticating: matches!(
+                state,
+                PgWireConnectionState::AwaitingStartup
+                    | PgWireConnectionState::AuthenticationInProgress
+            ),
             frame_bytes,
         }
     }
@@ -382,6 +405,45 @@ mod tests {
             codec.decode(&mut bytes),
             Err(PgWireError::MessageTooLarge(20_000, 10_000))
         ));
+    }
+
+    #[test]
+    fn unauthenticated_frames_are_limited_to_small_sasl_messages_from_the_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let frame_bytes = 16 * 1024 * 1024;
+        let mut codec = make_codec_in(PgWireConnectionState::AuthenticationInProgress, frame_bytes);
+        let mut bytes = BytesMut::from(&b"p\0\0\x27\x11"[..]);
+        assert!(matches!(
+            codec.decode(&mut bytes),
+            Err(PgWireError::MessageTooLarge(10_001, 10_000))
+        ));
+        assert_eq!(bytes.len(), 5);
+        for header in [&b"Q\0\x10\0\0"[..], b"d\0\x10\0\0", b"Q\0\0\0\x0d"] {
+            let mut bytes = BytesMut::from(header);
+            assert!(matches!(
+                codec.decode(&mut bytes),
+                Err(PgWireError::InvalidMessageType(b'Q' | b'd'))
+            ));
+            assert_eq!(bytes.len(), 5);
+        }
+        let mut bytes = BytesMut::from(&b"p\0\0\0\x16SCRAM-SHA-256\0\xff\xff\xff\xff"[..]);
+        assert!(matches!(
+            codec.decode(&mut bytes)?,
+            Some(pgwire::messages::PgWireFrontendMessage::PasswordMessageFamily(_))
+        ));
+        assert!(
+            codec
+                .decode(&mut BytesMut::from(&b"X\0\0\0\x04"[..]))?
+                .is_some()
+        );
+        // After login the configured cap applies: the body is awaited.
+        let mut codec = make_codec(false, frame_bytes);
+        assert!(
+            codec
+                .decode(&mut BytesMut::from(&b"Q\0\x10\0\0"[..]))?
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]
