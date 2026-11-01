@@ -71,6 +71,7 @@ const DEFAULT_AUTH_FAILURE_LIMIT: usize = 10;
 const DEFAULT_AUTH_FAILURE_WINDOW_MS: u64 = 60_000;
 const MAX_AUTH_RATE_KEYS: usize = 65_536;
 const MAX_AUTH_USERNAME_BYTES: usize = 256;
+const MAX_PENDING_CAPACITY_REJECTIONS: usize = 32;
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(5);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
@@ -628,6 +629,7 @@ impl PgServer {
         let max_connections = config.max_connections.max(1);
         let session_limits = session::SessionLimits::from_config(&config);
         let connection_permits = Arc::new(Semaphore::new(max_connections));
+        let rejection_permits = Arc::new(Semaphore::new(MAX_PENDING_CAPACITY_REJECTIONS));
         let blocking_tasks = u32::try_from(config.max_blocking_tasks.max(1))
             .map_err(|_| NetworkError::Runtime("max_blocking_tasks exceeds u32".to_owned()))?;
         let factory = Arc::new(DbPgFactory::new(database, config));
@@ -655,6 +657,15 @@ impl PgServer {
                     let permits = Arc::clone(&connection_permits);
                     let Ok(permit) = permits.try_acquire_owned() else {
                         tracing::warn!(max_connections, "pgwire connection limit reached");
+                        // A bounded number of refused clients get 53300; the rest are dropped.
+                        if let Ok(rejection) = Arc::clone(&rejection_permits).try_acquire_owned() {
+                            connections.spawn(async move {
+                                let _rejection = rejection;
+                                if let Err(error) = session::reject_at_capacity(socket, tls_acceptor, session_limits).await {
+                                    tracing::debug!(%error, "pgwire capacity rejection failed");
+                                }
+                            });
+                        }
                         continue;
                     };
                     connections.spawn(async move {
@@ -2217,6 +2228,44 @@ mod tests {
             read_until_closed(&mut client)
                 .await
                 .map_err(|error| format!("{}: {error}", char::from(tag)))?;
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_at_capacity_returns_53300() -> Result<(), Box<dyn std::error::Error>> {
+        let config =
+            NetworkConfig::new(TlsMode::DisabledForTests, test_auth()).with_max_connections(1);
+        let server = start_session_test_server(config).await?;
+        let first = plain_client(server.addr, "secret").await?;
+
+        let error = plain_client(server.addr, "secret")
+            .await
+            .err()
+            .ok_or("connection over the limit unexpectedly succeeded")?;
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS)
+        );
+
+        drop(first);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match plain_client(server.addr, "secret").await {
+                Ok(client) => {
+                    client.simple_query("select name from users").await?;
+                    break;
+                }
+                Err(error)
+                    if tokio::time::Instant::now() < deadline
+                        && error.code()
+                            == Some(&tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         server.shutdown().await?;
         Ok(())

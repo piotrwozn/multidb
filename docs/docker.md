@@ -95,7 +95,9 @@ meaning changed from a total session lifetime to one protocol request.
 
 A failed PostgreSQL authentication closes the connection: the server reads no
 further message from it. FATAL errors and cancel requests also close their
-connection.
+connection. At most 512 PostgreSQL sessions run at once. Further clients
+receive `FATAL 53300` (`sorry, too many clients already`); while 32 of those
+answers are pending, any more clients are disconnected without a message.
 
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.

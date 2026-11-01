@@ -52,6 +52,12 @@ All notable public changes will be recorded here.
   now accepts only SCRAM authentication messages and Terminate, each of at most
   10,000 bytes (pgwire's own limit for these messages), and closes the
   connection on anything else as soon as its header arrives.
+- PostgreSQL wire answers clients over its 512-session limit with
+  `FATAL 53300` (`sorry, too many clients already`), as PostgreSQL does.
+  Before, they were disconnected without a message, so connection pools could
+  not tell a full server from a network failure. Up to 32 such answers run at
+  once, each within the handshake deadline; further clients are still
+  disconnected without a message.
 - Pgwire reuses its Tokio runtime, applies separate handshake, idle and request
   deadlines instead of a total session lifetime, and checks frontend frame sizes
   before decoding. Successful logins release their authentication reservation

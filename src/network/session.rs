@@ -3,7 +3,7 @@
 use std::{io, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use pgwire::{
     api::{
         ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers,
@@ -188,6 +188,43 @@ where
         }
     }
     Ok(())
+}
+
+/// Answers a client that arrives while every session slot is taken with
+/// `FATAL 53300`, as `PostgreSQL` does, instead of dropping it silently. The
+/// whole exchange, including TLS, runs within the handshake deadline.
+pub(super) async fn reject_at_capacity(
+    socket: TcpStream,
+    tls: Option<TlsAcceptor>,
+    limits: SessionLimits,
+) -> io::Result<()> {
+    let handshake_deadline = deadline(limits.handshake)?;
+    let rejection = async move {
+        let Some(socket) = negotiate_tls::<String>(socket, tls).await? else {
+            return Ok(());
+        };
+        let mut bounded = socket.map_codec(|inner| BoundedCodec {
+            inner,
+            startup: true,
+            authenticating: true,
+            frame_bytes: limits.frame_bytes,
+        });
+        if let Some(Ok(PgWireFrontendMessage::Startup(_))) = bounded.next().await {
+            let error = ErrorInfo::new(
+                "FATAL".to_owned(),
+                "53300".to_owned(),
+                "sorry, too many clients already".to_owned(),
+            );
+            bounded
+                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                .await?;
+            bounded.close().await?;
+        }
+        Ok(())
+    };
+    tokio::time::timeout_at(handshake_deadline, rejection)
+        .await
+        .map_err(|_| timed_out("capacity rejection"))?
 }
 
 /// Sends an error response and returns whether the error was FATAL.
