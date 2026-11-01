@@ -93,6 +93,10 @@ use the defaults. These settings apply to the running server only. The request
 timeout maps to the library's legacy `connection_timeout_ms` field, whose
 meaning changed from a total session lifetime to one protocol request.
 
+A failed PostgreSQL authentication closes the connection: the server reads no
+further message from it. FATAL errors and cancel requests also close their
+connection.
+
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.
 

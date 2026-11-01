@@ -9,12 +9,14 @@ use pgwire::{
         ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers,
         portal::PortalExecutionState, store::PortalStore,
     },
-    error::{PgWireError, PgWireResult},
+    error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage},
-    tokio::server::{PgWireMessageServerCodec, negotiate_tls, process_error, process_message},
+    tokio::server::{
+        MaybeTls, PgWireMessageServerCodec, negotiate_tls, process_error, process_message,
+    },
 };
 use tokio::net::TcpStream;
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use super::{DbPgFactory, NetworkConfig, TlsAcceptor};
 
@@ -179,6 +181,18 @@ where
     Ok(())
 }
 
+/// Sends an error response and returns whether the error was FATAL.
+async fn report_error(
+    socket: &mut Framed<MaybeTls, PgWireMessageServerCodec<String>>,
+    error: PgWireError,
+    is_extended: bool,
+) -> io::Result<bool> {
+    let error = ErrorInfo::from(error);
+    let fatal = error.is_fatal();
+    process_error(socket, PgWireError::UserError(Box::new(error)), is_extended).await?;
+    Ok(fatal)
+}
+
 pub(super) async fn process_socket(
     socket: TcpStream,
     tls: Option<TlsAcceptor>,
@@ -201,6 +215,9 @@ pub(super) async fn process_socket(
     let cancel = factory.cancel_handler();
     let errors = factory.error_handler();
     let mut state_budget = super::session_state::Budget::default();
+    // Set only once a startup message completed the login, never from client metadata:
+    // pgwire copies the untrusted startup parameters, including `user`, into it.
+    let mut authenticated = false;
     loop {
         let state = socket.state();
         let authenticating = matches!(
@@ -208,6 +225,12 @@ pub(super) async fn process_socket(
             PgWireConnectionState::AwaitingStartup
                 | PgWireConnectionState::AuthenticationInProgress
         );
+        if !authenticating && !authenticated {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pgwire session left authentication without logging in",
+            ));
+        }
         let mut bounded = socket.map_codec(|inner| BoundedCodec {
             inner,
             startup: matches!(state, PgWireConnectionState::AwaitingStartup),
@@ -239,6 +262,7 @@ pub(super) async fn process_socket(
             PgWireConnectionState::CopyInProgress(is_extended) => is_extended,
             _ => message.is_extended_query(),
         };
+        let is_cancel = matches!(message, PgWireFrontendMessage::CancelRequest(_));
         let request_deadline = deadline(limits.request)?;
         let request_deadline = if authenticating {
             request_deadline.min(handshake_deadline)
@@ -258,15 +282,27 @@ pub(super) async fn process_socket(
             .await
             {
                 errors.on_error(&socket, &mut error);
-                process_error(&mut socket, error, is_extended).await?;
-            } else if let Some(update) = state_update {
+                let fatal = report_error(&mut socket, error, is_extended).await?;
+                // process_error moves the session to ReadyForQuery (or AwaitingSync) and
+                // shuts only the write half. Reading on after a failed login would dispatch
+                // the next frame as the user named in the startup message.
+                return Ok::<bool, io::Error>(authenticating || fatal);
+            }
+            if let Some(update) = state_update {
                 state_budget.commit(update);
             }
-            Ok::<(), io::Error>(())
+            // pgwire answers a cancel request and closes only the write half.
+            Ok(is_cancel)
         };
-        tokio::time::timeout_at(request_deadline, processing)
+        let close = tokio::time::timeout_at(request_deadline, processing)
             .await
             .map_err(|_| timed_out("protocol request"))??;
+        if close {
+            return Ok(());
+        }
+        if authenticating && matches!(socket.state(), PgWireConnectionState::ReadyForQuery) {
+            authenticated = true;
+        }
         finish_state_budget(&socket, &mut state_budget, execution.as_deref()).await?;
     }
 }

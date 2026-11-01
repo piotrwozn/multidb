@@ -19,6 +19,22 @@ All notable public changes will be recorded here.
 - Concurrent audit requests share durable batches without an added single-caller
   wait window. Every event retains its integrity sequence and is acknowledged
   after database and configured anchor persistence; events can share a commit LSN.
+- Fixed PostgreSQL wire connections that kept reading after a failed login.
+  When authentication failed (a wrong SCRAM proof, an unsupported SASL
+  mechanism, TLS required, the login rate limit or an over-long user name), the
+  server sent the error and shut only its sending side, then read the client's
+  next message and ran it as the user named in the startup message. Any client
+  that could reach the pgwire port could trigger it without credentials. That
+  user only had to be a mapped principal, not to have a SCRAM credential, so in
+  `multidb serve` the built-in `admin` principal qualified, and such names are
+  not rate-limited. The client could not read the result, but one write or DDL
+  statement per connection committed with that principal's rights. When the
+  error came before the user name was read, the statement ran as a principal
+  with no roles: authorization refused it, but it was still parsed and planned
+  for a client that never logged in. Such connections also held a session slot
+  until the idle or handshake deadline. A connection now closes after any error
+  during authentication, after any FATAL error and after a cancel request, and
+  only a completed login lets a session run statements.
 - Pgwire reuses its Tokio runtime, applies separate handshake, idle and request
   deadlines instead of a total session lifetime, and checks frontend frame sizes
   before decoding. Successful logins release their authentication reservation
