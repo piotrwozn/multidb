@@ -635,6 +635,10 @@ impl PgServer {
         let factory = Arc::new(DbPgFactory::new(database, config));
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
+        // One accept future lives across iterations, so a finished connection does
+        // not cut short or reset the backoff of a failing accept().
+        let accept = accept_with_backoff("pgwire", &listener);
+        tokio::pin!(accept);
 
         loop {
             tokio::select! {
@@ -650,7 +654,8 @@ impl PgServer {
                     return Ok(());
                 },
                 _ = connections.join_next(), if !connections.is_empty() => {},
-                accepted = accept_with_backoff("pgwire", &listener) => {
+                accepted = &mut accept => {
+                    accept.set(accept_with_backoff("pgwire", &listener));
                     let (socket, _) = accepted;
                     let tls_acceptor = tls_acceptor.clone();
                     let factory = Arc::clone(&factory);
