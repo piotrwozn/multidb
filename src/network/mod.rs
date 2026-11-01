@@ -90,7 +90,8 @@ pub struct NetworkConfig {
     /// Deadline for receiving one next frame, never time spent executing a query.
     pub idle_timeout_ms: u64,
     /// Maximum declared frontend frame length; upstream type-specific limits also apply.
-    /// Before login, only startup and SASL frames of at most 10,000 bytes are accepted.
+    /// Before login, only startup-phase packets (startup, SSL/GSS encryption and cancel
+    /// requests), SASL messages and Terminate are accepted, each of at most 10,000 bytes.
     pub max_frame_bytes: usize,
     pub auth_failure_limit: usize,
     pub auth_failure_window_ms: u64,

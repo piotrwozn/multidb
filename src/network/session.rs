@@ -47,8 +47,9 @@ const SMALL_PACKET_BYTES: usize = 10_000;
 struct BoundedCodec {
     inner: PgWireMessageServerCodec<String>,
     startup: bool,
-    /// Before login only SASL messages and Terminate are accepted, each within
-    /// [`SMALL_PACKET_BYTES`]; the configured cap applies to authenticated sessions.
+    /// Before login only startup packets, SASL messages and Terminate are accepted,
+    /// each within [`SMALL_PACKET_BYTES`]; the configured cap applies to authenticated
+    /// sessions.
     authenticating: bool,
     frame_bytes: usize,
 }
@@ -79,7 +80,7 @@ impl Decoder for BoundedCodec {
         if self.authenticating && !self.startup && !matches!(bytes[0], b'p' | b'X') {
             return Err(PgWireError::InvalidMessageType(bytes[0]));
         }
-        if self.authenticating && length > SMALL_PACKET_BYTES {
+        if (self.startup || self.authenticating) && length > SMALL_PACKET_BYTES {
             return Err(PgWireError::MessageTooLarge(length, SMALL_PACKET_BYTES));
         }
         let total = length.checked_add(offset).ok_or_else(|| {

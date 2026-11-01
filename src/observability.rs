@@ -242,7 +242,8 @@ impl MetricsRegistry {
 impl MetricsServer {
     /// Serves `/metrics` as Prometheus text.
     /// # Errors
-    /// Does not fail: failed `accept()` calls are logged and retried with backoff.
+    /// Never returns an error; it serves until the future is dropped. Failed
+    /// `accept()` calls are logged and retried with backoff.
     pub async fn serve(
         listener: TcpListener,
         registry: MetricsRegistry,
@@ -252,7 +253,8 @@ impl MetricsServer {
 
     /// Serves `/metrics` as Prometheus text with optional bearer-token authorization.
     /// # Errors
-    /// Does not fail: failed `accept()` calls are logged and retried with backoff.
+    /// Never returns an error; it serves until the future is dropped. Failed
+    /// `accept()` calls are logged and retried with backoff.
     pub async fn serve_with_auth(
         listener: TcpListener,
         registry: MetricsRegistry,
