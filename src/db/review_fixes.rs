@@ -185,16 +185,26 @@ fn phase19_schema(name: &str) -> Option<SchemaRef> {
     let columns: &[(&str, DataType)] = match name {
         "match" => &[("id", Binary), ("score", Float64), ("text", Utf8)],
         "time_bucket" => &[("bucket", Int64)],
-        // Points are returned as JSON text.
         "within_radius" => &[
             ("id", Binary),
-            ("point", Utf8),
+            ("point", geo_point_type()),
             ("distance_meters", Float64),
         ],
         "graph_neighbors" => &[("node", Utf8)],
         _ => return None,
     };
     Some(static_schema(columns))
+}
+
+/// A geographic point, which pgwire sends as JSON like other structured values.
+fn geo_point_type() -> DataType {
+    DataType::Struct(
+        vec![
+            Field::new("lon", DataType::Float64, false),
+            Field::new("lat", DataType::Float64, false),
+        ]
+        .into(),
+    )
 }
 
 fn static_schema(columns: &[(&str, DataType)]) -> SchemaRef {
@@ -249,11 +259,15 @@ mod tests {
         cdc::{self, AggregateKind, AggregateSpec, MaterializedViewSpec},
         db::{DbConfig, Profile, create_database},
         extension::{ExtensionError, MaskingPolicy, RowPolicy},
-        model::FieldPath,
-        query::{ColumnDef, ColumnType, TableSchema},
+        geo::GeoIndexConfig,
+        model::{CollectionId, FieldPath},
+        query::{ColumnDef, ColumnType, DocField, TableLayout, TableSchema},
         repl::{ReadConsistency, Replication},
         security::{AuthzError, AuthzPolicy, Permission, Resource, Role},
-        tuning::WorkloadWindow,
+        tuning::{
+            ParameterEnvelope, ReprofilePlan, TunableParameter, TuningDecision, TuningPolicy,
+            WorkloadSample, WorkloadWindow,
+        },
     };
 
     #[tokio::test]
@@ -786,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn describe_types_builtins_like_execution() -> Result<(), Box<dyn std::error::Error>> {
-        let (database, admin, _) = describe_test_database()?;
+        let (mut database, admin, _) = describe_test_database()?;
         // A UDF call runs WASM, so it is not described.
         let described = database
             .describe_query_as(&admin, "SELECT absent_udf(1)")
@@ -799,12 +813,62 @@ mod tests {
             "{described:?}"
         );
 
+        // Each view and helper below returns a row, so its values' types are compared.
+        database.record_workload_sample(
+            &WorkloadSample::new("SELECT * FROM public_t WHERE name = 'x'")
+                .with_access("public_t", "name")
+                .with_observed_rows(1, 3_000),
+        )?;
+        let mut policy = TuningPolicy {
+            enabled: true,
+            recommend_only: false,
+            ..TuningPolicy::default()
+        };
+        policy.envelopes.insert(
+            TunableParameter::CacheMaxCapacity,
+            ParameterEnvelope::new(64, 4_096, 64),
+        );
+        database.set_tuning_policy(&policy)?;
+        let capacity = database.performance_config().cache.max_capacity;
+        database.apply_tuning(TuningDecision::new(
+            TunableParameter::CacheMaxCapacity,
+            capacity,
+            1_024,
+            "cache miss pressure",
+        ))?;
+        database.start_reprofile(ReprofilePlan {
+            object: "public_t".to_owned(),
+            from_layout: TableLayout::Row,
+            to_layout: TableLayout::Columnar,
+            reversible: true,
+        })?;
+        database
+            .create_collection(
+                "places",
+                CollectionId::new(1),
+                vec![DocField::document_id("id")],
+                Vec::new(),
+            )?
+            .insert(&Value::Object(BTreeMap::from([(
+                "point".to_owned(),
+                Value::GeoPoint {
+                    lon: 21.0,
+                    lat: 52.0,
+                },
+            )])))?;
+        database.create_geo_index(GeoIndexConfig::new(
+            "places_geo",
+            CollectionId::new(1),
+            FieldPath::new(["point"]),
+        ))?;
+
         for sql in [
             "SELECT * FROM system.workload",
             "SELECT * FROM system.tuning_log",
             "SELECT * FROM system.index_advice",
             "SELECT * FROM system.reprofile_jobs",
             "SELECT time_bucket(60000, 125000)",
+            "SELECT * FROM within_radius('places_geo', 21.0, 52.0, 10)",
         ] {
             let schema = database
                 .describe_query_as(&admin, sql)
@@ -813,6 +877,7 @@ mod tests {
             let SqlOutput::Rows(rows) = database.query_as(&admin, sql).await? else {
                 return Err(format!("{sql} returned no rows").into());
             };
+            assert!(!rows.rows.is_empty(), "{sql} returned no rows to compare");
             let names = schema
                 .fields()
                 .iter()
@@ -827,6 +892,7 @@ mod tests {
                         Value::Int(_) => DataType::Int64,
                         Value::Float(_) => DataType::Float64,
                         Value::Bytes(_) => DataType::Binary,
+                        Value::GeoPoint { .. } => super::geo_point_type(),
                         _ => DataType::Utf8,
                     };
                     assert_eq!(field.data_type(), &expected, "{sql}: {}", field.name());
