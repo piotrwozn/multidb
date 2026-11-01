@@ -1149,7 +1149,9 @@ pub(crate) fn split_args(args: &str) -> Result<Vec<String>, ExtensionError> {
 pub(crate) fn parse_literal_value(value: &str) -> Result<Value, ExtensionError> {
     let value = value.trim();
     // Bound parameters write negative numbers in parentheses, e.g. `(-5)`.
-    if let Some(inner) = value.strip_prefix('(').and_then(|v| v.strip_suffix(')')) {
+    if let Some(inner) = value.strip_prefix('(').and_then(|v| v.strip_suffix(')'))
+        && closing_paren(value, 0) == Some(value.len() - 1)
+    {
         return parse_literal_value_unwrapped(inner.trim());
     }
     parse_literal_value_unwrapped(value)
@@ -1166,6 +1168,12 @@ fn parse_literal_value_unwrapped(value: &str) -> Result<Value, ExtensionError> {
         return Ok(Value::Bool(false));
     }
     if let Some(stripped) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        // A quote inside a string literal is doubled; any other quote ends it.
+        if stripped.replace("''", "").contains('\'') {
+            return Err(ExtensionError::InvalidSyntax(format!(
+                "argument is not a single literal: {value}"
+            )));
+        }
         return Ok(Value::Str(stripped.replace("''", "'")));
     }
     if value.contains('.') {
@@ -1509,6 +1517,10 @@ mod tests {
         );
         assert_eq!(parse_literal_value("NULL")?, Value::Null);
         assert!(parse_literal_value("((-5))").is_err());
+        // An argument is one literal, in parentheses or not.
+        for argument in ["('a') || ('b')", "(1) + (2)", "'a' || 'b'", "'a'''b'"] {
+            assert!(parse_literal_value(argument).is_err(), "{argument}");
+        }
 
         let call = parse_select_udf_call("SELECT f((-5), (-1.5))")?
             .ok_or_else(|| "missing call".to_owned())?;

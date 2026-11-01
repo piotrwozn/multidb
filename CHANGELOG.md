@@ -61,7 +61,8 @@ All notable public changes will be recorded here.
   parentheses (`(-5)`), and a space separates a spliced value from a
   neighbouring token. Floats that hold a whole number stay floats (`1.0` was
   spliced as `1`, so `$1 / 2` divided as integers), `INSERT` accepts a bound
-  `i64::MIN`, `CALL` and UDF arguments accept parenthesized numbers, and a
+  `i64::MIN`, `CALL` and UDF arguments accept parenthesized numbers (each
+  argument must be one literal: `'a' || 'b'` was read as one string), and a
   projection such as `SELECT 1, (-5)` that ends with `)` is no longer taken for
   a WASM UDF call.
 - Prepared statements are checked when the client parses them (`Parse`). A
