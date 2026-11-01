@@ -8627,7 +8627,7 @@ fn apply_procedure_commands(
     Ok(ProcedureResult::AffectedRows(affected))
 }
 
-fn parse_as_of_query(sql: &str) -> Result<Option<(String, TemporalPoint)>, DbError> {
+pub(crate) fn parse_as_of_query(sql: &str) -> Result<Option<(String, TemporalPoint)>, DbError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     if let Some(index) = lower.rfind(" as of lsn ") {

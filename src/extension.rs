@@ -888,11 +888,16 @@ pub fn parse_select_udf_call(sql: &str) -> Result<Option<(String, Vec<Value>)>, 
     let Some(open) = expr.find('(') else {
         return Ok(None);
     };
-    if !expr.ends_with(')') {
+    // Only a projection that is one call `name(args)` is a UDF call. Other
+    // expressions, such as `1, (-5)` or `abs(1) + (-5)` with a bound negative
+    // number, are left to the SQL engine.
+    if closing_paren(expr, open) != Some(expr.len() - 1) {
         return Ok(None);
     }
     let name = expr[..open].trim().trim_matches('"').to_owned();
-    validate_identifier(&name)?;
+    if validate_identifier(&name).is_err() {
+        return Ok(None);
+    }
     let args = expr[open + 1..expr.len() - 1].trim();
     if args.is_empty() {
         return Ok(Some((name, Vec::new())));
@@ -902,6 +907,27 @@ pub fn parse_select_udf_call(sql: &str) -> Result<Option<(String, Vec<Value>)>, 
         .map(|arg| parse_literal_value(&arg))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some((name, values)))
+}
+
+/// The index of the `)` that closes the `(` at `open`, outside single-quoted
+/// strings.
+fn closing_paren(expr: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    for (index, ch) in expr.char_indices().skip_while(|(index, _)| *index < open) {
+        match ch {
+            '\'' => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub fn extension_sql_requirements(
@@ -1121,6 +1147,15 @@ pub(crate) fn split_args(args: &str) -> Result<Vec<String>, ExtensionError> {
 }
 
 pub(crate) fn parse_literal_value(value: &str) -> Result<Value, ExtensionError> {
+    let value = value.trim();
+    // Bound parameters write negative numbers in parentheses, e.g. `(-5)`.
+    if let Some(inner) = value.strip_prefix('(').and_then(|v| v.strip_suffix(')')) {
+        return parse_literal_value_unwrapped(inner.trim());
+    }
+    parse_literal_value_unwrapped(value)
+}
+
+fn parse_literal_value_unwrapped(value: &str) -> Result<Value, ExtensionError> {
     if value.eq_ignore_ascii_case("null") {
         return Ok(Value::Null);
     }
@@ -1200,7 +1235,8 @@ mod tests {
 
     use super::{
         CodecRegistry, CollationRegistry, ExtensionError, PolicyConfig, UdfSpec, WasmRuntime,
-        builtin_collation_key, parse_create_wasm_function, parse_select_udf_call,
+        builtin_collation_key, parse_create_wasm_function, parse_literal_value,
+        parse_select_udf_call,
     };
     use crate::{
         extension::{LimitPolicy, MaskingPolicy, ValidationPolicy},
@@ -1456,6 +1492,54 @@ mod tests {
                 Value::Bool(true)
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_arguments_accept_parenthesized_bound_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Bound parameters render negative numbers as `(-5)`.
+        assert_eq!(parse_literal_value("(-5)")?, Value::Int(-5));
+        assert_eq!(parse_literal_value("(-1.5)")?, Value::Float(-1.5));
+        assert_eq!(parse_literal_value("( 'a' )")?, Value::Str("a".to_owned()));
+        assert_eq!(parse_literal_value("-5")?, Value::Int(-5));
+        assert_eq!(
+            parse_literal_value("'it''s'")?,
+            Value::Str("it's".to_owned())
+        );
+        assert_eq!(parse_literal_value("NULL")?, Value::Null);
+        assert!(parse_literal_value("((-5))").is_err());
+
+        let call = parse_select_udf_call("SELECT f((-5), (-1.5))")?
+            .ok_or_else(|| "missing call".to_owned())?;
+        assert_eq!(call.1, vec![Value::Int(-5), Value::Float(-1.5)]);
+        // A parenthesized expression is not a function call.
+        assert!(parse_select_udf_call("SELECT (-5)")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_single_call_projection_is_a_udf_call() -> Result<(), Box<dyn std::error::Error>> {
+        // Bound negative parameters end these expressions with `)`.
+        for sql in [
+            "SELECT 1, (-5)",
+            "SELECT 1 AS a, (-5)",
+            "SELECT 10 - (-5)",
+            "SELECT -(-5)",
+            "SELECT abs(1) + (-5)",
+            "SELECT f(1), (-5)",
+            "SELECT f('x') || ('y')",
+            "SELECT \"bad name\"(1)",
+        ] {
+            assert!(parse_select_udf_call(sql)?.is_none(), "{sql}");
+        }
+
+        let call =
+            parse_select_udf_call("SELECT f('a)')")?.ok_or_else(|| "missing call".to_owned())?;
+        assert_eq!(call, ("f".to_owned(), vec![Value::Str("a)".to_owned())]));
+        let call = parse_select_udf_call("SELECT f('a)(', (-5))")?
+            .ok_or_else(|| "missing call".to_owned())?;
+        assert_eq!(call.1, vec![Value::Str("a)(".to_owned()), Value::Int(-5)]);
         Ok(())
     }
 }

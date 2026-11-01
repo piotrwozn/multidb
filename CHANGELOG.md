@@ -47,6 +47,30 @@ All notable public changes will be recorded here.
   This covers queries, `EXPLAIN`, Describe (`INSERT ... RETURNING` is now
   described from its parsed `RETURNING` items) and the permission check of
   `EXPLAIN`.
+- Fixed PostgreSQL wire extended-protocol parameters that could change the
+  statement they were bound into. A negative number bound right after a minus
+  sign, as in `age > 0-$1`, was spliced as `0--5`, which starts a comment, so
+  the rest of the line (for example `AND tenant_id = $2`) was dropped; next to a
+  unary minus or a higher-precedence operator its sign could also bind
+  differently. Any end user controlling a numeric parameter in such a statement
+  could trigger it; reads stayed limited to what the principal may read, with
+  row and masking policies applied. Negative numbers are now spliced in
+  parentheses (`(-5)`), and a space separates a spliced value from a
+  neighbouring token. Floats that hold a whole number stay floats (`1.0` was
+  spliced as `1`, so `$1 / 2` divided as integers), `INSERT` accepts a bound
+  `i64::MIN`, `CALL` and UDF arguments accept parenthesized numbers, and a
+  projection such as `SELECT 1, (-5)` that ends with `)` is no longer taken for
+  a WASM UDF call.
+- Prepared statements are checked when the client parses them (`Parse`). A
+  prepared statement holds one SQL statement, as in PostgreSQL (SQLSTATE 42601
+  `cannot insert multiple commands into a prepared statement`); before, Execute
+  ran every statement of a `;`-separated batch. A placeholder used as a whole
+  `ORDER BY` or `GROUP BY` item (also an aggregate's `ORDER BY`) is refused with
+  SQLSTATE 0A000: the engine reads a number there as a column position, so a
+  bound `2` sorted or grouped by the second column instead of by a constant.
+  Placeholders run from `$1` to `$65535` (SQLSTATE 42P02), and a placeholder the
+  client sent no type for is described as `TEXT` in `ParameterDescription`, so
+  drivers that prepare without parameter types can bind it.
 - Added a reproducible local before/after SQL benchmark runner with binary/source
   provenance, raw latency verification and all nine supplied workloads. See
   `docs/performance-local-benchmarks.md`.

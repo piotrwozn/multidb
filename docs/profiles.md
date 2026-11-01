@@ -202,11 +202,12 @@ The four SQL parser limits (`query.max_sql_bytes`, `max_statements`,
 `max_values_rows`, `parser_recursion_limit`) bind the engine's parse and these
 pre-parses in front of it: the compatibility-query check of `Database::query`,
 the RBAC check of `query_as` and `query_as_of_as` and the retention check of
-`query_as_of`. They do not bind the tuning system view check
-(`tuning::parse_system_view`), the `match`, `time_bucket`, `within_radius` and
-`graph_neighbors` call check (`parse_phase19_call`) or the pgwire
-extended-protocol Describe pre-parse, which keep sqlparser's defaults (see
-below). The size limit counts the whole SQL text, trailing whitespace
+`query_as_of`. PostgreSQL wire Describe plans the statement through the same
+parse as execution, and the check of a prepared statement's placeholders when
+the client parses it uses these limits too. They do not bind the tuning system
+view check (`tuning::parse_system_view`) or the `match`, `time_bucket`,
+`within_radius` and `graph_neighbors` call check (`parse_phase19_call`), which
+keep sqlparser's defaults (see below). The size limit counts the whole SQL text, trailing whitespace
 and semicolons included; for the inline `... AS OF LSN n` / `AS OF TIMESTAMP n`
 form of `Database::query` it counts the query left after the `AS OF` clause
 is removed. DataFusion parses the SELECTs it plans (every SELECT

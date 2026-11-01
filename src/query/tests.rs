@@ -2137,3 +2137,43 @@ fn name_filter_literal(statements: &[Statement]) -> Option<String> {
         _ => None,
     }
 }
+
+#[tokio::test]
+async fn nested_negative_literals_are_values() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    engine
+        .execute(
+            "insert into public_t (id, name, age, active) values \
+             ((-5), 'n', (-1), true), ((-9223372036854775808), 'min', 0, false), \
+             (-(-7), 'double', 1, true)",
+        )
+        .await?;
+
+    for (sql, expected) in [
+        ("select age from public_t where id = (-5)", Value::Int(-1)),
+        (
+            "select name from public_t where id = (-9223372036854775808)",
+            Value::Str("min".to_owned()),
+        ),
+        (
+            "select name from public_t where id = 7",
+            Value::Str("double".to_owned()),
+        ),
+    ] {
+        let SqlOutput::Rows(rows) = engine.execute(sql).await? else {
+            return Err(format!("{sql} returned no rows").into());
+        };
+        assert_eq!(rows.rows, vec![vec![expected]], "{sql}");
+    }
+    let result = engine
+        .execute(
+            "insert into public_t (id, name, age, active) \
+             values (-(-9223372036854775808), 'overflow', 0, true)",
+        )
+        .await;
+    assert!(
+        matches!(result, Err(QueryError::InvalidValue(_))),
+        "{result:?}"
+    );
+    Ok(())
+}

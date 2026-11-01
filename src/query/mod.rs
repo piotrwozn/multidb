@@ -5521,12 +5521,24 @@ fn sql_expr_to_value(expr: &SqlExpr) -> Result<Value, QueryError> {
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } => match sql_expr_to_value(expr)? {
-            Value::Int(value) => Ok(Value::Int(-value)),
-            Value::Float(value) => Ok(Value::Float(-value)),
-            _ => Err(QueryError::Unsupported(expr.to_string())),
-        },
-        SqlExpr::UnaryOp {
+        } => {
+            // Parse the sign with the digits, so `-9223372036854775808` fits.
+            if let SqlExpr::Value(value) = expr.as_ref()
+                && let SqlValue::Number(raw, long) = &value.value
+            {
+                return sql_value_to_value(&SqlValue::Number(format!("-{raw}"), *long));
+            }
+            match sql_expr_to_value(expr)? {
+                Value::Int(value) => value.checked_neg().map(Value::Int).ok_or_else(|| {
+                    QueryError::InvalidValue(format!("integer out of range: -({value})"))
+                }),
+                Value::Float(value) => Ok(Value::Float(-value)),
+                _ => Err(QueryError::Unsupported(expr.to_string())),
+            }
+        }
+        // Bound parameters write negative numbers in parentheses.
+        SqlExpr::Nested(expr)
+        | SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => sql_expr_to_value(expr),
