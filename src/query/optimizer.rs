@@ -1461,9 +1461,20 @@ fn normalize_sql(sql: &str) -> String {
 
     while let Some(ch) = chars.next() {
         if ch == '\'' {
+            // The `E` or `N` prefix is part of the literal, and inside
+            // `E'...'` a backslash escapes the next character.
+            let escaped = match string_literal_prefix(&output) {
+                Some(prefix) => {
+                    output.pop();
+                    prefix == 'e'
+                }
+                None => false,
+            };
             output.push('?');
             while let Some(next) = chars.next() {
-                if next == '\'' {
+                if escaped && next == '\\' {
+                    let _ = chars.next();
+                } else if next == '\'' {
                     if chars.peek() == Some(&'\'') {
                         let _ = chars.next();
                     } else {
@@ -1505,6 +1516,17 @@ fn normalize_sql(sql: &str) -> String {
     }
 
     output.trim().trim_end_matches(';').to_owned()
+}
+
+/// The `e` or `n` at the end of the lowercased `output` when it starts an
+/// `E'...'` or `N'...'` string literal rather than ending an identifier.
+fn string_literal_prefix(output: &str) -> Option<char> {
+    let mut chars = output.chars().rev();
+    let prefix = chars.next().filter(|ch| matches!(ch, 'e' | 'n'))?;
+    chars
+        .next()
+        .is_none_or(|previous| !is_identifier_char(previous))
+        .then_some(prefix)
 }
 
 fn is_identifier_char(ch: char) -> bool {

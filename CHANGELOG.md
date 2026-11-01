@@ -81,6 +81,9 @@ All notable public changes will be recorded here.
   their first input's type, so binary clients decoded floats as integers), and
   refuses a WASM UDF call (SQLSTATE 0A000) and a query over a table whose
   masking replacement SQL cannot return, which Execute refuses too.
+- Workload fingerprints (`system.workload`) no longer keep part of the value
+  of an `E'...'` string literal with an escaped quote, or the `N` / `E` prefix
+  of a literal.
 - Added a reproducible local before/after SQL benchmark runner with binary/source
   provenance, raw latency verification and all nine supplied workloads. See
   `docs/performance-local-benchmarks.md`.

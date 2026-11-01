@@ -2307,3 +2307,30 @@ async fn describe_refuses_scans_whose_policies_sql_cannot_apply()
     );
     Ok(())
 }
+
+#[test]
+fn query_fingerprint_hides_escaped_string_values() {
+    let plain = QueryFingerprint::new("select name from users where name = 'x'");
+    for sql in [
+        "select name from users where name = E'secret-token\\' and more'",
+        "select name from users where name = e'secret\\\\'",
+        "select name from users where name = E'secret\\\\\\' or ''more'''",
+        "select name from users where name = N'secret'",
+        "select name from users where name = 'secret''s more'",
+    ] {
+        let fingerprint = QueryFingerprint::new(sql);
+        assert!(
+            !fingerprint.0.contains("secret") && !fingerprint.0.contains("more"),
+            "{sql}: {fingerprint:?}"
+        );
+        assert_eq!(fingerprint, plain, "{sql}");
+    }
+    assert_ne!(
+        QueryFingerprint::new("select name from users where name = 'x'"),
+        QueryFingerprint::new("select name from users where note = 'x'")
+    );
+    assert_ne!(
+        QueryFingerprint::new("select name from users where name = 'x'"),
+        QueryFingerprint::new("select name from users where name = e")
+    );
+}
