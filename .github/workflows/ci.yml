@@ -75,7 +75,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
-          toolchain: nightly
+          # Pinned: nightly-2026-11-01 fails to compile datafusion-catalog 54
+          # (E0391, a query cycle computing async drop for datafusion_expr::Expr).
+          # Move the date forward once a newer nightly builds the fuzz targets.
+          toolchain: nightly-2026-10-31
       - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
       - run: cargo install cargo-fuzz --locked
       - name: Required fuzz smoke

@@ -1,9 +1,13 @@
 use std::ops::ControlFlow;
 
 use sqlparser::{
-    ast::{Expr as SqlExpr, Query, SetExpr, Statement, Value as SqlValue, Visit, Visitor},
-    dialect::PostgreSqlDialect,
+    ast::{
+        Expr as SqlExpr, Query, SetExpr, Statement, Value as SqlValue, ValueWithSpan, Visit,
+        VisitMut, Visitor, VisitorMut,
+    },
+    dialect::{GenericDialect, PostgreSqlDialect},
     parser::Parser,
+    tokenizer::Tokenizer,
 };
 
 use super::{AnalyzeMode, AnalyzeTarget, QueryError};
@@ -18,10 +22,10 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>, QueryError> {
 
 /// Parses SQL text with the `PostgreSQL` dialect under the configured SQL text size, statement
 /// count, `VALUES` row and parser recursion limits. The engine and the compatibility, RBAC and
-/// `AS OF` retention pre-parses parse through it, so they agree on what SQL is accepted.
-/// `DataFusion` parses the SELECTs it plans again with its own recursion limit of 50; the pgwire
-/// extended-protocol Describe pre-parse and best-effort internal parses that ignore parse errors
-/// keep sqlparser's defaults.
+/// `AS OF` retention pre-parses parse through it, so they agree on what SQL is accepted, and so
+/// does the pgwire check of prepared statements. `DataFusion` parses the SELECTs it plans again
+/// with its own recursion limit of 50; best-effort internal parses that ignore parse errors keep
+/// sqlparser's defaults.
 pub(crate) fn parse_with_limits(
     sql: &str,
     limits: &QueryExecutionConfig,
@@ -63,6 +67,96 @@ pub(crate) fn parse_with_limits(
     }
 
     Ok(statements)
+}
+
+/// Renders a parsed statement as SQL text that the engine's planners parse back
+/// to the same statement.
+///
+/// The simple planners and `DataFusion` plan re-rendered text. sqlparser's
+/// printer does not escape every quoted value or name: inside `'...'` and
+/// `"..."` it leaves a quote that follows a backslash undoubled and passes an
+/// existing doubled quote through, and it prints `N'...'` unescaped. Neither
+/// the `PostgreSQL` nor the generic dialect treats a backslash as an escape
+/// there, so such a value or name would end early when the text is parsed
+/// again and the rest of it would run as SQL. String literals that contain a
+/// quote are therefore rendered as `E'...'`, whose escaping both dialects
+/// reverse exactly. The text is then checked: parsed again with the
+/// `PostgreSQL` dialect under `limits` it must give back the same statement,
+/// and the generic dialect `DataFusion` parses it with must split it into the
+/// same tokens.
+/// # Errors
+/// Fails with `Unsupported` when the text does not pass that check: for
+/// example for a quoted name that holds a backslash before a quote, a doubled
+/// unary minus (printed as `--`), or tokens the generic dialect reads
+/// differently, such as underscores in numbers.
+pub(crate) fn render_statement(
+    mut statement: Statement,
+    limits: &QueryExecutionConfig,
+) -> Result<String, QueryError> {
+    if let ControlFlow::Break(error) = VisitMut::visit(&mut statement, &mut QuoteSafeLiterals) {
+        return Err(error);
+    }
+    let sql = statement.to_string();
+    let not_printable = || {
+        QueryError::Unsupported(
+            "the statement cannot be planned: its SQL text does not parse back \
+             to the same statement"
+                .to_owned(),
+        )
+    };
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, &sql)
+        .tokenize_with_location()
+        .map_err(|_| not_printable())?;
+    if Tokenizer::new(&GenericDialect {}, &sql)
+        .tokenize_with_location()
+        .ok()
+        .is_none_or(|generic| generic != tokens)
+    {
+        return Err(QueryError::Unsupported(
+            "the statement cannot be planned: DataFusion's SQL dialect splits its \
+             SQL text into other tokens, as it does underscores in numbers and \
+             some PostgreSQL operators"
+                .to_owned(),
+        ));
+    }
+    let reparsed = Parser::new(&PostgreSqlDialect {})
+        .with_recursion_limit(limits.parser_recursion_limit)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|_| not_printable())?;
+    if reparsed.as_slice() != std::slice::from_ref(&statement) {
+        return Err(not_printable());
+    }
+    Ok(sql)
+}
+
+/// Rewrites string literals that hold a quote as `E'...'` literals.
+struct QuoteSafeLiterals;
+
+impl VisitorMut for QuoteSafeLiterals {
+    type Break = QueryError;
+
+    fn post_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        match &mut value.value {
+            SqlValue::SingleQuotedString(text) | SqlValue::NationalStringLiteral(text)
+                if text.contains('\'') =>
+            {
+                let text = std::mem::take(text);
+                value.value = SqlValue::EscapedStringLiteral(text);
+            }
+            SqlValue::HexStringLiteral(text)
+            | SqlValue::SingleQuotedByteStringLiteral(text)
+            | SqlValue::DoubleQuotedByteStringLiteral(text)
+                if text.contains(['\'', '"', '\\']) =>
+            {
+                return ControlFlow::Break(QueryError::Unsupported(
+                    "hex or bit-string literal containing a quote or backslash".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 fn count_statement_values_rows(statement: &Statement) -> usize {

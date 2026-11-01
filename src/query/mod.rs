@@ -83,8 +83,8 @@ pub use optimizer::{
     PlanDependency, PlannerFeedback, QueryFingerprint, STATS_TABLE, SimpleSelectPlan, StatsCatalog,
     StatsObjectKind, TableStats,
 };
-pub(crate) use parser::parse_with_limits;
 pub use parser::{parse, parse_analyze_for_authz};
+pub(crate) use parser::{parse_with_limits, render_statement};
 
 use parser::{parse_analyze_command, parse_limit};
 
@@ -2490,14 +2490,14 @@ impl SqlEngine {
         guard: &mut dyn SqlReadGuard,
     ) -> Result<Option<SchemaRef>, QueryError> {
         let statements = parse_with_limits(sql, &self.performance.query)?;
-        let [statement] = statements.as_slice() else {
+        let Ok([statement]) = <[Statement; 1]>::try_from(statements) else {
             return Err(QueryError::Unsupported(
                 "Describe requires exactly one SQL statement".to_owned(),
             ));
         };
         let policies = guard.relation_policies();
         let select_sql = match statement {
-            Statement::Query(_) => statement.to_string(),
+            Statement::Query(_) => render_statement(statement, &self.performance.query)?,
             Statement::Insert(insert) => {
                 let Some(returning) = &insert.returning else {
                     return Ok(None);
@@ -2518,16 +2518,15 @@ impl SqlEngine {
                     .get(&table)
                     .ok_or_else(|| QueryError::MissingTable(table.clone()))?;
                 returning_rows(relation.schema.as_ref(), returning, &[])?;
-                let projection = returning
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("SELECT {projection} FROM {name}")
+                render_statement(returning_select(name, returning)?, &self.performance.query)?
             }
             Statement::Explain { statement, .. } => {
                 let (_, reads) = self
-                    .prepare_explain(&statement.to_string(), ExplainOptions::default(), &policies)
+                    .prepare_explain(
+                        &render_statement(*statement, &self.performance.query)?,
+                        ExplainOptions::default(),
+                        &policies,
+                    )
                     .await?;
                 guard
                     .authorize_reads(&reads)
@@ -2544,7 +2543,34 @@ impl SqlEngine {
         guard
             .authorize_reads(&planned_read_targets(&plan, &providers)?)
             .map_err(QueryError::AuthzDenied)?;
-        Ok(Some(Arc::clone(plan.schema().inner())))
+        // Running the query would fail where it scans a relation whose
+        // policies SQL cannot apply, so Describe refuses it too.
+        if let Some(reason) = unappliable_policy_scan(&plan)? {
+            return Err(QueryError::Unsupported(reason));
+        }
+        // The SQL planner leaves type coercion to the analyzer, which runs
+        // when the plan executes: until then a UNION has its first input's
+        // types and a CASE its first branch's type. Result batches have the
+        // analyzed types and the planned column names.
+        let state = ctx.state();
+        let analyzed = state
+            .analyzer()
+            .execute_and_check(plan.clone(), state.config_options(), |_, _| {})
+            .map_err(|error| datafusion_to_query_error(&error))?;
+        let names = plan.schema().fields();
+        let fields = analyzed.schema().fields();
+        if names.len() != fields.len() {
+            return Err(QueryError::DataFusion(
+                "analysis changed the number of result columns".to_owned(),
+            ));
+        }
+        Ok(Some(Arc::new(Schema::new(
+            names
+                .iter()
+                .zip(fields.iter())
+                .map(|(name, field)| field.as_ref().clone().with_name(name.name()))
+                .collect::<Vec<_>>(),
+        ))))
     }
 
     /// Plans one statement without running it. Returns the relations it reads,
@@ -2558,7 +2584,10 @@ impl SqlEngine {
         match statement {
             Statement::Query(_) => {
                 let (select, reads) = self
-                    .prepare_select(&statement.to_string(), policies)
+                    .prepare_select(
+                        &render_statement(statement, &self.performance.query)?,
+                        policies,
+                    )
                     .await?;
                 Ok((PreparedStatement::Select(select), Some(reads)))
             }
@@ -2576,7 +2605,11 @@ impl SqlEngine {
                 analyze, statement, ..
             } => {
                 let (prepared, reads) = self
-                    .prepare_explain(&statement.to_string(), ExplainOptions { analyze }, policies)
+                    .prepare_explain(
+                        &render_statement(*statement, &self.performance.query)?,
+                        ExplainOptions { analyze },
+                        policies,
+                    )
                     .await?;
                 Ok((PreparedStatement::Explain(prepared), Some(reads)))
             }
@@ -5389,6 +5422,24 @@ fn conflict_assignment_value(
     }
 }
 
+/// The statement `SELECT {returning} FROM {name}`, which Describe plans for
+/// `INSERT ... RETURNING`. It is built on the parsed items, not on their text.
+fn returning_select(name: &ObjectName, returning: &[SelectItem]) -> Result<Statement, QueryError> {
+    let unsupported = || QueryError::Unsupported("INSERT ... RETURNING".to_owned());
+    let [mut statement] =
+        <[Statement; 1]>::try_from(parse("SELECT 1 FROM t")?).map_err(|_| unsupported())?;
+    if let Statement::Query(query) = &mut statement
+        && let SetExpr::Select(select) = query.body.as_mut()
+        && let [from] = select.from.as_mut_slice()
+        && let sqlparser::ast::TableFactor::Table { name: table, .. } = &mut from.relation
+    {
+        table.clone_from(name);
+        select.projection = returning.to_vec();
+        return Ok(statement);
+    }
+    Err(unsupported())
+}
+
 fn returning_rows(
     schema: Option<&TableSchema>,
     returning: &[SelectItem],
@@ -5497,12 +5548,24 @@ fn sql_expr_to_value(expr: &SqlExpr) -> Result<Value, QueryError> {
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } => match sql_expr_to_value(expr)? {
-            Value::Int(value) => Ok(Value::Int(-value)),
-            Value::Float(value) => Ok(Value::Float(-value)),
-            _ => Err(QueryError::Unsupported(expr.to_string())),
-        },
-        SqlExpr::UnaryOp {
+        } => {
+            // Parse the sign with the digits, so `-9223372036854775808` fits.
+            if let SqlExpr::Value(value) = expr.as_ref()
+                && let SqlValue::Number(raw, long) = &value.value
+            {
+                return sql_value_to_value(&SqlValue::Number(format!("-{raw}"), *long));
+            }
+            match sql_expr_to_value(expr)? {
+                Value::Int(value) => value.checked_neg().map(Value::Int).ok_or_else(|| {
+                    QueryError::InvalidValue(format!("integer out of range: -({value})"))
+                }),
+                Value::Float(value) => Ok(Value::Float(-value)),
+                _ => Err(QueryError::Unsupported(expr.to_string())),
+            }
+        }
+        // Bound parameters write negative numbers in parentheses.
+        SqlExpr::Nested(expr)
+        | SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => sql_expr_to_value(expr),
@@ -5545,6 +5608,26 @@ fn object_name_to_string(name: &ObjectName) -> Result<String, QueryError> {
         ObjectNamePart::Identifier(identifier) => Ok(identifier.value.clone()),
         ObjectNamePart::Function(_) => Err(QueryError::Unsupported(name.to_string())),
     }
+}
+
+/// Why `plan` would fail where it scans a relation behind policies SQL cannot
+/// apply, as `PolicyTableProvider::scan` reports when the plan runs, or `None`.
+fn unappliable_policy_scan(plan: &LogicalPlan) -> Result<Option<String>, QueryError> {
+    let mut reason = None;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && let Some(PolicyTableProvider {
+                plan: Err(refusal), ..
+            }) = provider.downcast_ref::<PolicyTableProvider>()
+        {
+            reason = Some(refusal.clone());
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|error| datafusion_to_query_error(&error))?;
+    Ok(reason)
 }
 
 /// Collects every relation a `DataFusion` plan scans, including scans inside

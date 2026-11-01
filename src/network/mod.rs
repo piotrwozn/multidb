@@ -13,8 +13,8 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use futures::{Sink, stream};
 use pgwire::{
     api::{
-        ClientInfo, ClientPortalStore, METADATA_USER, PgWireConnectionState, PgWireServerHandlers,
-        Type,
+        ClientInfo, ClientPortalStore, DEFAULT_NAME, METADATA_USER, PgWireConnectionState,
+        PgWireServerHandlers, Type,
         auth::{
             AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
             sasl::{
@@ -23,16 +23,19 @@ use pgwire::{
             },
         },
         portal::{Format, Portal},
-        query::{ExtendedQueryHandler, SimpleQueryHandler},
+        query::{ExtendedQueryHandler, SimpleQueryHandler, send_describe_response},
         results::{
             DataRowEncoder, DescribePortalResponse, DescribeResponse, DescribeStatementResponse,
             FieldFormat, FieldInfo, QueryResponse, Response, Tag,
         },
-        stmt::{NoopQueryParser, StoredStatement},
+        stmt::{QueryParser, StoredStatement},
         store::PortalStore,
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
-    messages::{PgWireBackendMessage, PgWireFrontendMessage},
+    messages::{
+        PgWireBackendMessage, PgWireFrontendMessage,
+        extendedquery::{Describe, TARGET_TYPE_BYTE_STATEMENT},
+    },
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{
@@ -146,7 +149,12 @@ struct BlockingDbExecutor {
 
 struct DbPgHandler {
     executor: BlockingDbExecutor,
-    parser: Arc<NoopQueryParser>,
+    parser: Arc<DbQueryParser>,
+}
+
+/// Checks the SQL text of each prepared statement when the client parses it.
+struct DbQueryParser {
+    executor: BlockingDbExecutor,
 }
 
 #[derive(Clone)]
@@ -661,6 +669,35 @@ impl BlockingDbExecutor {
         }
     }
 
+    /// Rejects placeholders used as whole `ORDER BY` / `GROUP BY` items, and
+    /// statements that do not parse so cannot be checked. The statement is
+    /// parsed on a blocking thread under the database's SQL parser limits,
+    /// like the statements the database runs.
+    async fn check_parameter_positions(&self, sql: String) -> PgWireResult<()> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| network_to_pg(NetworkError::Runtime(error.to_string())))?;
+        let database = self.database.clone();
+        let runtime = tokio::runtime::Handle::current();
+        spawn_blocking(move || {
+            let _permit = permit;
+            let limits = match database {
+                DatabaseHandle::Direct(database) => database.performance_config().query.clone(),
+                DatabaseHandle::Shared(database) => runtime
+                    .block_on(database.read())
+                    .performance_config()
+                    .query
+                    .clone(),
+            };
+            parameters::reject_positional_placeholders(&sql, &limits)
+        })
+        .await
+        .map_err(|error| network_to_pg(NetworkError::from(error)))?
+    }
+
     async fn describe_sql_as_user(
         &self,
         user: String,
@@ -759,8 +796,10 @@ impl DbPgFactory {
 
         Self {
             handler: Arc::new(DbPgHandler {
+                parser: Arc::new(DbQueryParser {
+                    executor: executor.clone(),
+                }),
                 executor,
-                parser: Arc::new(NoopQueryParser),
             }),
             auth: config.auth,
             certificate_pem,
@@ -957,12 +996,97 @@ impl SimpleQueryHandler for DbPgHandler {
 }
 
 #[async_trait]
+impl QueryParser for DbQueryParser {
+    type Statement = String;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        parameters::check_prepared(sql)?;
+        if parameters::contains(sql)? {
+            self.executor
+                .check_parameter_positions(sql.to_owned())
+                .await?;
+        }
+        Ok(sql.to_owned())
+    }
+}
+
+impl DbPgHandler {
+    /// The parameter types and planned result schema of a prepared statement.
+    /// A placeholder the client sent no type for is TEXT; `None` is a
+    /// statement that returns no rows.
+    async fn describe_statement(
+        &self,
+        user: String,
+        target: &StoredStatement<String>,
+    ) -> PgWireResult<(Vec<Type>, Option<SchemaRef>)> {
+        let mut parameters = target
+            .parameter_types
+            .iter()
+            .map(|ty| ty.clone().unwrap_or(Type::TEXT))
+            .collect::<Vec<_>>();
+        // Placeholder numbers are at most 65535, so this stays bounded.
+        let count = parameters::count(&target.statement)?;
+        if parameters.len() < count {
+            parameters.resize(count, Type::TEXT);
+        }
+
+        let sql = describe_sql_for_statement(target)?.unwrap_or_else(|| target.statement.clone());
+        let schema = self.executor.describe_sql_as_user(user, sql).await?;
+        Ok((parameters, schema))
+    }
+}
+
+#[async_trait]
 impl ExtendedQueryHandler for DbPgHandler {
     type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type QueryParser = DbQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::clone(&self.parser)
+    }
+
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // pgwire answers a statement Describe with a RowDescription whenever the
+        // statement has parameters. A statement that returns no rows gets NoData
+        // instead, as in PostgreSQL, so drivers expect no result set.
+        if message.target_type == TARGET_TYPE_BYTE_STATEMENT {
+            let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+            let statement = client
+                .portal_store()
+                .get_statement(name)
+                .ok_or_else(|| PgWireError::StatementNotFound(name.to_owned()))?;
+            let (parameters, schema) = self
+                .describe_statement(client_user(client), &statement)
+                .await?;
+            return match schema {
+                Some(schema) => {
+                    send_describe_response(
+                        client,
+                        &DescribeStatementResponse::new(
+                            parameters,
+                            fields_for_schema(&schema, None),
+                        ),
+                    )
+                    .await
+                }
+                None => send_describe_response(client, &NoRowsStatement { parameters }).await,
+            };
+        }
+        self._on_describe(client, message).await
     }
 
     async fn do_describe_statement<C>(
@@ -976,17 +1100,7 @@ impl ExtendedQueryHandler for DbPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let parameters = target
-            .parameter_types
-            .iter()
-            .map(|ty| ty.clone().unwrap_or(Type::TEXT))
-            .collect::<Vec<_>>();
-
-        let sql = describe_sql_for_statement(target)?.unwrap_or_else(|| target.statement.clone());
-        let schema = self
-            .executor
-            .describe_sql_as_user(client_user(client), sql)
-            .await?;
+        let (parameters, schema) = self.describe_statement(client_user(client), target).await?;
         let fields = schema
             .as_ref()
             .map_or_else(Vec::new, |schema| fields_for_schema(schema, None));
@@ -1245,11 +1359,13 @@ fn substitute_portal_params(portal: &Portal<String>) -> PgWireResult<String> {
 }
 
 fn describe_sql_for_statement(statement: &StoredStatement<String>) -> PgWireResult<Option<String>> {
-    if !parameters::contains(&statement.statement)? {
+    let count = parameters::count(&statement.statement)?;
+    if count == 0 {
         return Ok(Some(statement.statement.clone()));
     }
 
-    if statement.parameter_types.is_empty() || statement.parameter_types.iter().any(Option::is_none)
+    if statement.parameter_types.len() < count
+        || statement.parameter_types.iter().any(Option::is_none)
     {
         return Ok(None);
     }
@@ -1297,15 +1413,9 @@ fn portal_param_literal(portal: &Portal<String>, index: usize) -> PgWireResult<S
     }
 
     match ty {
-        Type::INT2 => Ok(portal
-            .parameter::<i16>(index, &Type::INT2)?
-            .map_or_else(|| "NULL".to_owned(), |value| value.to_string())),
-        Type::INT4 => Ok(portal
-            .parameter::<i32>(index, &Type::INT4)?
-            .map_or_else(|| "NULL".to_owned(), |value| value.to_string())),
-        Type::INT8 => Ok(portal
-            .parameter::<i64>(index, &Type::INT8)?
-            .map_or_else(|| "NULL".to_owned(), |value| value.to_string())),
+        Type::INT2 => Ok(int_literal(portal.parameter::<i16>(index, &Type::INT2)?)),
+        Type::INT4 => Ok(int_literal(portal.parameter::<i32>(index, &Type::INT4)?)),
+        Type::INT8 => Ok(int_literal(portal.parameter::<i64>(index, &Type::INT8)?)),
         Type::FLOAT4 => float_literal(portal.parameter::<f32>(index, &Type::FLOAT4)?),
         Type::FLOAT8 => float_literal(portal.parameter::<f64>(index, &Type::FLOAT8)?),
         Type::BOOL => Ok(portal
@@ -1325,6 +1435,17 @@ fn portal_param_literal(portal: &Portal<String>, index: usize) -> PgWireResult<S
     }
 }
 
+/// A negative number is written in parentheses: spliced after a `-`, as in
+/// `0-$1`, a bare `-5` would start a `--` comment, and after a unary minus or
+/// next to a higher-precedence operator its sign would bind differently.
+fn int_literal(value: Option<impl Into<i64>>) -> String {
+    match value.map(Into::into) {
+        None => "NULL".to_owned(),
+        Some(value) if value < 0 => format!("({value})"),
+        Some(value) => value.to_string(),
+    }
+}
+
 fn float_literal(value: Option<impl Into<f64>>) -> PgWireResult<String> {
     let Some(value) = value else {
         return Ok("NULL".to_owned());
@@ -1334,7 +1455,43 @@ fn float_literal(value: Option<impl Into<f64>>) -> PgWireResult<String> {
         return Err(pg_error("ERROR", "22003", "non-finite float parameter"));
     }
 
-    Ok(value.to_string())
+    // `Display` never uses an exponent and prints the shortest text that
+    // reads back as the same float; `.0` keeps a whole number a float.
+    let mut text = value.to_string();
+    if !text.contains('.') {
+        text.push_str(".0");
+    }
+    Ok(if value.is_sign_negative() {
+        format!("({text})")
+    } else {
+        text
+    })
+}
+
+/// Describe Statement answer for a statement that returns no rows:
+/// `ParameterDescription` followed by `NoData`.
+struct NoRowsStatement {
+    parameters: Vec<Type>,
+}
+
+impl DescribeResponse for NoRowsStatement {
+    fn parameters(&self) -> Option<&[Type]> {
+        Some(&self.parameters)
+    }
+
+    fn fields(&self) -> &[FieldInfo] {
+        &[]
+    }
+
+    fn no_data() -> Self {
+        Self {
+            parameters: Vec::new(),
+        }
+    }
+
+    fn is_no_data(&self) -> bool {
+        true
+    }
 }
 
 fn substitute_params(sql: &str, literals: &[String]) -> PgWireResult<String> {
@@ -1405,7 +1562,15 @@ fn pg_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{io, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        io,
+        net::SocketAddr,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
     use super::{
         AuthConfig, NetworkConfig, NetworkError, PgServer, ScramCredential, TlsConfig, TlsMode,
@@ -1418,8 +1583,21 @@ mod tests {
         security::{AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role},
         storage::StorageError,
     };
-    use pgwire::api::Type;
+    use futures::Sink;
+    use pgwire::{
+        api::{
+            ClientInfo, ClientPortalStore, DefaultClient, METADATA_USER, PgWireConnectionState,
+            Type, query::ExtendedQueryHandler, store::MemPortalStore,
+        },
+        messages::{
+            PgWireBackendMessage, ProtocolVersion,
+            extendedquery::{Bind, Describe, Execute, Parse, TARGET_TYPE_BYTE_STATEMENT},
+            response::TransactionStatus,
+            startup::SecretKey,
+        },
+    };
     use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls_pki_types::CertificateDer;
     use tokio::{
         net::TcpListener,
         sync::{RwLock, oneshot},
@@ -1450,6 +1628,21 @@ mod tests {
             "select '$1', name from users where age = 37 and name = 'Ada''s laptop'"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_parameters_render_as_single_values() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(super::int_literal(Some(-5_i64)), "(-5)");
+        assert_eq!(super::int_literal(Some(i64::MIN)), "(-9223372036854775808)");
+        assert_eq!(super::int_literal(Some(5_i16)), "5");
+        assert_eq!(super::int_literal(None::<i32>), "NULL");
+        assert_eq!(super::float_literal(Some(1.0_f64))?, "1.0");
+        assert_eq!(super::float_literal(Some(-0.0_f64))?, "(-0.0)");
+        assert_eq!(super::float_literal(Some(-1.5_f32))?, "(-1.5)");
+        let large = super::float_literal(Some(1e300_f64))?;
+        assert!(large.ends_with(".0") && !large.contains('e'), "{large}");
+        assert!(super::float_literal(Some(f64::NAN)).is_err());
         Ok(())
     }
 
@@ -2315,5 +2508,520 @@ mod tests {
             ],
             0,
         )
+    }
+
+    #[tokio::test]
+    async fn bound_text_parameters_cannot_change_statement_structure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+
+        // The engine printed `name = '\'' or 1=1 --'` back as `name = '\' or 1=1 --'`,
+        // so the rest of the value ran as SQL and commented out `age = $2`.
+        let filter = client
+            .prepare_typed(
+                "select name from users where name = $1 and age = $2",
+                &[Type::TEXT, Type::INT8],
+            )
+            .await?;
+        for payload in ["\\' or 1=1 --", "\\'' or 1=1 --", "x' or 'a'='a", "\\"] {
+            let rows = client.query(&filter, &[&payload, &37_i64]).await?;
+            assert!(rows.is_empty(), "{payload:?} matched {} rows", rows.len());
+        }
+        // A text parameter in an alias position is a single-quoted name.
+        let alias = client
+            .prepare_typed(
+                "select age as $1 from users where age = $2",
+                &[Type::TEXT, Type::INT8],
+            )
+            .await?;
+        match client
+            .query(&alias, &[&"a\\' , name from users --", &99_i64])
+            .await
+        {
+            Ok(rows) => assert!(rows.is_empty(), "alias matched {} rows", rows.len()),
+            Err(error) => assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+            ),
+        }
+        let rows = client.query(&alias, &[&"years", &37_i64]).await?;
+        let ages = rows
+            .iter()
+            .map(|row| row.try_get::<_, i64>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ages, vec![37]);
+
+        // Values holding quotes, backslashes and comment markers round-trip.
+        let insert = client
+            .prepare_typed(
+                "insert into users (id, name, age, active) values ($1, $2, 1, true)",
+                &[Type::INT8, Type::TEXT],
+            )
+            .await?;
+        let lookup = client
+            .prepare_typed("select id, name from users where name = $1", &[Type::TEXT])
+            .await?;
+        for (id, value) in [
+            (2_i64, "it's \\' -- x"),
+            (3, "\\'' or 1=1 --"),
+            (4, "a''b\\\\'c"),
+        ] {
+            client.execute(&insert, &[&id, &value]).await?;
+            let rows = client.query(&lookup, &[&value]).await?;
+            let found = rows
+                .iter()
+                .map(|row| Ok((row.try_get::<_, i64>(0)?, row.try_get::<_, String>(1)?)))
+                .collect::<Result<Vec<_>, tokio_postgres::Error>>()?;
+            assert_eq!(found, vec![(id, value.to_owned())], "{value:?}");
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_negative_numbers_cannot_start_a_comment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+
+        // `0-$1` bound to -5 was spliced as `0--5`, which starts a comment.
+        let filter = client
+            .prepare_typed(
+                "select name from users where age > 0-$1 and name = $2",
+                &[Type::INT8, Type::TEXT],
+            )
+            .await?;
+        assert!(
+            client
+                .query(&filter, &[&-5_i64, &"nobody"])
+                .await?
+                .is_empty()
+        );
+        assert_eq!(client.query(&filter, &[&-5_i64, &"Ada"]).await?.len(), 1);
+
+        let negated = client
+            .prepare_typed("select -$1 as v from users", &[Type::INT8])
+            .await?;
+        let row = client.query_one(&negated, &[&-5_i64]).await?;
+        assert_eq!(row.try_get::<_, i64>(0)?, 5);
+        let difference = client
+            .prepare_typed("select 1-$1 as v from users", &[Type::FLOAT8])
+            .await?;
+        let row = client.query_one(&difference, &[&-1.5_f64]).await?;
+        assert!((row.try_get::<_, f64>(0)? - 2.5).abs() < f64::EPSILON);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_whole_number_floats_stay_floats() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        // 1.0 was spliced as `1`, so this divided as integers.
+        let halved = client
+            .prepare_typed("select $1 / 2 as v from users", &[Type::FLOAT8])
+            .await?;
+        let row = client.query_one(&halved, &[&1.0_f64]).await?;
+        assert!((row.try_get::<_, f64>(0)? - 0.5).abs() < f64::EPSILON);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_accepts_bound_negative_numbers_down_to_the_minimum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        // INSERT reads the sign together with the digits.
+        let insert = client
+            .prepare_typed(
+                "insert into users (id, name, age, active) values ($1, 'min', $2, true)",
+                &[Type::INT8, Type::INT8],
+            )
+            .await?;
+        client.execute(&insert, &[&2_i64, &i64::MIN]).await?;
+        client.execute(&insert, &[&-3_i64, &-1_i64]).await?;
+        let rows = client
+            .query(
+                "select id, age from users where name = 'min' order by id",
+                &[],
+            )
+            .await?;
+        let found = rows
+            .iter()
+            .map(|row| Ok((row.try_get::<_, i64>(0)?, row.try_get::<_, i64>(1)?)))
+            .collect::<Result<Vec<_>, tokio_postgres::Error>>()?;
+        assert_eq!(found, vec![(-3, -1), (2, i64::MIN)]);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selects_without_from_accept_negative_parameters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = shared_users_database()?;
+        database.set_authz_policy(AuthzPolicy::new([Role::new("user")
+            .grant(Resource::Database, Permission::Read)
+            .grant(Resource::Table("users".to_owned()), Permission::Read)]));
+        let database = Arc::new(RwLock::new(database));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        for sql in ["select $1", "select 1, $1", "select abs(1) + $1"] {
+            let statement = client.prepare_typed(sql, &[Type::INT8]).await?;
+            let row = client.query_one(&statement, &[&-5_i64]).await?;
+            let last = row.len() - 1;
+            let value = row.try_get::<_, i64>(last)?;
+            assert!(value == -5 || value == -4, "{sql}: {value}");
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn untyped_parameters_are_described_as_text() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+        // tokio-postgres prepares this without parameter types.
+        let rows = client
+            .query("select age from users where name = $1", &[&"Ada"])
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<_, i64>(0)?, 37);
+        let statement = client
+            .prepare("select name from users where name = $2 or name = $1")
+            .await?;
+        assert_eq!(statement.params(), &[Type::TEXT, Type::TEXT]);
+        let statement = client
+            .prepare_typed(
+                "select name from users where age = $1 and name = $2",
+                &[Type::INT8],
+            )
+            .await?;
+        assert_eq!(statement.params(), &[Type::INT8, Type::TEXT]);
+
+        // Placeholder numbers are bounded before anything is sized from them.
+        for sql in [
+            "select name from users where age = $65536",
+            "select name from users where age = $4000000000",
+        ] {
+            let error = client
+                .prepare(sql)
+                .await
+                .err()
+                .ok_or_else(|| io::Error::other(format!("{sql} was prepared")))?;
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::UNDEFINED_PARAMETER),
+                "{sql}"
+            );
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_statements_hold_exactly_one_sql_statement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let factory = super::DbPgFactory::new(
+            super::DatabaseHandle::Shared(Arc::clone(&database)),
+            NetworkConfig::new(TlsMode::DisabledForTests, test_auth()),
+        );
+        let mut client = RecordingClient::for_user("alice");
+        let sql = "insert into users (id, name, age, active) values (2, 'Grace', 85, true); \
+                   insert into users (id, name, age, active) values (3, 'Linus', 54, true)";
+        let parsed = factory
+            .handler
+            .on_parse(
+                &mut client,
+                Parse::new(Some("two".to_owned()), sql.to_owned(), Vec::new()),
+            )
+            .await;
+        if parsed.is_ok() {
+            // Without the check, Execute ran every statement.
+            factory
+                .handler
+                .on_bind(
+                    &mut client,
+                    Bind::new(
+                        None,
+                        Some("two".to_owned()),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                )
+                .await?;
+            factory
+                .handler
+                .on_execute(&mut client, Execute::new(None, 0))
+                .await?;
+        }
+        let rows = database.read().await.query("select id from users").await?;
+        let crate::query::SqlOutput::Rows(rows) = rows else {
+            return Err("count returned no rows".into());
+        };
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(sqlstate(&parsed), Some("42601"), "{parsed:?}");
+
+        for single in [
+            "select 1;",
+            "select 1; -- trailing comment",
+            ";; select ';' ; ",
+            "select $$;$$, ';', \";\" /* ; */",
+            "",
+        ] {
+            factory
+                .handler
+                .on_parse(
+                    &mut client,
+                    Parse::new(Some("one".to_owned()), single.to_owned(), Vec::new()),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn placeholders_are_never_column_positions() -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let factory = super::DbPgFactory::new(
+            super::DatabaseHandle::Shared(database),
+            NetworkConfig::new(TlsMode::DisabledForTests, test_auth()),
+        );
+        let mut client = RecordingClient::for_user("alice");
+        let parse =
+            |sql: &str| Parse::new(Some("s".to_owned()), sql.to_owned(), vec![Type::INT8.oid()]);
+        // An integer there is read as a column position, so a bound `2` would
+        // sort or group by the second column.
+        for sql in [
+            "select name, age from users order by $1",
+            "select name, age from users order by name, $1 desc",
+            "select name, age from users order by (+$1)",
+            "select age, count(*) from users group by $1",
+            "select (select name from users order by $1 limit 1)",
+            "select string_agg(name, ',' order by $1) from users",
+            "select name from users where age > $1 order by $1 as of lsn 1",
+            // Execute removes an `AS OF` suffix whose point is a placeholder too.
+            "select name, age from users order by $1 as of lsn $2",
+            "select age, count(*) from users group by $1 as of timestamp $2",
+            // An alias placeholder parses once its value is spliced as a quoted name.
+            "select name as $2, age from users order by $1",
+            "select name $2, age from users order by $1",
+        ] {
+            let result = factory.handler.on_parse(&mut client, parse(sql)).await;
+            assert_eq!(sqlstate(&result), Some("0A000"), "{sql}: {result:?}");
+        }
+        // A statement that parses neither with placeholders nor with quoted
+        // values in their place cannot be checked, so it is refused.
+        let sql = "select name, age from users order by $1, cast(name as varchar($2))";
+        let result = factory.handler.on_parse(&mut client, parse(sql)).await;
+        assert_eq!(sqlstate(&result), Some("42601"), "{sql}: {result:?}");
+        for sql in [
+            "select name from users order by name limit $1",
+            "select name from users where age = $1 order by age",
+            "select name, age from users order by age + $1",
+            "select age + $1 as a, count(*) from users group by age + $1",
+            "select name from users where age > $1 order by age as of lsn $2",
+            "select age as $1 from users order by age",
+            "call absent($1)",
+            "create function f language wasm as hex $1",
+        ] {
+            factory.handler.on_parse(&mut client, parse(sql)).await?;
+        }
+        Ok(())
+    }
+
+    /// The SQLSTATE of a pgwire user error.
+    fn sqlstate<T>(result: &pgwire::error::PgWireResult<T>) -> Option<&str> {
+        match result {
+            Err(pgwire::error::PgWireError::UserError(info)) => Some(info.code.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A client connection that records the messages a handler sends it.
+    struct RecordingClient {
+        inner: DefaultClient<String>,
+        sent: Vec<PgWireBackendMessage>,
+    }
+
+    impl RecordingClient {
+        fn for_user(user: &str) -> Self {
+            let mut inner = DefaultClient::new(SocketAddr::from(([127, 0, 0, 1], 0)), false);
+            inner.set_state(PgWireConnectionState::ReadyForQuery);
+            inner
+                .metadata_mut()
+                .insert(METADATA_USER.to_owned(), user.to_owned());
+            Self {
+                inner,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl ClientInfo for RecordingClient {
+        fn socket_addr(&self) -> SocketAddr {
+            self.inner.socket_addr()
+        }
+
+        fn is_secure(&self) -> bool {
+            self.inner.is_secure()
+        }
+
+        fn protocol_version(&self) -> ProtocolVersion {
+            self.inner.protocol_version()
+        }
+
+        fn set_protocol_version(&mut self, version: ProtocolVersion) {
+            self.inner.set_protocol_version(version);
+        }
+
+        fn pid_and_secret_key(&self) -> (i32, SecretKey) {
+            self.inner.pid_and_secret_key()
+        }
+
+        fn set_pid_and_secret_key(&mut self, pid: i32, secret_key: SecretKey) {
+            self.inner.set_pid_and_secret_key(pid, secret_key);
+        }
+
+        fn state(&self) -> PgWireConnectionState {
+            self.inner.state()
+        }
+
+        fn set_state(&mut self, new_state: PgWireConnectionState) {
+            self.inner.set_state(new_state);
+        }
+
+        fn transaction_status(&self) -> TransactionStatus {
+            self.inner.transaction_status()
+        }
+
+        fn set_transaction_status(&mut self, new_status: TransactionStatus) {
+            self.inner.set_transaction_status(new_status);
+        }
+
+        fn metadata(&self) -> &HashMap<String, String> {
+            self.inner.metadata()
+        }
+
+        fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+            self.inner.metadata_mut()
+        }
+
+        fn sni_server_name(&self) -> Option<&str> {
+            self.inner.sni_server_name()
+        }
+
+        fn client_certificates<'a>(&self) -> Option<&[CertificateDer<'a>]> {
+            self.inner.client_certificates()
+        }
+    }
+
+    impl ClientPortalStore for RecordingClient {
+        type PortalStore = MemPortalStore<String>;
+
+        fn portal_store(&self) -> &Self::PortalStore {
+            self.inner.portal_store()
+        }
+    }
+
+    impl Sink<PgWireBackendMessage> for RecordingClient {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, message: PgWireBackendMessage) -> io::Result<()> {
+            self.get_mut().sent.push(message);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn statements_without_rows_are_described_with_no_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let factory = super::DbPgFactory::new(
+            super::DatabaseHandle::Shared(database),
+            NetworkConfig::new(TlsMode::DisabledForTests, test_auth()),
+        );
+        let mut client = RecordingClient::for_user("alice");
+        for (name, sql) in [
+            (
+                "insert",
+                "insert into users (id, name, age, active) values ($1, 'x', 1, true)",
+            ),
+            ("select", "select age from users where id = $1"),
+        ] {
+            factory
+                .handler
+                .on_parse(
+                    &mut client,
+                    Parse::new(
+                        Some(name.to_owned()),
+                        sql.to_owned(),
+                        vec![Type::INT8.oid()],
+                    ),
+                )
+                .await?;
+        }
+        client.sent.clear();
+        let describe =
+            |name: &str| Describe::new(TARGET_TYPE_BYTE_STATEMENT, Some(name.to_owned()));
+
+        factory
+            .handler
+            .on_describe(&mut client, describe("insert"))
+            .await?;
+        match std::mem::take(&mut client.sent).as_slice() {
+            [
+                PgWireBackendMessage::ParameterDescription(parameters),
+                PgWireBackendMessage::NoData(_),
+            ] => assert_eq!(parameters.types, vec![Type::INT8.oid()]),
+            other => {
+                return Err(format!("expected ParameterDescription and NoData: {other:?}").into());
+            }
+        }
+
+        factory
+            .handler
+            .on_describe(&mut client, describe("select"))
+            .await?;
+        match client.sent.as_slice() {
+            [
+                PgWireBackendMessage::ParameterDescription(parameters),
+                PgWireBackendMessage::RowDescription(row),
+            ] => {
+                assert_eq!(parameters.types, vec![Type::INT8.oid()]);
+                let fields = row
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.as_str(), field.type_id))
+                    .collect::<Vec<_>>();
+                assert_eq!(fields, vec![("age", Type::INT8.oid())]);
+            }
+            other => {
+                return Err(
+                    format!("expected ParameterDescription and RowDescription: {other:?}").into(),
+                );
+            }
+        }
+        Ok(())
     }
 }

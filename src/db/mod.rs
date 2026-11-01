@@ -3839,14 +3839,7 @@ impl Database {
             return self.finish_query(sql, started, result);
         }
         if let Some(kind) = phase32_declaration_kind(sql) {
-            return self.finish_query(
-                sql,
-                started,
-                Err(QueryError::Unsupported(format!(
-                    "{kind} SQL DDL is outside the current SQL support matrix; use the stable Database API"
-                ))
-                .into()),
-            );
+            return self.finish_query(sql, started, Err(phase32_unsupported(kind)));
         }
         if let Some(command) = extension::parse_create_wasm_function(sql)? {
             let result = self
@@ -8138,7 +8131,11 @@ fn sql_requirements(
                 }
             }
             Statement::Explain { statement, .. } => {
-                requirements.extend(sql_requirements(&statement.to_string(), catalog, limits)?);
+                requirements.extend(sql_requirements(
+                    &crate::query::render_statement(*statement, limits)?,
+                    catalog,
+                    limits,
+                )?);
             }
             other => return Err(QueryError::Unsupported(other.to_string()).into()),
         }
@@ -8623,30 +8620,64 @@ fn apply_procedure_commands(
     Ok(ProcedureResult::AffectedRows(affected))
 }
 
-fn parse_as_of_query(sql: &str) -> Result<Option<(String, TemporalPoint)>, DbError> {
+pub(crate) fn parse_as_of_query(sql: &str) -> Result<Option<(String, TemporalPoint)>, DbError> {
+    let Some((statement, suffix, point)) = split_as_of_query(sql) else {
+        return Ok(None);
+    };
+    let point = match suffix {
+        AsOfSuffix::Lsn => TemporalPoint::Lsn(
+            point
+                .parse::<TxnId>()
+                .map_err(|error| QueryError::Parse(format!("invalid AS OF LSN: {error}")))?,
+        ),
+        AsOfSuffix::Timestamp => {
+            let millis = point
+                .parse::<u64>()
+                .map_err(|error| QueryError::Parse(format!("invalid AS OF TIMESTAMP: {error}")))?;
+            TemporalPoint::Timestamp(UNIX_EPOCH + Duration::from_millis(millis))
+        }
+    };
+    Ok(Some((statement.to_owned(), point)))
+}
+
+/// The statement an inline `AS OF` query plans, found as [`parse_as_of_query`]
+/// finds it but without reading the point, which may still be a placeholder.
+pub(crate) fn as_of_statement(sql: &str) -> Option<&str> {
+    split_as_of_query(sql).map(|(statement, _, _)| statement)
+}
+
+enum AsOfSuffix {
+    Lsn,
+    Timestamp,
+}
+
+/// Splits `sql` at its last ` as of lsn ` or, when it has none, at its last
+/// ` as of timestamp `, into the statement, the suffix and the point's text.
+fn split_as_of_query(sql: &str) -> Option<(&str, AsOfSuffix, &str)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    if let Some(index) = lower.rfind(" as of lsn ") {
-        let point = trimmed[index + " as of lsn ".len()..].trim();
-        let lsn = point
-            .parse::<TxnId>()
-            .map_err(|error| QueryError::Parse(format!("invalid AS OF LSN: {error}")))?;
-        return Ok(Some((
-            trimmed[..index].trim().to_owned(),
-            TemporalPoint::Lsn(lsn),
-        )));
-    }
-    if let Some(index) = lower.rfind(" as of timestamp ") {
-        let point = trimmed[index + " as of timestamp ".len()..].trim();
-        let millis = point
-            .parse::<u64>()
-            .map_err(|error| QueryError::Parse(format!("invalid AS OF TIMESTAMP: {error}")))?;
-        return Ok(Some((
-            trimmed[..index].trim().to_owned(),
-            TemporalPoint::Timestamp(UNIX_EPOCH + Duration::from_millis(millis)),
-        )));
-    }
-    Ok(None)
+    [
+        (" as of lsn ", AsOfSuffix::Lsn),
+        (" as of timestamp ", AsOfSuffix::Timestamp),
+    ]
+    .into_iter()
+    .find_map(|(marker, suffix)| {
+        let index = lower.rfind(marker)?;
+        Some((
+            trimmed[..index].trim(),
+            suffix,
+            trimmed[index + marker.len()..].trim(),
+        ))
+    })
+}
+
+/// Whether the query path answers `sql` from its text without the SQL engine
+/// parsing it: a `CALL`, a declaration outside the SQL support matrix or a
+/// `CREATE FUNCTION`, checked in that order once no `AS OF` suffix is found.
+pub(crate) fn answered_from_text(sql: &str) -> bool {
+    !matches!(parse_call_procedure_sql(sql), Ok(None))
+        || phase32_declaration_kind(sql).is_some()
+        || !matches!(extension::parse_create_wasm_function(sql), Ok(None))
 }
 
 fn parse_call_procedure_sql(sql: &str) -> Result<Option<(String, Vec<Value>)>, DbError> {
@@ -8673,6 +8704,13 @@ fn parse_call_procedure_sql(sql: &str) -> Result<Option<(String, Vec<Value>)>, D
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(Some((name, values)))
+}
+
+fn phase32_unsupported(kind: &str) -> DbError {
+    QueryError::Unsupported(format!(
+        "{kind} SQL DDL is outside the current SQL support matrix; use the stable Database API"
+    ))
+    .into()
 }
 
 fn phase32_declaration_kind(sql: &str) -> Option<&'static str> {

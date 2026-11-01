@@ -24,6 +24,76 @@ All notable public changes will be recorded here.
   before decoding. Successful logins release their authentication reservation
   without spending the failed-login budget. CLI timeout/frame overrides are
   documented in `docs/docker.md`.
+- Fixed SQL statements that could change meaning between parsing and
+  planning. The engine printed each parsed statement back to SQL text with
+  sqlparser's printer and planned that text. The printer leaves a quote that
+  follows a backslash undoubled and prints `N'...'` unescaped, so a string
+  literal or quoted name holding a backslash before a quote ended early in the
+  planned text and the rest of it ran as SQL: it could comment out the rest of
+  a `WHERE` clause (a tenant filter, other bound parameters) or add `OR` /
+  `UNION` branches. Anyone whose input reaches a
+  SQL string could trigger it: an end user of an application that binds text
+  parameters over the PostgreSQL wire extended protocol (they are spliced as
+  quoted literals, and a parameter in an alias position, `AS $1`, as a quoted
+  name), or of an application that quotes literals correctly for simple
+  queries, Control Plane `POST /sql`, the SDKs or `Database::query`/`query_as`.
+  It allowed no writes or extra statements. Reads stayed limited to what the
+  principal may read, with row and masking policies applied, except through
+  `Database::query`, which has no principal. String literals that hold a quote
+  are now printed as `E'...'`, and the printed statement must parse back to the
+  same statement with the PostgreSQL dialect and split into the same tokens
+  with DataFusion's generic dialect; otherwise it is refused with `Unsupported`
+  (SQLSTATE 0A000), as is a quoted name holding a backslash before its quote.
+  So are statements whose printed text the two dialects split into different
+  tokens, such as numbers with underscores (`1_000`) and the `?` operator,
+  and a doubled unary minus, which prints as a `--` comment.
+  This covers queries, `EXPLAIN`, Describe (`INSERT ... RETURNING` is now
+  described from its parsed `RETURNING` items) and the permission check of
+  `EXPLAIN`.
+- Fixed PostgreSQL wire extended-protocol parameters that could change the
+  statement they were bound into. A negative number bound right after a minus
+  sign, as in `age > 0-$1`, was spliced as `0--5`, which starts a comment, so
+  the rest of the line (for example `AND tenant_id = $2`) was dropped; next to a
+  unary minus or a higher-precedence operator its sign could also bind
+  differently. Any end user controlling a numeric parameter in such a statement
+  could trigger it; reads stayed limited to what the principal may read, with
+  row and masking policies applied. Negative numbers are now spliced in
+  parentheses (`(-5)`), and a space separates a spliced value from a
+  neighbouring token. Floats that hold a whole number stay floats (`1.0` was
+  spliced as `1`, so `$1 / 2` divided as integers), `INSERT` accepts a bound
+  `i64::MIN`, `CALL` and UDF arguments accept parenthesized numbers (each
+  argument must be one literal: `'a' || 'b'` was read as one string), and a
+  projection such as `SELECT 1, (-5)` that ends with `)` is no longer taken for
+  a WASM UDF call.
+- Prepared statements are checked when the client parses them (`Parse`). A
+  prepared statement holds one SQL statement, as in PostgreSQL (SQLSTATE 42601
+  `cannot insert multiple commands into a prepared statement`); before, Execute
+  ran every statement of a `;`-separated batch. A placeholder used as a whole
+  `ORDER BY` or `GROUP BY` item (also an aggregate's `ORDER BY`) is refused with
+  SQLSTATE 0A000: the engine reads a number there as a column position, so a
+  bound `2` sorted or grouped by the second column instead of by a constant.
+  The check covers statements with an inline `AS OF` suffix and placeholders
+  used as aliases. A statement with placeholders that parses neither with them
+  nor with quoted values in their place, such as one with a placeholder as a
+  type modifier (`varchar($1)`), is refused with SQLSTATE 42601, as in
+  PostgreSQL; `CALL` and `CREATE FUNCTION`, which multidb runs from their text,
+  are not parsed there. Placeholders run from `$1` to `$65535` (SQLSTATE
+  42P02), and a placeholder the client sent no type for is described as `TEXT`
+  in `ParameterDescription`, so drivers that prepare without parameter types
+  can bind it.
+- Pgwire Describe answers `NoData` for a statement that returns no rows
+  (`INSERT` without `RETURNING`, `CALL`, `CREATE FUNCTION`) instead of an empty
+  row description, and describes `CALL` and `CREATE FUNCTION` without running
+  them. It describes the built-in system views (`system.workload`,
+  `system.tuning_log`, `system.index_advice`, `system.reprofile_jobs`) and the
+  `match`, `time_bucket`, `within_radius` and `graph_neighbors` helpers, reports
+  `UNION` and `CASE` columns with the coerced types Execute returns (they had
+  their first input's type, so binary clients decoded floats as integers), and
+  refuses a WASM UDF call (SQLSTATE 0A000) and a query over a table whose
+  masking replacement SQL cannot return, which Execute refuses too.
+- Workload fingerprints (`system.workload`) no longer keep part of the value
+  of an `E'...'` string literal with an escaped quote, or the `N` / `E` prefix
+  of a literal.
 - Added a reproducible local before/after SQL benchmark runner with binary/source
   provenance, raw latency verification and all nine supplied workloads. See
   `docs/performance-local-benchmarks.md`.
@@ -388,10 +458,10 @@ All notable public changes will be recorded here.
   and a denial names the CTE. `INSERT ... RETURNING` returns stored rows (for
   `ON CONFLICT DO UPDATE`, the existing row), so it now needs `Read` on the
   table as well as `Write`; before, `Write` alone could read any row by key.
-  Not covered by this fix: extended-protocol Describe over PostgreSQL wire
-  still returns the column names and types of catalog tables (no rows)
-  without an RBAC check; the separate PostgreSQL wire extended-protocol fix
-  closes it.
+  Extended-protocol Describe over PostgreSQL wire, which returned the column
+  names and types of catalog tables (no rows) without an RBAC check, now
+  plans the statement under the same checks (see "Pgwire Describe authorizes
+  a metadata-only plan" under Unreleased).
 - Fixed SQL bypasses of row and masking policies. SQL run as a principal applied
   them to the query result, matched to its columns by name, so a principal with
   `Read` on a policy-protected table could see the rows its row policies hide
@@ -950,7 +1020,8 @@ All notable public changes will be recorded here.
   the planner errors it builds from them) are now `QueryError::Parse`
   (SQLSTATE 42601) like the engine's, instead of `QueryError::DataFusion`
   (XX000). The pgwire
-  extended-protocol Describe still pre-parses with sqlparser's defaults.
+  extended-protocol Describe plans the statement through the same parse as
+  execution instead of pre-parsing it with sqlparser's defaults.
 - Metadata reads tolerate compression frames. A legacy database created with
   `OperationalConfig.performance.compression` and opened without it now fails
   with `StorageFormatMismatch` (previously an opaque serde error). Every

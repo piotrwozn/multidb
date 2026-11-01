@@ -7,14 +7,18 @@ use std::{
 };
 
 use datafusion::error::DataFusionError;
-use sqlparser::parser::ParserError;
+use sqlparser::{
+    ast::{BinaryOperator, Expr as SqlExpr, SetExpr, Statement},
+    dialect::GenericDialect,
+    parser::{Parser, ParserError},
+};
 
 use super::{
     AccessPath, AnalyzeMode, AnalyzeTarget, CardinalityEstimator, ColumnDef, ColumnType,
     ExplainOptions, MostCommonValue, QueryError, QueryFingerprint, REL_COLUMNAR_SEGMENTS_TABLE,
     REL_INDEX_TABLE, REL_ROWS_TABLE, RelIndexExpression, RelIndexSpec, RelPlanKind, RelPredicate,
     RelTable, SqlEngine, SqlOutput, SqlReadGuard, SqlReadTarget, StatsCatalog, TableLayout,
-    TableSchema, Value, datafusion_to_query_error, make_row_key, parse,
+    TableSchema, Value, datafusion_to_query_error, make_row_key, parse, render_statement,
 };
 use crate::{
     db::{DbConfig, Profile, create_database, open_database},
@@ -1919,4 +1923,450 @@ async fn datafusion_read_plans_reject_non_read_nodes() -> Result<(), Box<dyn std
         "{result:?}"
     );
     Ok(())
+}
+
+/// Queries over `public_t` whose filter no row passes. The engine plans each
+/// statement from its re-rendered text; printed back with sqlparser's printer,
+/// a string literal that holds a backslash before its quote ended early there,
+/// and the rest of it ran as SQL that commented out the filter.
+const REQUOTED_VALUE_QUERIES: &[&str] = &[
+    "select id from public_t where name = '\\'' or 1=1 --' and id = 99",
+    "select id from public_t where name = '\\'' or id = 1 --' and id = 99",
+    "select id from public_t where name = N'x'' or 1=1 --' and id = 99",
+];
+
+/// The same for a quoted name, which has no escaped form.
+const REQUOTED_NAME_QUERIES: &[&str] = &[
+    "select id as 'a\\'' from public_t --' from public_t where id = 99",
+    "select id as \"a\\\"\" from public_t --\" from public_t where id = 99",
+];
+
+#[tokio::test]
+async fn requoted_values_cannot_drop_a_filter() -> Result<(), Box<dyn std::error::Error>> {
+    assert_filters_hold(REQUOTED_VALUE_QUERIES).await
+}
+
+#[tokio::test]
+async fn requoted_names_cannot_drop_a_filter() -> Result<(), Box<dyn std::error::Error>> {
+    assert_filters_hold(REQUOTED_NAME_QUERIES).await
+}
+
+/// Runs each of `queries` over two rows that their filters reject.
+async fn assert_filters_hold(queries: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    engine
+        .execute(
+            "insert into public_t (id, name, age, active) \
+             values (1, 'Ada', 37, true), (2, 'Bob', 41, false)",
+        )
+        .await?;
+
+    for sql in queries {
+        match engine.execute(sql).await {
+            Ok(SqlOutput::Rows(rows)) => assert!(rows.rows.is_empty(), "{sql}: {:?}", rows.rows),
+            Err(QueryError::Unsupported(_)) => {}
+            other => return Err(format!("{sql}: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn requoted_values_cannot_add_reads() -> Result<(), Box<dyn std::error::Error>> {
+    // Reads only `public_t`. Re-rendered with sqlparser's printer, the rest of
+    // the value read `secrets`.
+    assert_reads_stay_within_public_t(
+        &["select id from public_t where name = '\\'' union select id from secrets --'"],
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn requoted_names_cannot_add_reads() -> Result<(), Box<dyn std::error::Error>> {
+    assert_reads_stay_within_public_t(
+        &[
+            "select id as 'a\\'' from secrets --' from public_t",
+            "select id as \"a\\\"\" from secrets --\" from public_t",
+            "insert into public_t (id, name, age, active) values (5, 'x', 1, true) \
+             returning id as \"a\\\"\" from secrets --\"",
+        ],
+        false,
+    )
+    .await
+}
+
+/// Describes, executes and explains each statement with a guard that allows
+/// `public_t` only, and checks that nothing planned a read of `secrets`. With
+/// `runs`, each statement must also be described and run, returning the rows
+/// of the empty `public_t`.
+async fn assert_reads_stay_within_public_t(
+    statements: &[&str],
+    runs: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    let secrets = SqlReadTarget::Catalog("secrets".to_owned());
+    for sql in statements {
+        let explained = format!("explain {sql}");
+        for statement in [*sql, explained.as_str()] {
+            let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+            let described = engine.describe_with_read_guard(statement, &mut guard).await;
+            assert!(
+                !guard.seen.contains(&secrets)
+                    && !matches!(described, Err(QueryError::AuthzDenied(_))),
+                "describe {statement}: {described:?} {:?}",
+                guard.seen
+            );
+            assert!(
+                !runs || matches!(described, Ok(Some(_))),
+                "describe {statement}: {described:?}"
+            );
+            if statement.starts_with("insert") {
+                continue;
+            }
+            let mut guard = RecordingReadGuard::allowing(&["public_t"]);
+            let executed = engine
+                .execute_with_read_guard(statement, Some(&mut guard))
+                .await;
+            assert!(
+                !guard.seen.contains(&secrets)
+                    && !matches!(executed, Err(QueryError::AuthzDenied(_))),
+                "execute {statement}: {executed:?} {:?}",
+                guard.seen
+            );
+            assert!(
+                !runs
+                    || matches!(&executed, Ok(SqlOutput::Rows(rows))
+                        if rows.rows.is_empty() || statement.starts_with("explain")),
+                "execute {statement}: {executed:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// String values that try to end a literal early, in every escaping style.
+const QUOTE_VALUES: &[&str] = &[
+    "\\' or 1=1 --",
+    "\\'",
+    "\\\\'",
+    "''",
+    "'''",
+    "a\\'b",
+    "it's",
+    "\\",
+    "x' or 'a'='a",
+    "line\nbreak",
+    "tab\there",
+];
+
+#[test]
+fn render_statement_round_trips_string_values() -> Result<(), Box<dyn std::error::Error>> {
+    let limits = crate::performance::QueryExecutionConfig::default();
+    for value in QUOTE_VALUES {
+        for prefix in ["", "N"] {
+            let sql = format!(
+                "select name from public_t where name = {prefix}'{}' and id = 1",
+                value.replace('\'', "''")
+            );
+            let [statement] = <[Statement; 1]>::try_from(parse(&sql)?)
+                .map_err(|_| std::io::Error::other("expected one statement"))?;
+            let rendered = render_statement(statement, &limits)?;
+
+            for (dialect, statements) in [
+                ("postgres", parse(&rendered)?),
+                ("generic", Parser::parse_sql(&GenericDialect {}, &rendered)?),
+            ] {
+                assert_eq!(
+                    name_filter_literal(&statements).as_deref(),
+                    Some(*value),
+                    "{dialect}: {value:?} -> {rendered}"
+                );
+            }
+        }
+    }
+
+    for sql in [
+        "SELECT name FROM public_t WHERE name LIKE 'a\\%' ESCAPE '\\'",
+        "SELECT \"Name\", 2 ^ 3 AS p, 'a' || name AS q FROM public_t WHERE id::BIGINT = 1",
+        "SELECT name AS 'label', \"odd \"\" name\" FROM public_t",
+    ] {
+        let [statement] = <[Statement; 1]>::try_from(parse(sql)?)
+            .map_err(|_| std::io::Error::other("expected one statement"))?;
+        assert_eq!(render_statement(statement, &limits)?, sql);
+    }
+
+    // Quoted names have no escaped form; one that would end early is refused.
+    for sql in [
+        "select id as 'a\\''' from public_t",
+        "select id as \"a\\\"\"\" from public_t",
+        "select \"a\\\"\"\" from public_t",
+        "select id from public_t where name = X'0a''0b'",
+    ] {
+        let [statement] = <[Statement; 1]>::try_from(parse(sql)?)
+            .map_err(|_| std::io::Error::other("expected one statement"))?;
+        let result = render_statement(statement, &limits);
+        assert!(
+            matches!(result, Err(QueryError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+
+    // Other text that does not read back the same is refused too, naming the
+    // check that failed.
+    for (sql, reason) in [
+        ("select - -1 as v", "does not parse back"),
+        ("select 1_000 as v", "DataFusion's SQL dialect"),
+        (
+            "select name ? 'a' from public_t",
+            "DataFusion's SQL dialect",
+        ),
+    ] {
+        let [statement] = <[Statement; 1]>::try_from(parse(sql)?)
+            .map_err(|_| std::io::Error::other("expected one statement"))?;
+        let result = render_statement(statement, &limits);
+        assert!(
+            matches!(&result, Err(QueryError::Unsupported(message)) if message.contains(reason)),
+            "{sql}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Returns `v` from a `WHERE name = v AND id = 1` filter, or `None` when the
+/// filter has any other shape.
+fn name_filter_literal(statements: &[Statement]) -> Option<String> {
+    let [Statement::Query(query)] = statements else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let Some(SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    }) = &select.selection
+    else {
+        return None;
+    };
+    let SqlExpr::BinaryOp {
+        left: name,
+        op: BinaryOperator::Eq,
+        right: literal,
+    } = left.as_ref()
+    else {
+        return None;
+    };
+    let id_filter = matches!(
+        right.as_ref(),
+        SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right }
+            if matches!(left.as_ref(), SqlExpr::Identifier(ident) if ident.value == "id")
+                && right.to_string() == "1"
+    );
+    match (name.as_ref(), literal.as_ref()) {
+        (SqlExpr::Identifier(ident), SqlExpr::Value(value))
+            if ident.value == "name" && id_filter =>
+        {
+            value.value.clone().into_string()
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn nested_negative_literals_are_values() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    engine
+        .execute(
+            "insert into public_t (id, name, age, active) values \
+             ((-5), 'n', (-1), true), ((-9223372036854775808), 'min', 0, false), \
+             (-(-7), 'double', 1, true)",
+        )
+        .await?;
+
+    for (sql, expected) in [
+        ("select age from public_t where id = (-5)", Value::Int(-1)),
+        (
+            "select name from public_t where id = (-9223372036854775808)",
+            Value::Str("min".to_owned()),
+        ),
+        (
+            "select name from public_t where id = 7",
+            Value::Str("double".to_owned()),
+        ),
+    ] {
+        let SqlOutput::Rows(rows) = engine.execute(sql).await? else {
+            return Err(format!("{sql} returned no rows").into());
+        };
+        assert_eq!(rows.rows, vec![vec![expected]], "{sql}");
+    }
+    let result = engine
+        .execute(
+            "insert into public_t (id, name, age, active) \
+             values (-(-9223372036854775808), 'overflow', 0, true)",
+        )
+        .await;
+    assert!(
+        matches!(result, Err(QueryError::InvalidValue(_))),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+/// The kind of value each column of `schema` holds, as `Value` reports it.
+fn described_kinds(schema: &datafusion::arrow::datatypes::Schema) -> Vec<(String, &'static str)> {
+    use datafusion::arrow::datatypes::DataType;
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let kind = match field.data_type() {
+                DataType::Boolean => "bool",
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => "int",
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => "float",
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes",
+                _ => "other",
+            };
+            (field.name().clone(), kind)
+        })
+        .collect()
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bytes(_) => "bytes",
+        _ => "other",
+    }
+}
+
+#[tokio::test]
+async fn describe_types_match_executed_values() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = guarded_engine().await?;
+    engine
+        .execute("insert into public_t (id, name, age, active) values (1, 'Ada', 37, true)")
+        .await?;
+    engine.create_table("events", Some(event_schema()), Vec::new())?;
+    engine
+        .execute("insert into events (id, category, price, active) values (1, 'a', 2.5, true)")
+        .await?;
+
+    for sql in [
+        "select id, name, age, active from public_t where id = 1",
+        "select age * 2 as doubled, age * 1.5 as weighted, age + 1 as next from public_t",
+        "select count(*), sum(age), avg(age), max(age) from public_t",
+        "select id, price, category from events",
+        // Mixed input types are coerced only when the plan is analyzed.
+        "select age from public_t union all select 2.5 as age",
+        "select 2.5 as v union all select age from public_t",
+        "select null as v union all select age from public_t",
+        "select case when id = 1 then age else 0.5 end as v from public_t",
+        "select case when id = 2 then null else age end as v from public_t",
+    ] {
+        let mut guard = RecordingReadGuard::allowing_all();
+        let schema = engine
+            .describe_with_read_guard(sql, &mut guard)
+            .await?
+            .ok_or_else(|| format!("{sql} has no result columns"))?;
+        let described = described_kinds(&schema);
+        let SqlOutput::Rows(rows) = engine.execute(sql).await? else {
+            return Err(format!("{sql} returned no rows").into());
+        };
+        // Every non-null value of a column has the described type.
+        let executed = rows
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut kinds = rows
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.get(index))
+                    .filter(|value| !matches!(value, Value::Null))
+                    .map(value_kind)
+                    .collect::<Vec<_>>();
+                kinds.dedup();
+                (name.clone(), kinds)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(described.len(), executed.len(), "{sql}");
+        for ((name, kind), (executed_name, kinds)) in described.iter().zip(&executed) {
+            assert_eq!(name, executed_name, "{sql}");
+            assert!(
+                kinds.iter().all(|executed| executed == kind),
+                "{sql}: {name} is described as {kind}, executed as {kinds:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn describe_refuses_scans_whose_policies_sql_cannot_apply()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = guarded_engine().await?;
+    let mut guard = RecordingReadGuard::allowing_all();
+    guard.policies.insert(
+        "secrets".to_owned(),
+        super::SqlRelationPolicy {
+            masks: vec![(FieldPath::new(["name"]), Value::Array(Vec::new()))],
+            ..super::SqlRelationPolicy::default()
+        },
+    );
+    for sql in [
+        "select name from secrets",
+        "select id from public_t where id in (select id from secrets)",
+    ] {
+        let executed = engine.execute_with_read_guard(sql, Some(&mut guard)).await;
+        assert!(executed.is_err(), "{sql}: {executed:?}");
+        let described = engine.describe_with_read_guard(sql, &mut guard).await;
+        assert!(
+            matches!(described, Err(QueryError::Unsupported(_))),
+            "{sql}: {described:?}"
+        );
+    }
+    assert!(
+        engine
+            .describe_with_read_guard("select name from public_t", &mut guard)
+            .await?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn query_fingerprint_hides_escaped_string_values() {
+    let plain = QueryFingerprint::new("select name from users where name = 'x'");
+    for sql in [
+        "select name from users where name = E'secret-token\\' and more'",
+        "select name from users where name = e'secret\\\\'",
+        "select name from users where name = E'secret\\\\\\' or ''more'''",
+        "select name from users where name = N'secret'",
+        "select name from users where name = 'secret''s more'",
+    ] {
+        let fingerprint = QueryFingerprint::new(sql);
+        assert!(
+            !fingerprint.0.contains("secret") && !fingerprint.0.contains("more"),
+            "{sql}: {fingerprint:?}"
+        );
+        assert_eq!(fingerprint, plain, "{sql}");
+    }
+    assert_ne!(
+        QueryFingerprint::new("select name from users where name = 'x'"),
+        QueryFingerprint::new("select name from users where note = 'x'")
+    );
+    assert_ne!(
+        QueryFingerprint::new("select name from users where name = 'x'"),
+        QueryFingerprint::new("select name from users where name = e")
+    );
 }

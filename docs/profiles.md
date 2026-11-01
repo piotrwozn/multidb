@@ -202,11 +202,12 @@ The four SQL parser limits (`query.max_sql_bytes`, `max_statements`,
 `max_values_rows`, `parser_recursion_limit`) bind the engine's parse and these
 pre-parses in front of it: the compatibility-query check of `Database::query`,
 the RBAC check of `query_as` and `query_as_of_as` and the retention check of
-`query_as_of`. They do not bind the tuning system view check
-(`tuning::parse_system_view`), the `match`, `time_bucket`, `within_radius` and
-`graph_neighbors` call check (`parse_phase19_call`) or the pgwire
-extended-protocol Describe pre-parse, which keep sqlparser's defaults (see
-below). The size limit counts the whole SQL text, trailing whitespace
+`query_as_of`. PostgreSQL wire Describe plans the statement through the same
+parse as execution, and the check of a prepared statement's placeholders when
+the client parses it uses these limits too. They do not bind the tuning system
+view check (`tuning::parse_system_view`) or the `match`, `time_bucket`,
+`within_radius` and `graph_neighbors` call check (`parse_phase19_call`), which
+keep sqlparser's defaults (see below). The size limit counts the whole SQL text, trailing whitespace
 and semicolons included; for the inline `... AS OF LSN n` / `AS OF TIMESTAMP n`
 form of `Database::query` it counts the query left after the `AS OF` clause
 is removed. DataFusion parses the SELECTs it plans (every SELECT
@@ -215,9 +216,9 @@ functions, and every `AS OF` query) a second time with its own fixed recursion
 limit of 50, so a `query.parser_recursion_limit` above 50 deepens only the
 statements multidb executes itself, such as `INSERT` and indexed equality
 lookups; a SELECT that DataFusion plans and that nests deeper than 50 fails
-with a parse error (SQLSTATE 42601). The pgwire extended-protocol Describe
-pre-parse still uses sqlparser's defaults (recursion depth 50, no size or
-statement limits); moving it to these limits is left to the pgwire work.
+with a parse error (SQLSTATE 42601). The engine plans a statement from its
+re-rendered text, which must parse back to the same statement under
+`parser_recursion_limit`.
 Best-effort internal parses also keep sqlparser's defaults: the tuning system
 views (`tuning::parse_system_view`), workload sampling and the optimizer
 fingerprint, which leave the statement to the engine when they fail, and the

@@ -3,9 +3,10 @@
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use super::{
-    Arc, BTreeMap, BTreeSet, CatalogEntry, Database, DbError, PolicyConfig, Principal, SqlOutput,
-    TemporalError, Value, compat, parse_as_of_query, policy_has_row_or_masking,
-    resource_for_catalog_name, sql_requirements,
+    Arc, BTreeMap, BTreeSet, CatalogEntry, Database, DbError, PolicyConfig, Principal, QueryError,
+    SqlOutput, TemporalError, TuningSystemView, Value, compat, extension, parse_as_of_query,
+    parse_call_procedure_sql, parse_phase19_call, phase32_unsupported, policy_has_row_or_masking,
+    resource_for_catalog_name, sql_requirements, tuning,
 };
 
 impl Database {
@@ -43,6 +44,18 @@ impl Database {
                 .describe_with_read_guard(&rewritten, &mut guard)
                 .await?);
         }
+        // The statements execution runs itself are described in the order it
+        // dispatches them, without running any of them. A procedure's result
+        // depends on the module it runs, so `CALL` is described as returning
+        // no rows, like `CREATE FUNCTION`.
+        if parse_call_procedure_sql(sql)?.is_some()
+            || extension::parse_create_wasm_function(sql)?.is_some()
+        {
+            return Ok(None);
+        }
+        if let Some(kind) = super::phase32_declaration_kind(sql) {
+            return Err(phase32_unsupported(kind));
+        }
         // Compatibility statements have fixed engine-owned results. They do not
         // evaluate user SQL or read user tables.
         if let Some(output) = compat::execute_compat_sql(
@@ -77,6 +90,19 @@ impl Database {
                 ))),
             });
         }
+        if let Some(view) = tuning::parse_system_view(sql)? {
+            return Ok(Some(system_view_schema(view)));
+        }
+        if let Some(schema) = parse_phase19_call(sql)?.and_then(|call| phase19_schema(&call.name)) {
+            return Ok(Some(schema));
+        }
+        if extension::parse_select_udf_call(sql)?.is_some() {
+            return Err(QueryError::Unsupported(
+                "a WASM UDF call cannot be described without running it; use the simple query protocol"
+                    .to_owned(),
+            )
+            .into());
+        }
         Ok(self
             .sql_engine()?
             .describe_with_read_guard(sql, &mut guard)
@@ -106,6 +132,88 @@ impl Database {
             batch_rows,
         )?)
     }
+}
+
+/// The result columns the built-in system view `view` returns.
+fn system_view_schema(view: TuningSystemView) -> SchemaRef {
+    use DataType::{Float64, Int64, Utf8};
+    let columns: &[(&str, DataType)] = match view {
+        TuningSystemView::Workload => &[
+            ("fingerprint", Utf8),
+            ("executions", Int64),
+            ("avg_latency_ms", Float64),
+            ("returned_rows", Int64),
+            ("examined_rows", Int64),
+            ("access_pattern", Utf8),
+            ("last_seen_millis", Int64),
+        ],
+        TuningSystemView::TuningLog => &[
+            ("id", Utf8),
+            ("at_millis", Int64),
+            ("parameter", Utf8),
+            ("old_value", Int64),
+            ("new_value", Int64),
+            ("status", Utf8),
+            ("outcome", Utf8),
+            ("rollback_of", Utf8),
+        ],
+        TuningSystemView::IndexAdvice => &[
+            ("id", Utf8),
+            ("action", Utf8),
+            ("table_name", Utf8),
+            ("column_name", Utf8),
+            ("estimated_benefit", Float64),
+            ("status", Utf8),
+            ("reason", Utf8),
+        ],
+        TuningSystemView::ReprofileJobs => &[
+            ("id", Utf8),
+            ("object", Utf8),
+            ("from_layout", Utf8),
+            ("to_layout", Utf8),
+            ("status", Utf8),
+            ("detail", Utf8),
+        ],
+    };
+    static_schema(columns)
+}
+
+/// The result columns of the built-in SQL helper `name`, or `None` for
+/// another name.
+fn phase19_schema(name: &str) -> Option<SchemaRef> {
+    use DataType::{Binary, Float64, Int64, Utf8};
+    let columns: &[(&str, DataType)] = match name {
+        "match" => &[("id", Binary), ("score", Float64), ("text", Utf8)],
+        "time_bucket" => &[("bucket", Int64)],
+        "within_radius" => &[
+            ("id", Binary),
+            ("point", geo_point_type()),
+            ("distance_meters", Float64),
+        ],
+        "graph_neighbors" => &[("node", Utf8)],
+        _ => return None,
+    };
+    Some(static_schema(columns))
+}
+
+/// A geographic point, which pgwire sends as JSON like other structured values.
+fn geo_point_type() -> DataType {
+    DataType::Struct(
+        vec![
+            Field::new("lon", DataType::Float64, false),
+            Field::new("lat", DataType::Float64, false),
+        ]
+        .into(),
+    )
+}
+
+fn static_schema(columns: &[(&str, DataType)]) -> SchemaRef {
+    Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Aggregated materialized data cannot safely inherit source row predicates or
@@ -151,11 +259,15 @@ mod tests {
         cdc::{self, AggregateKind, AggregateSpec, MaterializedViewSpec},
         db::{DbConfig, Profile, create_database},
         extension::{ExtensionError, MaskingPolicy, RowPolicy},
-        model::FieldPath,
-        query::{ColumnDef, ColumnType, TableSchema},
+        geo::GeoIndexConfig,
+        model::{CollectionId, FieldPath},
+        query::{ColumnDef, ColumnType, DocField, TableLayout, TableSchema},
         repl::{ReadConsistency, Replication},
         security::{AuthzError, AuthzPolicy, Permission, Resource, Role},
-        tuning::WorkloadWindow,
+        tuning::{
+            ParameterEnvelope, ReprofilePlan, TunableParameter, TuningDecision, TuningPolicy,
+            WorkloadSample, WorkloadWindow,
+        },
     };
 
     #[tokio::test]
@@ -607,6 +719,185 @@ mod tests {
                     .is_none(),
                 "denied view creation wrote {table}/{name}"
             );
+        }
+        Ok(())
+    }
+
+    fn describe_test_database()
+    -> Result<(Database, Principal, Principal), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let schema = || {
+            TableSchema::new(
+                vec![
+                    ColumnDef::new("id", ColumnType::Int, false),
+                    ColumnDef::new("name", ColumnType::Str, false),
+                ],
+                0,
+            )
+        };
+        database.create_table("public_t", Some(schema()), Vec::new())?;
+        database.create_table("secrets", Some(schema()), Vec::new())?;
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("admin")
+                .grant(Resource::Database, Permission::Read)
+                .grant(Resource::Database, Permission::Write)
+                .grant(Resource::Database, Permission::Admin)
+                .grant(Resource::System, Permission::Admin),
+            Role::new("reader").grant(Resource::Table("public_t".to_owned()), Permission::Read),
+        ]));
+        Ok((
+            database,
+            Principal::new("root").with_role("admin"),
+            Principal::new("alice").with_role("reader"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn explain_requirements_come_from_the_statement_as_parsed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, _, reader) = describe_test_database()?;
+        // The pre-check printed the explained statement back and parsed it
+        // again; the quoted value ended early there and read `secrets`.
+        let sql =
+            "explain select id from public_t where name = '\\'' union select id from secrets --'";
+        assert!(
+            matches!(database.query_as(&reader, sql).await?, SqlOutput::Rows(_)),
+            "{sql}"
+        );
+        assert!(
+            database.describe_query_as(&reader, sql).await?.is_some(),
+            "{sql}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn describe_answers_statements_without_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (database, admin, _) = describe_test_database()?;
+        // Neither statement runs: the procedure does not exist and the
+        // module is not valid WASM.
+        for sql in [
+            "CALL absent(1, 'x')",
+            "CREATE FUNCTION f LANGUAGE wasm AS HEX '00'",
+        ] {
+            let described = database.describe_query_as(&admin, sql).await;
+            assert!(matches!(described, Ok(None)), "{sql}: {described:?}");
+        }
+        let udfs = database.udf_specs()?;
+        assert!(udfs.is_empty(), "{udfs:?}");
+        let described = database
+            .describe_query_as(&admin, "CREATE TRIGGER t BEFORE INSERT ON public_t")
+            .await;
+        assert!(
+            matches!(
+                described,
+                Err(DbError::Query(crate::query::QueryError::Unsupported(_)))
+            ),
+            "{described:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn describe_types_builtins_like_execution() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut database, admin, _) = describe_test_database()?;
+        // A UDF call runs WASM, so it is not described.
+        let described = database
+            .describe_query_as(&admin, "SELECT absent_udf(1)")
+            .await;
+        assert!(
+            matches!(
+                described,
+                Err(DbError::Query(crate::query::QueryError::Unsupported(_)))
+            ),
+            "{described:?}"
+        );
+
+        // Each view and helper below returns a row, so its values' types are compared.
+        database.record_workload_sample(
+            &WorkloadSample::new("SELECT * FROM public_t WHERE name = 'x'")
+                .with_access("public_t", "name")
+                .with_observed_rows(1, 3_000),
+        )?;
+        let mut policy = TuningPolicy {
+            enabled: true,
+            recommend_only: false,
+            ..TuningPolicy::default()
+        };
+        policy.envelopes.insert(
+            TunableParameter::CacheMaxCapacity,
+            ParameterEnvelope::new(64, 4_096, 64),
+        );
+        database.set_tuning_policy(&policy)?;
+        let capacity = database.performance_config().cache.max_capacity;
+        database.apply_tuning(TuningDecision::new(
+            TunableParameter::CacheMaxCapacity,
+            capacity,
+            1_024,
+            "cache miss pressure",
+        ))?;
+        database.start_reprofile(ReprofilePlan {
+            object: "public_t".to_owned(),
+            from_layout: TableLayout::Row,
+            to_layout: TableLayout::Columnar,
+            reversible: true,
+        })?;
+        database
+            .create_collection(
+                "places",
+                CollectionId::new(1),
+                vec![DocField::document_id("id")],
+                Vec::new(),
+            )?
+            .insert(&Value::Object(BTreeMap::from([(
+                "point".to_owned(),
+                Value::GeoPoint {
+                    lon: 21.0,
+                    lat: 52.0,
+                },
+            )])))?;
+        database.create_geo_index(GeoIndexConfig::new(
+            "places_geo",
+            CollectionId::new(1),
+            FieldPath::new(["point"]),
+        ))?;
+
+        for sql in [
+            "SELECT * FROM system.workload",
+            "SELECT * FROM system.tuning_log",
+            "SELECT * FROM system.index_advice",
+            "SELECT * FROM system.reprofile_jobs",
+            "SELECT time_bucket(60000, 125000)",
+            "SELECT * FROM within_radius('places_geo', 21.0, 52.0, 10)",
+        ] {
+            let schema = database
+                .describe_query_as(&admin, sql)
+                .await?
+                .ok_or_else(|| format!("{sql} has no result columns"))?;
+            let SqlOutput::Rows(rows) = database.query_as(&admin, sql).await? else {
+                return Err(format!("{sql} returned no rows").into());
+            };
+            assert!(!rows.rows.is_empty(), "{sql} returned no rows to compare");
+            let names = schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names, rows.columns, "{sql}");
+            for row in &rows.rows {
+                for (value, field) in row.iter().zip(schema.fields()) {
+                    let expected = match value {
+                        Value::Null => continue,
+                        Value::Bool(_) => DataType::Boolean,
+                        Value::Int(_) => DataType::Int64,
+                        Value::Float(_) => DataType::Float64,
+                        Value::Bytes(_) => DataType::Binary,
+                        Value::GeoPoint { .. } => super::geo_point_type(),
+                        _ => DataType::Utf8,
+                    };
+                    assert_eq!(field.data_type(), &expected, "{sql}: {}", field.name());
+                }
+            }
         }
         Ok(())
     }
