@@ -24,6 +24,29 @@ All notable public changes will be recorded here.
   before decoding. Successful logins release their authentication reservation
   without spending the failed-login budget. CLI timeout/frame overrides are
   documented in `docs/docker.md`.
+- Fixed SQL statements that could change meaning between parsing and
+  planning. The engine printed each parsed statement back to SQL text with
+  sqlparser's printer and planned that text. The printer leaves a quote that
+  follows a backslash undoubled and prints `N'...'` unescaped, so a string
+  literal or quoted name holding a backslash before a quote ended early in the
+  planned text and the rest of it ran as SQL: it could comment out the rest of
+  a `WHERE` clause (a tenant filter, other bound parameters) or add `OR` /
+  `UNION` branches. Anyone whose input reaches a
+  SQL string could trigger it: an end user of an application that binds text
+  parameters over the PostgreSQL wire extended protocol (they are spliced as
+  quoted literals, and a parameter in an alias position, `AS $1`, as a quoted
+  name), or of an application that quotes literals correctly for simple
+  queries, Control Plane `POST /sql`, the SDKs or `Database::query`/`query_as`.
+  It allowed no writes or extra statements. Reads stayed limited to what the
+  principal may read, with row and masking policies applied, except through
+  `Database::query`, which has no principal. String literals that hold a quote
+  are now printed as `E'...'`, and the printed statement must parse back to the
+  same statement with the PostgreSQL dialect and split into the same tokens
+  with DataFusion's generic dialect; otherwise it is refused with `Unsupported`
+  (SQLSTATE 0A000), as is a quoted name holding a backslash before its quote.
+  This covers queries, `EXPLAIN`, Describe (`INSERT ... RETURNING` is now
+  described from its parsed `RETURNING` items) and the permission check of
+  `EXPLAIN`.
 - Added a reproducible local before/after SQL benchmark runner with binary/source
   provenance, raw latency verification and all nine supplied workloads. See
   `docs/performance-local-benchmarks.md`.

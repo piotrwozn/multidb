@@ -2316,4 +2316,74 @@ mod tests {
             0,
         )
     }
+
+    #[tokio::test]
+    async fn bound_text_parameters_cannot_change_statement_structure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(RwLock::new(shared_users_database()?));
+        let server = start_shared_test_server(TlsMode::DisabledForTests, database).await?;
+        let client = plain_client(server.addr, "secret").await?;
+
+        // The engine printed `name = '\'' or 1=1 --'` back as `name = '\' or 1=1 --'`,
+        // so the rest of the value ran as SQL and commented out `age = $2`.
+        let filter = client
+            .prepare_typed(
+                "select name from users where name = $1 and age = $2",
+                &[Type::TEXT, Type::INT8],
+            )
+            .await?;
+        for payload in ["\\' or 1=1 --", "\\'' or 1=1 --", "x' or 'a'='a", "\\"] {
+            let rows = client.query(&filter, &[&payload, &37_i64]).await?;
+            assert!(rows.is_empty(), "{payload:?} matched {} rows", rows.len());
+        }
+        // A text parameter in an alias position is a single-quoted name.
+        let alias = client
+            .prepare_typed(
+                "select age as $1 from users where age = $2",
+                &[Type::TEXT, Type::INT8],
+            )
+            .await?;
+        match client
+            .query(&alias, &[&"a\\' , name from users --", &99_i64])
+            .await
+        {
+            Ok(rows) => assert!(rows.is_empty(), "alias matched {} rows", rows.len()),
+            Err(error) => assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+            ),
+        }
+        let rows = client.query(&alias, &[&"years", &37_i64]).await?;
+        let ages = rows
+            .iter()
+            .map(|row| row.try_get::<_, i64>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ages, vec![37]);
+
+        // Values holding quotes, backslashes and comment markers round-trip.
+        let insert = client
+            .prepare_typed(
+                "insert into users (id, name, age, active) values ($1, $2, 1, true)",
+                &[Type::INT8, Type::TEXT],
+            )
+            .await?;
+        let lookup = client
+            .prepare_typed("select id, name from users where name = $1", &[Type::TEXT])
+            .await?;
+        for (id, value) in [
+            (2_i64, "it's \\' -- x"),
+            (3, "\\'' or 1=1 --"),
+            (4, "a''b\\\\'c"),
+        ] {
+            client.execute(&insert, &[&id, &value]).await?;
+            let rows = client.query(&lookup, &[&value]).await?;
+            let found = rows
+                .iter()
+                .map(|row| Ok((row.try_get::<_, i64>(0)?, row.try_get::<_, String>(1)?)))
+                .collect::<Result<Vec<_>, tokio_postgres::Error>>()?;
+            assert_eq!(found, vec![(id, value.to_owned())], "{value:?}");
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
 }

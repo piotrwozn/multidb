@@ -8138,7 +8138,11 @@ fn sql_requirements(
                 }
             }
             Statement::Explain { statement, .. } => {
-                requirements.extend(sql_requirements(&statement.to_string(), catalog, limits)?);
+                requirements.extend(sql_requirements(
+                    &crate::query::render_statement(*statement, limits)?,
+                    catalog,
+                    limits,
+                )?);
             }
             other => return Err(QueryError::Unsupported(other.to_string()).into()),
         }

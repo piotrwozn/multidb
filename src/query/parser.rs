@@ -1,9 +1,13 @@
 use std::ops::ControlFlow;
 
 use sqlparser::{
-    ast::{Expr as SqlExpr, Query, SetExpr, Statement, Value as SqlValue, Visit, Visitor},
-    dialect::PostgreSqlDialect,
+    ast::{
+        Expr as SqlExpr, Query, SetExpr, Statement, Value as SqlValue, ValueWithSpan, Visit,
+        VisitMut, Visitor, VisitorMut,
+    },
+    dialect::{GenericDialect, PostgreSqlDialect},
     parser::Parser,
+    tokenizer::Tokenizer,
 };
 
 use super::{AnalyzeMode, AnalyzeTarget, QueryError};
@@ -63,6 +67,86 @@ pub(crate) fn parse_with_limits(
     }
 
     Ok(statements)
+}
+
+/// Renders a parsed statement as SQL text that the engine's planners parse back
+/// to the same statement.
+///
+/// The simple planners and `DataFusion` plan re-rendered text. sqlparser's
+/// printer does not escape every quoted value or name: inside `'...'` and
+/// `"..."` it leaves a quote that follows a backslash undoubled and passes an
+/// existing doubled quote through, and it prints `N'...'` unescaped. Neither
+/// the `PostgreSQL` nor the generic dialect treats a backslash as an escape
+/// there, so such a value or name would end early when the text is parsed
+/// again and the rest of it would run as SQL. String literals that contain a
+/// quote are therefore rendered as `E'...'`, whose escaping both dialects
+/// reverse exactly. The text is then checked: parsed again with the
+/// `PostgreSQL` dialect under `limits` it must give back the same statement,
+/// and the generic dialect `DataFusion` parses it with must split it into the
+/// same tokens.
+/// # Errors
+/// Fails with `Unsupported` when no text passes that check, for example for a
+/// quoted name that holds a backslash before a quote.
+pub(crate) fn render_statement(
+    mut statement: Statement,
+    limits: &QueryExecutionConfig,
+) -> Result<String, QueryError> {
+    if let ControlFlow::Break(error) = VisitMut::visit(&mut statement, &mut QuoteSafeLiterals) {
+        return Err(error);
+    }
+    let sql = statement.to_string();
+    let reparsed = Tokenizer::new(&PostgreSqlDialect {}, &sql)
+        .tokenize_with_location()
+        .ok()
+        .filter(|tokens| {
+            Tokenizer::new(&GenericDialect {}, &sql)
+                .tokenize_with_location()
+                .is_ok_and(|generic| generic == *tokens)
+        })
+        .and_then(|tokens| {
+            Parser::new(&PostgreSqlDialect {})
+                .with_recursion_limit(limits.parser_recursion_limit)
+                .with_tokens_with_locations(tokens)
+                .parse_statements()
+                .ok()
+        });
+    if reparsed.as_deref() != Some(std::slice::from_ref(&statement)) {
+        return Err(QueryError::Unsupported(
+            "the statement cannot be planned from unambiguous SQL text; \
+             check quoted names and values for a backslash before a quote"
+                .to_owned(),
+        ));
+    }
+    Ok(sql)
+}
+
+/// Rewrites string literals that hold a quote as `E'...'` literals.
+struct QuoteSafeLiterals;
+
+impl VisitorMut for QuoteSafeLiterals {
+    type Break = QueryError;
+
+    fn post_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        match &mut value.value {
+            SqlValue::SingleQuotedString(text) | SqlValue::NationalStringLiteral(text)
+                if text.contains('\'') =>
+            {
+                let text = std::mem::take(text);
+                value.value = SqlValue::EscapedStringLiteral(text);
+            }
+            SqlValue::HexStringLiteral(text)
+            | SqlValue::SingleQuotedByteStringLiteral(text)
+            | SqlValue::DoubleQuotedByteStringLiteral(text)
+                if text.contains(['\'', '"', '\\']) =>
+            {
+                return ControlFlow::Break(QueryError::Unsupported(
+                    "hex or bit-string literal containing a quote or backslash".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 fn count_statement_values_rows(statement: &Statement) -> usize {

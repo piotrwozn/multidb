@@ -83,8 +83,8 @@ pub use optimizer::{
     PlanDependency, PlannerFeedback, QueryFingerprint, STATS_TABLE, SimpleSelectPlan, StatsCatalog,
     StatsObjectKind, TableStats,
 };
-pub(crate) use parser::parse_with_limits;
 pub use parser::{parse, parse_analyze_for_authz};
+pub(crate) use parser::{parse_with_limits, render_statement};
 
 use parser::{parse_analyze_command, parse_limit};
 
@@ -2490,14 +2490,14 @@ impl SqlEngine {
         guard: &mut dyn SqlReadGuard,
     ) -> Result<Option<SchemaRef>, QueryError> {
         let statements = parse_with_limits(sql, &self.performance.query)?;
-        let [statement] = statements.as_slice() else {
+        let Ok([statement]) = <[Statement; 1]>::try_from(statements) else {
             return Err(QueryError::Unsupported(
                 "Describe requires exactly one SQL statement".to_owned(),
             ));
         };
         let policies = guard.relation_policies();
         let select_sql = match statement {
-            Statement::Query(_) => statement.to_string(),
+            Statement::Query(_) => render_statement(statement, &self.performance.query)?,
             Statement::Insert(insert) => {
                 let Some(returning) = &insert.returning else {
                     return Ok(None);
@@ -2518,16 +2518,15 @@ impl SqlEngine {
                     .get(&table)
                     .ok_or_else(|| QueryError::MissingTable(table.clone()))?;
                 returning_rows(relation.schema.as_ref(), returning, &[])?;
-                let projection = returning
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("SELECT {projection} FROM {name}")
+                render_statement(returning_select(name, returning)?, &self.performance.query)?
             }
             Statement::Explain { statement, .. } => {
                 let (_, reads) = self
-                    .prepare_explain(&statement.to_string(), ExplainOptions::default(), &policies)
+                    .prepare_explain(
+                        &render_statement(*statement, &self.performance.query)?,
+                        ExplainOptions::default(),
+                        &policies,
+                    )
                     .await?;
                 guard
                     .authorize_reads(&reads)
@@ -2558,7 +2557,10 @@ impl SqlEngine {
         match statement {
             Statement::Query(_) => {
                 let (select, reads) = self
-                    .prepare_select(&statement.to_string(), policies)
+                    .prepare_select(
+                        &render_statement(statement, &self.performance.query)?,
+                        policies,
+                    )
                     .await?;
                 Ok((PreparedStatement::Select(select), Some(reads)))
             }
@@ -2576,7 +2578,11 @@ impl SqlEngine {
                 analyze, statement, ..
             } => {
                 let (prepared, reads) = self
-                    .prepare_explain(&statement.to_string(), ExplainOptions { analyze }, policies)
+                    .prepare_explain(
+                        &render_statement(*statement, &self.performance.query)?,
+                        ExplainOptions { analyze },
+                        policies,
+                    )
                     .await?;
                 Ok((PreparedStatement::Explain(prepared), Some(reads)))
             }
@@ -5387,6 +5393,24 @@ fn conflict_assignment_value(
         }
         _ => sql_expr_to_value(expr),
     }
+}
+
+/// The statement `SELECT {returning} FROM {name}`, which Describe plans for
+/// `INSERT ... RETURNING`. It is built on the parsed items, not on their text.
+fn returning_select(name: &ObjectName, returning: &[SelectItem]) -> Result<Statement, QueryError> {
+    let unsupported = || QueryError::Unsupported("INSERT ... RETURNING".to_owned());
+    let [mut statement] =
+        <[Statement; 1]>::try_from(parse("SELECT 1 FROM t")?).map_err(|_| unsupported())?;
+    if let Statement::Query(query) = &mut statement
+        && let SetExpr::Select(select) = query.body.as_mut()
+        && let [from] = select.from.as_mut_slice()
+        && let sqlparser::ast::TableFactor::Table { name: table, .. } = &mut from.relation
+    {
+        table.clone_from(name);
+        select.projection = returning.to_vec();
+        return Ok(statement);
+    }
+    Err(unsupported())
 }
 
 fn returning_rows(

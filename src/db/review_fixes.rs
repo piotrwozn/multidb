@@ -610,4 +610,52 @@ mod tests {
         }
         Ok(())
     }
+
+    fn describe_test_database()
+    -> Result<(Database, Principal, Principal), Box<dyn std::error::Error>> {
+        let mut database = create_database(DbConfig::new(Profile::InMemory))?;
+        let schema = || {
+            TableSchema::new(
+                vec![
+                    ColumnDef::new("id", ColumnType::Int, false),
+                    ColumnDef::new("name", ColumnType::Str, false),
+                ],
+                0,
+            )
+        };
+        database.create_table("public_t", Some(schema()), Vec::new())?;
+        database.create_table("secrets", Some(schema()), Vec::new())?;
+        database.set_authz_policy(AuthzPolicy::new([
+            Role::new("admin")
+                .grant(Resource::Database, Permission::Read)
+                .grant(Resource::Database, Permission::Write)
+                .grant(Resource::Database, Permission::Admin)
+                .grant(Resource::System, Permission::Admin),
+            Role::new("reader").grant(Resource::Table("public_t".to_owned()), Permission::Read),
+        ]));
+        Ok((
+            database,
+            Principal::new("root").with_role("admin"),
+            Principal::new("alice").with_role("reader"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn explain_requirements_come_from_the_statement_as_parsed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, _, reader) = describe_test_database()?;
+        // The pre-check printed the explained statement back and parsed it
+        // again; the quoted value ended early there and read `secrets`.
+        let sql =
+            "explain select id from public_t where name = '\\'' union select id from secrets --'";
+        assert!(
+            matches!(database.query_as(&reader, sql).await?, SqlOutput::Rows(_)),
+            "{sql}"
+        );
+        assert!(
+            database.describe_query_as(&reader, sql).await?.is_some(),
+            "{sql}"
+        );
+        Ok(())
+    }
 }
