@@ -2272,25 +2272,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_required_failure_does_not_execute_following_command()
+    async fn startup_rejection_does_not_execute_following_command()
     -> Result<(), Box<dyn std::error::Error>> {
-        let TestTls { server, .. } = test_tls()?;
-        let server = start_test_server(TlsMode::Require(server)).await?;
-        let mut attacker = TcpStream::connect(server.addr).await?;
+        // These logins fail before pgwire records the startup user, so a statement read
+        // afterwards would run as the fallback name `unknown`. Mapping that name to a
+        // writer makes such a statement commit instead of being refused by RBAC.
+        let TestTls { server: tls, .. } = test_tls()?;
+        let long_name = "u".repeat(300);
+        for (case, tls, user) in [
+            ("TLS required", TlsMode::Require(tls), "alice"),
+            (
+                "over-long user name",
+                TlsMode::DisabledForTests,
+                long_name.as_str(),
+            ),
+        ] {
+            let server = start_test_server_for_principals(tls, true, &["alice", "unknown"]).await?;
+            let mut attacker = TcpStream::connect(server.addr).await?;
 
-        let mut payload = startup_message("alice")?;
-        payload.extend(query_message(INJECTED_INSERT)?);
-        attacker.write_all(&payload).await?;
-        let messages = read_until_closed(&mut attacker).await?;
+            let mut payload = startup_message(user)?;
+            payload.extend(query_message(INJECTED_INSERT)?);
+            attacker.write_all(&payload).await?;
+            let messages = read_until_closed(&mut attacker).await?;
 
-        assert!(
-            has_error_code(&messages, "28000"),
-            "expected FATAL 28000, got {messages:?}"
-        );
-        assert_no_command_completed(&messages);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(user_count(server.database()?).await?, 1);
-        server.shutdown().await?;
+            assert!(
+                has_error_code(&messages, "28000"),
+                "{case}: expected FATAL 28000, got {messages:?}"
+            );
+            assert_no_command_completed(&messages);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(user_count(server.database()?).await?, 1, "{case}");
+            server.shutdown().await?;
+        }
         Ok(())
     }
 
@@ -2728,6 +2741,15 @@ mod tests {
         tls: TlsMode,
         write_allowed: bool,
     ) -> Result<TestServer, Box<dyn std::error::Error>> {
+        start_test_server_for_principals(tls, write_allowed, &["alice"]).await
+    }
+
+    /// Serves the `users` table with each named principal holding the `user` role.
+    async fn start_test_server_for_principals(
+        tls: TlsMode,
+        write_allowed: bool,
+        names: &[&str],
+    ) -> Result<TestServer, Box<dyn std::error::Error>> {
         let mut database = create_database(DbConfig::new(Profile::InMemory))?;
         let users = database.create_table("users", Some(user_schema()), Vec::new())?;
         users.insert(vec![
@@ -2742,7 +2764,9 @@ mod tests {
             user_role = user_role.grant(Resource::Table("users".to_owned()), Permission::Write);
         }
         let mut principals = PrincipalRegistry::new();
-        principals.insert("alice", Principal::new("alice").with_role("user"));
+        for name in names {
+            principals.insert(*name, Principal::new(*name).with_role("user"));
+        }
         database.set_authz_policy(AuthzPolicy::new([user_role]));
         database.set_principal_registry(principals);
 
