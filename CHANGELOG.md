@@ -35,6 +35,14 @@ All notable public changes will be recorded here.
   until the idle or handshake deadline. A connection now closes after any error
   during authentication, after any FATAL error and after a cancel request, and
   only a completed login lets a session run statements.
+- Fixed listeners that stopped after one failed `accept()`. An accept error,
+  such as running out of file descriptors, stopped the PostgreSQL wire listener,
+  which ended `multidb serve`, and stopped the internal transport listener,
+  which left a running cluster node unreachable for Raft and replication
+  traffic. `MetricsServer` stopped the same way. Any client able to open many
+  connections could trigger it without credentials. Failed accepts are now
+  logged and retried: at once when the error concerns one connection, otherwise
+  with a backoff of up to one second.
 - Pgwire reuses its Tokio runtime, applies separate handshake, idle and request
   deadlines instead of a total session lifetime, and checks frontend frame sizes
   before decoding. Successful logins release their authentication reservation

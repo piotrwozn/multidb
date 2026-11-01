@@ -3,6 +3,7 @@ use std::{
     fmt::Debug,
     future::Future,
     io,
+    net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -39,7 +40,7 @@ use pgwire::{
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::RwLock,
     sync::Semaphore,
     task::{JoinError, JoinSet, spawn_blocking},
@@ -70,6 +71,8 @@ const DEFAULT_AUTH_FAILURE_LIMIT: usize = 10;
 const DEFAULT_AUTH_FAILURE_WINDOW_MS: u64 = 60_000;
 const MAX_AUTH_RATE_KEYS: usize = 65_536;
 const MAX_AUTH_USERNAME_BYTES: usize = 256;
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(5);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct NetworkConfig {
@@ -528,9 +531,10 @@ impl AuthRateLimiter {
 }
 
 impl PgServer {
-    /// Serves `PostgreSQL` wire connections until the listener fails.
+    /// Serves `PostgreSQL` wire connections.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve(
         listener: TcpListener,
         database: Arc<crate::db::Database>,
@@ -547,7 +551,8 @@ impl PgServer {
 
     /// Serves `PostgreSQL` wire connections until the shutdown future completes.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_until_shutdown<F>(
         listener: TcpListener,
         database: Arc<crate::db::Database>,
@@ -571,7 +576,8 @@ impl PgServer {
     /// Statements share a read guard; a held or queued write guard pauses new
     /// statements until it is released.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_shared(
         listener: TcpListener,
         database: SharedDatabase,
@@ -585,7 +591,8 @@ impl PgServer {
     /// Statements share a read guard; a held or queued write guard pauses new
     /// statements until it is released.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_shared_until_shutdown<F>(
         listener: TcpListener,
         database: SharedDatabase,
@@ -640,8 +647,8 @@ impl PgServer {
                     return Ok(());
                 },
                 _ = connections.join_next(), if !connections.is_empty() => {},
-                accepted = listener.accept() => {
-                    let (socket, _) = accepted?;
+                accepted = accept_with_backoff("pgwire", &listener) => {
+                    let (socket, _) = accepted;
                     let tls_acceptor = tls_acceptor.clone();
                     let factory = Arc::clone(&factory);
                     let permits = Arc::clone(&connection_permits);
@@ -659,6 +666,52 @@ impl PgServer {
             }
         }
     }
+}
+
+/// Accepts the next TCP connection, retrying failed `accept()` calls instead
+/// of stopping the server. Errors that concern a single connection are
+/// retried at once; others, such as running out of file descriptors, are
+/// retried with exponential backoff.
+pub(crate) async fn accept_with_backoff(
+    server: &'static str,
+    listener: &TcpListener,
+) -> (TcpStream, SocketAddr) {
+    retry_accept(server, || listener.accept()).await
+}
+
+async fn retry_accept<T, F, Fut>(server: &'static str, mut accept: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    let mut backoff = ACCEPT_BACKOFF_INITIAL;
+    loop {
+        match accept().await {
+            Ok(accepted) => return accepted,
+            Err(error) if is_connection_error(&error) => {
+                tracing::debug!(server, error = %error, "accept failed for one connection");
+            }
+            Err(error) => {
+                tracing::error!(
+                    server,
+                    error = %error,
+                    retry_in_ms = backoff.as_millis(),
+                    "accept failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+fn is_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
 }
 
 impl BlockingDbExecutor {
@@ -1994,6 +2047,25 @@ mod tests {
             "unexpected authentication rejection: {database_error:?}"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_with_backoff_retries_transient_errors() {
+        let mut script = std::collections::VecDeque::from([
+            Err(io::Error::other("too many open files")),
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+            Ok(7_u8),
+        ]);
+        let mut calls = 0;
+
+        let accepted = super::retry_accept("test", || {
+            calls += 1;
+            std::future::ready(script.pop_front().unwrap_or(Ok(0)))
+        })
+        .await;
+
+        assert_eq!(accepted, 7);
+        assert_eq!(calls, 3);
     }
 
     #[tokio::test]
