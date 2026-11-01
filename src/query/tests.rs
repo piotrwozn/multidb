@@ -1975,27 +1975,34 @@ async fn assert_filters_hold(queries: &[&str]) -> Result<(), Box<dyn std::error:
 async fn requoted_values_cannot_add_reads() -> Result<(), Box<dyn std::error::Error>> {
     // Reads only `public_t`. Re-rendered with sqlparser's printer, the rest of
     // the value read `secrets`.
-    assert_reads_stay_within_public_t(&[
-        "select id from public_t where name = '\\'' union select id from secrets --'",
-    ])
+    assert_reads_stay_within_public_t(
+        &["select id from public_t where name = '\\'' union select id from secrets --'"],
+        true,
+    )
     .await
 }
 
 #[tokio::test]
 async fn requoted_names_cannot_add_reads() -> Result<(), Box<dyn std::error::Error>> {
-    assert_reads_stay_within_public_t(&[
-        "select id as 'a\\'' from secrets --' from public_t",
-        "select id as \"a\\\"\" from secrets --\" from public_t",
-        "insert into public_t (id, name, age, active) values (5, 'x', 1, true) \
-         returning id as \"a\\\"\" from secrets --\"",
-    ])
+    assert_reads_stay_within_public_t(
+        &[
+            "select id as 'a\\'' from secrets --' from public_t",
+            "select id as \"a\\\"\" from secrets --\" from public_t",
+            "insert into public_t (id, name, age, active) values (5, 'x', 1, true) \
+             returning id as \"a\\\"\" from secrets --\"",
+        ],
+        false,
+    )
     .await
 }
 
 /// Describes, executes and explains each statement with a guard that allows
-/// `public_t` only, and checks that nothing planned a read of `secrets`.
+/// `public_t` only, and checks that nothing planned a read of `secrets`. With
+/// `runs`, each statement must also be described and run, returning the rows
+/// of the empty `public_t`.
 async fn assert_reads_stay_within_public_t(
     statements: &[&str],
+    runs: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = guarded_engine().await?;
     let secrets = SqlReadTarget::Catalog("secrets".to_owned());
@@ -2010,6 +2017,10 @@ async fn assert_reads_stay_within_public_t(
                 "describe {statement}: {described:?} {:?}",
                 guard.seen
             );
+            assert!(
+                !runs || matches!(described, Ok(Some(_))),
+                "describe {statement}: {described:?}"
+            );
             if statement.starts_with("insert") {
                 continue;
             }
@@ -2022,6 +2033,12 @@ async fn assert_reads_stay_within_public_t(
                     && !matches!(executed, Err(QueryError::AuthzDenied(_))),
                 "execute {statement}: {executed:?} {:?}",
                 guard.seen
+            );
+            assert!(
+                !runs
+                    || matches!(&executed, Ok(SqlOutput::Rows(rows))
+                        if rows.rows.is_empty() || statement.starts_with("explain")),
+                "execute {statement}: {executed:?}"
             );
         }
     }

@@ -460,7 +460,8 @@ All notable public changes will be recorded here.
   table as well as `Write`; before, `Write` alone could read any row by key.
   Extended-protocol Describe over PostgreSQL wire, which returned the column
   names and types of catalog tables (no rows) without an RBAC check, now
-  plans the statement under the same checks (see the pgwire Describe entry).
+  plans the statement under the same checks (see "Pgwire Describe authorizes
+  a metadata-only plan" under Unreleased).
 - Fixed SQL bypasses of row and masking policies. SQL run as a principal applied
   them to the query result, matched to its columns by name, so a principal with
   `Read` on a policy-protected table could see the rows its row policies hide
