@@ -669,9 +669,10 @@ impl BlockingDbExecutor {
         }
     }
 
-    /// Rejects placeholders used as whole `ORDER BY` / `GROUP BY` items. The
-    /// statement is parsed on a blocking thread under the database's SQL
-    /// parser limits, like the statements the database runs.
+    /// Rejects placeholders used as whole `ORDER BY` / `GROUP BY` items, and
+    /// statements that do not parse so cannot be checked. The statement is
+    /// parsed on a blocking thread under the database's SQL parser limits,
+    /// like the statements the database runs.
     async fn check_parameter_positions(&self, sql: String) -> PgWireResult<()> {
         let permit = self
             .permits
@@ -2807,16 +2808,30 @@ mod tests {
             "select (select name from users order by $1 limit 1)",
             "select string_agg(name, ',' order by $1) from users",
             "select name from users where age > $1 order by $1 as of lsn 1",
+            // Execute removes an `AS OF` suffix whose point is a placeholder too.
+            "select name, age from users order by $1 as of lsn $2",
+            "select age, count(*) from users group by $1 as of timestamp $2",
+            // An alias placeholder parses once its value is spliced as a quoted name.
+            "select name as $2, age from users order by $1",
+            "select name $2, age from users order by $1",
         ] {
             let result = factory.handler.on_parse(&mut client, parse(sql)).await;
             assert_eq!(sqlstate(&result), Some("0A000"), "{sql}: {result:?}");
         }
+        // A statement that parses neither with placeholders nor with quoted
+        // values in their place cannot be checked, so it is refused.
+        let sql = "select name, age from users order by $1, cast(name as varchar($2))";
+        let result = factory.handler.on_parse(&mut client, parse(sql)).await;
+        assert_eq!(sqlstate(&result), Some("42601"), "{sql}: {result:?}");
         for sql in [
             "select name from users order by name limit $1",
             "select name from users where age = $1 order by age",
             "select name, age from users order by age + $1",
             "select age + $1 as a, count(*) from users group by age + $1",
+            "select name from users where age > $1 order by age as of lsn $2",
+            "select age as $1 from users order by age",
             "call absent($1)",
+            "create function f language wasm as hex $1",
         ] {
             factory.handler.on_parse(&mut client, parse(sql)).await?;
         }

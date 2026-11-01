@@ -6,14 +6,19 @@ use pgwire::error::{PgWireError, PgWireResult};
 use sqlparser::{
     ast::{
         Expr as SqlExpr, Function, FunctionArgumentClause, FunctionArguments, GroupByExpr, OrderBy,
-        OrderByKind, Query, Select, UnaryOperator, Value as SqlValue, Visit, Visitor,
+        OrderByKind, Query, Select, Statement, UnaryOperator, Value as SqlValue, Visit, Visitor,
     },
     dialect::PostgreSqlDialect,
-    tokenizer::{Token, Tokenizer},
+    parser::Parser,
+    tokenizer::{Location, Token, Tokenizer},
 };
 
-use super::pg_error;
-use crate::{performance::QueryExecutionConfig, query::parse_with_limits};
+use super::{db_error_to_pg, pg_error};
+use crate::{
+    db::DbError,
+    performance::QueryExecutionConfig,
+    query::{QueryError, parse_with_limits},
+};
 
 const MAX_EXPANDED_SQL_BYTES: usize = 16 * 1024 * 1024;
 
@@ -187,30 +192,75 @@ fn separator(neighbour: Option<char>) -> &'static str {
 /// Rejects a prepared statement that uses a placeholder as a whole `ORDER BY`
 /// or `GROUP BY` item. The engine reads an integer there as a column
 /// position, so a bound `2` would sort or group by the second column; in
-/// `PostgreSQL` it is a constant. Statements that do not parse, such as
-/// `CALL`, are left to the engine, which reports their errors when they run.
+/// `PostgreSQL` it is a constant.
+///
+/// The statement is checked as Execute plans it, without an `AS OF` suffix,
+/// whose point may be a placeholder too. Where sqlparser takes a quoted value
+/// but not a placeholder, as for an alias, a placeholder is read as the
+/// quoted value it is spliced as. A statement that parses neither way is
+/// refused, as `PostgreSQL` refuses it at `Parse`, unless the database answers
+/// it from its text without planning it, as it does `CALL`.
 pub(super) fn reject_positional_placeholders(
     sql: &str,
     limits: &QueryExecutionConfig,
 ) -> PgWireResult<()> {
-    let statement = crate::db::parse_as_of_query(sql)
-        .ok()
-        .flatten()
-        .map_or_else(|| sql.to_owned(), |(statement, _)| statement);
-    let Ok(statements) = parse_with_limits(&statement, limits) else {
-        return Ok(());
+    let statement = match crate::db::as_of_statement(sql) {
+        Some(statement) => statement,
+        None if crate::db::answered_from_text(sql) => return Ok(()),
+        None => sql,
     };
+    let (statements, quoted) = match parse_with_limits(statement, limits) {
+        Ok(statements) => (statements, Vec::new()),
+        Err(error) => matches!(error, QueryError::Parse(_))
+            .then(|| parse_with_quoted_placeholders(statement, limits))
+            .flatten()
+            .ok_or_else(|| db_error_to_pg(&DbError::from(error)))?,
+    };
+    let mut visitor = PositionalPlaceholder { quoted: &quoted };
     for statement in &statements {
-        if let ControlFlow::Break(error) = statement.visit(&mut PositionalPlaceholder) {
+        if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
             return Err(error);
         }
     }
     Ok(())
 }
 
-struct PositionalPlaceholder;
+/// The start and text of each placeholder read as a quoted value.
+type QuotedPlaceholders = Vec<(Location, String)>;
 
-impl Visitor for PositionalPlaceholder {
+/// Parses `sql` under the parser's recursion limit with each placeholder read
+/// as a quoted value. Returns the statements and those placeholders.
+fn parse_with_quoted_placeholders(
+    sql: &str,
+    limits: &QueryExecutionConfig,
+) -> Option<(Vec<Statement>, QuotedPlaceholders)> {
+    let mut quoted = Vec::new();
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?
+        .into_iter()
+        .map(|mut token| {
+            if let Token::Placeholder(placeholder) = &mut token.token {
+                quoted.push((token.span.start, std::mem::take(placeholder)));
+                token.token = Token::SingleQuotedString(String::new());
+            }
+            token
+        })
+        .collect();
+    let statements = Parser::new(&PostgreSqlDialect {})
+        .with_recursion_limit(limits.parser_recursion_limit)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .ok()?;
+    Some((statements, quoted))
+}
+
+struct PositionalPlaceholder<'a> {
+    /// The start and text of each placeholder read as a quoted value.
+    quoted: &'a [(Location, String)],
+}
+
+impl Visitor for PositionalPlaceholder<'_> {
     type Break = PgWireError;
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
@@ -218,14 +268,14 @@ impl Visitor for PositionalPlaceholder {
             Some(OrderBy {
                 kind: OrderByKind::Expressions(items),
                 ..
-            }) => reject_placeholder_items(items.iter().map(|item| &item.expr), "ORDER BY"),
+            }) => self.reject_items(items.iter().map(|item| &item.expr), "ORDER BY"),
             _ => ControlFlow::Continue(()),
         }
     }
 
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
         match &select.group_by {
-            GroupByExpr::Expressions(items, _) => reject_placeholder_items(items, "GROUP BY"),
+            GroupByExpr::Expressions(items, _) => self.reject_items(items, "GROUP BY"),
             GroupByExpr::All(_) => ControlFlow::Continue(()),
         }
     }
@@ -249,38 +299,50 @@ impl Visitor for PositionalPlaceholder {
                 _ => &[],
             })
             .chain(within_group);
-        reject_placeholder_items(items.map(|item| &item.expr), "ORDER BY")
+        self.reject_items(items.map(|item| &item.expr), "ORDER BY")
     }
 }
 
-fn reject_placeholder_items<'a>(
-    items: impl IntoIterator<Item = &'a SqlExpr>,
-    clause: &str,
-) -> ControlFlow<PgWireError> {
-    for mut expr in items {
-        // Parentheses and a unary plus leave a numeric literal unchanged in the planner.
-        while let SqlExpr::Nested(inner)
-        | SqlExpr::UnaryOp {
-            op: UnaryOperator::Plus,
-            expr: inner,
-        } = expr
-        {
-            expr = inner;
+impl PositionalPlaceholder<'_> {
+    fn reject_items<'e>(
+        &self,
+        items: impl IntoIterator<Item = &'e SqlExpr>,
+        clause: &str,
+    ) -> ControlFlow<PgWireError> {
+        for mut expr in items {
+            // Parentheses and a unary plus leave a numeric literal unchanged in the planner.
+            while let SqlExpr::Nested(inner)
+            | SqlExpr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr: inner,
+            } = expr
+            {
+                expr = inner;
+            }
+            let SqlExpr::Value(value) = expr else {
+                continue;
+            };
+            let placeholder = match &value.value {
+                SqlValue::Placeholder(placeholder) => Some(placeholder),
+                _ => self
+                    .quoted
+                    .iter()
+                    .find(|(start, _)| *start == value.span.start)
+                    .map(|(_, placeholder)| placeholder),
+            };
+            if let Some(placeholder) = placeholder {
+                return ControlFlow::Break(pg_error(
+                    "ERROR",
+                    "0A000",
+                    format!(
+                        "parameter {placeholder} cannot be a whole {clause} item, \
+                         where a number is a column position"
+                    ),
+                ));
+            }
         }
-        if let SqlExpr::Value(value) = expr
-            && let SqlValue::Placeholder(placeholder) = &value.value
-        {
-            return ControlFlow::Break(pg_error(
-                "ERROR",
-                "0A000",
-                format!(
-                    "parameter {placeholder} cannot be a whole {clause} item, \
-                     where a number is a column position"
-                ),
-            ));
-        }
+        ControlFlow::Continue(())
     }
-    ControlFlow::Continue(())
 }
 
 #[cfg(test)]

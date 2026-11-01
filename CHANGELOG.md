@@ -68,9 +68,15 @@ All notable public changes will be recorded here.
   `ORDER BY` or `GROUP BY` item (also an aggregate's `ORDER BY`) is refused with
   SQLSTATE 0A000: the engine reads a number there as a column position, so a
   bound `2` sorted or grouped by the second column instead of by a constant.
-  Placeholders run from `$1` to `$65535` (SQLSTATE 42P02), and a placeholder the
-  client sent no type for is described as `TEXT` in `ParameterDescription`, so
-  drivers that prepare without parameter types can bind it.
+  The check covers statements with an inline `AS OF` suffix and placeholders
+  used as aliases. A statement with placeholders that parses neither with them
+  nor with quoted values in their place, such as one with a placeholder as a
+  type modifier (`varchar($1)`), is refused with SQLSTATE 42601, as in
+  PostgreSQL; `CALL` and `CREATE FUNCTION`, which multidb runs from their text,
+  are not parsed there. Placeholders run from `$1` to `$65535` (SQLSTATE
+  42P02), and a placeholder the client sent no type for is described as `TEXT`
+  in `ParameterDescription`, so drivers that prepare without parameter types
+  can bind it.
 - Pgwire Describe answers `NoData` for a statement that returns no rows
   (`INSERT` without `RETURNING`, `CALL`, `CREATE FUNCTION`) instead of an empty
   row description, and describes `CALL` and `CREATE FUNCTION` without running
