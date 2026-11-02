@@ -55,6 +55,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
           toolchain: nightly
+          # tsan-smoke.ps1 rebuilds std with -Zbuild-std, which needs the std sources.
+          components: rust-src
       - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
       - name: ThreadSanitizer smoke
         shell: pwsh
