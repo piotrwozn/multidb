@@ -3,6 +3,7 @@ use std::{
     fmt::Debug,
     future::Future,
     io,
+    net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -39,7 +40,7 @@ use pgwire::{
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::RwLock,
     sync::Semaphore,
     task::{JoinError, JoinSet, spawn_blocking},
@@ -70,6 +71,9 @@ const DEFAULT_AUTH_FAILURE_LIMIT: usize = 10;
 const DEFAULT_AUTH_FAILURE_WINDOW_MS: u64 = 60_000;
 const MAX_AUTH_RATE_KEYS: usize = 65_536;
 const MAX_AUTH_USERNAME_BYTES: usize = 256;
+const MAX_PENDING_CAPACITY_REJECTIONS: usize = 32;
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(5);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct NetworkConfig {
@@ -86,6 +90,8 @@ pub struct NetworkConfig {
     /// Deadline for receiving one next frame, never time spent executing a query.
     pub idle_timeout_ms: u64,
     /// Maximum declared frontend frame length; upstream type-specific limits also apply.
+    /// Before login, only startup-phase packets (startup, SSL/GSS encryption and cancel
+    /// requests), SASL messages and Terminate are accepted, each of at most 10,000 bytes.
     pub max_frame_bytes: usize,
     pub auth_failure_limit: usize,
     pub auth_failure_window_ms: u64,
@@ -528,9 +534,10 @@ impl AuthRateLimiter {
 }
 
 impl PgServer {
-    /// Serves `PostgreSQL` wire connections until the listener fails.
+    /// Serves `PostgreSQL` wire connections.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve(
         listener: TcpListener,
         database: Arc<crate::db::Database>,
@@ -547,7 +554,8 @@ impl PgServer {
 
     /// Serves `PostgreSQL` wire connections until the shutdown future completes.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_until_shutdown<F>(
         listener: TcpListener,
         database: Arc<crate::db::Database>,
@@ -571,7 +579,8 @@ impl PgServer {
     /// Statements share a read guard; a held or queued write guard pauses new
     /// statements until it is released.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_shared(
         listener: TcpListener,
         database: SharedDatabase,
@@ -585,7 +594,8 @@ impl PgServer {
     /// Statements share a read guard; a held or queued write guard pauses new
     /// statements until it is released.
     /// # Errors
-    /// Fails when TLS setup fails or accepting a TCP connection fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_shared_until_shutdown<F>(
         listener: TcpListener,
         database: SharedDatabase,
@@ -620,11 +630,16 @@ impl PgServer {
         let max_connections = config.max_connections.max(1);
         let session_limits = session::SessionLimits::from_config(&config);
         let connection_permits = Arc::new(Semaphore::new(max_connections));
+        let rejection_permits = Arc::new(Semaphore::new(MAX_PENDING_CAPACITY_REJECTIONS));
         let blocking_tasks = u32::try_from(config.max_blocking_tasks.max(1))
             .map_err(|_| NetworkError::Runtime("max_blocking_tasks exceeds u32".to_owned()))?;
         let factory = Arc::new(DbPgFactory::new(database, config));
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
+        // One accept future lives across iterations, so a finished connection does
+        // not cut short or reset the backoff of a failing accept().
+        let accept = accept_with_backoff("pgwire", &listener);
+        tokio::pin!(accept);
 
         loop {
             tokio::select! {
@@ -640,13 +655,23 @@ impl PgServer {
                     return Ok(());
                 },
                 _ = connections.join_next(), if !connections.is_empty() => {},
-                accepted = listener.accept() => {
-                    let (socket, _) = accepted?;
+                accepted = &mut accept => {
+                    accept.set(accept_with_backoff("pgwire", &listener));
+                    let (socket, _) = accepted;
                     let tls_acceptor = tls_acceptor.clone();
                     let factory = Arc::clone(&factory);
                     let permits = Arc::clone(&connection_permits);
                     let Ok(permit) = permits.try_acquire_owned() else {
                         tracing::warn!(max_connections, "pgwire connection limit reached");
+                        // A bounded number of refused clients get 53300; the rest are dropped.
+                        if let Ok(rejection) = Arc::clone(&rejection_permits).try_acquire_owned() {
+                            connections.spawn(async move {
+                                let _rejection = rejection;
+                                if let Err(error) = session::reject_at_capacity(socket, tls_acceptor, session_limits).await {
+                                    tracing::debug!(%error, "pgwire capacity rejection failed");
+                                }
+                            });
+                        }
                         continue;
                     };
                     connections.spawn(async move {
@@ -659,6 +684,52 @@ impl PgServer {
             }
         }
     }
+}
+
+/// Accepts the next TCP connection, retrying failed `accept()` calls instead
+/// of stopping the server. Errors that concern a single connection are
+/// retried at once; others, such as running out of file descriptors, are
+/// retried with exponential backoff.
+pub(crate) async fn accept_with_backoff(
+    server: &'static str,
+    listener: &TcpListener,
+) -> (TcpStream, SocketAddr) {
+    retry_accept(server, || listener.accept()).await
+}
+
+async fn retry_accept<T, F, Fut>(server: &'static str, mut accept: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    let mut backoff = ACCEPT_BACKOFF_INITIAL;
+    loop {
+        match accept().await {
+            Ok(accepted) => return accepted,
+            Err(error) if is_connection_error(&error) => {
+                tracing::debug!(server, error = %error, "accept failed for one connection");
+            }
+            Err(error) => {
+                tracing::error!(
+                    server,
+                    error = %error,
+                    retry_in_ms = backoff.as_millis(),
+                    "accept failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+fn is_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
 }
 
 impl BlockingDbExecutor {
@@ -1577,9 +1648,9 @@ mod tests {
         db_error_sqlstate, escape_sql_literal, pg_type_for_value, substitute_params,
     };
     use crate::{
-        db::{DbConfig, DbError, Profile, create_database},
+        db::{Database, DbConfig, DbError, Profile, create_database},
         model::Value,
-        query::{ColumnDef, ColumnType, QueryError, TableSchema},
+        query::{ColumnDef, ColumnType, QueryError, SqlOutput, TableSchema},
         security::{AuthzPolicy, Permission, Principal, PrincipalRegistry, Resource, Role},
         storage::StorageError,
     };
@@ -1599,7 +1670,8 @@ mod tests {
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use rustls_pki_types::CertificateDer;
     use tokio::{
-        net::TcpListener,
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
         sync::{RwLock, oneshot},
     };
     use tokio_postgres::config::SslMode;
@@ -1825,7 +1897,7 @@ mod tests {
         let (shutdown, receive) = oneshot::channel();
         let handle = tokio::spawn(PgServer::serve_until_shutdown(
             listener,
-            database,
+            Arc::clone(&database),
             config,
             async {
                 let _ = receive.await;
@@ -1833,6 +1905,7 @@ mod tests {
         ));
         Ok(TestServer {
             addr,
+            database: Some(database),
             shutdown,
             handle,
         })
@@ -1991,6 +2064,272 @@ mod tests {
                 .contains("authentication rate limit exceeded"),
             "unexpected authentication rejection: {database_error:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_with_backoff_retries_transient_errors() {
+        let mut script = std::collections::VecDeque::from([
+            Err(io::Error::other("too many open files")),
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+            Ok(7_u8),
+        ]);
+        let mut calls = 0;
+
+        let accepted = super::retry_accept("test", || {
+            calls += 1;
+            std::future::ready(script.pop_front().unwrap_or(Ok(0)))
+        })
+        .await;
+
+        assert_eq!(accepted, 7);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn failed_auth_does_not_execute_following_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = start_test_server(TlsMode::DisabledForTests).await?;
+        let mut attacker = TcpStream::connect(server.addr).await?;
+        attacker.write_all(&startup_message("alice")?).await?;
+        read_until(&mut attacker, b'R').await?;
+
+        let mut payload = sasl_initial_response("BOGUS", None)?;
+        payload.extend(query_message(INJECTED_INSERT)?);
+        attacker.write_all(&payload).await?;
+        let messages = read_until_closed(&mut attacker).await?;
+
+        assert!(
+            matches!(messages.first(), Some((b'E', _))),
+            "expected an error response, got {messages:?}"
+        );
+        assert_no_command_completed(&messages);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(user_count(server.database()?).await?, 1);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mapped_principal_without_credential_cannot_run_a_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server =
+            start_session_test_server(NetworkConfig::new(TlsMode::DisabledForTests, test_auth()))
+                .await?;
+        let mut attacker = TcpStream::connect(server.addr).await?;
+        attacker.write_all(&startup_message("bob")?).await?;
+        read_until(&mut attacker, b'R').await?;
+
+        let mut payload =
+            sasl_initial_response("SCRAM-SHA-256", Some(b"n,,n=,r=0123456789abcdef"))?;
+        payload.extend(query_message(INJECTED_INSERT)?);
+        attacker.write_all(&payload).await?;
+        let messages = read_until_closed(&mut attacker).await?;
+
+        assert!(
+            has_error_code(&messages, "28P01"),
+            "expected FATAL 28P01, got {messages:?}"
+        );
+        assert_no_command_completed(&messages);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(user_count(server.database()?).await?, 1);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_logins_and_cancel_requests_release_their_session_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Long deadlines: a session that kept reading would hold its slot past the check.
+        let base = |tls| {
+            NetworkConfig::new(tls, test_auth())
+                .with_max_connections(1)
+                .with_handshake_timeout_ms(30_000)
+                .with_idle_timeout_ms(30_000)
+        };
+        let long_name = "u".repeat(300);
+        for (case, user, sasl, code) in [
+            ("unsupported SASL mechanism", "alice", true, "08P01"),
+            ("over-long user name", long_name.as_str(), false, "28000"),
+        ] {
+            let server = start_session_test_server(base(TlsMode::DisabledForTests)).await?;
+            let mut attacker = TcpStream::connect(server.addr).await?;
+            attacker.write_all(&startup_message(user)?).await?;
+            if sasl {
+                read_until(&mut attacker, b'R').await?;
+                attacker
+                    .write_all(&sasl_initial_response("BOGUS", None)?)
+                    .await?;
+            }
+            let messages = read_until_closed(&mut attacker).await?;
+            assert!(has_error_code(&messages, code), "{case}: {messages:?}");
+            wait_for_free_session_slot(server.addr)
+                .await
+                .map_err(|error| format!("{case}: {error}"))?;
+            drop(attacker);
+            server.shutdown().await?;
+        }
+
+        let server = start_session_test_server(base(TlsMode::DisabledForTests)).await?;
+        let mut cancel = TcpStream::connect(server.addr).await?;
+        cancel.write_all(&cancel_request()).await?;
+        let messages = read_until_closed(&mut cancel).await?;
+        assert_eq!(messages, Vec::<(u8, Vec<u8>)>::new());
+        wait_for_free_session_slot(server.addr)
+            .await
+            .map_err(|error| format!("cancel request: {error}"))?;
+        drop(cancel);
+        server.shutdown().await?;
+
+        // A login refused by the rate limiter: the first session holds the only
+        // reservation, so the second is rejected at startup.
+        let server = start_session_test_server(
+            base(TlsMode::DisabledForTests)
+                .with_max_connections(2)
+                .with_auth_failure_limit(1, 60_000),
+        )
+        .await?;
+        let mut pending = TcpStream::connect(server.addr).await?;
+        pending.write_all(&startup_message("alice")?).await?;
+        read_until(&mut pending, b'R').await?;
+        let mut limited = TcpStream::connect(server.addr).await?;
+        limited.write_all(&startup_message("alice")?).await?;
+        let messages = read_until_closed(&mut limited).await?;
+        assert!(has_error_code(&messages, "28000"), "{messages:?}");
+        wait_for_free_session_slot(server.addr)
+            .await
+            .map_err(|error| format!("rate-limited login: {error}"))?;
+        drop((pending, limited));
+        server.shutdown().await?;
+
+        let TestTls { server, .. } = test_tls()?;
+        let server = start_session_test_server(base(TlsMode::Require(server))).await?;
+        let mut plaintext = TcpStream::connect(server.addr).await?;
+        plaintext.write_all(&startup_message("alice")?).await?;
+        let messages = read_until_closed(&mut plaintext).await?;
+        assert!(has_error_code(&messages, "28000"), "{messages:?}");
+        wait_for_free_session_slot(server.addr)
+            .await
+            .map_err(|error| format!("TLS required: {error}"))?;
+        drop(plaintext);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_large_frames_close_the_connection_from_the_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A long handshake deadline: a server waiting for the declared body would
+        // keep the connection open past read_until_closed's limit.
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_handshake_timeout_ms(30_000);
+        let server = start_session_test_server(config).await?;
+        for tag in *b"Qp" {
+            let mut client = TcpStream::connect(server.addr).await?;
+            client.write_all(&startup_message("alice")?).await?;
+            read_until(&mut client, b'R').await?;
+            let mut header = vec![tag];
+            header.extend_from_slice(&(1_i32 << 20).to_be_bytes());
+            client.write_all(&header).await?;
+            read_until_closed(&mut client)
+                .await
+                .map_err(|error| format!("{}: {error}", char::from(tag)))?;
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_at_capacity_returns_53300() -> Result<(), Box<dyn std::error::Error>> {
+        let config =
+            NetworkConfig::new(TlsMode::DisabledForTests, test_auth()).with_max_connections(1);
+        let server = start_session_test_server(config).await?;
+        let first = plain_client(server.addr, "secret").await?;
+
+        let error = plain_client(server.addr, "secret")
+            .await
+            .err()
+            .ok_or("connection over the limit unexpectedly succeeded")?;
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS)
+        );
+
+        drop(first);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match plain_client(server.addr, "secret").await {
+                Ok(client) => {
+                    client.simple_query("select name from users").await?;
+                    break;
+                }
+                Err(error)
+                    if tokio::time::Instant::now() < deadline
+                        && error.code()
+                            == Some(&tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_rejection_does_not_execute_following_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // These logins fail before pgwire records the startup user, so a statement read
+        // afterwards would run as the fallback name `unknown`. Mapping that name to a
+        // writer makes such a statement commit instead of being refused by RBAC.
+        let TestTls { server: tls, .. } = test_tls()?;
+        let long_name = "u".repeat(300);
+        for (case, tls, user) in [
+            ("TLS required", TlsMode::Require(tls), "alice"),
+            (
+                "over-long user name",
+                TlsMode::DisabledForTests,
+                long_name.as_str(),
+            ),
+        ] {
+            let server = start_test_server_for_principals(tls, true, &["alice", "unknown"]).await?;
+            let mut attacker = TcpStream::connect(server.addr).await?;
+
+            let mut payload = startup_message(user)?;
+            payload.extend(query_message(INJECTED_INSERT)?);
+            attacker.write_all(&payload).await?;
+            let messages = read_until_closed(&mut attacker).await?;
+
+            assert!(
+                has_error_code(&messages, "28000"),
+                "{case}: expected FATAL 28000, got {messages:?}"
+            );
+            assert_no_command_completed(&messages);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(user_count(server.database()?).await?, 1, "{case}");
+            server.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminate_before_login_closes_the_connection() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // A long handshake deadline: a server that ignored Terminate would keep the
+        // connection open past read_until_closed's limit.
+        let config = NetworkConfig::new(TlsMode::DisabledForTests, test_auth())
+            .with_handshake_timeout_ms(30_000);
+        let server = start_session_test_server(config).await?;
+        let mut client = TcpStream::connect(server.addr).await?;
+        client.write_all(&startup_message("alice")?).await?;
+        read_until(&mut client, b'R').await?;
+        client.write_all(&typed_message(b'X', &[])?).await?;
+        assert_eq!(
+            read_until_closed(&mut client).await?,
+            Vec::<(u8, Vec<u8>)>::new()
+        );
+        server.shutdown().await?;
         Ok(())
     }
 
@@ -2347,6 +2686,7 @@ mod tests {
 
         Ok(TestServer {
             addr,
+            database: None,
             shutdown,
             handle,
         })
@@ -2366,6 +2706,8 @@ mod tests {
             .grant(Resource::Table("users".to_owned()), Permission::Write);
         let mut principals = PrincipalRegistry::new();
         principals.insert("alice", Principal::new("alice").with_role("user"));
+        // A mapped principal without a SCRAM credential, like the built-in `admin` in serve.
+        principals.insert("bob", Principal::new("bob").with_role("user"));
         database.set_authz_policy(AuthzPolicy::new([user_role]));
         database.set_principal_registry(principals);
         Ok(database)
@@ -2378,11 +2720,19 @@ mod tests {
 
     struct TestServer {
         addr: std::net::SocketAddr,
+        /// The served database for direct checks; `None` for a shared handle.
+        database: Option<Arc<Database>>,
         shutdown: oneshot::Sender<()>,
         handle: tokio::task::JoinHandle<Result<(), NetworkError>>,
     }
 
     impl TestServer {
+        fn database(&self) -> Result<&Database, Box<dyn std::error::Error>> {
+            self.database
+                .as_deref()
+                .ok_or_else(|| "test server has no direct database handle".into())
+        }
+
         async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
             let _ = self.shutdown.send(());
             self.handle.await??;
@@ -2417,6 +2767,15 @@ mod tests {
         tls: TlsMode,
         write_allowed: bool,
     ) -> Result<TestServer, Box<dyn std::error::Error>> {
+        start_test_server_for_principals(tls, write_allowed, &["alice"]).await
+    }
+
+    /// Serves the `users` table with each named principal holding the `user` role.
+    async fn start_test_server_for_principals(
+        tls: TlsMode,
+        write_allowed: bool,
+        names: &[&str],
+    ) -> Result<TestServer, Box<dyn std::error::Error>> {
         let mut database = create_database(DbConfig::new(Profile::InMemory))?;
         let users = database.create_table("users", Some(user_schema()), Vec::new())?;
         users.insert(vec![
@@ -2431,17 +2790,20 @@ mod tests {
             user_role = user_role.grant(Resource::Table("users".to_owned()), Permission::Write);
         }
         let mut principals = PrincipalRegistry::new();
-        principals.insert("alice", Principal::new("alice").with_role("user"));
+        for name in names {
+            principals.insert(*name, Principal::new(*name).with_role("user"));
+        }
         database.set_authz_policy(AuthzPolicy::new([user_role]));
         database.set_principal_registry(principals);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let (shutdown, shutdown_rx) = oneshot::channel();
+        let database = Arc::new(database);
         let config = NetworkConfig::new(tls, test_auth()).with_max_blocking_tasks(4);
         let handle = tokio::spawn(PgServer::serve_until_shutdown(
             listener,
-            Arc::new(database),
+            Arc::clone(&database),
             config,
             async {
                 let _ = shutdown_rx.await;
@@ -2450,9 +2812,166 @@ mod tests {
 
         Ok(TestServer {
             addr,
+            database: Some(database),
             shutdown,
             handle,
         })
+    }
+
+    const INJECTED_INSERT: &str =
+        "insert into users (id, name, age, active) values (99, 'Mallory', 1, true)";
+
+    async fn user_count(database: &Database) -> Result<i64, Box<dyn std::error::Error>> {
+        let SqlOutput::Rows(rows) = database.query("select count(*) from users").await? else {
+            return Err(io::Error::other("count returned no rows").into());
+        };
+        match rows.rows.first().and_then(|row| row.first()) {
+            Some(Value::Int(count)) => Ok(*count),
+            other => Err(io::Error::other(format!("unexpected count {other:?}")).into()),
+        }
+    }
+
+    fn startup_message(user: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut body = 196_608_i32.to_be_bytes().to_vec();
+        for (key, value) in [("user", user), ("database", "multidb")] {
+            body.extend_from_slice(key.as_bytes());
+            body.push(0);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut message = i32::try_from(body.len() + 4)?.to_be_bytes().to_vec();
+        message.extend(body);
+        Ok(message)
+    }
+
+    fn cancel_request() -> Vec<u8> {
+        let mut message = 16_i32.to_be_bytes().to_vec();
+        for field in [80_877_102_i32, 1, 2] {
+            message.extend_from_slice(&field.to_be_bytes());
+        }
+        message
+    }
+
+    fn typed_message(tag: u8, body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut message = vec![tag];
+        message.extend_from_slice(&i32::try_from(body.len() + 4)?.to_be_bytes());
+        message.extend_from_slice(body);
+        Ok(message)
+    }
+
+    fn query_message(sql: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        typed_message(b'Q', &body)
+    }
+
+    fn sasl_initial_response(
+        mechanism: &str,
+        data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut body = mechanism.as_bytes().to_vec();
+        body.push(0);
+        match data {
+            Some(data) => {
+                body.extend_from_slice(&i32::try_from(data.len())?.to_be_bytes());
+                body.extend_from_slice(data);
+            }
+            None => body.extend_from_slice(&(-1_i32).to_be_bytes()),
+        }
+        typed_message(b'p', &body)
+    }
+
+    /// Reads one backend message, or `None` once the server closed the connection.
+    async fn read_backend_message(
+        stream: &mut TcpStream,
+    ) -> Result<Option<(u8, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let mut tag = [0_u8; 1];
+        match stream.read(&mut tag).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await?;
+        let length = usize::try_from(i32::from_be_bytes(length))?
+            .checked_sub(4)
+            .ok_or("invalid backend message length")?;
+        let mut body = vec![0_u8; length];
+        stream.read_exact(&mut body).await?;
+        Ok(Some((tag[0], body)))
+    }
+
+    async fn read_until(stream: &mut TcpStream, tag: u8) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            match read_backend_message(stream).await? {
+                Some((received, _)) if received == tag => return Ok(()),
+                Some(_) => {}
+                None => return Err(io::Error::other("connection closed early").into()),
+            }
+        }
+    }
+
+    /// Collects backend messages until the server closes the connection, failing after 5 s.
+    async fn read_until_closed(
+        stream: &mut TcpStream,
+    ) -> Result<Vec<(u8, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let mut messages = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = read_backend_message(stream).await? {
+                messages.push(message);
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await??;
+        Ok(messages)
+    }
+
+    fn has_error_code(messages: &[(u8, Vec<u8>)], code: &str) -> bool {
+        messages.iter().any(|(tag, body)| {
+            *tag == b'E'
+                && body
+                    .split(|byte| *byte == 0)
+                    .any(|field| field.strip_prefix(b"C") == Some(code.as_bytes()))
+        })
+    }
+
+    fn assert_no_command_completed(messages: &[(u8, Vec<u8>)]) {
+        assert!(
+            !messages.iter().any(|(tag, _)| *tag == b'C'),
+            "a command completed: {messages:?}"
+        );
+    }
+
+    /// Waits until a new client is given a session slot, failing after 5 s. A slot is
+    /// granted when the server answers a fresh startup message, unless it answers 53300.
+    async fn wait_for_free_session_slot(
+        addr: std::net::SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut probe = TcpStream::connect(addr).await?;
+            let answered = match probe.write_all(&startup_message("probe")?).await {
+                Ok(()) => {
+                    tokio::time::timeout(Duration::from_secs(1), read_backend_message(&mut probe))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten()
+                }
+                Err(_) => None,
+            };
+            if let Some(message) = answered
+                && !has_error_code(std::slice::from_ref(&message), "53300")
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::other("no pgwire session slot became free").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn connect_client(

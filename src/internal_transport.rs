@@ -703,7 +703,8 @@ impl InternalTransportServer {
     /// Serves AP/health/flow-control frames until shutdown completes.
     ///
     /// # Errors
-    /// Fails when accepting connections or setting up TLS fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_ap_until_shutdown<F>(
         listener: TcpListener,
         config: InternalTransportConfig,
@@ -720,7 +721,8 @@ impl InternalTransportServer {
     /// Serves AP, health, flow-control, Raft and cluster-admin frames until shutdown completes.
     ///
     /// # Errors
-    /// Fails when accepting connections or setting up TLS fails.
+    /// Fails when TLS setup fails; failed `accept()` calls are logged and
+    /// retried with backoff.
     pub async fn serve_cluster_until_shutdown<F>(
         listener: TcpListener,
         config: InternalTransportConfig,
@@ -772,8 +774,8 @@ impl InternalTransportServer {
         loop {
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
-                accepted = listener.accept() => {
-                    let (socket, peer) = accepted?;
+                accepted = crate::network::accept_with_backoff("internal-transport", &listener) => {
+                    let (socket, peer) = accepted;
                     let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                         observability::record_internal_transport_connection("limit");
                         continue;

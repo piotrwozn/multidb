@@ -3,18 +3,20 @@
 use std::{io, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use pgwire::{
     api::{
         ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers,
         portal::PortalExecutionState, store::PortalStore,
     },
-    error::{PgWireError, PgWireResult},
+    error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{PgWireBackendMessage, PgWireFrontendMessage},
-    tokio::server::{PgWireMessageServerCodec, negotiate_tls, process_error, process_message},
+    tokio::server::{
+        MaybeTls, PgWireMessageServerCodec, negotiate_tls, process_error, process_message,
+    },
 };
 use tokio::net::TcpStream;
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use super::{DbPgFactory, NetworkConfig, TlsAcceptor};
 
@@ -37,11 +39,18 @@ impl SessionLimits {
     }
 }
 
+/// pgwire's limit for startup and password messages, including the length field.
+const SMALL_PACKET_BYTES: usize = 10_000;
+
 /// Rejects oversized declared lengths before the upstream decoder can reserve body space.
 /// The upstream type-specific packet limits still apply, even if the configured cap is larger.
 struct BoundedCodec {
     inner: PgWireMessageServerCodec<String>,
     startup: bool,
+    /// Before login only startup packets, SASL messages and Terminate are accepted,
+    /// each within [`SMALL_PACKET_BYTES`]; the configured cap applies to authenticated
+    /// sessions.
+    authenticating: bool,
     frame_bytes: usize,
 }
 
@@ -68,8 +77,11 @@ impl Decoder for BoundedCodec {
         if length > self.frame_bytes {
             return Err(PgWireError::MessageTooLarge(length, self.frame_bytes));
         }
-        if self.startup && length > 10_000 {
-            return Err(PgWireError::MessageTooLarge(length, 10_000));
+        if self.authenticating && !self.startup && !matches!(bytes[0], b'p' | b'X') {
+            return Err(PgWireError::InvalidMessageType(bytes[0]));
+        }
+        if (self.startup || self.authenticating) && length > SMALL_PACKET_BYTES {
+            return Err(PgWireError::MessageTooLarge(length, SMALL_PACKET_BYTES));
         }
         let total = length.checked_add(offset).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid pgwire frame length")
@@ -179,6 +191,65 @@ where
     Ok(())
 }
 
+/// Answers a client that arrives while every session slot is taken with
+/// `FATAL 53300`, as `PostgreSQL` does, instead of dropping it silently. The
+/// whole exchange, including TLS, runs within the handshake deadline.
+pub(super) async fn reject_at_capacity(
+    socket: TcpStream,
+    tls: Option<TlsAcceptor>,
+    limits: SessionLimits,
+) -> io::Result<()> {
+    let handshake_deadline = deadline(limits.handshake)?;
+    let rejection = async move {
+        let Some(socket) = negotiate_tls::<String>(socket, tls).await? else {
+            return Ok(());
+        };
+        let mut bounded = socket.map_codec(|inner| BoundedCodec {
+            inner,
+            startup: true,
+            authenticating: true,
+            frame_bytes: limits.frame_bytes,
+        });
+        if let Some(Ok(PgWireFrontendMessage::Startup(_))) = bounded.next().await {
+            let error = ErrorInfo::new(
+                "FATAL".to_owned(),
+                "53300".to_owned(),
+                "sorry, too many clients already".to_owned(),
+            );
+            bounded
+                .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                .await?;
+            bounded.close().await?;
+        }
+        Ok(())
+    };
+    tokio::time::timeout_at(handshake_deadline, rejection)
+        .await
+        .map_err(|_| timed_out("capacity rejection"))?
+}
+
+/// Whether the session ends once `message` is processed. pgwire answers a cancel
+/// request and closes only the write half; it ignores Terminate, after which
+/// `PostgreSQL` closes the connection.
+fn closes_connection(message: &PgWireFrontendMessage) -> bool {
+    matches!(
+        message,
+        PgWireFrontendMessage::CancelRequest(_) | PgWireFrontendMessage::Terminate(_)
+    )
+}
+
+/// Sends an error response and returns whether the error was FATAL.
+async fn report_error(
+    socket: &mut Framed<MaybeTls, PgWireMessageServerCodec<String>>,
+    error: PgWireError,
+    is_extended: bool,
+) -> io::Result<bool> {
+    let error = ErrorInfo::from(error);
+    let fatal = error.is_fatal();
+    process_error(socket, PgWireError::UserError(Box::new(error)), is_extended).await?;
+    Ok(fatal)
+}
+
 pub(super) async fn process_socket(
     socket: TcpStream,
     tls: Option<TlsAcceptor>,
@@ -201,6 +272,9 @@ pub(super) async fn process_socket(
     let cancel = factory.cancel_handler();
     let errors = factory.error_handler();
     let mut state_budget = super::session_state::Budget::default();
+    // Set only once a startup message completed the login, never from client metadata:
+    // pgwire copies the untrusted startup parameters, including `user`, into it.
+    let mut authenticated = false;
     loop {
         let state = socket.state();
         let authenticating = matches!(
@@ -208,9 +282,16 @@ pub(super) async fn process_socket(
             PgWireConnectionState::AwaitingStartup
                 | PgWireConnectionState::AuthenticationInProgress
         );
+        if !authenticating && !authenticated {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pgwire session left authentication without logging in",
+            ));
+        }
         let mut bounded = socket.map_codec(|inner| BoundedCodec {
             inner,
             startup: matches!(state, PgWireConnectionState::AwaitingStartup),
+            authenticating,
             frame_bytes: limits.frame_bytes,
         });
         let message = if authenticating {
@@ -239,6 +320,7 @@ pub(super) async fn process_socket(
             PgWireConnectionState::CopyInProgress(is_extended) => is_extended,
             _ => message.is_extended_query(),
         };
+        let close_after = closes_connection(&message);
         let request_deadline = deadline(limits.request)?;
         let request_deadline = if authenticating {
             request_deadline.min(handshake_deadline)
@@ -258,15 +340,26 @@ pub(super) async fn process_socket(
             .await
             {
                 errors.on_error(&socket, &mut error);
-                process_error(&mut socket, error, is_extended).await?;
-            } else if let Some(update) = state_update {
+                let fatal = report_error(&mut socket, error, is_extended).await?;
+                // process_error moves the session to ReadyForQuery (or AwaitingSync) and
+                // shuts only the write half. Reading on after a failed login would dispatch
+                // the next frame as the user named in the startup message.
+                return Ok::<bool, io::Error>(authenticating || fatal);
+            }
+            if let Some(update) = state_update {
                 state_budget.commit(update);
             }
-            Ok::<(), io::Error>(())
+            Ok(close_after)
         };
-        tokio::time::timeout_at(request_deadline, processing)
+        let close = tokio::time::timeout_at(request_deadline, processing)
             .await
             .map_err(|_| timed_out("protocol request"))??;
+        if close {
+            return Ok(());
+        }
+        if authenticating && matches!(socket.state(), PgWireConnectionState::ReadyForQuery) {
+            authenticated = true;
+        }
         finish_state_budget(&socket, &mut state_budget, execution.as_deref()).await?;
     }
 }
@@ -281,6 +374,16 @@ mod tests {
     };
 
     fn make_codec(startup: bool, frame_bytes: usize) -> BoundedCodec {
+        let state = if startup {
+            PgWireConnectionState::AwaitingStartup
+        } else {
+            PgWireConnectionState::ReadyForQuery
+        };
+        make_codec_in(state, frame_bytes)
+    }
+
+    fn make_codec_in(state: PgWireConnectionState, frame_bytes: usize) -> BoundedCodec {
+        let startup = matches!(state, PgWireConnectionState::AwaitingStartup);
         let mut client = DefaultClient::<String>::new(([127, 0, 0, 1], 5432).into(), false);
         client.set_state(PgWireConnectionState::AwaitingStartup);
         let mut inner = PgWireMessageServerCodec::new(client);
@@ -294,13 +397,16 @@ mod tests {
                     Some(pgwire::messages::PgWireFrontendMessage::Startup(_))
                 )
             }));
-            inner
-                .client_info
-                .set_state(PgWireConnectionState::ReadyForQuery);
+            inner.client_info.set_state(state);
         }
         BoundedCodec {
             inner,
             startup,
+            authenticating: matches!(
+                state,
+                PgWireConnectionState::AwaitingStartup
+                    | PgWireConnectionState::AuthenticationInProgress
+            ),
             frame_bytes,
         }
     }
@@ -346,6 +452,45 @@ mod tests {
             codec.decode(&mut bytes),
             Err(PgWireError::MessageTooLarge(20_000, 10_000))
         ));
+    }
+
+    #[test]
+    fn unauthenticated_frames_are_limited_to_small_sasl_messages_from_the_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let frame_bytes = 16 * 1024 * 1024;
+        let mut codec = make_codec_in(PgWireConnectionState::AuthenticationInProgress, frame_bytes);
+        let mut bytes = BytesMut::from(&b"p\0\0\x27\x11"[..]);
+        assert!(matches!(
+            codec.decode(&mut bytes),
+            Err(PgWireError::MessageTooLarge(10_001, 10_000))
+        ));
+        assert_eq!(bytes.len(), 5);
+        for header in [&b"Q\0\x10\0\0"[..], b"d\0\x10\0\0", b"Q\0\0\0\x0d"] {
+            let mut bytes = BytesMut::from(header);
+            assert!(matches!(
+                codec.decode(&mut bytes),
+                Err(PgWireError::InvalidMessageType(b'Q' | b'd'))
+            ));
+            assert_eq!(bytes.len(), 5);
+        }
+        let mut bytes = BytesMut::from(&b"p\0\0\0\x16SCRAM-SHA-256\0\xff\xff\xff\xff"[..]);
+        assert!(matches!(
+            codec.decode(&mut bytes)?,
+            Some(pgwire::messages::PgWireFrontendMessage::PasswordMessageFamily(_))
+        ));
+        assert!(
+            codec
+                .decode(&mut BytesMut::from(&b"X\0\0\0\x04"[..]))?
+                .is_some()
+        );
+        // After login the configured cap applies: the body is awaited.
+        let mut codec = make_codec(false, frame_bytes);
+        assert!(
+            codec
+                .decode(&mut BytesMut::from(&b"Q\0\x10\0\0"[..]))?
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

@@ -68,7 +68,7 @@ Environment:
 | `MULTIDB_PG_HANDSHAKE_TIMEOUT_MS` | no | `10000` | Positive total deadline for TLS, startup and SCRAM authentication. |
 | `MULTIDB_PG_IDLE_TIMEOUT_MS` | no | `60000` | Positive deadline for receiving the next frontend frame. Query execution does not consume this budget; connection pools can set a longer idle deadline. |
 | `MULTIDB_PG_REQUEST_TIMEOUT_MS` | no | `300000` | Positive processing deadline for one protocol request, including response writes. Active sessions have no total lifetime cap; database query/governor budgets still apply. |
-| `MULTIDB_PG_MAX_FRAME_BYTES` | no | `16777216` | Positive declared frontend frame limit, checked before decoding. Smaller upstream message-specific limits still apply. |
+| `MULTIDB_PG_MAX_FRAME_BYTES` | no | `16777216` | Positive declared frontend frame limit, checked before decoding. Smaller upstream message-specific limits still apply. Before login, only startup-phase packets (startup, SSL/GSS encryption and cancel requests), SCRAM messages and Terminate are accepted, each of at most 10,000 bytes. |
 | `MULTIDB_SPEC_PATH` | no | unset | Spec mode (preview): the `DatabaseSpec` the database is built from and checked against at every start; see [Spec mode](#spec-mode). |
 | `MULTIDB_SPEC_APPLY` | no | `verify` | Spec mode only: `verify`, `create` or `additive`. Set without `MULTIDB_SPEC_PATH`, it is a usage error. |
 | `MULTIDB_REPLICATION` | no | unset | Read in spec mode only (`cp` or `ap`), where it must agree with the spec; ignored otherwise. |
@@ -92,6 +92,13 @@ numbers; zero, invalid numbers and integer overflow stop startup. Empty values
 use the defaults. These settings apply to the running server only. The request
 timeout maps to the library's legacy `connection_timeout_ms` field, whose
 meaning changed from a total session lifetime to one protocol request.
+
+A failed PostgreSQL authentication closes the connection: the server reads no
+further message from it. FATAL errors, cancel requests and Terminate messages
+also close their connection. At most 512 PostgreSQL sessions run at once.
+Further clients receive `FATAL 53300` (`sorry, too many clients already`);
+while 32 of those answers are pending, any more clients are disconnected
+without a message.
 
 `MULTIDB_ADMIN_PASSWORD` is required only when the database does not already
 contain the durable `admin` credential and no legacy admin token is configured.

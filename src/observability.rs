@@ -242,7 +242,8 @@ impl MetricsRegistry {
 impl MetricsServer {
     /// Serves `/metrics` as Prometheus text.
     /// # Errors
-    /// Fails when the listener cannot accept a connection.
+    /// Never returns an error; it serves until the future is dropped. Failed
+    /// `accept()` calls are logged and retried with backoff.
     pub async fn serve(
         listener: TcpListener,
         registry: MetricsRegistry,
@@ -252,7 +253,8 @@ impl MetricsServer {
 
     /// Serves `/metrics` as Prometheus text with optional bearer-token authorization.
     /// # Errors
-    /// Fails when the listener cannot accept a connection.
+    /// Never returns an error; it serves until the future is dropped. Failed
+    /// `accept()` calls are logged and retried with backoff.
     pub async fn serve_with_auth(
         listener: TcpListener,
         registry: MetricsRegistry,
@@ -277,7 +279,7 @@ async fn serve_metrics_bounded(
     timeout: Duration,
 ) -> Result<(), ObservabilityError> {
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, _) = crate::network::accept_with_backoff("metrics", &listener).await;
         // Refuse excess sockets before spawning or waiting: a stalled client may
         // consume only one of a fixed number of tasks and descriptors.
         let Ok(permit) = connections.clone().try_acquire_owned() else {
